@@ -147,7 +147,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("tf-cas-tree-{tag}-{}", std::process::id()));
+        p.push(format!("cargoless-cas-tree-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -269,7 +269,10 @@ mod tests {
     #[test]
     fn missing_root_is_an_io_error_not_a_panic() {
         let mut p = std::env::temp_dir();
-        p.push(format!("tf-cas-does-not-exist-{}", std::process::id()));
+        p.push(format!(
+            "cargoless-cas-does-not-exist-{}",
+            std::process::id()
+        ));
         assert!(hash_source_tree(&p).is_err());
     }
 }

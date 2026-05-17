@@ -1,6 +1,6 @@
 //! The `BuildIdentity → InputHash` reduction — the CAS key derivation.
 //!
-//! `tf-proto` carries the *shape* of a build's identity (each output-affecting
+//! `cargoless-proto` carries the *shape* of a build's identity (each output-affecting
 //! input as its own typed field) and guarantees one invariant to every
 //! consumer: **equal [`BuildIdentity`] ⇒ equal [`InputHash`] ⇒ substitutable
 //! artifact** (AC#5 dedupe, AC#4 provenance). It deliberately does *not*
@@ -72,7 +72,7 @@ fn canonical_preimage(id: &BuildIdentity) -> Vec<u8> {
 
 /// Reduce a full [`BuildIdentity`] to its single [`InputHash`] CAS key.
 ///
-/// This is *the* function behind the `tf-proto` invariant. It is total,
+/// This is *the* function behind the `cargoless-proto` invariant. It is total,
 /// deterministic, and dependency-free. Two `BuildIdentity` values compare
 /// `Eq` **iff** this returns equal `InputHash` values — proven component by
 /// component in [`tests`].
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(
             input_hash(&base()),
             input_hash(&base()),
-            "the tf-proto invariant: equal BuildIdentity ⇒ equal InputHash"
+            "the cargoless-proto invariant: equal BuildIdentity ⇒ equal InputHash"
         );
         // And it is a real 64-hex SHA-256, not a passthrough.
         assert_eq!(input_hash(&base()).as_str().len(), 64);

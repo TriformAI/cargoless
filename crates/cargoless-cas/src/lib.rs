@@ -4,7 +4,7 @@
 //! v0 even though only [`LocalDiskStore`] implements it, or v1 becomes a
 //! rewrite (decision D10). v0 ships local-disk only; S3/RustFS are v1.
 //!
-//! This crate also owns the half of the `tf-proto` contract that `tf-proto`
+//! This crate also owns the half of the `cargoless-proto` contract that `cargoless-proto`
 //! deliberately does *not* specify: the hash algorithm ([`sha256`]) and the
 //! `BuildIdentity → InputHash` reduction ([`input_hash`]) that the whole AC#5
 //! dedupe / AC#4 provenance guarantee rests on. The daemon assembles a

@@ -39,7 +39,7 @@
 //!
 //! ## Frozen-seam discipline
 //!
-//! `StateEvent` and the four `tf-proto` seams are byte-frozen. `check_once`,
+//! `StateEvent` and the four `cargoless-proto` seams are byte-frozen. `check_once`,
 //! `watch`, `ModelSession::{subscribe,tree_state,shutdown}` keep their exact
 //! signatures (cli-ux is wired to them). Provenance is ADDITIVE only:
 //! [`Verdict`], [`VerdictProvenance`], [`check_verdict`],
@@ -95,7 +95,7 @@ fn resolve_watch_debounce() -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// #21 additive provenance types (cargoless_core::model, serde-free — NOT tf-proto)
+// #21 additive provenance types (cargoless_core::model, serde-free — NOT cargoless-proto)
 // ---------------------------------------------------------------------------
 
 /// Where a verdict's authority comes from.
@@ -117,7 +117,7 @@ pub struct Verdict {
 /// FIELD FINDING #6-NEG-A (#51): supervisor-lifecycle events surfaced to
 /// the CLI so the watch stream is never silent during an AC#6 transparent
 /// restart. Separate channel from [`StateEvent`] (which is the byte-frozen
-/// tf-proto seam — must NOT grow) and [`Verdict`] (which is the #21
+/// cargoless-proto seam — must NOT grow) and [`Verdict`] (which is the #21
 /// authoritative-vs-advisory verdict, not lifecycle). Additive only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LifecycleEvent {

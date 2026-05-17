@@ -5,11 +5,11 @@
 //! ModelSession, std::sync::mpsc::Receiver<StateEvent>)>`. We pass
 //! `cargoless_core::model::placeholder_identity` directly — a bare
 //! `fn() -> BuildIdentity` satisfying the blanket `IdentityProvider` impl;
-//! tf-cli never computes a `BuildIdentity` (build-cas owns the real seam).
+//! cargoless never computes a `BuildIdentity` (build-cas owns the real seam).
 //!
 //! Headless: prints verdict transitions to stderr, NO browser/HTTP. The
 //! event stream is drained with [`HEARTBEAT`](crate::statusfile::HEARTBEAT)
-//! `recv_timeout` so the tf-cli status file's `updated` is refreshed even
+//! `recv_timeout` so the cargoless status file's `updated` is refreshed even
 //! when a quiet green tree emits no events — that heartbeat is the liveness
 //! signal `status` reads (RULING 1). `ModelSession` is held for the whole
 //! run (drop = graceful shutdown: stops watcher, kills rust-analyzer).
@@ -80,7 +80,7 @@ pub fn run(cfg: &Config) -> ExitCode {
     // {ver}" banner off CARGO_PKG_VERSION here. Before #89 this line
     // was the divergent site — `--version` said "tf-trunk {ver}" while
     // this said "cargoless {ver}", same binary two names. One source
-    // now; the D1 rename is one literal in tf-core.
+    // now; the D1 rename is one literal in cargoless-core.
     ui::step(format!(
         "{} — watching {} ({})",
         cargoless_core::BUILD_ID,

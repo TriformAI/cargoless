@@ -1,11 +1,11 @@
-//! The tf-cli-owned daemon-status file (lead RULING 1).
+//! The cargoless-owned daemon-status file (lead RULING 1).
 //!
 //! `ModelSession` is in-process only — a separate `status` invocation cannot
 //! call `tree_state()`. So the running `watch` / `build --watch` process
 //! writes this small file (liveness heartbeat + current verdict) and
 //! `status` reads it. This is DISTINCT from build-cas's
 //! `.cargoless/latest-green` (latest *green* artifact pointer, build-cas
-//! owned/format-owned). tf-cli owns and documents *this* file's format.
+//! owned/format-owned). cargoless owns and documents *this* file's format.
 //!
 //! ## Format (`<root>/.cargoless/cli-status`) — documented contract
 //!
@@ -464,7 +464,7 @@ fn process_comm(pid: u32) -> Option<String> {
 /// false-match `cargo` against `cargoless` — fatal in a tool that
 /// literally runs next to `cargo`. So a prefix only counts when it is
 /// *exactly* a 15-char truncation of a longer real name (e.g. the
-/// `cargo test` runner binary `tf_cli-<hash>` on the Linux CI builder,
+/// `cargo test` runner binary `cargoless-<hash>` on the Linux CI builder,
 /// which is how this very module's own tests exercise the self-pid).
 #[cfg(unix)]
 fn names_match(mine: &str, reported: &str) -> bool {
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn atomic_write_then_clear() {
         let mut root = std::env::temp_dir();
-        root.push(format!("tf-cli-sf-{}", std::process::id()));
+        root.push(format!("cargoless-sf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let st = Status {
@@ -770,7 +770,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let mut root = std::env::temp_dir();
-        root.push(format!("tf-cli-128-{}-{}", std::process::id(), now_unix()));
+        root.push(format!("cargoless-128-{}-{}", std::process::id(), now_unix()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 

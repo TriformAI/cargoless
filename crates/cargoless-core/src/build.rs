@@ -1,7 +1,7 @@
 //! Build orchestration (Epic 3, CWDL-35) — the layer between a green verdict
 //! and a servable artifact.
 //!
-//! Data flow (from the `tf-proto` contract): the model emits
+//! Data flow (from the `cargoless-proto` contract): the model emits
 //! `StateEvent::BecameGreen { identity }`; the daemon turns that into a
 //! [`BuildTrigger`]; this orchestrator either finds the input set already in
 //! the CAS (→ [`BuildOutcome::Deduplicated`], **no compile** — the observable
@@ -16,7 +16,7 @@
 //! no WebSocket — that is v0.1). On every *servable* green build (`Compiled`
 //! or `Deduplicated`) this layer atomically advances a canonical pointer file
 //! `<project>/.cargoless/latest-green` (a [`PublishedArtifact`] rendered by
-//! the `tf-proto` codec) to the new CAS artifact. **AC#4 — never publish
+//! the `cargoless-proto` codec) to the new CAS artifact. **AC#4 — never publish
 //! red:** a red tree never reaches here, and a failed build *or* a failed
 //! pointer swap leaves the previous pointer byte-untouched (fail closed). The
 //! CLI `status` / `build --watch --out` read the pointer via
@@ -332,7 +332,7 @@ pub enum Materialized {
 /// One-call read path for the CLI (`build --watch --out`, `status`): read the
 /// canonical pointer, fetch the blob from the caller-supplied `store`, and
 /// expand it into `out_dir`. Keeps the blob layout entirely inside this crate
-/// — `tf-cli` never reaches into CAS internals (the option-(b) seam cli-ux
+/// — `cargoless` never reaches into CAS internals (the option-(b) seam cli-ux
 /// asked for).
 ///
 /// Both `store` (the cli-ux-configured out-of-tree cache) and `project_root`
@@ -551,7 +551,7 @@ mod tests {
 
     fn scratch(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("tf-core-build-{tag}-{}", std::process::id()));
+        p.push(format!("cargoless-core-build-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p

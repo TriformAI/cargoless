@@ -51,7 +51,7 @@ path = "src/lib.rs"
     )
     .expect("write Cargo.toml");
     // E0277 — a clear, named compiler error a user could not miss in the
-    // dogfood reproducer (and one tf-cli MUST surface verbatim).
+    // dogfood reproducer (and one cargoless MUST surface verbatim).
     fs::write(
         src.join("lib.rs"),
         b"pub fn boom() -> u32 { \"not a u32\" }\n",

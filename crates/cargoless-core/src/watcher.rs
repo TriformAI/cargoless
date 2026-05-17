@@ -387,7 +387,7 @@ mod tests {
     fn builtin_ignores_target_and_git_anywhere() {
         let ig = IgnoreRules::builtin();
         assert!(ig.is_ignored(&p("target/debug/app.wasm")));
-        assert!(ig.is_ignored(&p("crates/tf-core/target/x")));
+        assert!(ig.is_ignored(&p("crates/cargoless-core/target/x")));
         assert!(ig.is_ignored(&p(".git/HEAD")));
         assert!(!ig.is_ignored(&p("src/main.rs")));
         assert!(!ig.is_ignored(&p("")));

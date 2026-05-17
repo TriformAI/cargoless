@@ -11,7 +11,7 @@
 //! commands with three flags, `Cargo.lock` is committed and CI builds
 //! `--locked`, and there is no local cargo to regenerate the lock — so a new
 //! parser dependency would red-line the gate for zero real benefit. This
-//! matches the repo's dependency-minimal ethos (tf-proto is dep-free; the
+//! matches the repo's dependency-minimal ethos (cargoless-proto is dep-free; the
 //! watcher hand-rolls its gitignore/debounce).
 //!
 //! Naming: `cargoless` is the working repo/binary identifier; the shipping
@@ -248,7 +248,7 @@ fn main() -> ExitCode {
     }
     // #74 RA weight-shedding knobs — same pattern as TF_DEBOUNCE_MS:
     // CLI flag exports the env var, cargoless_core::lsp::InitOpts reads it in
-    // `from_env_and_project`. Keeps tf-core's API surface stable.
+    // `from_env_and_project`. Keeps cargoless-core's API surface stable.
     if let Some(pm) = parsed.opts.proc_macro.as_deref() {
         unsafe {
             std::env::set_var("TF_PROC_MACRO", pm);
