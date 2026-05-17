@@ -179,18 +179,49 @@ stream_tree
 # Each check: prefixed with the operator-approved build escape, run in the
 # streamed tree, full output captured and echoed. rust-toolchain.toml pins
 # 1.85.0 (warm on the PVC) so the toolchain matches CI exactly.
+# D-CI-RESILIENCE F-K (split, lead-routed 2026-05-18): the cargoless-builder
+# pod is SHARED across the agent fleet; ci-gate runs its own checks serially
+# but multiple agents' ci-gate invocations hit the SAME pod concurrently —
+# N parallel heavy `cargo` builds in one pod → memory oversubscription →
+# SIGKILL `exit 137` (#122-gate1) / FS-stream races (#123-step4). The
+# *root-cause* cheap fix lands HERE: a pod-local flock so the two
+# high-memory integ steps (integ-build, integ-test) are MUTUALLY EXCLUSIVE
+# across all concurrent ci-gate invocations on this pod — they queue
+# instead of OOMing. Self-validating (this very gate exercises it).
+#   - DEFERRED to v0.1 (lead-routed): bumping the cargoless-builder
+#     Deployment mem request/limit — prod gate-infra, non-self-validating,
+#     higher blast radius; serialize-alone is expected to suffice.
+#   - Interim if serialize is insufficient at any later gate: the
+#     documented *diagnosed*-same-SHA-re-gate discipline (never blind) —
+#     then STOP+surface to revisit the Deployment bump. See D-CI-RESILIENCE
+#     §F-K + §2.1.
+HEAVY_LOCK="${CI_GATE_HEAVY_LOCK:-/tmp/cargoless-cigate-heavy.lock}"
+HEAVY_LOCK_WAIT="${CI_GATE_HEAVY_LOCK_WAIT:-2400}"   # 40m: > any single heavy step
+
 run_check() {
-  local name="$1" cmd="$2" rc=0 out
+  local name="$1" cmd="$2" serialize="${3:-0}" rc=0 out incmd
   echo
   echo "======================================================================"
-  echo "=== $name :: cargo ${cmd}"
+  echo "=== $name :: cargo ${cmd}${serialize:+  [F-K serialized]}"
   echo "======================================================================"
+  if [ "$serialize" = "1" ]; then
+    # Robust shell flock idiom: fd-redirection CREATES the lockfile (plain
+    # `flock <file> cmd` errors if the file is absent); fd 9 holds the
+    # exclusive lock for the cargo lifetime; -w timeout → rc 75 (distinct,
+    # LOUD — a 40m wait is a real anomaly worth reding + diagnosing, never
+    # silently masked).
+    incmd="cd $REMOTE_SRC && ( flock -w $HEAVY_LOCK_WAIT 9 || { echo '::ci-gate:: F-K heavy-lock wait timeout (${HEAVY_LOCK_WAIT}s) — concurrent gate stuck?'; exit 75; }; $APPROVE cargo ${cmd} ) 9>$HEAVY_LOCK 2>&1"
+  else
+    incmd="cd $REMOTE_SRC && $APPROVE cargo ${cmd} 2>&1"
+  fi
   set +e
-  out="$(kexec_i bash -c "cd $REMOTE_SRC && $APPROVE cargo ${cmd} 2>&1")"
+  out="$(kexec_i bash -c "$incmd")"
   rc=$?
   set -e
   printf '%s\n' "$out"
-  if [ "$rc" -eq 0 ]; then echo "--- $name: PASS"; else echo "--- $name: FAIL (exit $rc)"; fi
+  if [ "$rc" -eq 0 ]; then echo "--- $name: PASS"
+  elif [ "$rc" -eq 75 ]; then echo "--- $name: FAIL (F-K heavy-lock timeout, exit 75 — diagnosed-re-gate, NOT a code defect)"
+  else echo "--- $name: FAIL (exit $rc)"; fi
   return "$rc"
 }
 
@@ -243,7 +274,14 @@ if kexec bash -c "grep -qE '^[[:space:]]*integration[[:space:]]*=' $REMOTE_SRC/c
   for entry in "${INTEG[@]}"; do
     cname="${entry%%|*}"
     ccmd="${entry#*|}"
-    if run_check "$cname" "$ccmd"; then
+    # F-K: serialize the two high-memory integ steps (build, test) across
+    # concurrent fleet ci-gate invocations on the shared pod; integ-clippy
+    # reuses build artifacts and is light → left unserialized.
+    case "$cname" in
+      integ-build|integ-test) iser=1 ;;
+      *)                      iser=0 ;;
+    esac
+    if run_check "$cname" "$ccmd" "$iser"; then
       RESULT[$cname]="PASS"
     else
       RESULT[$cname]="FAIL"
