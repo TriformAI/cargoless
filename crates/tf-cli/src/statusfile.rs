@@ -252,6 +252,192 @@ fn pid_is_alive(pid: u32) -> Option<bool> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FIELD FINDING #13a (#93) — dual-watch refusal
+//
+// Two `cargoless watch` (or a `watch` + `build --watch`) on the SAME
+// project root both heartbeat THIS `.cargoless/cli-status` file; `pid`
+// then flaps between writers and `status` ambiguously reports whichever
+// wrote last. (AC#4's `latest-green` pointer is unaffected — its content
+// is input-hash-derived, so concurrent publishers stay consistent; this
+// is a `cli-status` ambiguity, not data corruption.)
+//
+// The fix is a startup admission check: if a status file for this root
+// already names a LIVE process that is another instance of THIS binary,
+// refuse to start (exit 2) with an actionable message instead of racing.
+//
+// Refuse-and-exit, not flock: v0 is headless + dependency-minimal. The
+// check reuses the #56 `kill(pid,0)` liveness lane plus a nix-free `ps`
+// name probe and degrades SAFE — any uncertainty proceeds, never
+// false-refusing a legitimate lone watcher (the same
+// false-suppress-over-false-contradict asymmetry that drove #55/#10).
+// ---------------------------------------------------------------------------
+
+/// A detected live sibling watcher (the "refuse" payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub pid: u32,
+    pub root: String,
+    pub verdict: Verdict,
+    pub age_secs: u64,
+}
+
+impl Conflict {
+    /// The actionable refusal text (rendered via `ui::error`, so it is
+    /// prefixed `xx` and may span lines). Remedies are rename-proof:
+    /// `kill <pid>` is exact regardless of the D1 binary name, and the
+    /// `--root` alternative names the legitimate concurrent path —
+    /// watching two *different* trees at once is fine; only same-root
+    /// is the race.
+    pub fn message(&self) -> String {
+        format!(
+            "another cargoless watcher is already running for {} \
+             (pid {}, verdict {}, last heartbeat {}s ago).\n  \
+             stop it first: `kill {}` — or watch a different tree: \
+             `cargoless watch --root <other-dir>`.",
+            self.root,
+            self.pid,
+            self.verdict.as_str(),
+            self.age_secs,
+            self.pid,
+        )
+    }
+}
+
+/// Startup admission verdict for `watch` / `build --watch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchAdmission {
+    /// No live sibling — safe to become the watcher for this root.
+    Proceed,
+    /// A live sibling watcher already owns this root.
+    Refuse(Conflict),
+}
+
+/// Pure decision (no I/O) so every branch is unit-tested deterministically.
+/// `pid_alive` mirrors [`pid_is_alive`]'s tri-state: `None` (non-Unix)
+/// cannot safely refuse and therefore proceeds — the #56 legacy posture.
+fn admission_decision(
+    existing: Option<&Status>,
+    my_pid: u32,
+    now: u64,
+    pid_alive: Option<bool>,
+    same_binary: bool,
+) -> WatchAdmission {
+    let Some(st) = existing else {
+        return WatchAdmission::Proceed; // no prior watcher
+    };
+    if st.pid == 0 || st.pid == my_pid {
+        // Malformed (pid 0) or our own re-read — never a conflict.
+        return WatchAdmission::Proceed;
+    }
+    if pid_alive != Some(true) {
+        // Dead pid (the #56 F10 stale-file case) OR non-Unix (None):
+        // the prior daemon is gone / unprobable — take over the root.
+        return WatchAdmission::Proceed;
+    }
+    if !same_binary {
+        // pid alive but recycled to some OTHER program — not a
+        // cargoless watcher; do NOT false-refuse.
+        return WatchAdmission::Proceed;
+    }
+    WatchAdmission::Refuse(Conflict {
+        pid: st.pid,
+        root: st.root.clone(),
+        verdict: Verdict::parse(&st.verdict_str),
+        age_secs: now.saturating_sub(st.updated),
+    })
+}
+
+/// Resolve the I/O probes and apply [`admission_decision`]. Call ONCE at
+/// `watch` / `build --watch` startup, BEFORE the costly rust-analyzer
+/// bring-up, so a refused start is instant.
+pub fn admission(root: &Path, my_pid: u32) -> WatchAdmission {
+    let Ok(text) = std::fs::read_to_string(path(root)) else {
+        return WatchAdmission::Proceed; // no status file ⇒ no sibling
+    };
+    let st = Status::parse(&text);
+    let alive = pid_is_alive(st.pid);
+    // Only run the (process-spawning) binary-identity probe when the pid
+    // is actually alive — short-circuits the common stale-file path.
+    let same = alive == Some(true) && pid_is_this_binary(st.pid);
+    admission_decision(Some(&st), my_pid, now_unix(), alive, same)
+}
+
+/// True iff `pid` is running the *same executable as us*. Identity is by
+/// binary basename (via [`std::env::current_exe`]) — rename-proof: it
+/// asks "is that pid another instance of THIS program?", so the pending
+/// D1 binary rename needs no change here.
+///
+/// nix-free, matching house policy (local-extern for single syscalls —
+/// `kill`/`getppid`; `ps` for richer per-pid queries — `pgrep -s` in
+/// tf_core::analyzer). `ps -p <pid> -o comm=` is portable across the v0
+/// targets (Linux + macOS). Any failure ⇒ `false` ⇒ caller proceeds: a
+/// missed refusal (rare dual-watch) is strictly safer than false-refusing
+/// a legitimate lone watcher.
+fn pid_is_this_binary(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        match (self_exe_basename(), process_comm(pid)) {
+            (Some(mine), Some(reported)) => names_match(&mine, &reported),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(unix)]
+fn self_exe_basename() -> Option<String> {
+    std::env::current_exe()
+        .ok()?
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// `ps -p <pid> -o comm=` → the process's command name. macOS may print
+/// a full path; we reduce to the file-name. Spawn/exit-status/empty
+/// failures all collapse to `None` (caller then proceeds — safe).
+#[cfg(unix)]
+fn process_comm(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        Path::new(raw)
+            .file_name()
+            .map_or_else(|| raw.to_string(), |n| n.to_string_lossy().into_owned()),
+    )
+}
+
+/// Compare our binary name to a `ps`-reported `comm`, tolerating the
+/// Linux `comm` 15-char truncation (`TASK_COMM_LEN - 1`) WITHOUT a naive
+/// generic-prefix match. A bare `mine.starts_with(reported)` would
+/// false-match `cargo` against `cargoless` — fatal in a tool that
+/// literally runs next to `cargo`. So a prefix only counts when it is
+/// *exactly* a 15-char truncation of a longer real name (e.g. the
+/// `cargo test` runner binary `tf_cli-<hash>` on the Linux CI builder,
+/// which is how this very module's own tests exercise the self-pid).
+#[cfg(unix)]
+fn names_match(mine: &str, reported: &str) -> bool {
+    const LINUX_COMM_MAX: usize = 15; // TASK_COMM_LEN (16) - 1 (NUL)
+    if mine == reported {
+        return true;
+    }
+    reported.len() == LINUX_COMM_MAX && mine.len() > LINUX_COMM_MAX && mine.starts_with(reported)
+}
+
 /// Report build-cas's latest-green pointer. Its on-disk format is
 /// build-cas-owned and the publisher type (#23) is not yet on main, so we do
 /// NOT guess a parse: presence is reported honestly; structured fields land
@@ -369,6 +555,179 @@ mod tests {
         assert_eq!(back, st);
         clear(&root);
         assert!(std::fs::read_to_string(path(&root)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #13a (#93) — dual-watch admission
+    // -----------------------------------------------------------------------
+
+    fn st_with(pid: u32, updated: u64, verdict: &str) -> Status {
+        Status {
+            pid,
+            root: "/proj".into(),
+            started: 0,
+            updated,
+            verdict_str: verdict.into(),
+        }
+    }
+
+    #[test]
+    fn admission_proceeds_when_no_status_file() {
+        assert_eq!(
+            admission_decision(None, 100, 0, Some(true), true),
+            WatchAdmission::Proceed
+        );
+    }
+
+    #[test]
+    fn admission_proceeds_on_pid_zero_or_self() {
+        // pid 0 is malformed; pid == us is our own re-read — neither is a
+        // sibling, regardless of the (irrelevant) liveness/binary probes.
+        let z = st_with(0, 10, "green");
+        assert_eq!(
+            admission_decision(Some(&z), 4242, 100, Some(true), true),
+            WatchAdmission::Proceed
+        );
+        let me = st_with(4242, 10, "green");
+        assert_eq!(
+            admission_decision(Some(&me), 4242, 100, Some(true), true),
+            WatchAdmission::Proceed
+        );
+    }
+
+    #[test]
+    fn admission_proceeds_on_dead_or_unprobable_pid() {
+        let s = st_with(777, 10, "green");
+        // Dead pid (the #56 F10 stale-file case): take over the root.
+        assert_eq!(
+            admission_decision(Some(&s), 4242, 100, Some(false), false),
+            WatchAdmission::Proceed
+        );
+        // Non-Unix (None): cannot safely refuse — legacy proceed posture.
+        assert_eq!(
+            admission_decision(Some(&s), 4242, 100, None, false),
+            WatchAdmission::Proceed
+        );
+    }
+
+    #[test]
+    fn admission_proceeds_when_pid_recycled_to_other_program() {
+        // pid alive but it's NOT another cargoless — must not false-refuse.
+        let s = st_with(777, 10, "green");
+        assert_eq!(
+            admission_decision(Some(&s), 4242, 100, Some(true), false),
+            WatchAdmission::Proceed
+        );
+    }
+
+    #[test]
+    fn admission_refuses_only_live_same_binary_sibling() {
+        let s = st_with(777, 40, "red");
+        let d = admission_decision(Some(&s), 4242, 100, Some(true), true);
+        assert_eq!(
+            d,
+            WatchAdmission::Refuse(Conflict {
+                pid: 777,
+                root: "/proj".into(),
+                verdict: Verdict::Red,
+                age_secs: 60, // now(100) - updated(40)
+            })
+        );
+    }
+
+    #[test]
+    fn conflict_message_is_actionable() {
+        let c = Conflict {
+            pid: 777,
+            root: "/proj".into(),
+            verdict: Verdict::Green,
+            age_secs: 3,
+        };
+        let m = c.message();
+        // Identifies the offender, the tree, the freshness, and BOTH
+        // remedies (exact `kill <pid>` + the legitimate --root path).
+        assert!(m.contains("/proj"), "names the root: {m}");
+        assert!(m.contains("777"), "names the pid: {m}");
+        assert!(m.contains("green"), "names the verdict: {m}");
+        assert!(m.contains("kill 777"), "exact rename-proof remedy: {m}");
+        assert!(m.contains("--root"), "names the concurrent-use path: {m}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_match_exact_and_bounded_truncation_only() {
+        // Exact.
+        assert!(names_match("tftrunk", "tftrunk"));
+        // The critical false-positive guard: `cargo` must NOT match
+        // `cargoless` (this tool runs literally next to cargo).
+        assert!(!names_match("cargoless", "cargo"));
+        assert!(!names_match("cargo", "cargoless"));
+        // Genuine Linux 15-char comm truncation of a longer real name
+        // (e.g. the `cargo test` runner binary on the CI builder).
+        let long = "tftrunk-0123456789abcdef"; // 24 chars
+        let trunc = &long[..15]; // exactly TASK_COMM_LEN-1
+        assert_eq!(trunc.len(), 15);
+        assert!(names_match(long, trunc));
+        // A short prefix that is NOT a 15-char truncation never matches.
+        assert!(!names_match("tftrunkXX", "tftrunk"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_this_binary_true_for_our_own_pid() {
+        // Our own process is, by definition, an instance of our own
+        // binary. Proves the `ps -o comm=` + current_exe() wiring works
+        // on THIS platform — including the Linux comm-truncation path on
+        // the CI builder (analog of #56's pid_is_alive self-pid test).
+        // If `ps` is unavailable the probe cannot function at all; skip
+        // cleanly rather than assert a mechanism the platform lacks
+        // (mirrors orphan.rs's no-POSIX-shell skip precedent).
+        if process_comm(std::process::id()).is_none() {
+            return;
+        }
+        assert!(pid_is_this_binary(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_end_to_end_refuses_live_self_then_proceeds_on_dead_pid() {
+        use std::process::{Command, Stdio};
+
+        let mut root = std::env::temp_dir();
+        root.push(format!("tf-cli-f13a-{}-{}", std::process::id(), now_unix()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // (a) status file names a LIVE same-binary process (ourselves);
+        // call admission with a DIFFERENT my_pid so WE are the sibling.
+        // Skip if `ps` is unavailable (the probe can't run — see above).
+        if process_comm(std::process::id()).is_some() {
+            write(&root, &st_with(std::process::id(), now_unix(), "green"));
+            match admission(&root, std::process::id().wrapping_add(1)) {
+                WatchAdmission::Refuse(c) => assert_eq!(c.pid, std::process::id()),
+                WatchAdmission::Proceed => {
+                    panic!("a live same-binary sibling must be refused")
+                }
+            }
+        }
+
+        // (b) status file names a guaranteed-DEAD pid → proceed (the #56
+        // F10 stale-file case, through the real pid_is_alive path).
+        let mut dead = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let dead_pid = dead.id();
+        let _ = dead.wait();
+        write(&root, &st_with(dead_pid, now_unix(), "green"));
+        assert_eq!(
+            admission(&root, std::process::id()),
+            WatchAdmission::Proceed
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

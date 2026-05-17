@@ -135,7 +135,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 
     use tf_core::build::{BuildOrchestrator, TrunkCompiler};
 
-    use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
+    use crate::statusfile::{self, Status, Verdict, HEARTBEAT};
 
     let Some(out) = out else {
         ui::error("`build` requires `--out <DIR>`: `cargoless build --watch --out <dir>`.");
@@ -147,6 +147,18 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
     // first green edge minutes later.
     if let Err(code) = require_trunk_or_exit() {
         return code;
+    }
+    // FIELD FINDING #13a (#93): `build --watch` heartbeats the SAME
+    // `.cargoless/cli-status` file as `watch`, so the dual-watch race
+    // spans BOTH subcommands (watch×2, build×2, and watch+build on one
+    // root). The refusal is per-status-file, not per-subcommand — guard
+    // here too, before --out creation and the rust-analyzer bring-up,
+    // so a refused start is instant and side-effect-free.
+    if let statusfile::WatchAdmission::Refuse(c) =
+        statusfile::admission(&cfg.root, std::process::id())
+    {
+        ui::error(c.message());
+        return ExitCode::from(2);
     }
     if let Err(e) = std::fs::create_dir_all(out) {
         ui::error(format!(
@@ -297,7 +309,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 /// left it (AC#4: a non-green never advances the user's output).
 #[cfg(feature = "integration")]
 fn publish_to_out(project_root: &Path, cache_root: &Path, out: &Path) {
-    use tf_core::build::{Materialized, materialize_latest_green};
+    use tf_core::build::{materialize_latest_green, Materialized};
 
     let store = tf_core::LocalDiskStore::new(cache_root.to_path_buf());
     match materialize_latest_green(&store, project_root, out) {

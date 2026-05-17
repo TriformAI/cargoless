@@ -24,7 +24,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
+use crate::statusfile::{self, Status, Verdict, HEARTBEAT};
 use crate::ui;
 
 const BRINGUP_BUDGET: Duration = Duration::from_secs(30);
@@ -87,6 +87,21 @@ pub fn run(cfg: &Config) -> ExitCode {
         cfg.root.display(),
         cfg.detection.describe()
     ));
+
+    // FIELD FINDING #13a (#93): refuse a SECOND watcher on the same
+    // root. Two `cargoless watch` on one tree both heartbeat the
+    // `.cargoless/cli-status` file; pid flaps and `status` reports
+    // whichever wrote last. Checked HERE — before the costly
+    // rust-analyzer bring-up — so a refused start is instant. Only
+    // refuses against a *live* process that is *another instance of
+    // this binary*: stale files, dead pids, and pids recycled to some
+    // other program all proceed (never false-refuse a lone watcher).
+    if let statusfile::WatchAdmission::Refuse(c) =
+        statusfile::admission(&cfg.root, std::process::id())
+    {
+        ui::error(c.message());
+        return ExitCode::from(2);
+    }
 
     // `watch()` blocks on rust-analyzer's initialize handshake (seconds);
     // the first green waits on a cold cargo check (minutes) — that is fine,
