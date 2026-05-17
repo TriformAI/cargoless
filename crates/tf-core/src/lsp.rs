@@ -218,25 +218,6 @@ pub(crate) fn cargo_toml_signals_proc_macro(text: &str) -> bool {
     false
 }
 
-/// Build the full lean `initializationOptions` JSON for RA. Pure: takes
-/// the resolved [`InitOpts`], emits the JSON value the LSP `initialize`
-/// `params.initializationOptions` field carries.
-///
-/// Settings (post-Option B+ refinement on #1; see module-doc comment):
-///   1. checkOnSave: enabled (load-bearing for #21/F8-redo verdict),
-///      subsettings softened (allTargets/invocationStrategy/Location/
-///      features) for ~15-30% checkOnSave-cost reduction without
-///      breaking the verdict path.
-///   2. inlayHints.*: ALL DISABLED (cargoless never displays them).
-///   3. cachePriming.enable: false (skip eager startup analysis).
-///   4. procMacro.enable: from InitOpts.proc_macro_enabled (auto-detected
-///      from Cargo.toml or explicit per `cargoless.proc-macro` knob).
-///   5. cargo.allFeatures: false + features: from InitOpts + workspace.
-///      symbol narrowed (only_types, workspace scope).
-///   + Honorable mentions: hover.actions, lens.enable, completion.
-///      snippets.custom, assist.expressionFillDefault, references.
-///      excludeImports — all idle-cost reductions on signals cargoless
-///      doesn't consume.
 /// #112-B Tier-2 — RA salsa LRU cap. Default is 64, deliberately half
 /// of rust-analyzer's built-in default of 128: a RAM-vs-recompute trade
 /// tuned for cargoless's batchy agent-edit access pattern.
@@ -256,6 +237,25 @@ fn ra_lru_capacity() -> u32 {
     }
 }
 
+/// Build the full lean `initializationOptions` JSON for RA. Pure: takes
+/// the resolved [`InitOpts`], emits the JSON value the LSP `initialize`
+/// `params.initializationOptions` field carries.
+///
+/// Settings (post-Option B+ refinement on #1; see module-doc comment):
+///   1. checkOnSave: enabled (load-bearing for #21/F8-redo verdict),
+///      subsettings softened (allTargets/invocationStrategy/Location/
+///      features) for ~15-30% checkOnSave-cost reduction without
+///      breaking the verdict path.
+///   2. inlayHints.*: ALL DISABLED (cargoless never displays them).
+///   3. cachePriming.enable: false (skip eager startup analysis).
+///   4. procMacro.enable: from InitOpts.proc_macro_enabled (auto-detected
+///      from Cargo.toml or explicit per `cargoless.proc-macro` knob).
+///   5. cargo.allFeatures: false + features: from InitOpts + workspace.
+///      symbol narrowed (only_types, workspace scope).
+///   + Honorable mentions: hover.actions, lens.enable, completion.
+///      snippets.custom, assist.expressionFillDefault, references.
+///      excludeImports — all idle-cost reductions on signals cargoless
+///      doesn't consume.
 pub fn lean_init_options(opts: &InitOpts) -> Value {
     json!({
         // (1) checkOnSave — Option B+ softened (not disabled).
