@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The TF-Trunk binary. Subcommands: serve, check, status, clean."
+description = "The cargoless binary. Subcommands: serve, check, status, clean."
 
 [lints]
 workspace = true
@@ -16,3 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 tf-core = { path = "../tf-core" }
+# Owner-added (cli-ux, Epic 5 / CWDL-46). clap 4.x derive: the standard,
+# maintained arg parser — replaces the brittle hand-rolled match so help,
+# version, flags, and error UX are correct by construction. This is the
+# FIRST external dependency in the root workspace; it forces the committed
+# Cargo.lock decision the CI rationale defers to proto/build-cas (flagged to
+# the lead). `std`-only otherwise: the holding-page server, tf.toml reader,
+# and process glue are hand-rolled to keep the dep tree minimal, matching the
+# house style (tf-proto dep-free, watcher hand-rolls gitignore/debounce).
+clap = { version = "4", features = ["derive"] }
