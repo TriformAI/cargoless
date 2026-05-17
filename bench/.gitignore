@@ -1,0 +1,5 @@
+# Standalone-workspace build outputs (these dirs are NOT covered by the
+# repo-root /target rule).
+fixture/target/
+harness/target/
+**/Cargo.lock.orig
