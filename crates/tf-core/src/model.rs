@@ -10,15 +10,32 @@
 //! S1 proved RA-native diagnostics are BLIND to the type/trait/method/macro
 //! error class — only `cargo check` (RA's *flycheck*) produces it. A checker
 //! that called such code GREEN off RA-native would violate the product's one
-//! promise. So the **authoritative** verdict derives ONLY from the
-//! cargo-check (rustc-source) tier, observed at a flycheck-pass boundary:
+//! promise. So GREEN is gated strictly on a completed flycheck pass:
 //!
-//! * GREEN ⟺ at least one flycheck pass has COMPLETED and that pass left no
-//!   rustc-source error. Pre-first-flycheck the tree is RED (never claim
-//!   unproven green — the project-long invariant).
-//! * RA-native is at most an **advisory** "provisional" hint, surfaced on a
-//!   separate, visibly-distinct channel ([`ModelSession::subscribe_advisory`]
-//!   / [`Verdict::provenance`]); it is NEVER asserted as a `StateEvent` green.
+//! * GREEN ⟺ at least one flycheck pass has COMPLETED and that pass left
+//!   NO `severity == Error` diagnostic from ANY source.
+//!   Pre-first-flycheck the tree is RED (never claim unproven green —
+//!   the project-long invariant).
+//!
+//! ## #8-redo — severity:Error from ANY source drives RED (FIELD FINDING #55)
+//!
+//! The original #21 rule restricted RED to `source == "rustc"` errors and
+//! treated RA-native errors as advisory-only. dogfood-lead's `let bad =`
+//! reproducer broke this: an RA-native severity:Error on a parse failure
+//! never reaches cargo-check (cargo errors before producing JSON
+//! diagnostics for the broken file in some cases), so the rustc-only rule
+//! reported GREEN on a tree that cargo check called RED. The fix tightens
+//! the per-file rule to **any severity:Error from any source** while
+//! leaving GREEN gating on flycheck-completion unchanged. The asymmetry
+//! is honest: RA's "saw an error" is strictly stronger evidence than
+//! "didn't see one" because RA's analysis is partial — so RA-native
+//! severity:Error can drive RED (the bug evidence is real), but only
+//! flycheck-completion + zero errors can drive GREEN (absence of
+//! evidence must be backed by cargo's fuller analysis).
+//!
+//! [`ModelSession::subscribe_advisory`] / [`Verdict::provenance`] still
+//! exist for the warning/info/hint advisory channel; only the verdict bit
+//! has been broadened.
 //!
 //! ## Frozen-seam discipline
 //!
@@ -267,7 +284,20 @@ impl Model {
                 let Some(path) = crate::lsp::path_from_uri(&pd.uri) else {
                     return;
                 };
-                let auth_state = if pd.has_authoritative_error() {
+                // FIELD FINDING #8-redo: per-file RED on ANY severity:Error
+                // (rustc-tier OR rust-analyzer-native). The #21 design
+                // restricted authoritative-RED to rustc-source only, but
+                // dogfood-lead's `let bad =` reproducer showed that
+                // RA-native parse errors don't make it to cargo-check (so
+                // never publish as source:rustc) yet are unambiguous
+                // evidence the file cannot compile. The asymmetry is
+                // honest: RA's "saw an error" is strictly stronger
+                // evidence than "didn't see one" because RA's analysis
+                // is partial — so RA-native severity:Error can drive RED
+                // (the bug evidence is real), but only flycheck-completion
+                // + zero errors can drive GREEN (the absence of evidence
+                // must be backed by cargo's fuller analysis).
+                let file_state = if pd.has_any_severity_error() {
                     FileState::Red
                 } else {
                     FileState::Green
@@ -277,7 +307,7 @@ impl Model {
                 } else {
                     FileState::Green
                 };
-                self.auth.insert(path.clone(), auth_state);
+                self.auth.insert(path.clone(), file_state);
                 self.native.insert(path.clone(), native_state);
                 // FIELD FINDING #2: stash the rich diagnostic list for this
                 // file. RA's `publishDiagnostics` replaces the list (an empty
@@ -479,7 +509,15 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
             Ok(LspEvent::Diagnostics(pd)) => {
                 got_any = true;
                 if let Some(p) = crate::lsp::path_from_uri(&pd.uri) {
-                    let s = if pd.has_authoritative_error() {
+                    // FIELD FINDING #8-redo: severity:Error from ANY
+                    // source flips the file Red — matches the model's
+                    // apply_event rule. RA-native parse errors (e.g.
+                    // `let bad =` at file scope, the dogfood reproducer)
+                    // never make it to cargo-check, so the original
+                    // rustc-source-only rule produced a silent-green
+                    // verdict on a broken tree. Treating any severity:
+                    // Error as authoritative-for-RED is the honest fix.
+                    let s = if pd.has_any_severity_error() {
                         FileState::Red
                     } else {
                         FileState::Green
@@ -605,7 +643,13 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
             Ok(LspEvent::Diagnostics(pd)) => {
                 got_any = true;
                 if let Some(p) = crate::lsp::path_from_uri(&pd.uri) {
-                    let s = if pd.has_authoritative_error() {
+                    // FIELD FINDING #8-redo: severity:Error from ANY
+                    // source flips Red — same rule as check_verdict and
+                    // the model's apply_event (see those for the full
+                    // honest-asymmetry rationale: RA-native parse errors
+                    // are real evidence; cargo-check is the only thing
+                    // that can earn GREEN).
+                    let s = if pd.has_any_severity_error() {
                         FileState::Red
                     } else {
                         FileState::Green
@@ -1055,6 +1099,42 @@ mod tests {
         );
         let evs = drain(&rx);
         assert!(evs.contains(&StateEvent::BecameGreen { identity: ident() }));
+    }
+
+    #[test]
+    fn ra_native_severity_error_post_flycheck_is_red_too() {
+        // FIELD FINDING #8-redo (#55): dogfood-lead's smoking-gun case.
+        // After a clean flycheck (tree green), a NEW edit with an
+        // RA-native severity:Error (e.g. `let bad =` at file scope —
+        // RA's parser catches it but cargo-check may not produce a
+        // source:rustc diagnostic for it) MUST flip the tree Red. Under
+        // the original #21 rustc-only rule this case was silently
+        // green-on-broken — the worst possible v0 failure mode.
+        let mut m = model();
+        let rx = m.subscribe();
+        // Get to authoritative green.
+        m.apply_event(&diag("file:///p/lib.rs", 0, 0));
+        m.apply_event(&LspEvent::FlycheckEnded);
+        assert_eq!(m.tree_state(), TreeState::Green);
+        let _ = drain(&rx);
+        // User saves `let bad =` — RA-native severity:Error fires; cargo
+        // hasn't re-checked yet (or won't, if cargo-check itself errors
+        // before producing per-file JSON output for this file).
+        m.apply_event(&diag("file:///p/lib.rs", 0, 1)); // 1 ra-native err
+        assert_eq!(
+            m.tree_state(),
+            TreeState::Red,
+            "RA-native severity:Error post-flycheck must flip tree Red"
+        );
+        // The transition event fires on the verdict bus.
+        assert!(drain(&rx).contains(&StateEvent::BecameRed));
+        // Provenance stays Authoritative (a flycheck has completed —
+        // that's what the provenance flag tracks, not which tier the
+        // current red comes from).
+        assert_eq!(
+            m.last_verdict().provenance,
+            VerdictProvenance::Authoritative
+        );
     }
 
     #[test]
