@@ -421,7 +421,14 @@ mod tests {
     fn byte_strings_and_byte_chars() {
         assert!(is_closed(r#"const M: &[u8] = b"tf-cas/input-hash/v1";"#));
         assert!(is_closed("let z = b'}';"));
-        assert!(is_closed(r###"let r = br#"raw { byte "# str"#;"###));
+        // Raw byte string `br#"…"#` (1 hash): the `{ ( ]` inside are
+        // content, not delimiters. (NB: the content must not itself
+        // contain `"#`, which would terminate a 1-hash raw string —
+        // embedded-`"#` is covered by the 2-hash case in
+        // `raw_strings_with_hashes`.)
+        assert!(is_closed(r##"let r = br#"raw { byte ( ] str"#;"##));
+        // Raw byte string with MORE hashes can legitimately carry `"#`.
+        assert!(is_closed(r###"let r = br##"has "# inside { ) ]"##;"###));
         assert!(!is_closed(r#"let m = b"unterminated"#));
     }
 
