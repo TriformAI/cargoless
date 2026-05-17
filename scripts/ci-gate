@@ -33,6 +33,12 @@
 #   that ref is `git archive`-streamed into the pod over `kubectl exec` stdin
 #   (no in-pod git, no registry auth, deterministic — tracked files only).
 #
+#   The gate runs the four .forgejo checks under DEFAULT features, then —
+#   iff crates/tf-cli/Cargo.toml declares an `integration` feature in the
+#   streamed tree — ALSO runs build/test/clippy for `-p tf-cli --features
+#   integration` (the wired daemon, excluded from the default build). On a
+#   tree with no such feature those three are reported SKIPPED, not failed.
+#
 #   --bench exists because the CI `bench` job (which publishes the
 #   `s1-ac2-verdict` commit status gating the project's #1 risk, D-A2/AC#2)
 #   is `if: github.ref == refs/heads/main` AND sits behind the ~40min shared
@@ -191,12 +197,45 @@ for entry in "${CHECKS[@]}"; do
   fi
 done
 
+# tf-cli's wired daemon (check/serve/status against the live daemon-core +
+# devserver) compiles ONLY under `--features integration`; the default
+# workspace build deliberately excludes it (standalone holding-page
+# semantics). The 4 checks above are default-feature only, so on the
+# converged set they would NOT exercise the wired tf-cli at all. Detect the
+# feature in the STREAMED tree and, when present, gate it explicitly. This
+# is a no-op on plain main (no `integration` feature → checks reported
+# SKIPPED, not failed) and a hard gate on the convergence branch.
+INTEG_CHECKS=(integ-build integ-test integ-clippy)
+if kexec bash -c "grep -qE '^[[:space:]]*integration[[:space:]]*=' $REMOTE_SRC/crates/tf-cli/Cargo.toml 2>/dev/null"; then
+  echo
+  echo "[ci-gate] tf-cli declares an 'integration' feature — gating the wired daemon too"
+  INTEG=(
+    "integ-build|build -p tf-cli --features integration --all-targets"
+    "integ-test|test -p tf-cli --features integration"
+    "integ-clippy|clippy -p tf-cli --features integration --all-targets -- -D warnings"
+  )
+  for entry in "${INTEG[@]}"; do
+    cname="${entry%%|*}"
+    ccmd="${entry#*|}"
+    if run_check "$cname" "$ccmd"; then
+      RESULT[$cname]="PASS"
+    else
+      RESULT[$cname]="FAIL"
+      OVERALL=1
+      [ "$CI_GATE_KEEP_GOING" = "1" ] || break
+    fi
+  done
+else
+  echo
+  echo "[ci-gate] no 'integration' feature in tf-cli — wired-daemon checks SKIPPED (expected on plain main)"
+fi
+
 echo
 echo "======================================================================"
 echo "=== ci-gate verdict   ref=$REF  sha=$SHORT  pod=$BUILDER_NS/$POD"
 echo "======================================================================"
-for cname in build test fmt clippy; do
-  printf '  %-7s %s\n' "$cname" "${RESULT[$cname]:-SKIPPED}"
+for cname in build test fmt clippy "${INTEG_CHECKS[@]}"; do
+  printf '  %-12s %s\n' "$cname" "${RESULT[$cname]:-SKIPPED}"
 done
 if [ "$OVERALL" -eq 0 ]; then
   echo "=== RESULT: ALL GREEN — safe to integrate $SHORT"

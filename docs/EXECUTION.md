@@ -128,8 +128,16 @@ streamed tree, the exact four checks `.forgejo/workflows/ci.yml` runs:
 | fmt    | `cargo fmt --all -- --check` |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 
-It prints a per-check verdict table and exits `0` iff all four are green
-(`1` if any red, `2` on transport/setup error). All four run even if an
+If the streamed tree's `crates/tf-cli/Cargo.toml` declares an `integration`
+feature (the converged set does; plain `main` does not), the gate ALSO runs
+`build`/`test`/`clippy` for `-p tf-cli --features integration` — the wired
+daemon that the default workspace build deliberately excludes. On a tree
+without that feature those three rows show `SKIPPED` (not a failure). This
+makes a single `scripts/ci-gate <convergence-branch>` cover BOTH the
+default/standalone semantics and the wired-daemon build in one run.
+
+It prints a per-check verdict table and exits `0` iff all checks are green
+(`1` if any red, `2` on transport/setup error). All run even if an
 early one fails (`CI_GATE_KEEP_GOING=0` to stop at first failure). Remote
 cargo invocations carry the operator-sanctioned
 `TRIFORM_OPERATOR_APPROVED_BUILD=1` escape (the operator explicitly
