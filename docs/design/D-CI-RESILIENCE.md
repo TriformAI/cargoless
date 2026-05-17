@@ -199,6 +199,39 @@ registry). **Proposed hardening:** **V0-RESIDUAL** — already in PHASE-D
 the manual step. **V0.1** — publish automation once token-rotation is
 designed (already a tracked 0.2.0 concern).
 
+### F-K — Gate-tier non-determinism under concurrent load — HARDEN-NOW (recommend v0) + V0.1
+The `cargoless-builder` gate pod runs all 7 ci-gate checks
+(build/test/fmt/clippy + integ-*) against a streamed tarball; under
+concurrent gate load it exhibits **non-deterministic failures that a
+zero-change re-gate clears** — the dangerous signature, because it can
+both *spuriously red a good SHA* (velocity tax) and *mask a real
+failure* (a green that should be red). Two live observations:
+- **#122 gate1:** `integ-build`+`integ-test` SIGKILL'd `exit 137`
+  (OOM) while build/test/fmt/clippy/integ-clippy passed on the *same
+  SHA*; same-SHA re-gate → ALL GREEN. → memory-bound under concurrent
+  load (on-thesis: corroborates the operator's RAM priority).
+- **#123 bundle step-4 (this audit's own integration gate):** `clippy`
+  RED with `error finding Clippy's config: No such file` +
+  `couldn't read crates/tf-cli/tests/diagnostics_field_finding_2.rs:
+  No such file` — on a file that demonstrably exists; 6/7 green on the
+  identical archived tree (incl. `integ-clippy` compiling the same
+  tests). FS/tar-stream race, not a lint. Same-SHA re-gate → 7/7.
+**Blast radius:** a launch-critical gate that is non-deterministic
+erodes trust in every verdict; the masking direction is the severe one
+(a memory-evicted check can `exit 137` *or* skip work and look green).
+**Proposed hardening:** **HARDEN-NOW (recommend v0)** — serialize the
+two high-memory integ steps (don't run `integ-build`/`integ-test`
+concurrently with the base tier) and/or raise the gate-pod memory
+request/limit + cap concurrent gate jobs to 1 (the gate is already a
+serialized merge gate by intent — enforce it at the pod). **V0.1** —
+a re-gate-on-transient-signature auto-retry *with an explicit
+"transient-retry" annotation* so a masked real failure can't hide
+behind silent retries (retry must be visible, bounded, and logged).
+Interim mitigation IN USE: diagnosed same-SHA re-gate (never a blind
+retry — distinguish "file-not-found on an existing file / exit 137" =
+transient from a real compile/lint error by reading the failure +
+checking the other 6 checks on the identical tree first).
+
 ---
 
 ## 2. Classification summary (lead routes V0-BLOCK / HARDEN-NOW)
@@ -209,12 +242,13 @@ designed (already a tracked 0.2.0 concern).
 | F-B | No Release object for `gh release upload` | **V0-BLOCK** | fix proposed, pending route (Phase-C Finding #3) |
 | F-C | Cross-cloud verdict read on tag path | V0-RESIDUAL + V0.1 | runbook (now) + Option-2 (v0.1) |
 | F-D | Mirror = silent single point for tag arrival | V0-RESIDUAL + V0.1 | runbook check (now) + monitor (v0.1) |
-| F-E | Verdict producer fails silently (`\|\| true`) | **HARDEN-NOW** | recommend v0; routing |
+| F-E | Verdict producer fails silently (`\|\| true`) | **HARDEN-NOW** | **LANDED this commit** — ci.yml POST asserts HTTP 2xx → fail-loud (run.sh exit-0 evidence semantics preserved) |
 | F-F | CI base-image / apt monoculture | V0.1 + residual | pre-bake+mirror (v0.1) |
 | F-G | Gate-self-reference (`-p` from invoker) | V0-RESIDUAL + V0.1 | → #96 note (now) + self-detect (v0.1) |
 | F-H | 404 log routes (diagnosis MTTR) | V0-RESIDUAL + V0.1 | documented + self-describe (v0.1) |
 | F-I | Single builder pod/PVC | V0-RESIDUAL | dev-velocity only; runbook |
 | F-J | Operator-manual crates.io publish | V0-RESIDUAL + V0.1 | preflight (now) + automate (v0.1) |
+| F-K | Gate-tier non-determinism under concurrent load (OOM/FS-race) | **HARDEN-NOW** | serialize integ + gate-pod mem/concurrency-cap (v0); visible-bounded auto-retry (v0.1). 2 live observations (#122 OOM, #123 FS-race) |
 
 **Recommended before the real `v0.1.0` tag:** F-B (in flight) and **F-E**
 (silent-producer → loud, cheap one-liner), plus the F-C/F-D **operator

@@ -119,8 +119,23 @@ jobs:
           V=$(grep -m1 '^S1_VERDICT:' /tmp/s1.out || echo 'S1_VERDICT: BLOCKER=no-verdict-line AC2=UNKNOWN D-A2=BLOCKED')
           echo "Publishing commit status: $V"
           BODY=$(printf '%s' "$V" | python3 -c 'import json,sys; print(json.dumps({"state":"success","context":"s1-ac2-verdict","description":sys.stdin.read().strip()[:255]}))')
-          curl -sS -X POST \
+          # D-CI-RESILIENCE F-E (HARDEN-NOW): the verdict PRODUCER must not
+          # fail silently. run.sh's exit-0 evidence-not-a-gate semantics
+          # are preserved (an honest "sub-1s impossible" still never reds
+          # main — V above is published as-is). But the POST itself failing
+          # (transport error or non-2xx, e.g. token scope/Forgejo down)
+          # means the s1-ac2-verdict was NOT published — a real infra
+          # failure that silently breaks every later tag-validate. Make it
+          # LOUD: red `main` at commit time instead of surprising the
+          # operator at tag time. Distinguish transport vs HTTP for triage.
+          HTTP=$(curl -sS -X POST \
             -H "Authorization: token ${FJ_TOKEN}" -H "Content-Type: application/json" \
             "https://forgejo.triform.dev/api/v1/repos/triform/cargoless/statuses/${GITHUB_SHA}" \
-            -d "$BODY" -o /tmp/s1resp.json -w "status-post HTTP %{http_code}\n" || true
-          head -c 300 /tmp/s1resp.json 2>/dev/null || true
+            -d "$BODY" -o /tmp/s1resp.json -w '%{http_code}') \
+            || { echo "::error::s1-ac2-verdict POST: curl transport failure (Forgejo unreachable from CI?) — verdict NOT published"; exit 1; }
+          echo "status-post HTTP $HTTP"
+          head -c 300 /tmp/s1resp.json 2>/dev/null || true; echo
+          case "$HTTP" in
+            2[0-9][0-9]) echo "s1-ac2-verdict published ✓ ($HTTP)" ;;
+            *) echo "::error::s1-ac2-verdict POST returned HTTP $HTTP — verdict NOT published (token scope? endpoint? auth?). Failing loud (D-CI-RESILIENCE F-E): a silently-unpublished verdict breaks every later release tag-validate."; exit 1 ;;
+          esac
