@@ -1,0 +1,325 @@
+# cargoless release pipeline — DRAFT (CWDL-71)
+#
+# ============================================================================
+#                                THIS IS A DRAFT
+# ============================================================================
+# Filename `.yml.draft` is intentional: GitHub Actions scans for `*.yml` and
+# `*.yaml` only, so this file CANNOT fire. Do NOT rename to `release.yml`
+# until every open decision in docs/design/D-RELEASE.md §8 is resolved and
+# team-lead ratifies. Renaming is the literal switch-on operation.
+#
+# Read docs/design/D-RELEASE.md before editing this file. The doc is the
+# spec; this file is the mechanical-readable form. If they disagree, the
+# doc wins — fix this file to match.
+#
+# §1.1 runner split (post-§8 #8 (b) GitHub mirror):
+#   - PR-gate / S1 bench / ci-gate    -> Forgejo (.forgejo/workflows/ci.yml,
+#                                        scripts/ci-gate, cargoless-builder pod)
+#   - Release pipeline (this file)    -> GitHub Actions (free-tier macOS
+#                                        runners solve §8 #2 Mac builder)
+#   - Source of truth                 -> GitHub (canonical) + Forgejo (mirror)
+#
+# Naming discipline (D-RELEASE §0):
+#   - "release semver 0.1.0" is the first crates.io / binstall release.
+#   - "internal phase v0.1" is the server/browser-reload epic (CWDL-40–45).
+#   The strings v0.1 and 0.1.0 are NOT interchangeable.
+#
+# Job granularity discipline mirrors .forgejo/workflows/ci.yml (one job per
+# check). GH Actions exposes per-job logs over REST cleanly so the
+# discipline is less *necessary* here than on Forgejo — but the same shape
+# keeps the project's CI patterns consistent across runners.
+#
+# Trigger: tag-only, semver shape `v[0-9]+.*`. Never `main` merges.
+# See D-RELEASE §2 for rationale.
+# ============================================================================
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+# Conservative defaults: every job runs as the GitHub-token-scoped identity
+# with only the permissions it needs. tag-validate + build need read; only
+# attach-release-assets writes to the release.
+permissions:
+  contents: read
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # tag-validate — assert tag and tree agree on the release version.
+  #
+  # Refuses to proceed on:
+  #   - tag != v$WORKSPACE_VERSION
+  #   - any crates/*/Cargo.toml version != $WORKSPACE_VERSION
+  #   - CHANGELOG.md missing a heading for $WORKSPACE_VERSION
+  #   - the tagged SHA having no `s1-ac2-verdict` commit status on the
+  #     Forgejo side (forgejo.triform.dev — the bench/PR-CI side of truth)
+  #
+  # PASSING THIS JOB is the moment the team commits to releasing this SHA.
+  # ─────────────────────────────────────────────────────────────────────────
+  tag-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history to verify tag points at a real SHA
+      - name: Derive version from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"          >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"  >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (semver $VERSION)"
+      - name: Assert workspace version matches tag
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The release model assumes [workspace.package].version is the single
+          # source of truth and crates inherit via version.workspace = true.
+          # See D-RELEASE §4.1.
+          WS_VER=$(grep -A1 '^\[workspace.package\]' Cargo.toml \
+            | grep '^version' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$WS_VER" != "$VERSION" ]; then
+            echo "::error::workspace.package.version=$WS_VER but tag=v$VERSION"
+            exit 1
+          fi
+          # Each crate must inherit (not override) so the single source holds.
+          for crate in crates/*/Cargo.toml; do
+            grep -q '^version\.workspace[[:space:]]*=[[:space:]]*true' "$crate" \
+              || { echo "::error::$crate does not inherit version.workspace = true"; exit 1; }
+          done
+          echo "tag $VERSION == [workspace.package].version $WS_VER ✓"
+      - name: Assert CHANGELOG.md has section for this version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -f CHANGELOG.md ] || { echo "::error::CHANGELOG.md missing"; exit 1; }
+          # Accept either `## 0.1.0` or `## [0.1.0]` (keepachangelog style).
+          grep -E "^##[[:space:]]+\[?${VERSION}\]?" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          echo "CHANGELOG.md has ## $VERSION section ✓"
+      - name: Assert SHA has s1-ac2-verdict commit status on Forgejo
+        run: |
+          set -euo pipefail
+          SHA="$GITHUB_SHA"
+          # The s1-ac2-verdict context lives on the Forgejo side (where the
+          # bench runs — see D-RELEASE §1.1). Anonymous read is sufficient
+          # for commit-status queries IF the Forgejo repo is publicly
+          # readable; otherwise the operator pre-stages a deploy token.
+          # TODO(D-RELEASE §8 #8 follow-up): if the Forgejo site-wide
+          # REQUIRE_SIGNIN_VIEW stays on, this curl needs a token — surface
+          # the token via FORGEJO_READONLY_TOKEN secret (read-only scope).
+          API="https://forgejo.triform.dev/api/v1/repos/triform/cargoless"
+          STATUSES=$(curl -sS "${API}/commits/${SHA}/statuses?limit=50") || \
+            { echo "::error::cannot reach Forgejo statuses endpoint"; exit 1; }
+          echo "$STATUSES" | jq -e '[.[] | select(.context=="s1-ac2-verdict")] | length > 0' \
+            > /dev/null || { echo "::error::SHA $SHA has no s1-ac2-verdict commit status on Forgejo"; exit 1; }
+          # Don't gate on the verdict's payload — that's an evidence string,
+          # not a pass/fail flag (per D-A2). Existence alone proves the SHA
+          # has been benched. Pass/fail is enforced at AC#7 GATE (#36).
+          echo "SHA $SHA has s1-ac2-verdict ✓"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # build (matrix) — release-profile build, three native runners.
+  #
+  # GH Actions free-tier matrix:
+  #   - ubuntu-latest        for x86_64-unknown-linux-gnu
+  #   - macos-14             for aarch64-apple-darwin  (Apple Silicon)
+  #   - macos-13             for x86_64-apple-darwin    (Intel)
+  #
+  # Each target builds natively — no cross-compile, no Apple SDK gymnastics.
+  # Release profile exercises different codegen paths from ci-gate's dev
+  # profile (LTO, opt-level edges) — don't skip even on a clean dev gate.
+  #
+  # Produces three tarballs with consistent layout (see D-RELEASE §7) so the
+  # `[package.metadata.binstall]` pkg-url template + bin-dir resolve to one
+  # rule across all three triples.
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    needs: tag-validate
+    strategy:
+      fail-fast: false   # don't kill the other two if one regresses
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (matches rust-toolchain.toml = 1.85)
+        # The toolchain pin already lives in rust-toolchain.toml; setup-rust
+        # honors it. --target installs the target std lib for cross-OS
+        # consistency even on native runners.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: ${{ matrix.target }}
+      - name: cargo build --release -p tf-cli --locked
+        run: |
+          set -euo pipefail
+          cargo build -p tf-cli --release --locked --target ${{ matrix.target }}
+          # TODO(D1/CWDL-12): if the binary name changes from `tftrunk`,
+          # update both the strip path AND the bin-dir in
+          # crates/tf-cli/Cargo.toml [package.metadata.binstall].
+          BIN=target/${{ matrix.target }}/release/tftrunk
+          # macOS doesn't have GNU strip by default; native `strip` works
+          # but the codepath differs. The `|| true` covers the very rare
+          # case where strip fails — the binary is still usable, just
+          # larger; downstream `file` reports the truth.
+          strip "$BIN" || true
+          file "$BIN"
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          # TODO(D1/CWDL-12): replace 'tftrunk' below with the picked product
+          # binary name. Affects tarball name, dir name, and binstall bin-dir.
+          NAME="tftrunk"
+          TARGET="${{ matrix.target }}"
+          BASE="${NAME}-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${BASE}"
+          cp target/${TARGET}/release/tftrunk "dist/${BASE}/${NAME}"
+          cp README.md LICENSE "dist/${BASE}/"
+          tar -czf "dist/${BASE}.tgz" -C dist "${BASE}"
+          # SHA-256 — sha256sum on Linux, shasum -a 256 on macOS.
+          (sha256sum "dist/${BASE}.tgz" 2>/dev/null \
+            || shasum -a 256 "dist/${BASE}.tgz") > "dist/${BASE}.tgz.sha256"
+          echo "tarball=dist/${BASE}.tgz"        >> "$GITHUB_OUTPUT"
+          echo "sha256=dist/${BASE}.tgz.sha256" >> "$GITHUB_OUTPUT"
+      - name: Upload artifact (intra-CI hand-off)
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # attach-release-assets — post the three tarballs + sha256 to the GitHub
+  # release at the tag.
+  #
+  # GitHub auto-creates a release for a pushed tag (visible on the Releases
+  # page in draft state until something attaches assets). This job downloads
+  # all three matrix build artifacts and attaches them via `gh release upload`.
+  # The `gh` CLI is preinstalled on GH Actions runners.
+  #
+  # URL shape after this:
+  #   https://github.com/<ORG>/cargoless/releases/download/v0.1.0/
+  #     tftrunk-v0.1.0-x86_64-unknown-linux-gnu.tgz
+  #     tftrunk-v0.1.0-aarch64-apple-darwin.tgz
+  #     tftrunk-v0.1.0-x86_64-apple-darwin.tgz
+  #     + each .sha256
+  #
+  # The pkg-url template in crates/tf-cli/Cargo.toml binstall metadata
+  # depends on this exact URL shape (GitHub's canonical form — well-known,
+  # so the §8 #6 verification is a one-time confidence check rather than a
+  # discovery exercise).
+  # ─────────────────────────────────────────────────────────────────────────
+  attach-release-assets:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to attach assets to the release
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prebuilt-*
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist/
+      - name: Upload assets to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          # `gh release upload <tag> file1 file2 ...` attaches assets to the
+          # release. --clobber lets re-runs overwrite existing assets (safer
+          # for retries after a transient API blip).
+          gh release upload "$TAG" \
+            dist/*.tgz dist/*.tgz.sha256 \
+            --clobber \
+            --repo "${{ github.repository }}"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # publish-* — crates.io publish, topological order.
+  #
+  # MARKED `if: false` FOR 0.1.0. The first crates.io publish is OPERATOR-RUN
+  # from their laptop (D-RELEASE §4.3 / §6). Automating injection of
+  # CARGO_REGISTRY_TOKEN into the GH Actions runner is deferred to release
+  # 0.2.0 — token rotation strategy needs design first.
+  #
+  # The jobs are declarative documentation of the publish order. When
+  # automation lands, drop `if: false` and add:
+  #     env:
+  #       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+  #
+  # Dep order verified via cargo metadata on origin/main @ 3cfc835:
+  #   tf-proto → tf-cas → tf-core → tf-cli
+  # Each depends on its predecessor; crates.io needs ~30s propagation between
+  # publishes before the next crate can resolve its deps.
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-tf-proto:
+    needs: tag-validate
+    if: false  # operator-run for 0.1.0; flip when 0.2.0 automation lands
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - run: cargo publish -p tf-proto --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  publish-tf-cas:
+    needs: publish-tf-proto
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - run: sleep 30 && cargo publish -p tf-cas --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  publish-tf-core:
+    needs: publish-tf-cas
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - run: sleep 30 && cargo publish -p tf-core --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  publish-tf-cli:
+    needs: publish-tf-core
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - run: sleep 30 && cargo publish -p tf-cli --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
