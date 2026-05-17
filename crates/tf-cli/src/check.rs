@@ -32,47 +32,21 @@ use std::process::ExitCode;
 use crate::config::Config;
 use crate::ui;
 
-/// The one-shot tree verdict (default path only). `Unknown` is a first-class
-/// state: "I cannot currently tell you" is the honest answer while the model
-/// API is not linked.
+/// Default path: project preflight only. The real verdict is the
+/// `integration` path's `check_once`; the old `Verdict` seam enum was a
+/// placeholder superseded by that real call and is removed (it was never
+/// constructed with anything but the pending state — dead code under
+/// `-D warnings`). Exit `0` (preflight passed) with an explicit pending
+/// line so a script never mistakes this for a verified green.
 #[cfg(not(feature = "integration"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    Green,
-    Red(String),
-    /// Verdict pipeline not yet wired (daemon-core model API not linked).
-    Unknown,
-}
-
-#[cfg(not(feature = "integration"))]
-fn verdict(_cfg: &Config) -> Verdict {
-    Verdict::Unknown
-}
-
-/// Default path: preflight only, verdict pending. Exit `0` (preflight passed)
-/// so this is not mistaken for a verified green by a script — the WAIT line
-/// makes the pending state explicit on the terminal.
-#[cfg(not(feature = "integration"))]
-fn run_verdict(cfg: &Config) -> ExitCode {
-    match verdict(cfg) {
-        Verdict::Green => {
-            ui::ok("green — every tracked file compiles");
-            ExitCode::SUCCESS
-        }
-        Verdict::Red(why) => {
-            ui::error(format!("red — {why}"));
-            ExitCode::from(1)
-        }
-        Verdict::Unknown => {
-            ui::ok("project preflight passed");
-            ui::wait(
-                "compile verdict pipeline pending daemon model API — \
-                 `check` returns 0=green / 1=red / 2=setup-error once the \
-                 model is linked (build with --features integration).",
-            );
-            ExitCode::SUCCESS
-        }
-    }
+fn run_verdict(_cfg: &Config) -> ExitCode {
+    ui::ok("project preflight passed");
+    ui::wait(
+        "compile verdict pipeline pending daemon model API — \
+         `check` returns 0=green / 1=red / 2=setup-error once the \
+         model is linked (build with --features integration).",
+    );
+    ExitCode::SUCCESS
 }
 
 /// Integration path: the real verdict. Maps daemon-core's
@@ -135,19 +109,5 @@ mod tests {
     #[test]
     fn preflight_ok_exits_zero_while_verdict_pending() {
         assert_eq!(run(&cfg()), ExitCode::SUCCESS);
-    }
-
-    #[test]
-    fn verdict_mapping_is_total() {
-        // Guards the seam: every Verdict maps to a defined exit, so wiring
-        // the real tf-core call cannot silently leave a case unhandled.
-        for v in [
-            Verdict::Green,
-            Verdict::Red("E0599".into()),
-            Verdict::Unknown,
-        ] {
-            let _ = v; // exhaustiveness enforced by `run_verdict`'s match
-        }
-        assert_eq!(verdict(&cfg()), Verdict::Unknown);
     }
 }

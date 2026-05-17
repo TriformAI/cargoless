@@ -27,6 +27,12 @@ use crate::config::Config;
 mod check;
 mod clean;
 mod config;
+// holding.rs is the feature-off standalone AC#1 server (decision (a),
+// retained). Under `integration` the single-server DevServer owns the
+// socket and serves its own holding page, so this module is unused there —
+// gating it out keeps converged-set clippy dead-code-clean without deleting
+// what the standalone path needs.
+#[cfg(not(feature = "integration"))]
 mod holding;
 mod serve;
 mod status;

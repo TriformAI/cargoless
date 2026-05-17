@@ -27,6 +27,12 @@ pub enum Phase {
     /// Tree is green; the cold/initial build is running (minutes, honestly).
     Building,
     /// Tree is red — last-green is held (AC#4). Carries a one-liner.
+    // Exercised by this module's render tests, but the verdict-less
+    // standalone serve never produces it (the verdict pipeline is the
+    // `integration` path, where DevServer owns the page) — so it is never
+    // constructed in the bin target. Kept (decision (a): holding.rs is the
+    // retained feature-off server) rather than deleting tested render logic.
+    #[allow(dead_code)]
     Red(String),
 }
 
@@ -128,6 +134,12 @@ impl HoldingServer {
         *self.phase.lock().unwrap_or_else(|e| e.into_inner()) = phase;
     }
 
+    // Explicit-shutdown convenience used by this module's lifecycle test;
+    // the standalone serve loop relies on `Drop` (do_shutdown) instead, so
+    // it is never called in the bin target. Kept as the symmetric public
+    // counterpart to `Drop` for the retained feature-off server (decision
+    // (a)) rather than removing tested API.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) {
         self.do_shutdown();
     }
