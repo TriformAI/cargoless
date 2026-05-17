@@ -2,7 +2,7 @@
 //!
 //! ## The bug
 //!
-//! `tftrunk watch &` then close the terminal / kill the shell: the
+//! `cargoless watch &` then close the terminal / kill the shell: the
 //! daemon SURVIVES as an orphan, still holding rust-analyzer, cargo,
 //! and ~2GB RSS. The user has to `pkill` it by hand. It also feeds
 //! the F10 stale-daemon confusion — sometimes a "stale" status file

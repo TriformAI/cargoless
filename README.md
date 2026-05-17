@@ -22,9 +22,9 @@ is justified by either sharpening the codebase's self-knowledge or
 shortening the latency from brokenness to signal. Anything that does
 neither isn't here.
 
-> **Naming note:** the public product name is still TBD. The repository
-> and binary name `tftrunk` / `cargoless` is a working placeholder; the
-> capabilities below are unaffected.
+> **Name:** the product, the published crate, and the binary you run are
+> all **`cargoless`** (operator decision D1, 2026-05-17). The internal
+> library crates remain `tf-proto` / `tf-cas` / `tf-core`.
 
 ---
 
@@ -32,12 +32,12 @@ neither isn't here.
 
 **v0 IS** — a *headless continuous checker and latest-green publisher*:
 
-- `tftrunk check` — one-shot verdict + diagnostics. Green or red, exit
+- `cargoless check` — one-shot verdict + diagnostics. Green or red, exit
   code reflects it, errors are formatted file:line:col + severity + code
   + message.
-- `tftrunk watch` — continuous timestamped verdict stream with
+- `cargoless watch` — continuous timestamped verdict stream with
   per-file granularity.
-- `tftrunk build --watch --out <dir>` — wraps `trunk build` and
+- `cargoless build --watch --out <dir>` — wraps `trunk build` and
   publishes the latest green WASM artifact via an atomic
   `.cargoless/latest-green` pointer that **only advances on green**.
 - Zero-config — auto-detects `cdylib` + `wasm32` / `leptos` projects.
@@ -70,18 +70,18 @@ deferred work, and the v1 parking lot.
 
 ```bash
 cargo install --git https://github.com/TriformAI/cargoless.git \
-              tf-cli --branch main --locked
+              cargoless --branch main --locked
 ```
 
-**Why the explicit `tf-cli`:** `cargo install --git` walks the entire
-repo for `Cargo.toml` files and refuses to pick when multiple
-installable binary crates exist. This repo's `bench/{harness,fixture}`
-sub-workspaces produce `ra-latency`, `cargoless-bench`, and
-`cargoless-bench-fixture` binaries that cargo treats as candidates.
-Without `tf-cli`, you get:
+**Why the explicit `cargoless` package arg:** `cargo install --git`
+walks the entire repo for `Cargo.toml` files and refuses to pick when
+multiple installable binary crates exist. This repo's
+`bench/{harness,fixture}` sub-workspaces produce `ra-latency`,
+`cargoless-bench`, and `cargoless-bench-fixture` binaries that cargo
+treats as candidates. Without the explicit `cargoless` arg, you get:
 
-> error: multiple packages with binaries found: cargoless-bench-fixture,
-> cargoless-bench-harness, tf-cli.
+> error: multiple packages with binaries found: cargoless,
+> cargoless-bench-fixture, cargoless-bench-harness.
 
 **Why `--locked`:** the workspace ships a committed `Cargo.lock`; `--locked`
 makes the dependency graph identical to what CI / `scripts/ci-gate` proved
@@ -89,7 +89,7 @@ green. See [D-RELEASE Appendix B](docs/design/D-RELEASE.md#appendix-b--why---loc
 
 > The default install includes the wired daemon (`build --watch --out`
 > publisher pipeline). As of commit `1c25017`, the `integration` feature
-> is on by default on `tf-cli`. Users who want only the standalone
+> is on by default on `cargoless`. Users who want only the standalone
 > checker semantics can opt out via `--no-default-features`.
 
 **Once `v0.1.0` releases:**
@@ -108,7 +108,7 @@ aarch64, Windows) fall back to `cargo install` (source compile). See
 [docs/design/D-RELEASE.md §3](docs/design/D-RELEASE.md#3-targets--the-honest-install-matrix)
 for the full matrix.
 
-`tftrunk build --watch --out` wraps `trunk build` — install the
+`cargoless build --watch --out` wraps `trunk build` — install the
 upstream `trunk` for the WASM artifact step:
 
 ```bash
@@ -123,19 +123,19 @@ cargoless surfaces an actionable error if `trunk` is missing from PATH.
 
 ```bash
 # In a Rust + WASM project root (auto-detected: cdylib + wasm32 / leptos)
-$ tftrunk check
+$ cargoless check
 >> checking /work/my-app (auto-detected: cdylib + leptos (Leptos CSR))
 ok green — every tracked file compiles
 
 # A continuous verdict stream — first verdict in under a second
-$ tftrunk watch
+$ cargoless watch
 >> [+   0.083s] daemon up, watching /work/my-app
 >> [+   0.741s] /work/my-app/src/lib.rs: Green
 ^C
 
 # Publish the latest green WASM artifact to ./dist; pointer never
 # advances on red.
-$ tftrunk build --watch --out ./dist
+$ cargoless build --watch --out ./dist
 >> publishing latest-green to .cargoless/latest-green → ./dist
 ok green — latest-green @ <hash>
 ```
@@ -242,7 +242,7 @@ before launch).
 | `tf-proto` | Shared contract types (daemon ↔ build ↔ future remote backends). |
 | `tf-cas` | Content-addressed store. `ContentStore` trait + local-disk impl. |
 | `tf-core` | The daemon: watcher, rust-analyzer wrapper, green/red model, build orchestration. |
-| `tf-cli` | The binary: `check` / `watch` / `build` / `status` / `clean`. |
+| `cargoless` | The binary: `check` / `watch` / `build` / `status` / `clean`. (Crate dir: `crates/tf-cli/`.) |
 
 `bench/{harness,fixture}` are standalone non-workspace crates with
 `publish = false` baked in — they exist to run the AC#7 comparative

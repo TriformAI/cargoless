@@ -9,7 +9,7 @@ real-world Leptos/WASM project shapes the maintainers haven't tried.
 
 1. **Install the development tip** (see [`README.md`](README.md) for the
    exact command — single `cargo install` against the GitHub repo).
-2. **Try it on your own project.** Run `tftrunk check` and `tftrunk
+2. **Try it on your own project.** Run `cargoless check` and `cargoless
    watch` against a real Rust+WASM tree you care about; report anything
    that surprises you.
 3. **Open an issue** at
@@ -44,7 +44,7 @@ cargoless's whole pitch is *trust* — that the verdict you see is the
 ground truth. So when you find something that breaks that trust, the
 maintainers want to fix it fast, and a precise repro shortens that loop:
 
-- **Your environment**: OS + arch, `tftrunk --version`, `rustc --version`.
+- **Your environment**: OS + arch, `cargoless --version`, `rustc --version`.
 - **The project shape**: framework (Leptos, Yew, Sycamore, none), is it
   `cdylib`-only or `cdylib+rlib`, anything unusual about the workspace?
 - **The exact commands you ran**, with their output.
@@ -108,7 +108,8 @@ mirror: commit, push, and CI (`.forgejo/workflows/ci.yml`) runs
 gating.
 
 The crate ownership is disjoint (`tf-proto`, `tf-cas`, `tf-core`,
-`tf-cli`, `bench/`) — see the crate table in [`README.md`](README.md).
+`cargoless` — the published binary crate, dir `crates/tf-cli/` — and
+`bench/`) — see the crate table in [`README.md`](README.md).
 
 **Workflow for internal agent-team contributors** (not required for
 outside contributors):

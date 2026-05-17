@@ -1,4 +1,4 @@
-//! FIELD FINDING #2 — `tftrunk check` against a known-red fixture MUST print
+//! FIELD FINDING #2 — `cargoless check` against a known-red fixture MUST print
 //! the diagnostics (file:line:col + severity + code + message), not just
 //! `red — at least one tracked file does not compile`.
 //!
@@ -30,7 +30,7 @@ fn rust_analyzer_available() -> bool {
 /// (the `cargo check` tier — exactly the FIELD FINDING #2 reproducer
 /// class). Zero external dependencies so the test does not need crates.io.
 fn fixture_with_known_error() -> PathBuf {
-    let base = std::env::temp_dir().join(format!("tftrunk-ff2-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("cargoless-ff2-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     let src = base.join("src");
     fs::create_dir_all(&src).expect("create fixture dir");
@@ -61,7 +61,7 @@ path = "src/lib.rs"
 }
 
 #[test]
-fn tftrunk_check_against_red_fixture_prints_diagnostics() {
+fn cargoless_check_against_red_fixture_prints_diagnostics() {
     if !rust_analyzer_available() {
         eprintln!(
             "SKIP: rust-analyzer not on PATH (CI image without RA / no \
@@ -70,7 +70,7 @@ fn tftrunk_check_against_red_fixture_prints_diagnostics() {
         );
         return;
     }
-    let bin = env!("CARGO_BIN_EXE_tftrunk");
+    let bin = env!("CARGO_BIN_EXE_cargoless");
     let root = fixture_with_known_error();
     // Tight cap: a cold RA + cargo-check pass on a 1-file fixture is
     // typically <30s; double that for slow CI without flapping.
@@ -83,7 +83,7 @@ fn tftrunk_check_against_red_fixture_prints_diagnostics() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("spawn tftrunk");
+        .expect("spawn cargoless");
     let combined = format!(
         "{}\n--- stderr ---\n{}\n--- stdout ---\n{}",
         out.status,

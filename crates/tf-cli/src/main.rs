@@ -148,7 +148,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
 fn usage() {
     println!("{}", tf_core::build_id());
     println!();
-    println!("USAGE: tftrunk <COMMAND> [FLAGS]");
+    println!("USAGE: cargoless <COMMAND> [FLAGS]");
     println!();
     println!("  check                 One-shot verdict; exit 0=green 1=red 2=setup-error");
     println!("  check --watch         Continuous headless verdict stream (alias: watch)");

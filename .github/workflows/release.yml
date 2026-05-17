@@ -171,14 +171,14 @@ jobs:
         with:
           toolchain: "1.85"
           targets: ${{ matrix.target }}
-      - name: cargo build --release -p tf-cli --locked
+      - name: cargo build --release -p cargoless --locked
         run: |
           set -euo pipefail
-          cargo build -p tf-cli --release --locked --target ${{ matrix.target }}
-          # TODO(D1/CWDL-12): if the binary name changes from `tftrunk`,
-          # update both the strip path AND the bin-dir in
-          # crates/tf-cli/Cargo.toml [package.metadata.binstall].
-          BIN=target/${{ matrix.target }}/release/tftrunk
+          cargo build -p cargoless --release --locked --target ${{ matrix.target }}
+          # D1 RESOLVED 2026-05-17 = `cargoless` (was placeholder `tftrunk`).
+          # Strip path + bin-dir in crates/tf-cli/Cargo.toml
+          # [package.metadata.binstall] renamed in lockstep (same commit).
+          BIN=target/${{ matrix.target }}/release/cargoless
           # macOS doesn't have GNU strip by default; native `strip` works
           # but the codepath differs. The `|| true` covers the very rare
           # case where strip fails — the binary is still usable, just
@@ -195,17 +195,20 @@ jobs:
           # D-RELEASE §8 #6 verification, 2026-05-17 — static analysis caught
           # the bug the throwaway-test would have caught more expensively):
           #
-          #   binstall's `{name}` template resolves to `package.name`
-          #   (= `tf-cli`), NOT to `[[bin]].name` (= `tftrunk`). So the
-          #   tarball + dir MUST use the PACKAGE name to match binstall's
+          #   binstall's `{name}` template resolves to `package.name`,
+          #   NOT to `[[bin]].name`. D1 RESOLVED 2026-05-17: both the
+          #   package and the binary are now `cargoless` (was `tf-cli` /
+          #   `tftrunk` pre-D1), so PKG == BIN == "cargoless" here; the
+          #   tarball + dir use the PACKAGE name to match binstall's
           #   pkg-url; the FILE inside the dir is the BINARY name.
           #
-          # TODO(D1/CWDL-12): if D1 renames the crate (which sets PKG) or
-          # the binary (which sets BIN) — possibly both — update both vars
-          # here AND the corresponding `[package.metadata.binstall]` keys
-          # in `crates/tf-cli/Cargo.toml`.
-          PKG="tf-cli"        # package name → tarball/dir name (matches binstall {name})
-          BIN="tftrunk"       # binary name  → file name inside dir (matches binstall bin-dir tail)
+          # D1 RESOLVED: PKG (crate) + BIN (binary) both = cargoless. Kept
+          # as two vars (not collapsed) so the binstall-{name}-vs-bin-dir
+          # design intent stays legible and a future divergence is a
+          # one-line change. Lockstep with crates/tf-cli/Cargo.toml
+          # [package.metadata.binstall] (same D1-rename commit).
+          PKG="cargoless"     # package name → tarball/dir name (matches binstall {name})
+          BIN="cargoless"     # binary name  → file name inside dir (matches binstall bin-dir tail)
           TARGET="${{ matrix.target }}"
           BASE="${PKG}-v${VERSION}-${TARGET}"
           mkdir -p "dist/${BASE}"
@@ -234,17 +237,19 @@ jobs:
   #
   # URL shape after this (verified vs binstall pkg-url template via static
   # analysis 2026-05-17 — D-RELEASE §8 #6 closure; tarball uses PKG
-  # = `tf-cli` to match binstall's `{name}` template, which resolves to
-  # package.name NOT [[bin]].name):
+  # = `cargoless` to match binstall's `{name}` template, which resolves to
+  # package.name NOT [[bin]].name. D1 RESOLVED: package == binary ==
+  # `cargoless`, was `tf-cli`/`tftrunk` pre-D1):
   #   https://github.com/TriformAI/cargoless/releases/download/v0.1.0/
-  #     tf-cli-v0.1.0-x86_64-unknown-linux-gnu.tgz
-  #     tf-cli-v0.1.0-aarch64-apple-darwin.tgz
-  #     tf-cli-v0.1.0-x86_64-apple-darwin.tgz
+  #     cargoless-v0.1.0-x86_64-unknown-linux-gnu.tgz
+  #     cargoless-v0.1.0-aarch64-apple-darwin.tgz
+  #     cargoless-v0.1.0-x86_64-apple-darwin.tgz
   #     + each .sha256
   #
-  # Inside each tarball: a single dir `tf-cli-v0.1.0-{target}/` containing
-  # the `tftrunk` binary file (= [[bin]].name) + README.md + LICENSE.
-  # Matches binstall's bin-dir `{name}-v{version}-{target}/tftrunk` exactly.
+  # Inside each tarball: a single dir `cargoless-v0.1.0-{target}/`
+  # containing the `cargoless` binary file (= [[bin]].name) + README.md +
+  # LICENSE. Matches binstall's bin-dir
+  # `{name}-v{version}-{target}/cargoless` exactly.
   #
   # The pkg-url + bin-dir templates in crates/tf-cli/Cargo.toml binstall
   # metadata depend on this exact URL shape. If D1 renames the package
@@ -294,7 +299,7 @@ jobs:
   #       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
   #
   # Dep order verified via cargo metadata on origin/main @ 3cfc835:
-  #   tf-proto → tf-cas → tf-core → tf-cli
+  #   tf-proto → tf-cas → tf-core → cargoless   (D1: tf-cli renamed → cargoless)
   # Each depends on its predecessor; crates.io needs ~30s propagation between
   # publishes before the next crate can resolve its deps.
   # ─────────────────────────────────────────────────────────────────────────
@@ -337,7 +342,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
-  publish-tf-cli:
+  publish-cargoless:   # D1 RESOLVED: was publish-tf-cli (crate renamed tf-cli→cargoless)
     needs: publish-tf-core
     if: false
     runs-on: ubuntu-latest
@@ -346,6 +351,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      - run: sleep 30 && cargo publish -p tf-cli --locked
+      - run: sleep 30 && cargo publish -p cargoless --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
