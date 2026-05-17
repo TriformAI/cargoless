@@ -90,10 +90,12 @@ fn run_verdict(cfg: &Config) -> ExitCode {
             ExitCode::from(1)
         }
         Err(e) => {
+            // daemon-core's contract: ANY Err = setup/env problem (RA
+            // missing, spawn/handshake/pipe, bad root) — treat uniformly,
+            // never switch on ErrorKind. Distinct from code-red (exit 1).
             ui::error(format!(
-                "could not run the verdict: {e}\n  \
-                 cargoless needs rust-analyzer — install it: \
-                 `rustup component add rust-analyzer`."
+                "could not check (rust-analyzer/setup): {e}\n  \
+                 if rust-analyzer is missing: `rustup component add rust-analyzer`."
             ));
             ExitCode::from(2)
         }

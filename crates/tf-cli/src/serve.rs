@@ -22,11 +22,13 @@
 //! `spawn(self, SocketAddr) -> io::Result<ServerHandle>`, `ServerHandle::
 //! {local_addr,notify_state,notify_build,has_green,tree_is_red,shutdown}`.
 //!
-//! The model drive (`tf_core::model::watch` → `handle.notify_state`) is the
-//! one piece still pending daemon-core's `IdentityProvider` signature
-//! clarification; until that lands the integration path stands the DevServer
-//! up (AC#1 holds — it serves its own holding page) and parks, rather than
-//! guessing a signature. That fill is localized to one block.
+//! The model drive is wired against daemon-core's frozen contract
+//! (`agent/daemon-core-sup` @ e5e4916): `tf_core::model::watch(&Path, I:
+//! IdentityProvider + 'static)` with the display-only sentinel
+//! `tf_core::model::placeholder_identity` (tf-cli never computes a
+//! `BuildIdentity`), draining `Receiver<StateEvent>` on this single thread
+//! into `handle.notify_state`. `ModelSession` is held for the serve lifetime
+//! (drop = intentional shutdown). No guessed signatures remain.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -241,33 +243,58 @@ pub fn run(cfg: &Config) -> ExitCode {
         ));
     }
 
-    // MODEL DRIVE — the one block pending daemon-core's `IdentityProvider`
-    // signature (asked; not guessing). When confirmed, this becomes:
-    //
-    //   let (session, events) =
-    //       tf_core::model::watch(&cfg.root, <IdentityProvider per daemon-core>)?;
-    //   for ev in events {                       // std::sync::mpsc::Receiver
-    //       handle.notify_state(&ev);            // AC#4: Red only flips status
-    //       // first BecameGreen ⇒ DevServer auto-reloads to the artifact;
-    //       // status line + status-file latest_green updated from `ev`
-    //       //   / session.tree_state()
-    //   }
-    //
-    // DevServer already satisfies AC#1 (its own holding page is live above),
-    // so the honest interim is to keep it serving and park — not to fabricate
-    // an unconfirmed `watch` call. `handle` stays in scope (Drop = clean stop).
-    ui::step(format!(
-        "DevServer state: has_green={}, tree_is_red={} (cold start)",
-        handle.has_green(),
-        handle.tree_is_red()
-    ));
+    // MODEL DRIVE. `watch` blocks on RA's initialize handshake (seconds), so
+    // it MUST come after the bind above (daemon-core ordering rule). The
+    // identity is daemon-core's display-only sentinel `placeholder_identity`
+    // — a bare `fn() -> BuildIdentity` that satisfies the blanket
+    // `impl<F: Fn() -> BuildIdentity + Send> IdentityProvider for F`; tf-cli
+    // never computes a BuildIdentity (build-cas owns the real provider).
+    let (session, events) =
+        match tf_core::model::watch(&cfg.root, tf_core::model::placeholder_identity) {
+            Ok(se) => se,
+            Err(e) => {
+                ui::error(format!(
+                    "could not start the model (rust-analyzer/setup): {e}\n  \
+                     install rust-analyzer: `rustup component add rust-analyzer`."
+                ));
+                status::clear_status(&cfg.root);
+                return ExitCode::from(2);
+            }
+        };
     ui::wait(
-        "DevServer up and serving its holding page. Model-drive wiring is \
-         pending daemon-core's IdentityProvider signature — Ctrl-C to stop.",
+        "watching — the first green build is a cold compile (minutes); the \
+         page reloads itself when the app is ready. Ctrl-C to stop.",
     );
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
+
+    // Drain the StateEvent stream on THIS (single) thread — `Receiver` is not
+    // `Sync`. `session` is held for the whole serve lifetime: dropping it is
+    // the intentional shutdown (stops watcher, kills RA). Every event is
+    // forwarded to DevServer; AC#4 (`BecameRed` only flips status, never
+    // changes served bytes) is DevServer's contract, not ours to police.
+    for ev in events.iter() {
+        handle.notify_state(&ev);
+        match &ev {
+            tf_core::StateEvent::BecameGreen { .. } => {
+                // identity is the sentinel until build-cas wires a real
+                // provider, so we deliberately do NOT record a hash here
+                // (an honest `None` beats a fake key in the status file).
+                ui::ok("tree green — DevServer advancing to the build");
+            }
+            tf_core::StateEvent::BecameRed => {
+                ui::warn("tree red — holding last green (AC#4)");
+            }
+            tf_core::StateEvent::FileVerdict { path, state } => {
+                ui::step(format!("{path}: {state:?}"));
+            }
+        }
     }
+
+    // `events` disconnected ⇒ the model pipeline shut down. Clean up and exit
+    // non-zero so a supervisor/script sees the daemon stopped unexpectedly.
+    session.shutdown();
+    status::clear_status(&cfg.root);
+    ui::warn("model stopped — exiting.");
+    ExitCode::from(1)
 }
 
 #[cfg(test)]
