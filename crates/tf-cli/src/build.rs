@@ -19,14 +19,15 @@
 //! gate stays green). The default path is an honest `EX_UNAVAILABLE` stub.
 //! #29 convergence enables `integration` on the converged tree.
 //!
-//! ## Open flag (build-cas): blob → dir materialization
+//! ## Blob → dir materialization (RESOLVED — option (b))
 //!
-//! build-cas describes the CAS blob as "TrunkCompiler's dist/ dump"
-//! (opaque). Whether that is a tar/archive or a single file is NOT specified
-//! — so v0 writes the opaque blob atomically as `--out/<input_hash>` and
-//! does NOT guess an unpack format. Expanding it into a usable `dist/` needs
-//! either build-cas's blob container format or a `materialize(pa, out_dir)`
-//! helper (build-cas offered to add one). Flagged; localized to one spot.
+//! build-cas shipped `tf_core::build::materialize_latest_green` (frozen seam
+//! @ build-cas-publisher 5b4b7f9): one call does read_latest_green → CAS get
+//! → faithful `dist/` expansion into `out_dir`. The blob/container format
+//! stays entirely build-cas's; tf-cli never parses CAS internals. v0 uses
+//! build-cas's non-destructive default (overwrite, do not delete unrelated
+//! pre-existing files in `--out`) — a documented v0-simple behavior, not a
+//! guess; a pristine `--out` is the user's responsibility for now.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -167,59 +168,35 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
     }
 }
 
-/// Fetch the just-published CAS blob and materialize it into `out`.
-/// `read_latest_green` codec is build-cas-owned — parse ONLY via it.
+/// Materialize the just-published latest-green tree into `out` via
+/// build-cas's frozen `materialize_latest_green` seam (option (b)). The
+/// blob/container format stays entirely build-cas's — tf-cli never parses
+/// CAS internals. NoGreen/Evicted are normal states (no crash, --out
+/// untouched); Err is only a genuinely corrupt pointer/blob or real FS/CAS
+/// failure — surfaced, never panicked, --out left as the path-safe helper
+/// left it (AC#4: a non-green never advances the user's output).
 #[cfg(feature = "integration")]
 fn publish_to_out(project_root: &Path, cache_root: &Path, out: &Path) {
-    use std::io::Write as _;
+    use tf_core::build::{Materialized, materialize_latest_green};
 
-    use tf_core::ContentStore as _;
-    use tf_core::build::read_latest_green;
-
-    let pa = match read_latest_green(project_root) {
-        Ok(Some(pa)) => pa,
-        Ok(None) => {
-            ui::warn("published pointer missing after green build — will retry next edge");
-            return;
-        }
-        Err(_) => {
-            // Corrupt pointer = treat as no-green, not a crash (build-cas contract).
-            ui::warn("latest-green pointer unreadable/corrupt — treating as no-green");
-            return;
-        }
-    };
     let store = tf_core::LocalDiskStore::new(cache_root.to_path_buf());
-    let bytes = match store.get(&pa.artifact.input_hash) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            ui::warn("CAS blob evicted — re-trigger on next green edge");
-            return;
-        }
-        Err(e) => {
-            ui::error(format!("could not read CAS blob: {e}"));
-            return;
-        }
-    };
-
-    // Opaque blob (build-cas owns the container format). v0: write atomically
-    // as <out>/<input_hash>; dir-expansion is the flagged open item.
-    let dest = out.join(pa.artifact.input_hash.as_str());
-    let tmp = out.join(".cargoless-out.tmp");
-    let ok = std::fs::File::create(&tmp)
-        .and_then(|mut f| f.write_all(&bytes).and_then(|_| f.flush()))
-        .and_then(|_| std::fs::rename(&tmp, &dest));
-    match ok {
-        Ok(()) => ui::ok(format!(
-            "published {} → {} ({} bytes, at {}s)",
+    match materialize_latest_green(&store, project_root, out) {
+        Ok(Materialized::Materialized(pa)) => ui::ok(format!(
+            "published {} → {} (at {}s)",
             pa.artifact.input_hash,
-            dest.display(),
-            bytes.len(),
+            out.display(),
             pa.published_at.0
         )),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            ui::error(format!("could not write artifact to --out: {e}"));
+        Ok(Materialized::NoGreen) => {
+            ui::warn("published pointer missing after green build — will retry next edge");
         }
+        Ok(Materialized::Evicted(pa)) => ui::warn(format!(
+            "CAS blob for {} evicted (cache cleaned) — re-trigger on next green edge",
+            pa.artifact.input_hash
+        )),
+        Err(e) => ui::error(format!(
+            "could not materialize latest-green into --out ({e}) — holding last good"
+        )),
     }
 }
 
