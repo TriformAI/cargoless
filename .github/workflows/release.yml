@@ -130,21 +130,49 @@ jobs:
             || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
           echo "CHANGELOG.md has ## $VERSION section ✓"
       - name: Assert SHA has s1-ac2-verdict commit status on Forgejo
+        env:
+          # Read-only Forgejo token. Forgejo runs site-wide
+          # REQUIRE_SIGNIN_VIEW, so the statuses API is NOT anonymously
+          # readable (returns {"message":"Only signed in user..."} — a JSON
+          # object). Operator pre-stages this repo secret; see
+          # docs/release/PHASE-D-OPERATOR-HANDOFF.md. (D-RELEASE §8 #8
+          # follow-up; CWDL-71 Phase C confirmed this is a hard gate
+          # 2026-05-17 — the prior anonymous curl crashed `jq` with
+          # "Cannot index string with string" and false-failed every tag.)
+          FORGEJO_READONLY_TOKEN: ${{ secrets.FORGEJO_READONLY_TOKEN }}
         run: |
           set -euo pipefail
           SHA="$GITHUB_SHA"
-          # The s1-ac2-verdict context lives on the Forgejo side (where the
-          # bench runs — see D-RELEASE §1.1). Anonymous read is sufficient
-          # for commit-status queries IF the Forgejo repo is publicly
-          # readable; otherwise the operator pre-stages a deploy token.
-          # TODO(D-RELEASE §8 #8 follow-up): if the Forgejo site-wide
-          # REQUIRE_SIGNIN_VIEW stays on, this curl needs a token — surface
-          # the token via FORGEJO_READONLY_TOKEN secret (read-only scope).
           API="https://forgejo.triform.dev/api/v1/repos/triform/cargoless"
-          STATUSES=$(curl -sS "${API}/commits/${SHA}/statuses?limit=50") || \
+          if [ -z "${FORGEJO_READONLY_TOKEN:-}" ]; then
+            echo "::error::FORGEJO_READONLY_TOKEN secret is not set. The Forgejo"
+            echo "::error::statuses API requires auth (site-wide REQUIRE_SIGNIN_VIEW)."
+            echo "::error::Add a read-only Forgejo token as the FORGEJO_READONLY_TOKEN"
+            echo "::error::repo secret — see docs/release/PHASE-D-OPERATOR-HANDOFF.md."
+            exit 1
+          fi
+          HTTP=$(curl -sS -o /tmp/s1statuses.json -w '%{http_code}' \
+            -H "Authorization: token ${FORGEJO_READONLY_TOKEN}" \
+            "${API}/commits/${SHA}/statuses?limit=50") || \
             { echo "::error::cannot reach Forgejo statuses endpoint"; exit 1; }
-          echo "$STATUSES" | jq -e '[.[] | select(.context=="s1-ac2-verdict")] | length > 0' \
-            > /dev/null || { echo "::error::SHA $SHA has no s1-ac2-verdict commit status on Forgejo"; exit 1; }
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Forgejo statuses endpoint returned HTTP $HTTP for $SHA"
+            echo "::error::(token missing/expired/insufficient scope?). Body:"
+            head -c 300 /tmp/s1statuses.json; echo
+            exit 1
+          fi
+          # Defensive: the body MUST be a JSON array. Anything else (an
+          # error object, an HTML login page) → an actionable error, never
+          # a cryptic `jq: Cannot index string with string "context"`.
+          if ! jq -e 'type=="array"' /tmp/s1statuses.json >/dev/null 2>&1; then
+            echo "::error::Forgejo statuses response for $SHA is not a JSON array"
+            echo "::error::(auth / REQUIRE_SIGNIN_VIEW / token scope). Body:"
+            head -c 300 /tmp/s1statuses.json; echo
+            exit 1
+          fi
+          jq -e '[.[] | select(.context=="s1-ac2-verdict")] | length > 0' \
+            /tmp/s1statuses.json >/dev/null \
+            || { echo "::error::SHA $SHA has no s1-ac2-verdict commit status on Forgejo"; exit 1; }
           # Don't gate on the verdict's payload — that's an evidence string,
           # not a pass/fail flag (per D-A2). Existence alone proves the SHA
           # has been benched. Pass/fail is enforced at AC#7 GATE (#36).
