@@ -89,7 +89,7 @@ impl ContentStore for LocalDiskStore {
 /// Test-only helper: a unique temp dir under the OS temp root.
 fn scratch_dir(tag: &str) -> PathBuf {
     let mut p: PathBuf = std::env::temp_dir();
-    p.push(format!("tf-trunk-cas-{tag}-{}", std::process::id()));
+    p.push(format!("cargoless-cas-{tag}-{}", std::process::id()));
     p
 }
 

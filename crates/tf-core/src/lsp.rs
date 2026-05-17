@@ -230,7 +230,7 @@ pub(crate) fn cargo_toml_signals_proc_macro(text: &str) -> bool {
 ///   2. inlayHints.*: ALL DISABLED (cargoless never displays them).
 ///   3. cachePriming.enable: false (skip eager startup analysis).
 ///   4. procMacro.enable: from InitOpts.proc_macro_enabled (auto-detected
-///      from Cargo.toml or explicit per `tftrunk.proc-macro` knob).
+///      from Cargo.toml or explicit per `cargoless.proc-macro` knob).
 ///   5. cargo.allFeatures: false + features: from InitOpts + workspace.
 ///      symbol narrowed (only_types, workspace scope).
 ///   + Honorable mentions: hover.actions, lens.enable, completion.

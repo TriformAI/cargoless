@@ -76,7 +76,7 @@ pub fn run(cfg: &Config) -> ExitCode {
             // native warnings/info/hints (noise that doesn't drive a
             // verdict). On Green, only authoritative is printed; the
             // advisory count is mentioned at the end so the user knows
-            // we saw them but knows where to find them (`tftrunk watch`).
+            // we saw them but knows where to find them (`cargoless watch`).
             let (authoritative, advisory) = partition_by_provenance(&diagnostics);
             if !authoritative.is_empty() {
                 // A green tree can still carry rustc warnings; show those so
@@ -109,7 +109,7 @@ pub fn run(cfg: &Config) -> ExitCode {
                 } else {
                     format!(
                         " ({} advisory hint{} from rust-analyzer; \
-                         `tftrunk watch` for the live stream)",
+                         `cargoless watch` for the live stream)",
                         advisory.len(),
                         if advisory.len() == 1 { "" } else { "s" },
                     )
@@ -117,7 +117,7 @@ pub fn run(cfg: &Config) -> ExitCode {
                 ui::error(format!(
                     "red — at least one tracked file does not compile, \
                      but no diagnostics were captured before the check \
-                     settled (try `tftrunk watch` for live updates, or \
+                     settled (try `cargoless watch` for live updates, or \
                      re-run with `TF_CHECK_TIMEOUT_SECS=300`).{advisory_hint}"
                 ));
             } else {
@@ -204,11 +204,11 @@ fn advisory_suppression_note(n: usize) -> String {
     match n {
         0 => String::new(),
         1 => " (1 rust-analyzer advisory hint suppressed; \
-              `tftrunk watch` shows the live stream)"
+              `cargoless watch` shows the live stream)"
             .to_string(),
         _ => format!(
             " ({n} rust-analyzer advisory hints suppressed; \
-             `tftrunk watch` shows the live stream)"
+             `cargoless watch` shows the live stream)"
         ),
     }
 }
@@ -699,7 +699,7 @@ mod tests {
     fn advisory_suppression_note_grammar() {
         assert!(advisory_suppression_note(0).is_empty());
         assert!(advisory_suppression_note(1).contains("1 rust-analyzer advisory hint suppressed"));
-        assert!(advisory_suppression_note(1).contains("`tftrunk watch`"));
+        assert!(advisory_suppression_note(1).contains("`cargoless watch`"));
         assert!(advisory_suppression_note(5).contains("5 rust-analyzer advisory hints suppressed"));
     }
 

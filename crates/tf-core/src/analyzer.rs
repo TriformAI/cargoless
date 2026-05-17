@@ -415,7 +415,7 @@ impl Drop for ReapOnDrop {
 /// runs; this is defense in depth).
 ///
 /// Cost: ~1 process spawn (pgrep is small + warm in distro caches). Runs
-/// once per ReapOnDrop drop, i.e. once per `tftrunk check`. Not on a
+/// once per ReapOnDrop drop, i.e. once per `cargoless check`. Not on a
 /// hot path.
 #[cfg(unix)]
 fn snapshot_session_members(sid: i32) -> Vec<i32> {

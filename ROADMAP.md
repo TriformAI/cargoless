@@ -14,9 +14,9 @@ ambitious-but-not-now ideas. Anything that doesn't sharpen the codebase's
 self-knowledge or reduce the latency from brokenness to signal is **not**
 v0 — it goes to v0.1 or v1.
 
-> **Naming:** the shipping product name is still TBD (the working
-> repository and binary name `tftrunk` / `cargoless` is a placeholder).
-> Once the name lands it will appear in install commands; the capabilities
+> **Name:** the product, the published crate, and the binary are all
+> **`cargoless`** (operator decision D1, 2026-05-17). Internal library
+> crates remain `tf-proto` / `tf-cas` / `tf-core`. The capabilities
 > described here are unaffected.
 
 ---
@@ -30,18 +30,18 @@ v0.1.
 
 ### v0 capabilities (available today on `main`)
 
-- **`tftrunk check`** — one-shot verdict. Exit code 0 on green, non-zero on
+- **`cargoless check`** — one-shot verdict. Exit code 0 on green, non-zero on
   red; diagnostics formatted file:line:col + severity + code + message.
-- **`tftrunk watch`** — continuous headless verdict stream with per-line
+- **`cargoless watch`** — continuous headless verdict stream with per-line
   relative timestamps. Sub-second save→verdict on the reference fixture;
   field-measured at ~0.74s end-to-end on the dogfood Leptos project after
   the debouncer fix (see [dogfood report](docs/dogfood/PHASE-2-REPORT.md)).
-- **`tftrunk build --watch --out <dir>`** — continuous build that publishes
+- **`cargoless build --watch --out <dir>`** — continuous build that publishes
   the latest green WASM artifact via an atomic `.cargoless/latest-green`
   pointer. Requires the upstream `trunk` binary to perform the actual WASM
   build (cargoless wraps it; see the install note in the README).
-- **`tftrunk status`** — daemon liveness + last verdict + latest-green hash.
-- **`tftrunk clean`** — clear the content-addressed cache.
+- **`cargoless status`** — daemon liveness + last verdict + latest-green hash.
+- **`cargoless clean`** — clear the content-addressed cache.
 - **Zero-config auto-detection** — a `cdylib` + `wasm32` / `leptos` project
   needs no flags; auto-detected on first run.
 
@@ -71,11 +71,11 @@ that protect the launch surface. Each is on the v0.1 or v1 list.
 - **No browser, no HTTP, no WebSocket.** cargoless does not serve your
   WASM bundle. If you need that today, run `trunk serve` (or a static
   server like `miniserve`) against the directory cargoless publishes via
-  `tftrunk build --watch --out <dir>`. The integrated dev-server is v0.1.
+  `cargoless build --watch --out <dir>`. The integrated dev-server is v0.1.
 - **Not a `trunk serve` drop-in replacement in v0.** cargoless replaces
   the *verdict* and *latest-green-publisher* surfaces, not the
   browser-facing serve loop. v0.1 closes that gap.
-- **Not a `trunk build` replacement.** `tftrunk build --watch --out`
+- **Not a `trunk build` replacement.** `cargoless build --watch --out`
   wraps `trunk build` (which calls cargo + wasm-bindgen + post-processing).
   cargoless drives it and adds the watch/publish loop on top.
 - **No hot-swap, no symbol-level granularity, no editor LSP plugin.**
@@ -97,7 +97,7 @@ shipping promise with a date.**
 - Browser "never serve red" — the server keeps serving last-green while
   the tree is red (the browser-facing consumer of v0's never-publish-red
   guarantee).
-- `tftrunk serve` command (one-command drop-in for `trunk serve`).
+- `cargoless serve` command (one-command drop-in for `trunk serve`).
 
 The std-only implementation already exists as research on branches
 `agent/devserver` and `agent/devserver-bundle` — preserved, not deleted, so
