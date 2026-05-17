@@ -11,10 +11,10 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://forgejo.triform.dev/triform/tf-trunk"
+repository = "https://forgejo.triform.dev/triform/cargoless"
 # NOTE: the published product name is open decision D1 (Plane CWDL-12).
-# "tf-trunk" is a name-neutral working identifier, NOT the shipping name.
-# `tf` collides with Terraform and must not be the published binary name.
+# The repo/working identifier is "cargoless"; the shipping name is still the
+# formal D1 decision. `tf` is NOT it — it collides with Terraform.
 
 [workspace.lints.clippy]
 all = "warn"
