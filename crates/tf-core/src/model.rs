@@ -28,9 +28,26 @@
 //! unit-tested by draining a subscriber.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use tf_proto::{BuildIdentity, FileState, StateEvent, TreeState};
+
+/// Hard ceiling for [`check_once`] (override: `TF_CHECK_TIMEOUT_SECS`). A
+/// cold rust-analyzer flycheck (`cargo check`) can take minutes; this only
+/// bounds pathological hangs.
+const CHECK_HARD_CAP: Duration = Duration::from_secs(180);
+/// Quiet window: once diagnostics have arrived and none have for this long,
+/// the verdict is considered settled.
+const CHECK_SETTLE: Duration = Duration::from_secs(2);
+/// Debounce for the streaming [`watch`] pipeline.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Supplies the current [`BuildIdentity`] at a green edge. Blanket-impl'd for
 /// any `Fn() -> BuildIdentity`, so callers usually just pass a closure; the
@@ -121,11 +138,7 @@ impl Model {
     }
 
     fn aggregate(&self) -> TreeState {
-        if !self.files.is_empty() && self.files.values().all(|s| *s == FileState::Green) {
-            TreeState::Green
-        } else {
-            TreeState::Red
-        }
+        tree_from_states(&self.files)
     }
 
     fn reconcile_tree(&mut self) {
@@ -146,6 +159,285 @@ impl Model {
     fn emit(&mut self, ev: StateEvent) {
         self.subscribers.retain(|s| s.send(ev.clone()).is_ok());
     }
+}
+
+/// The D4 tree rule, single source of truth: green iff at least one file is
+/// known and every known file is green; otherwise red.
+pub(crate) fn tree_from_states(files: &BTreeMap<String, FileState>) -> TreeState {
+    if !files.is_empty() && files.values().all(|s| *s == FileState::Green) {
+        TreeState::Green
+    } else {
+        TreeState::Red
+    }
+}
+
+fn poisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Recursively collect `*.rs` files under `root`, skipping ignored paths
+/// (`target/`, `.git/`, `.gitignore`d) via the watcher's [`crate::watcher::IgnoreRules`].
+fn collect_rs_files(root: &Path, ignore: &crate::watcher::IgnoreRules) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            if ignore.is_ignored(rel) {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(path),
+                Ok(ft) if ft.is_file() => {
+                    if path.extension().is_some_and(|e| e == "rs") {
+                        out.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// cli-ux public surface: one-shot check + streaming subscription
+// ---------------------------------------------------------------------------
+
+/// One-shot verdict for `root`: spin up rust-analyzer, open every workspace
+/// `.rs` file, wait for diagnostics to settle, and fold them into the D4 tree
+/// rule. The `tf check` entrypoint cli-ux consumes.
+///
+/// Returns `io::Result` (not bare [`TreeState`]) deliberately: a missing
+/// rust-analyzer or spawn failure is *not* "the code is red" — it is an error
+/// the CLI must surface distinctly. A successful run with no provable-green
+/// files yields [`TreeState::Red`] (never claim unproven green — AC#4).
+pub fn check_once(root: &Path) -> io::Result<TreeState> {
+    let root = fs::canonicalize(root)?;
+    let mut cmd = crate::analyzer::rust_analyzer_command()?;
+    cmd.current_dir(&root);
+    let mut child = cmd.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    let root_str = root.to_string_lossy().into_owned();
+    let (client, diags) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
+
+    let ignore = crate::watcher::IgnoreRules::for_root(&root);
+    for f in collect_rs_files(&root, &ignore) {
+        if let Ok(text) = fs::read_to_string(&f) {
+            let _ = client.did_open(&f.to_string_lossy(), &text, 1);
+        }
+    }
+
+    let cap = std::env::var("TF_CHECK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(CHECK_HARD_CAP);
+    let deadline = Instant::now() + cap;
+    let mut states: BTreeMap<String, FileState> = BTreeMap::new();
+    let mut got_any = false;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = CHECK_SETTLE.min(deadline - now);
+        match diags.recv_timeout(wait) {
+            Ok(pd) => {
+                got_any = true;
+                if let Some(p) = crate::lsp::path_from_uri(&pd.uri) {
+                    let s = if pd.is_green() {
+                        FileState::Green
+                    } else {
+                        FileState::Red
+                    };
+                    states.insert(p, s);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if got_any {
+                    break; // settled
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break, // RA exited
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(tree_from_states(&states))
+}
+
+/// A running watch pipeline: rust-analyzer + LSP + watcher feeding the model.
+/// Drop = graceful shutdown (stop threads, stop watcher, kill RA).
+pub struct ModelSession {
+    model: Arc<Mutex<Model>>,
+    stop: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    watch: Option<crate::watcher::WatchHandle>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl ModelSession {
+    /// Add another [`StateEvent`] subscriber to the live stream.
+    pub fn subscribe(&self) -> Receiver<StateEvent> {
+        poisoned(&self.model).subscribe()
+    }
+
+    /// Current aggregate verdict.
+    pub fn tree_state(&self) -> TreeState {
+        poisoned(&self.model).tree_state()
+    }
+
+    /// Explicit graceful shutdown (also runs on drop).
+    pub fn shutdown(mut self) {
+        self.do_shutdown();
+    }
+
+    fn do_shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Threads loop on 250ms recv timeouts checking `stop`, so they exit
+        // promptly regardless of channel state — safe to join before the
+        // watcher/child are torn down.
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+        drop(self.watch.take()); // stops the notify watcher + its thread
+        if let Some(mut c) = poisoned(&self.child).take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for ModelSession {
+    fn drop(&mut self) {
+        self.do_shutdown();
+    }
+}
+
+/// Start the streaming pipeline for `root` and return the session plus the
+/// initial [`StateEvent`] subscription. `identity` supplies the
+/// [`BuildIdentity`] at green edges (build-cas's seam — see module docs);
+/// callers that only display green/red can pass a trivial provider.
+pub fn watch<I: IdentityProvider + 'static>(
+    root: &Path,
+    identity: I,
+) -> io::Result<(ModelSession, Receiver<StateEvent>)> {
+    let root = fs::canonicalize(root)?;
+    let mut cmd = crate::analyzer::rust_analyzer_command()?;
+    cmd.current_dir(&root);
+    let mut child = cmd.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    let root_str = root.to_string_lossy().into_owned();
+    let (client, diags) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
+    let client = Arc::new(client);
+
+    let model = Arc::new(Mutex::new(Model::new(identity)));
+    let events = poisoned(&model).subscribe();
+
+    let ignore = crate::watcher::IgnoreRules::for_root(&root);
+    for f in collect_rs_files(&root, &ignore) {
+        if let Ok(text) = fs::read_to_string(&f) {
+            let _ = client.did_open(&f.to_string_lossy(), &text, 1);
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+
+    // Diagnostics → model.
+    {
+        let model = Arc::clone(&model);
+        let stop = Arc::clone(&stop);
+        threads.push(
+            thread::Builder::new()
+                .name("tf-model-diags".into())
+                .spawn(move || {
+                    loop {
+                        match diags.recv_timeout(Duration::from_millis(250)) {
+                            Ok(pd) => poisoned(&model).apply_publish(&pd),
+                            Err(RecvTimeoutError::Timeout) => {
+                                if stop.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })
+                .expect("spawn tf-model-diags"),
+        );
+    }
+
+    // Filesystem changes → re-sync RA so it re-checks.
+    let (watch_handle, batches) =
+        crate::watcher::watch(&root, WATCH_DEBOUNCE).map_err(io::Error::other)?;
+    {
+        let model = Arc::clone(&model);
+        let stop = Arc::clone(&stop);
+        let client = Arc::clone(&client);
+        threads.push(
+            thread::Builder::new()
+                .name("tf-model-fs".into())
+                .spawn(move || {
+                    let mut version: i64 = 2;
+                    loop {
+                        match batches.recv_timeout(Duration::from_millis(250)) {
+                            Ok(batch) => {
+                                for path in batch {
+                                    if path.extension().is_none_or(|e| e != "rs") {
+                                        continue;
+                                    }
+                                    let p = path.to_string_lossy().into_owned();
+                                    match fs::read_to_string(&path) {
+                                        Ok(text) => {
+                                            version += 1;
+                                            let _ = client.did_change(&p, &text, version);
+                                            let _ = client.did_save(&p);
+                                        }
+                                        Err(_) => poisoned(&model).forget_file(&p),
+                                    }
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                if stop.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })
+                .expect("spawn tf-model-fs"),
+        );
+    }
+
+    let session = ModelSession {
+        model,
+        stop,
+        child: Arc::new(Mutex::new(Some(child))),
+        watch: Some(watch_handle),
+        threads,
+    };
+    Ok((session, events))
 }
 
 #[cfg(test)]
@@ -328,5 +620,51 @@ mod tests {
                 StateEvent::BecameRed,
             ]
         );
+    }
+
+    #[test]
+    fn tree_rule_matches_model_invariant() {
+        let mut m: BTreeMap<String, FileState> = BTreeMap::new();
+        assert_eq!(tree_from_states(&m), TreeState::Red); // empty ⇒ red
+        m.insert("a.rs".into(), FileState::Green);
+        assert_eq!(tree_from_states(&m), TreeState::Green);
+        m.insert("b.rs".into(), FileState::Red);
+        assert_eq!(tree_from_states(&m), TreeState::Red);
+    }
+
+    #[test]
+    fn collect_rs_files_skips_target_git_and_gitignored() {
+        let base = std::env::temp_dir().join(format!("tf-model-walk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let mk = |rel: &str, body: &str| {
+            let p = base.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, body).unwrap();
+        };
+        mk(".gitignore", "ignored.rs\n");
+        mk("src/lib.rs", "");
+        mk("src/nested/m.rs", "");
+        mk("ignored.rs", "");
+        mk("target/debug/build.rs", "");
+        mk(".git/hooks/pre.rs", "");
+        mk("README.md", "");
+
+        let root = fs::canonicalize(&base).unwrap();
+        let ignore = crate::watcher::IgnoreRules::for_root(&root);
+        let mut got: Vec<String> = collect_rs_files(&root, &ignore)
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["src/lib.rs".to_string(), "src/nested/m.rs".to_string()]
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 }
