@@ -179,33 +179,43 @@ jobs:
           echo "SHA $SHA has s1-ac2-verdict ✓"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # build (matrix) — release-profile build, three native runners.
+  # build (matrix) — release-profile build, the TWO REQUIRED native runners.
   #
-  # GH Actions free-tier matrix:
+  # GH Actions free-tier REQUIRED matrix (these gate the release):
   #   - ubuntu-latest        for x86_64-unknown-linux-gnu
   #   - macos-14             for aarch64-apple-darwin  (Apple Silicon)
-  #   - macos-13             for x86_64-apple-darwin    (Intel)
+  # Intel (x86_64-apple-darwin / macos-13) is the DECOUPLED best-effort job
+  # `build-darwin-x86-besteffort` below — see its header for the CWDL-71
+  # Phase C rationale (free-tier macos-13 unavailability must never wedge
+  # the release).
   #
   # Each target builds natively — no cross-compile, no Apple SDK gymnastics.
   # Release profile exercises different codegen paths from ci-gate's dev
   # profile (LTO, opt-level edges) — don't skip even on a clean dev gate.
   #
-  # Produces three tarballs with consistent layout (see D-RELEASE §7) so the
+  # Produces the two required tarballs (+ the best-effort Intel one when
+  # macos-13 is available) with consistent layout (see D-RELEASE §7) so the
   # `[package.metadata.binstall]` pkg-url template + bin-dir resolve to one
-  # rule across all three triples.
+  # rule across all triples.
   # ─────────────────────────────────────────────────────────────────────────
   build:
     needs: tag-validate
     strategy:
-      fail-fast: false   # don't kill the other two if one regresses
+      fail-fast: false   # don't kill the other required leg if one regresses
       matrix:
+        # REQUIRED legs ONLY — these two gate the release/asset-upload.
+        # x86_64-apple-darwin (Intel / macos-13) is DECOUPLED into the
+        # separate `build-darwin-x86-besteffort` job below. CWDL-71 Phase C
+        # (2026-05-17) caught a real launch-topology fragility: a free-tier
+        # macos-13 runner sat queued/unassigned for 87 min and the old
+        # all-legs `needs: build` let ONE unavailable runner wedge the
+        # ENTIRE release/asset-upload. Required = ubuntu (x86_64-linux) +
+        # macos-14 (aarch64-darwin); nothing depends on the Intel leg.
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
           - target: aarch64-apple-darwin
             runner: macos-14
-          - target: x86_64-apple-darwin
-            runner: macos-13
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -273,12 +283,77 @@ jobs:
           path: dist/*
 
   # ─────────────────────────────────────────────────────────────────────────
-  # attach-release-assets — post the three tarballs + sha256 to the GitHub
+  # build-darwin-x86-besteffort — Intel-Mac (x86_64-apple-darwin) prebuilt,
+  # BEST-EFFORT, fully DECOUPLED from the required path.
+  #
+  # CWDL-71 Phase C 2026-05-17: the free-tier `macos-13` runner sat queued
+  # (never assigned) for 87 min; with the old all-legs `needs: build`,
+  # `attach-release-assets` could not run → the WHOLE release was wedged by
+  # one unavailable runner outside our control. Resolution (lead-authorized):
+  #   - this job is `continue-on-error: true` + `timeout-minutes: 30`
+  #   - NOTHING `needs:` it (it depends only on tag-validate) → a stuck or
+  #     missing macos-13 can NEVER block the release/asset-upload
+  #   - it SELF-UPLOADS its tarball to the (tag-auto-created) release, so
+  #     when macos-13 IS available the Intel prebuilt is attached as a bonus
+  #   - when it stalls/fails, `cargo binstall` auto-falls-back to source for
+  #     x86_64-apple-darwin — a documented v0 known-limitation
+  #     (PHASE-D-OPERATOR-HANDOFF.md §3/§8).
+  # ─────────────────────────────────────────────────────────────────────────
+  build-darwin-x86-besteffort:
+    needs: tag-validate
+    runs-on: macos-13
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: write   # self-attach the Intel prebuilt to the release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (matches rust-toolchain.toml = 1.85)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: x86_64-apple-darwin
+      - name: cargo build --release -p cargoless --locked
+        run: |
+          set -euo pipefail
+          cargo build -p cargoless --release --locked --target x86_64-apple-darwin
+          BIN=target/x86_64-apple-darwin/release/cargoless
+          strip "$BIN" || true
+          file "$BIN"
+      - name: Package + self-attach Intel-Mac tarball (best-effort)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          PKG="cargoless"; BIN="cargoless"; TARGET="x86_64-apple-darwin"
+          BASE="${PKG}-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${BASE}"
+          cp "target/${TARGET}/release/${BIN}" "dist/${BASE}/${BIN}"
+          cp README.md LICENSE "dist/${BASE}/"
+          tar -czf "dist/${BASE}.tgz" -C dist "${BASE}"
+          (sha256sum "dist/${BASE}.tgz" 2>/dev/null \
+            || shasum -a 256 "dist/${BASE}.tgz") > "dist/${BASE}.tgz.sha256"
+          # Self-upload: the release is auto-created on tag push; --clobber
+          # makes this idempotent and independent of attach-release-assets.
+          gh release upload "$TAG" \
+            "dist/${BASE}.tgz" "dist/${BASE}.tgz.sha256" \
+            --clobber --repo "${{ github.repository }}"
+          echo "Intel-Mac prebuilt attached (bonus)."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # attach-release-assets — post the required tarballs + sha256 to the GitHub
   # release at the tag.
   #
   # GitHub auto-creates a release for a pushed tag (visible on the Releases
   # page in draft state until something attaches assets). This job downloads
-  # all three matrix build artifacts and attaches them via `gh release upload`.
+  # the REQUIRED matrix build artifacts (ubuntu x86_64-linux + macos-14
+  # aarch64-darwin) and attaches them via `gh release upload`. It `needs:`
+  # ONLY the required `build` matrix — never the decoupled Intel best-effort
+  # job — so an unavailable macos-13 runner can never wedge this upload. The
+  # Intel prebuilt, when macos-13 is available, is self-attached by
+  # `build-darwin-x86-besteffort` (idempotent `--clobber`, independent path).
   # The `gh` CLI is preinstalled on GH Actions runners.
   #
   # URL shape after this (verified vs binstall pkg-url template via static
