@@ -135,7 +135,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 
     use tf_core::build::{BuildOrchestrator, TrunkCompiler};
 
-    use crate::statusfile::{self, Status, Verdict, HEARTBEAT};
+    use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
 
     let Some(out) = out else {
         ui::error("`build` requires `--out <DIR>`: `cargoless build --watch --out <dir>`.");
@@ -309,7 +309,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 /// left it (AC#4: a non-green never advances the user's output).
 #[cfg(feature = "integration")]
 fn publish_to_out(project_root: &Path, cache_root: &Path, out: &Path) {
-    use tf_core::build::{materialize_latest_green, Materialized};
+    use tf_core::build::{Materialized, materialize_latest_green};
 
     let store = tf_core::LocalDiskStore::new(cache_root.to_path_buf());
     match materialize_latest_green(&store, project_root, out) {
