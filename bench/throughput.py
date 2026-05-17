@@ -162,32 +162,44 @@ class ProcSnap:
     alive: bool
 
 
-def read_proc_stat(pid: int) -> tuple[int, int] | None:
-    """Return (utime_jiffies, stime_jiffies). None if pid is dead.
+def read_proc_stat(pid: int) -> int | None:
+    """Return total CPU jiffies = utime + stime + cutime + cstime.
+    None if pid is dead.
 
-    /proc/<pid>/stat is space-separated. comm field (position 2) can
-    contain spaces inside parens, so we split on ') ' to slice past it.
+    CRITICAL (the methodology bug this fixes): the FIRST version summed
+    only utime+stime (own CPU). Tools that spawn-compile-EXIT a child
+    per edit — bacon (`cargo check`), trunk (`cargo` + `wasm-bindgen`) —
+    have their compile CPU REAPED into the parent's cutime+cstime when
+    the child is `wait()`ed. Counting only utime+stime missed essentially
+    all of bacon's/trunk's actual work (bacon measured at 6 jiffies for
+    20 cargo checks — impossible) while cargoless's PERSISTENT
+    rust-analyzer accumulated in a live process that WAS counted. That
+    asymmetry inflated the cargoless-vs-{bacon,trunk} gap ~20x. Summing
+    cutime+cstime makes the comparison symmetric: a child's CPU is
+    counted in its own utime/stime while alive, and in the parent's
+    cutime/cstime after it exits+is-reaped — exactly once either way.
+
+    /proc/<pid>/stat: comm (field 2) can contain spaces+parens, so we
+    slice past the LAST ')'. After that, rest[0]=state (field 3), so
+    rest[11..14] = fields 14..17 = utime, stime, cutime, cstime.
     """
     try:
         with open(f"/proc/{pid}/stat", "r") as f:
             raw = f.read().strip()
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return None
-    except PermissionError:
-        return None
-    # Find the closing paren of `comm`
     rp = raw.rfind(")")
     if rp < 0:
         return None
     rest = raw[rp + 2 :].split()
-    # rest[0] is state; field 14 in 1-based = utime, 15 = stime
-    # In our split, that's indices 11 (utime) and 12 (stime).
     try:
         utime = int(rest[11])
         stime = int(rest[12])
+        cutime = int(rest[13])
+        cstime = int(rest[14])
     except (IndexError, ValueError):
         return None
-    return utime, stime
+    return utime + stime + cutime + cstime
 
 
 def read_proc_rss_kb(pid: int) -> int | None:
@@ -234,7 +246,18 @@ def descendant_pids(root_pid: int) -> list[int]:
 
 
 def sample_proc_tree(root_pid: int) -> ProcSnap:
-    """Sample RSS + cumulative CPU jiffies summed across the full tree."""
+    """Sample RSS + cumulative CPU jiffies summed across the full tree.
+
+    CPU per process = utime+stime+cutime+cstime (see read_proc_stat).
+    No double-count: a child's CPU is in its own utime/stime while it's
+    a live tree member, and in an ancestor's cutime/cstime after it
+    exits+is-reaped (at which point it is no longer in the tree). Either
+    way it is counted exactly once in the cumulative delta. Linux's
+    cutime/cstime is recursive (a reaped grandchild's CPU propagates up
+    the chain), and an exited child's still-live descendants re-parent
+    to init (so they leave this tree) — both confirm the once-only
+    accounting.
+    """
     ts_ms = time.time_ns() // 1_000_000
     pids = descendant_pids(root_pid)
     total_rss = 0
@@ -242,12 +265,12 @@ def sample_proc_tree(root_pid: int) -> ProcSnap:
     alive = False
     for pid in pids:
         rss = read_proc_rss_kb(pid)
-        stat = read_proc_stat(pid)
+        cpu = read_proc_stat(pid)
         if rss is not None:
             total_rss += rss
             alive = True
-        if stat is not None:
-            total_cpu += stat[0] + stat[1]
+        if cpu is not None:
+            total_cpu += cpu
     return ProcSnap(ts_ms=ts_ms, rss_kb=total_rss, cpu_jiffies=total_cpu, alive=alive)
 
 
@@ -303,10 +326,20 @@ class ToolResult:
     reps_done: int = 0
     target_reps: int = 0
     error: str | None = None
+    # High-frequency peak observed by the background RSS tracker (250ms
+    # tick). The per-edit `samples` (10s apart) MISS the transient
+    # compile-time RSS of spawn-exit tools (bacon's cargo, trunk's
+    # cargo+wasm-bindgen run ~0.4-2s then exit between edit samples);
+    # only cargoless's persistent RA is reliably caught at edit-sample
+    # time. This field makes the peak-RSS comparison symmetric.
+    bg_peak_rss_kb: int = 0
 
     # Computed properties (after collection)
     def peak_rss_kb(self) -> int:
-        return max((s.rss_kb for s in self.samples), default=0)
+        return max(
+            max((s.rss_kb for s in self.samples), default=0),
+            self.bg_peak_rss_kb,
+        )
 
     def baseline_rss_kb(self) -> int:
         return self.samples[0].rss_kb if self.samples else 0
@@ -456,6 +489,24 @@ def run_tool(
         flush=True,
     )
 
+    # High-frequency background RSS-peak tracker (250ms tick). Runs for
+    # the whole measurement window so the transient compile-time RSS of
+    # spawn-exit tools (bacon/trunk) is caught, not just cargoless's
+    # persistent RA. Daemon thread; stopped via the Event in `finally`.
+    import threading
+
+    stop_bg = threading.Event()
+
+    def _bg_peak() -> None:
+        while not stop_bg.is_set():
+            snap = sample_proc_tree(proc.pid)
+            if snap.rss_kb > res.bg_peak_rss_kb:
+                res.bg_peak_rss_kb = snap.rss_kb
+            stop_bg.wait(0.25)
+
+    bg_thread = threading.Thread(target=_bg_peak, daemon=True)
+    bg_thread.start()
+
     try:
         for rep in range(1, cfg.reps + 1):
             editor.flip(rep)
@@ -469,10 +520,13 @@ def run_tool(
             if rep % 5 == 0 or rep == cfg.reps:
                 print(
                     f"  [{tool.name}] rep {rep}/{cfg.reps} "
-                    f"rss={snap.rss_kb}kb cpu_j={snap.cpu_jiffies}",
+                    f"rss={snap.rss_kb}kb cpu_j={snap.cpu_jiffies} "
+                    f"bg_peak_rss={res.bg_peak_rss_kb}kb",
                     flush=True,
                 )
     finally:
+        stop_bg.set()
+        bg_thread.join(timeout=2)
         editor.restore()
         _reap(proc)
 

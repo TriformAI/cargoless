@@ -38,20 +38,39 @@ if [ "${rs_files:-0}" -lt "$MIN_FILES" ] || [ "${rs_loc:-0}" -lt "$MIN_LOC" ]; t
   blocker "fixture below honest-size floor (${rs_files}f/${rs_loc}L < ${MIN_FILES}f/${MIN_LOC}L)"
 fi
 
-# cargoless bin discovery (honors CARGO_TARGET_DIR — same as run-comparative.sh)
+# cargoless bin discovery (honors CARGO_TARGET_DIR — same as run-comparative.sh).
+#
+# D1-rename-aware (#87): the binary was `tftrunk` and is now `cargoless`;
+# the crate was `tf-cli` and is now `cargoless`. Substrate may be either
+# side of the rename depending on the merge point, so try BOTH names for
+# the binary AND the cargo package. New name first (post-rename is the
+# steady state).
 cargo_target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 CARGOLESS_BIN="${CARGOLESS_BIN:-}"
+find_built_bin() {
+  for n in cargoless tftrunk; do
+    if [ -x "$cargo_target_dir/release/$n" ]; then echo "$cargo_target_dir/release/$n"; return 0; fi
+  done
+  return 1
+}
 if [ -z "$CARGOLESS_BIN" ]; then
-  if command -v tftrunk >/dev/null 2>&1; then
+  if command -v cargoless >/dev/null 2>&1; then
+    CARGOLESS_BIN="$(command -v cargoless)"
+  elif command -v tftrunk >/dev/null 2>&1; then
     CARGOLESS_BIN="$(command -v tftrunk)"
-  elif [ -x "$cargo_target_dir/release/tftrunk" ]; then
-    CARGOLESS_BIN="$cargo_target_dir/release/tftrunk"
+  elif find_built_bin >/dev/null 2>&1; then
+    CARGOLESS_BIN="$(find_built_bin)"
   else
-    echo "building cargoless (tftrunk)..."
-    if ! ( cd "$repo" && cargo build --release -p tf-cli --features integration --locked 2>&1 | tail -50 ); then
-      blocker "could not build tftrunk — cargo build failed."
-    fi
-    CARGOLESS_BIN="$cargo_target_dir/release/tftrunk"
+    # Try the new crate name first, fall back to the old one.
+    echo "building cargoless CLI (trying -p cargoless then -p tf-cli)..."
+    built=0
+    for pkg in cargoless tf-cli; do
+      if ( cd "$repo" && cargo build --release -p "$pkg" --features integration --locked 2>&1 | tail -30 ); then
+        built=1; break
+      fi
+    done
+    [ "$built" = "1" ] || blocker "could not build the cargoless CLI (tried -p cargoless and -p tf-cli)."
+    CARGOLESS_BIN="$(find_built_bin)" || blocker "CLI built but no cargoless/tftrunk binary in $cargo_target_dir/release/"
   fi
 fi
 [ -x "$CARGOLESS_BIN" ] || blocker "cargoless binary missing at $CARGOLESS_BIN"
