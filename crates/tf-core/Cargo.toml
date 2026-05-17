@@ -1,6 +1,6 @@
 [package]
 name = "tf-core"
-version = "0.0.0"
+version.workspace = true  # CWDL-71 Phase B: inherits from [workspace.package]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,8 +11,8 @@ description = "The TF-Trunk daemon: filesystem watcher, rust-analyzer wrapper, g
 workspace = true
 
 [dependencies]
-tf-proto = { path = "../tf-proto" }
-tf-cas = { path = "../tf-cas" }
+tf-proto = { path = "../tf-proto", version = "0.0.0" }  # publish-ready
+tf-cas = { path = "../tf-cas", version = "0.0.0" }      # publish-ready
 # Owner-added (daemon-core, Epic 2). notify 6.x: stable cross-platform FS
 # backend (inotify/FSEvents/kqueue/ReadDirectoryChangesW), MSRV well under
 # 1.85. Debounce + ignore are implemented in-crate (pure, unit-tested) rather

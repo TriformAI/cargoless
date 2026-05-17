@@ -12,27 +12,37 @@
 //! hiding). The exit-code contract is byte-frozen — only the *body* of the
 //! red path gains diagnostic output.
 //!
-//! ## FIELD FINDING #8 — verdict/print provenance reconciliation
+//! ## FIELD FINDING #8 → #8-redo — verdict/print agreement on severity
 //!
-//! The verdict path reads the AUTHORITATIVE tier (cargo-check, `source =
-//! "rustc"`) per the #21 verdict-provenance seam: GREEN means *flycheck has
-//! completed with no rustc-source error*. The #42 print path naively
-//! displayed EVERY diagnostic — including RA-native syntax errors (`source =
-//! "rust-analyzer"`) that the verdict explicitly considers advisory. When
-//! the two tiers diverge (RA-native catches a syntax error instantly; cargo
-//! check doesn't see it until parse time, or skips that file entirely), the
-//! user saw `error[syntax-error; rust-analyzer]: …` followed by `green —
-//! every tracked file compiles`. Two distinct sources of truth printed
-//! side by side is *worse* than #42's original silence — it is actively
-//! contradictory.
+//! The original #8 fix said "filter print to source=='rustc'" to match
+//! the #21 rustc-source verdict rule. dogfood-lead caught the bigger
+//! problem: with `let bad =` at file scope (RA-native parse error, never
+//! reaches cargo-check's per-file JSON output), the verdict reported
+//! GREEN while cargo check exited non-zero. The first fix had silenced
+//! the symptom (contradictory output) but not the actual gap — the
+//! verdict itself was wrong.
 //!
-//! The fix here is the minimum-surface one: `check` only prints the
-//! diagnostics that share the verdict's authority. `watch` continues to
-//! show every diagnostic in #45's timestamp format — a live-debug user
-//! actively benefits from seeing the RA-native fast-hint stream, and the
-//! `[+N.NNNs]` timeline tells them which signal arrived when. The split
-//! matches #21's design intent: authoritative tier IS the verdict; the
-//! advisory tier exists as a fast hint that NEVER asserts the verdict.
+//! The #8-redo invariant: **the verdict and the diagnostic stream MUST
+//! agree on green/red**. The fix is in two coordinated halves:
+//!
+//! 1. tf-core::model: any `severity:Error` from any source (rustc OR
+//!    rust-analyzer-native) flips the file Red. GREEN gating is
+//!    unchanged — still requires a completed flycheck with zero errors
+//!    of any source. The asymmetry is honest: RA's "saw an error" is
+//!    strictly stronger evidence than "didn't see one" because RA's
+//!    analysis is partial.
+//! 2. tf-cli::check (this file): `is_authoritative` is now severity-
+//!    based — `severity:Error` from any source is verdict-driving and
+//!    rendered; warnings/info/hints stay source-filtered (rustc-source
+//!    kept as authoritative; rust-analyzer-native suppressed in `check`
+//!    output and visible in `watch`).
+//!
+//! `watch` continues to show every diagnostic in #45's timestamp format
+//! — a live-debug user actively benefits from seeing the RA-native
+//! fast-hint stream, and the `[+N.NNNs]` timeline tells them which
+//! signal arrived when. The split is honest: severity:Error from any
+//! source is honest evidence of brokenness; severity:Warning from
+//! rust-analyzer-native is noise that doesn't drive a verdict either way.
 //!
 //! Exit-code contract (stable for scripts/CI), per daemon-core's mapping —
 //! treat ANY `Err` uniformly (do NOT switch on `ErrorKind`):
@@ -60,13 +70,13 @@ pub fn run(cfg: &Config) -> ExitCode {
             tree: tf_core::TreeState::Green,
             diagnostics,
         }) => {
-            // FIELD FINDING #8: partition by provenance BEFORE rendering.
-            // The verdict reads the authoritative (cargo-check / `source =
-            // "rustc"`) tier per #21; the print must match. Advisory
-            // diagnostics (RA-native) are silently suppressed in `check`
-            // (visible in `watch`) — counting them in the verdict line so
-            // the user knows we saw them but did not let them drive the
-            // verdict.
+            // FIELD FINDING #8-redo: partition by severity-then-provenance.
+            // Authoritative = severity:Error from any source + rustc-tier
+            // warnings (matches the model's verdict rule). Advisory = RA-
+            // native warnings/info/hints (noise that doesn't drive a
+            // verdict). On Green, only authoritative is printed; the
+            // advisory count is mentioned at the end so the user knows
+            // we saw them but knows where to find them (`tftrunk watch`).
             let (authoritative, advisory) = partition_by_provenance(&diagnostics);
             if !authoritative.is_empty() {
                 // A green tree can still carry rustc warnings; show those so
@@ -84,9 +94,10 @@ pub fn run(cfg: &Config) -> ExitCode {
             diagnostics,
         }) => {
             // FIELD FINDING #2 stands: a red verdict MUST carry its
-            // evidence. FIELD FINDING #8 narrows that to the authoritative
-            // tier — the rustc errors that drove the verdict, not RA-native
-            // advisory ones that didn't.
+            // evidence. #8-redo says that evidence is *every severity:Error
+            // from any source* (the verdict-driving set) — RA-native parse
+            // errors get rendered alongside rustc errors because both are
+            // honest evidence the code does not compile.
             let (authoritative, advisory) = partition_by_provenance(&diagnostics);
             if authoritative.is_empty() {
                 // No authoritative diagnostics ⇒ unproven-red path (#21
@@ -132,17 +143,37 @@ pub fn run(cfg: &Config) -> ExitCode {
     }
 }
 
-/// FIELD FINDING #8: the print path is gated on the SAME provenance the
-/// verdict reads. `Diagnostic.source == Some("rustc")` is the authoritative
-/// tier per #21 (cargo-check / flycheck output); everything else (most
-/// notably `rust-analyzer` for native syntax/lint diagnostics) is advisory
-/// and must not appear in `check` output — `watch` is where the live
-/// advisory stream belongs.
+/// FIELD FINDING #8-redo: the print path matches the model's verdict rule
+/// (model/`apply_event` and `check_*_with_diagnostics` agree on this).
 ///
-/// A `None` source is conservatively treated as ADVISORY: if RA forgot to
-/// tag a diagnostic, the safer answer is "don't let it contradict the
-/// verdict line" — false-suppress < false-contradict.
+/// **Severity:Error from ANY source is "verdict-driving"** — it appears in
+/// `check` output and drives the green/red bit. This matches the dogfood-
+/// lead invariant: the verdict (green/red bit) and the diagnostic stream
+/// MUST agree. A diagnostic the user reads on stderr is one of the things
+/// that made the verdict what it is.
+///
+/// **Warnings / Info / Hints from non-rustc sources** stay "advisory" —
+/// they don't drive the verdict either way (cargo-check is the authority
+/// for green), and they tend to be noisy lints in `check` mode. Users can
+/// see them all in `watch` mode (#45's timestamp format makes provenance
+/// visible by ordering anyway).
+///
+/// **Warnings / Info / Hints from rustc** are kept (rustc warnings are
+/// authoritative — they came from cargo-check just like the errors did).
+///
+/// The original #8 fix (filter by source only) collapsed everything in the
+/// non-rustc bucket to "advisory" — including severity:Error from
+/// RA-native parse failures. That hid real errors and produced silent
+/// green on a broken tree. Severity-based gating is the honest fix.
 fn is_authoritative(d: &tf_core::Diagnostic) -> bool {
+    // Severity:Error from any source — always counted, always rendered,
+    // always drives the verdict (matches model::apply_event's new rule).
+    if d.severity == tf_core::Severity::Error {
+        return true;
+    }
+    // Warnings/Info/Hints: only rustc-source is kept as authoritative
+    // (rustc's lint pipeline is the authority on these); rust-analyzer
+    // and unsourced are "advisory" — visible in watch, suppressed here.
     d.source.as_deref() == Some("rustc")
 }
 
@@ -165,7 +196,10 @@ fn partition_by_provenance(
 
 /// One-line "we saw N advisory hints but they did not drive the verdict"
 /// note appended to the verdict line. Empty when there are no advisory
-/// hints — don't pollute the happy-path with parentheticals.
+/// hints — don't pollute the happy-path with parentheticals. Per #8-redo
+/// the advisory set is severity:Warning/Info/Hint from non-rustc sources
+/// only (RA-native lints, etc.) — severity:Error from any source is in
+/// the authoritative set and shown on its own line.
 fn advisory_suppression_note(n: usize) -> String {
     match n {
         0 => String::new(),
@@ -371,11 +405,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FIELD FINDING #8 — verdict/print provenance reconciliation
+    // FIELD FINDING #8-redo — verdict/print agreement on severity:Error
+    //
+    // The original #8 fix partitioned by source only — that silenced the
+    // RA-native error path entirely, hiding real parse errors and
+    // producing silent-green on a broken tree (the dogfood `let bad =`
+    // reproducer). #8-redo: severity:Error from any source is verdict-
+    // driving AND always rendered; warnings/info/hints stay source-
+    // filtered.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn partition_splits_rustc_from_everything_else() {
+    fn partition_keeps_every_severity_error_in_authoritative() {
         let ds = vec![
             d(
                 "/r/a.rs",
@@ -383,7 +424,7 @@ mod tests {
                 1,
                 tf_core::Severity::Error,
                 Some("E0277"),
-                "auth",
+                "rustc err",
                 Some("rustc"),
             ),
             d(
@@ -392,7 +433,7 @@ mod tests {
                 1,
                 tf_core::Severity::Error,
                 Some("syntax-error"),
-                "advisory error",
+                "ra-native err",
                 Some("rust-analyzer"),
             ),
             d(
@@ -401,22 +442,54 @@ mod tests {
                 1,
                 tf_core::Severity::Warning,
                 Some("unused"),
-                "advisory warn",
+                "ra-native warn",
                 Some("rust-analyzer"),
             ),
-            // No source tagged ⇒ conservatively advisory (false-suppress is
-            // safer than false-contradict — the README promise is at stake).
-            d("/r/a.rs", 4, 1, tf_core::Severity::Info, None, "unt", None),
+            // Untagged severity:Error: still authoritative — severity-
+            // based gating is unambiguous regardless of source tagging.
+            d(
+                "/r/a.rs",
+                4,
+                1,
+                tf_core::Severity::Error,
+                None,
+                "untagged-err",
+                None,
+            ),
+            d(
+                "/r/a.rs",
+                5,
+                1,
+                tf_core::Severity::Info,
+                None,
+                "ra-note",
+                None,
+            ),
         ];
         let (auth, adv) = partition_by_provenance(&ds);
-        assert_eq!(auth.len(), 1, "only the source=='rustc' entry");
-        assert_eq!(auth[0].code.as_deref(), Some("E0277"));
-        assert_eq!(adv.len(), 3, "rust-analyzer + no-source = advisory");
+        assert_eq!(
+            auth.len(),
+            3,
+            "three severity:Error from any source: {auth:?}"
+        );
+        // All Errors are in `auth` regardless of source.
+        let auth_codes: Vec<&str> = auth.iter().filter_map(|d| d.code.as_deref()).collect();
+        assert!(auth_codes.contains(&"E0277"));
+        assert!(auth_codes.contains(&"syntax-error"));
+        // The untagged Error has no code but IS in auth.
+        assert!(
+            auth.iter()
+                .any(|d| d.code.is_none() && d.message == "untagged-err"),
+            "untagged severity:Error must be authoritative-rendered"
+        );
+        // RA-native warnings + RA-native info stay advisory.
+        assert_eq!(adv.len(), 2, "ra-native warning + ra-native info: {adv:?}");
     }
 
     #[test]
-    fn is_authoritative_is_strict_rustc_only() {
-        let rustc = d(
+    fn is_authoritative_is_severity_based_for_errors_source_based_for_warnings() {
+        // Severity:Error → authoritative regardless of source.
+        let rustc_err = d(
             "/r/a.rs",
             1,
             1,
@@ -425,7 +498,7 @@ mod tests {
             "x",
             Some("rustc"),
         );
-        let ra = d(
+        let ra_err = d(
             "/r/a.rs",
             1,
             1,
@@ -434,7 +507,7 @@ mod tests {
             "x",
             Some("rust-analyzer"),
         );
-        let other = d(
+        let clippy_err = d(
             "/r/a.rs",
             1,
             1,
@@ -443,23 +516,64 @@ mod tests {
             "x",
             Some("clippy"),
         );
-        let untagged = d("/r/a.rs", 1, 1, tf_core::Severity::Error, None, "x", None);
-        assert!(is_authoritative(&rustc));
-        assert!(!is_authoritative(&ra));
-        assert!(!is_authoritative(&other), "clippy/other ≠ verdict source");
+        let untagged_err = d("/r/a.rs", 1, 1, tf_core::Severity::Error, None, "x", None);
+        assert!(is_authoritative(&rustc_err));
         assert!(
-            !is_authoritative(&untagged),
-            "untagged is conservatively advisory"
+            is_authoritative(&ra_err),
+            "RA-native error is honest evidence"
+        );
+        assert!(
+            is_authoritative(&clippy_err),
+            "clippy error is honest evidence"
+        );
+        assert!(
+            is_authoritative(&untagged_err),
+            "severity beats source tagging"
+        );
+
+        // Severity:Warning → source-based (rustc kept, others advisory).
+        let rustc_warn = d(
+            "/r/a.rs",
+            1,
+            1,
+            tf_core::Severity::Warning,
+            None,
+            "x",
+            Some("rustc"),
+        );
+        let ra_warn = d(
+            "/r/a.rs",
+            1,
+            1,
+            tf_core::Severity::Warning,
+            None,
+            "x",
+            Some("rust-analyzer"),
+        );
+        let untagged_warn = d("/r/a.rs", 1, 1, tf_core::Severity::Warning, None, "x", None);
+        assert!(
+            is_authoritative(&rustc_warn),
+            "rustc warnings stay authoritative"
+        );
+        assert!(
+            !is_authoritative(&ra_warn),
+            "RA-native warnings stay advisory"
+        );
+        assert!(
+            !is_authoritative(&untagged_warn),
+            "untagged warning ⇒ advisory"
         );
     }
 
     #[test]
-    fn f8_regression_green_tree_does_not_render_advisory_errors() {
-        // The exact dogfood reproducer for F8: an RA-native syntax-error
-        // alongside a green flycheck verdict. The CHECK output must NOT
-        // include the RA-native error in the printed diagnostics — it
-        // didn't drive the verdict and printing it next to "green" is the
-        // user-trust violation #55 fixed.
+    fn f8_redo_smoking_gun_ra_native_error_is_rendered_not_suppressed() {
+        // The dogfood reproducer that broke the first F8 fix: `let bad =`
+        // at file scope produces an RA-native severity:Error, and cargo-
+        // check may or may not emit a matching source:rustc diagnostic.
+        // Under the first F8 fix this was suppressed as "advisory hint"
+        // → user saw "green" exit 0 on a broken tree. Post-#8-redo: the
+        // RA-native error IS rendered (severity:Error is verdict-driving
+        // regardless of source).
         let root = PathBuf::from("/repo");
         let ds = vec![d(
             "/repo/src/components/footer.rs",
@@ -471,30 +585,35 @@ mod tests {
             Some("rust-analyzer"),
         )];
         let (auth, adv) = partition_by_provenance(&ds);
-        assert!(
-            auth.is_empty(),
-            "no rustc-source ⇒ nothing to print on green"
+        assert_eq!(
+            auth.len(),
+            1,
+            "RA-native severity:Error must be authoritative-rendered"
         );
-        assert_eq!(adv.len(), 1, "advisory hint preserved for the verdict note");
+        assert!(
+            adv.is_empty(),
+            "no advisory hints — the only diag is an error"
+        );
 
-        // Belt-and-braces: render the authoritative slice and confirm the
-        // contradictory string never makes it to output.
+        // Render and verify the user-visible string actually appears.
         let mut buf = Vec::new();
         render_diagnostics(&mut buf, &root, &auth).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.is_empty(), "no auth ⇒ no print: {out:?}");
         assert!(
-            !out.contains("Syntax Error"),
-            "advisory error must not leak: {out:?}"
+            out.contains("Syntax Error: expected an item"),
+            "the syntax error must reach the user: {out:?}"
         );
+        assert!(out.contains("src/components/footer.rs:25:1"));
+        // The severity tag is "error" not "warning"; rendering preserves it.
+        assert!(out.starts_with("error"), "rendered as error: {out:?}");
     }
 
     #[test]
-    fn f8_red_path_filters_advisory_out_of_tally() {
-        // A mixed publish: 1 rustc error (drives RED), 1 RA-native syntax
-        // error (advisory). The verdict line's "(N errors, M warnings
-        // surfaced)" tally must count only the authoritative rustc error,
-        // and the printed diagnostics must include only that one.
+    fn f8_redo_mixed_publish_renders_both_tiers_when_both_severity_error() {
+        // Mixed publish: 1 rustc Error + 1 RA-native Error. Both are
+        // severity:Error → both authoritative → both rendered → both
+        // counted in the verdict tally. (The prior #8 fix counted only
+        // the rustc one, hiding the RA-native one as "advisory".)
         let root = PathBuf::from("/repo");
         let ds = vec![
             d(
@@ -512,26 +631,68 @@ mod tests {
                 1,
                 tf_core::Severity::Error,
                 Some("syntax-error"),
-                "advisory syntax",
+                "ra syntax",
                 Some("rust-analyzer"),
             ),
         ];
-        let (auth, _adv) = partition_by_provenance(&ds);
+        let (auth, adv) = partition_by_provenance(&ds);
+        assert_eq!(auth.len(), 2, "both errors are authoritative");
+        assert!(adv.is_empty());
         let (errs, _warns) = severity_tally(&auth);
-        assert_eq!(
-            errs, 1,
-            "only the rustc error counts toward the verdict tally"
-        );
+        assert_eq!(errs, 2, "both severity:Error count toward the tally");
+
         let mut buf = Vec::new();
         render_diagnostics(&mut buf, &root, &auth).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("E0277"), "rustc error rendered");
-        assert!(out.contains("trait bound"), "rustc message rendered");
+        assert!(out.contains("E0277"));
+        assert!(out.contains("trait bound"));
+        assert!(out.contains("syntax-error"));
         assert!(
-            !out.contains("advisory syntax"),
-            "advisory message suppressed"
+            out.contains("ra syntax"),
+            "RA-native error reaches user: {out:?}"
         );
-        assert!(!out.contains("syntax-error"), "advisory code suppressed");
+    }
+
+    #[test]
+    fn f8_redo_advisory_is_now_warnings_only_from_non_rustc() {
+        // The "advisory" channel is now severity:Warning|Info|Hint from
+        // non-rustc sources only — those are the genuinely-noisy ones
+        // the user might want to hide in `check` and see in `watch`.
+        let ds = vec![
+            d(
+                "/r/a.rs",
+                1,
+                1,
+                tf_core::Severity::Warning,
+                Some("unused_imports"),
+                "ra lint",
+                Some("rust-analyzer"),
+            ),
+            d(
+                "/r/a.rs",
+                2,
+                1,
+                tf_core::Severity::Info,
+                None,
+                "ra hint",
+                Some("rust-analyzer"),
+            ),
+            d(
+                "/r/a.rs",
+                3,
+                1,
+                tf_core::Severity::Hint,
+                None,
+                "ra hint2",
+                Some("rust-analyzer"),
+            ),
+        ];
+        let (auth, adv) = partition_by_provenance(&ds);
+        assert!(
+            auth.is_empty(),
+            "no errors, no rustc-warnings ⇒ nothing authoritative"
+        );
+        assert_eq!(adv.len(), 3);
     }
 
     #[test]

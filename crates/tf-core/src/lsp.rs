@@ -88,6 +88,20 @@ impl PublishDiagnostics {
     pub fn has_authoritative_error(&self) -> bool {
         self.authoritative_errors > 0
     }
+
+    /// FIELD FINDING #8-redo (#55-reopen): this file has at LEAST one
+    /// `severity == Error` diagnostic, from ANY source (rustc, rust-
+    /// analyzer-native, or otherwise). Used by the model's per-file
+    /// state to flip RED on parse-tier evidence even before cargo
+    /// check has had a chance to fire — RA's parser catching a syntax
+    /// error means cargo cannot compile this file (strictly stronger
+    /// evidence than "rustc has not yet reported"). The original #21
+    /// distinction stands for the *advisory channel* + GREEN gating
+    /// (which still requires a completed flycheck), but RED is honest
+    /// on any severity-error.
+    pub fn has_any_severity_error(&self) -> bool {
+        self.error_count() > 0
+    }
 }
 
 /// What the reader thread streams to the model: a diagnostics notification,
@@ -656,6 +670,67 @@ mod tests {
         let pd = extract_publish_diagnostics(&v).unwrap();
         assert!(pd.diagnostics.is_empty());
         assert!(pd.is_green());
+    }
+
+    #[test]
+    fn has_any_severity_error_covers_both_tiers() {
+        // FIELD FINDING #8-redo: RA-native severity:Error alone (no
+        // rustc-tier error) MUST still register as "this file has an
+        // error" — the dogfood reproducer's exact case (RA's parser
+        // catches `let bad =` before cargo check runs).
+        let ra_only: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///r/src/lib.rs","diagnostics":[
+                  {"severity":1,"source":"rust-analyzer",
+                   "message":"Syntax Error: expected an item"}]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&ra_only).unwrap();
+        assert!(
+            !pd.has_authoritative_error(),
+            "no rustc-source ⇒ not authoritative-only error"
+        );
+        assert!(
+            pd.has_any_severity_error(),
+            "RA-native severity:Error counts toward `any` (the #8-redo invariant)"
+        );
+
+        let rustc_only: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///r/src/lib.rs","diagnostics":[
+                  {"severity":1,"source":"rustc","code":"E0277",
+                   "message":"trait bound"}]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&rustc_only).unwrap();
+        assert!(pd.has_authoritative_error());
+        assert!(pd.has_any_severity_error());
+
+        let both: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///r/src/lib.rs","diagnostics":[
+                  {"severity":1,"source":"rustc","code":"E0277","message":"a"},
+                  {"severity":1,"source":"rust-analyzer","message":"b"}]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&both).unwrap();
+        assert!(pd.has_authoritative_error());
+        assert!(pd.has_any_severity_error());
+
+        // Warnings/notes from any source do NOT count as severity-errors.
+        let warnings: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///r/src/lib.rs","diagnostics":[
+                  {"severity":2,"source":"rustc","message":"warn"},
+                  {"severity":2,"source":"rust-analyzer","message":"lint"}]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&warnings).unwrap();
+        assert!(!pd.has_authoritative_error());
+        assert!(
+            !pd.has_any_severity_error(),
+            "severity:Warning is not an error in any tier"
+        );
     }
 
     #[test]

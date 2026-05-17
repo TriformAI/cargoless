@@ -1,16 +1,22 @@
-# cargoless release pipeline — DRAFT (CWDL-71)
+# cargoless release pipeline — ACTIVE (CWDL-71)
 #
 # ============================================================================
-#                                THIS IS A DRAFT
-# ============================================================================
-# Filename `.yml.draft` is intentional: GitHub Actions scans for `*.yml` and
-# `*.yaml` only, so this file CANNOT fire. Do NOT rename to `release.yml`
-# until every open decision in docs/design/D-RELEASE.md §8 is resolved and
-# team-lead ratifies. Renaming is the literal switch-on operation.
+# This file is ACTIVATED (was `release.yml.draft` pre-CWDL-71 Phase A,
+# 2026-05-17). GitHub Actions WILL pick it up and fire on tag pushes matching
+# `v[0-9]+.*`. Edits here have real consequences for the release pipeline —
+# make them carefully.
 #
 # Read docs/design/D-RELEASE.md before editing this file. The doc is the
 # spec; this file is the mechanical-readable form. If they disagree, the
 # doc wins — fix this file to match.
+#
+# §8 open decisions blocking FIRST-tag-cut (vs activating the pipeline):
+#   - #1 D1 product name (operator) — gates everything
+#   - #3 crates.io crate-name resolution (operator + lead, post-D1)
+#   - #5 crates.io token automation (operator; publish-* jobs stay `if: false`)
+#   - #7 GPG signing (v1+ parking-lot per CLAUDE.md)
+# The pipeline activates here; the operator's first tag cut is gated on the
+# §10 path-to-real-fire checklist in D-RELEASE.md.
 #
 # §1.1 runner split (post-§8 #8 (b) GitHub mirror):
 #   - PR-gate / S1 bench / ci-gate    -> Forgejo (.forgejo/workflows/ci.yml,
@@ -185,13 +191,25 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${TAG#v}"
-          # TODO(D1/CWDL-12): replace 'tftrunk' below with the picked product
-          # binary name. Affects tarball name, dir name, and binstall bin-dir.
-          NAME="tftrunk"
+          # PKG / BIN split is load-bearing for binstall compatibility (per
+          # D-RELEASE §8 #6 verification, 2026-05-17 — static analysis caught
+          # the bug the throwaway-test would have caught more expensively):
+          #
+          #   binstall's `{name}` template resolves to `package.name`
+          #   (= `tf-cli`), NOT to `[[bin]].name` (= `tftrunk`). So the
+          #   tarball + dir MUST use the PACKAGE name to match binstall's
+          #   pkg-url; the FILE inside the dir is the BINARY name.
+          #
+          # TODO(D1/CWDL-12): if D1 renames the crate (which sets PKG) or
+          # the binary (which sets BIN) — possibly both — update both vars
+          # here AND the corresponding `[package.metadata.binstall]` keys
+          # in `crates/tf-cli/Cargo.toml`.
+          PKG="tf-cli"        # package name → tarball/dir name (matches binstall {name})
+          BIN="tftrunk"       # binary name  → file name inside dir (matches binstall bin-dir tail)
           TARGET="${{ matrix.target }}"
-          BASE="${NAME}-v${VERSION}-${TARGET}"
+          BASE="${PKG}-v${VERSION}-${TARGET}"
           mkdir -p "dist/${BASE}"
-          cp target/${TARGET}/release/tftrunk "dist/${BASE}/${NAME}"
+          cp "target/${TARGET}/release/${BIN}" "dist/${BASE}/${BIN}"
           cp README.md LICENSE "dist/${BASE}/"
           tar -czf "dist/${BASE}.tgz" -C dist "${BASE}"
           # SHA-256 — sha256sum on Linux, shasum -a 256 on macOS.
@@ -214,17 +232,25 @@ jobs:
   # all three matrix build artifacts and attaches them via `gh release upload`.
   # The `gh` CLI is preinstalled on GH Actions runners.
   #
-  # URL shape after this:
-  #   https://github.com/<ORG>/cargoless/releases/download/v0.1.0/
-  #     tftrunk-v0.1.0-x86_64-unknown-linux-gnu.tgz
-  #     tftrunk-v0.1.0-aarch64-apple-darwin.tgz
-  #     tftrunk-v0.1.0-x86_64-apple-darwin.tgz
+  # URL shape after this (verified vs binstall pkg-url template via static
+  # analysis 2026-05-17 — D-RELEASE §8 #6 closure; tarball uses PKG
+  # = `tf-cli` to match binstall's `{name}` template, which resolves to
+  # package.name NOT [[bin]].name):
+  #   https://github.com/TriformAI/cargoless/releases/download/v0.1.0/
+  #     tf-cli-v0.1.0-x86_64-unknown-linux-gnu.tgz
+  #     tf-cli-v0.1.0-aarch64-apple-darwin.tgz
+  #     tf-cli-v0.1.0-x86_64-apple-darwin.tgz
   #     + each .sha256
   #
-  # The pkg-url template in crates/tf-cli/Cargo.toml binstall metadata
-  # depends on this exact URL shape (GitHub's canonical form — well-known,
-  # so the §8 #6 verification is a one-time confidence check rather than a
-  # discovery exercise).
+  # Inside each tarball: a single dir `tf-cli-v0.1.0-{target}/` containing
+  # the `tftrunk` binary file (= [[bin]].name) + README.md + LICENSE.
+  # Matches binstall's bin-dir `{name}-v{version}-{target}/tftrunk` exactly.
+  #
+  # The pkg-url + bin-dir templates in crates/tf-cli/Cargo.toml binstall
+  # metadata depend on this exact URL shape. If D1 renames the package
+  # (which changes the dir/tarball name) or the binary (which changes the
+  # file inside), update BOTH places in lockstep — the workflow `PKG/BIN`
+  # vars + the binstall `pkg-url`/`bin-dir` templates.
   # ─────────────────────────────────────────────────────────────────────────
   attach-release-assets:
     needs: build
