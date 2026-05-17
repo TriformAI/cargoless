@@ -91,24 +91,42 @@ echo
 # 2. Build / locate the cargoless binary (`tftrunk`).
 #    In the ci-gate pod, cargo is operator-approved
 #    (TRIFORM_OPERATOR_APPROVED_BUILD=1). Locally it is hook-blocked.
+#
+#    HONORS $CARGO_TARGET_DIR. When the caller isolates the per-branch
+#    target dir (e.g. `CARGO_TARGET_DIR=/cache/target-bench-lead`) to
+#    avoid stomping a shared `/cache/target` that other agents use,
+#    the binary lands at `$CARGO_TARGET_DIR/release/tftrunk`, NOT
+#    `$repo/target/release/tftrunk`. The earlier hardcoded path was a
+#    real bug — fixed here so per-branch isolation is the easy path.
 # ---------------------------------------------------------------------
+cargo_target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 CARGOLESS_BIN="${CARGOLESS_BIN:-}"
 if [ -z "$CARGOLESS_BIN" ]; then
   if command -v tftrunk >/dev/null 2>&1; then
     CARGOLESS_BIN="$(command -v tftrunk)"
-  elif [ -x "$repo/target/release/tftrunk" ]; then
-    CARGOLESS_BIN="$repo/target/release/tftrunk"
+  elif [ -x "$cargo_target_dir/release/tftrunk" ]; then
+    CARGOLESS_BIN="$cargo_target_dir/release/tftrunk"
   else
     echo "building cargoless (tftrunk) with --features integration..."
-    if ! ( cd "$repo" && cargo build --release -p tf-cli --features integration --locked ) >/dev/null 2>&1; then
+    # NOTE: the cargo invocation inherits $CARGO_TARGET_DIR from this env;
+    # cargo writes the binary under $cargo_target_dir/release/, which we
+    # then point CARGOLESS_BIN at — regardless of whether $cargo_target_dir
+    # is the project-default `$repo/target` or an external isolated dir.
+    # Stream cargo output through `tee` so a build failure shows up in the
+    # report instead of being swallowed by `>/dev/null` (the old shape hid
+    # silent build successes-that-failed-to-place-the-binary as confusing
+    # "missing binary" blockers).
+    if ! ( cd "$repo" && cargo build --release -p tf-cli --features integration --locked 2>&1 | tail -50 ); then
       blocker "could not build tftrunk — cargo build failed. (In the ci-gate \
 pod set TRIFORM_OPERATOR_APPROVED_BUILD=1; locally use the dedicated builder \
 via scripts/ci-gate.)"
     fi
-    CARGOLESS_BIN="$repo/target/release/tftrunk"
+    CARGOLESS_BIN="$cargo_target_dir/release/tftrunk"
   fi
 fi
-[ -x "$CARGOLESS_BIN" ] || blocker "cargoless binary missing/non-exec at $CARGOLESS_BIN"
+[ -x "$CARGOLESS_BIN" ] || blocker "cargoless binary missing/non-exec at $CARGOLESS_BIN \
+(checked CARGO_TARGET_DIR=$cargo_target_dir; if you set CARGO_TARGET_DIR externally, \
+the build is expected to land under \$CARGO_TARGET_DIR/release/, not \$repo/target/release/)"
 echo "cargoless bin: $CARGOLESS_BIN"
 "$CARGOLESS_BIN" --version 2>/dev/null || "$CARGOLESS_BIN" help 2>/dev/null || true
 echo
@@ -144,13 +162,23 @@ echo
 
 # ---------------------------------------------------------------------
 # 5. Build the harness binary (std-only — same constraints as run.sh).
+#    HONORS $CARGO_TARGET_DIR — same fix shape as the tftrunk block
+#    above. bench/harness is its own [workspace] so its default target
+#    dir is `$harness/target`, but if the caller has set an external
+#    CARGO_TARGET_DIR (per-branch isolation), cargo writes there
+#    instead and we must look for the binary there too.
 # ---------------------------------------------------------------------
+harness_target_dir="${CARGO_TARGET_DIR:-$harness/target}"
 echo "building cargoless-bench harness..."
-if ! ( cd "$harness" && cargo build --release ) >/dev/null 2>&1; then
+# Surface build output on failure — silent /dev/null hid a real build
+# error as a confusing "missing binary" blocker in an earlier rev.
+if ! ( cd "$harness" && cargo build --release 2>&1 | tail -50 ); then
   blocker "harness failed to build."
 fi
-bin="$harness/target/release/cargoless-bench"
-[ -x "$bin" ] || blocker "harness binary missing at $bin"
+bin="$harness_target_dir/release/cargoless-bench"
+[ -x "$bin" ] || blocker "harness binary missing at $bin \
+(checked CARGO_TARGET_DIR=$harness_target_dir; if you set CARGO_TARGET_DIR \
+externally, the harness binary lands there, not at \$harness/target/release/)"
 echo "harness bin: $bin"
 echo
 
