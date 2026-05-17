@@ -68,17 +68,17 @@ docs-launch-lead pre-#87).
 
 | Crate | Owner role | Epic |
 |---|---|---|
-| `tf-proto` | proto-contracts | 1 / D8 — the cross-crate contract seam |
-| `tf-cas` | build-cas | 3 — ContentStore trait + local-disk |
-| `tf-core` | daemon-core + devserver + build-cas | 2 / 3 / 4 |
-| `tf-cli` | cli-ux | 5 |
+| `cargoless-proto` | proto-contracts | 1 / D8 — the cross-crate contract seam |
+| `cargoless-cas` | build-cas | 3 — ContentStore trait + local-disk |
+| `cargoless-core` | daemon-core + devserver + build-cas | 2 / 3 / 4 |
+| `cargoless` | cli-ux | 5 |
 | `bench/` | ra-bench | S1 spike + AC#2 harness |
 
-`tf-core` is shared by disjoint modules — `watcher`/`analyzer`/`model` =
+`cargoless-core` is shared by disjoint modules — `watcher`/`analyzer`/`model` =
 daemon-core; `build` + the latest-green publisher = build-cas. The `server`
 module is **v0.1** (live HTTP/WS dev-server), not v0; it is preserved on
 `agent/devserver*` branches and consumes the v0 published output. All
-cross-module data flows only through `tf-proto` types.
+cross-module data flows only through `cargoless-proto` types.
 
 ## Phasing (v0 / v0.1 / v1) — Plane CWDL-1 is the single source of truth
 
@@ -122,7 +122,7 @@ green on `main` — branch-only work is In Progress, never Done.
 - **D-A3**: the benchmark substrate is pulled forward (the S1 harness), not
   deferred; it is two-mode (checker save→verdict + artifact save→publish,
   reported separately).
-- **Contract status (ratified ledger)**: the four `tf-proto` seams
+- **Contract status (ratified ledger)**: the four `cargoless-proto` seams
   (StateEvent / BuildTrigger / BuildResult / ArtifactMeta) are frozen on
   `main` and unchanged. The latest-green publisher is the **only additive v0
   contract surface**: additive serde-free types `PublishedArtifact { artifact:
@@ -142,7 +142,7 @@ green on `main` — branch-only work is In Progress, never Done.
 
 Wave 1 (no cross-deps): `proto-contracts` (unblocks everyone — go first),
 `ra-bench` (independent), `daemon-core` (watcher needs no rich proto).
-Wave 2 (after the tf-proto contract is merged green): `build-cas`,
+Wave 2 (after the cargoless-proto contract is merged green): `build-cas`,
 `devserver`, `cli-ux`, `integration`.
 Recycle: shut an agent down once its epic is merged green; re-spawn/re-engage
 on demand. Keep the team ≤10 and lean.
@@ -191,9 +191,9 @@ streamed tree, the exact four checks `.forgejo/workflows/ci.yml` runs:
 | fmt    | `cargo fmt --all -- --check` |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
 
-If the streamed tree's `crates/tf-cli/Cargo.toml` declares an `integration`
+If the streamed tree's `crates/cargoless/Cargo.toml` declares an `integration`
 feature (the converged set does; plain `main` does not), the gate ALSO runs
-`build`/`test`/`clippy` for `-p tf-cli --features integration` — the wired
+`build`/`test`/`clippy` for `-p cargoless --features integration` — the wired
 daemon that the default workspace build deliberately excludes. On a tree
 without that feature those three rows show `SKIPPED` (not a failure). This
 makes a single `scripts/ci-gate <convergence-branch>` cover BOTH the

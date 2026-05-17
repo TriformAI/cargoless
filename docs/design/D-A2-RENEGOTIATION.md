@@ -460,7 +460,7 @@ spec, not the architecture changing.
 
 This design references:
 - #21 verdict-provenance seam (model.rs::Verdict / VerdictProvenance)
-- #45 watch-line timestamps (tf-cli/src/watch.rs::stamp)
+- #45 watch-line timestamps (cargoless/src/watch.rs::stamp)
 - #49 debouncer + `--debounce-ms` knob (model.rs::resolve_watch_debounce)
 - #55 / F8-redo severity:Error rule (model.rs::apply_event @
   ff1feaf; lsp.rs::PublishDiagnostics::has_any_severity_error)

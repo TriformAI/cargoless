@@ -38,7 +38,7 @@ reshape.
 ### D1 — Product name *(owner: Lead; status: OPEN, due Sprint 1 Fri)*
 The shipping name is undecided. `cargoless` is the repo/binary placeholder; `tf`
 is rejected (Terraform collision). **Contract impact:** none — no public name is
-hardcoded in `tf-proto`; crate is `tf-proto` purely as an internal seam name.
+hardcoded in `cargoless-proto`; crate is `cargoless-proto` purely as an internal seam name.
 Rationale captured so downstream README/crates.io reservation is unblocked the
 moment the Lead picks; nothing in code blocks on it.
 
@@ -55,7 +55,7 @@ Bias is compatibility so existing Trunk projects migrate with one command and
 keep their bundled JS. **This is a v0.1 concern** — v0 is headless and has no
 browser channel. **Contract impact:** none in v0. When the v0.1 dev-server is
 built, the dev-server↔browser WebSocket is the *first place serde will be
-needed*; `tf-proto` stays serde-free in v0 (§4) and the v0.1 `server` owner
+needed*; `cargoless-proto` stays serde-free in v0 (§4) and the v0.1 `server` owner
 adds an off-by-default `serde` feature on exactly the reload-signal types then.
 The frozen v0 `BuildResult`/publisher output is shaped so the reload signal is
 derivable without reshaping the contract.
@@ -89,7 +89,7 @@ rest; fail loudly with a specific message if it cannot. Feeds AC#1 and Epic 5.
 hashed config/toolchain inputs of `BuildIdentity`; detection logic itself is
 Epic 5, not the seam.
 
-## 3. The contract (`tf-proto`)
+## 3. The contract (`cargoless-proto`)
 
 One crate, every other crate depends on it; data crosses module boundaries only
 as these types. Three flows:
@@ -97,9 +97,9 @@ as these types. Three flows:
 ```
 watcher → analyzer → model ──StateEvent──▶ all subscribers (verdict stream)
                        │
-                       └─on BecameGreen──▶ BuildTrigger ─▶ build / tf-cas
+                       └─on BecameGreen──▶ BuildTrigger ─▶ build / cargoless-cas
                                                                   │
-              latest-green publisher ◀──BuildResult── build/tf-cas┘
+              latest-green publisher ◀──BuildResult── build/cargoless-cas┘
 ```
 
 The v0 data-flow **ends at the publisher** — there is no browser/server sink
@@ -110,16 +110,16 @@ in v0. A future v0.1 serve adapter consumes the published output (the
 
 | Type | Meaning | Owner of the *value* |
 |---|---|---|
-| `ContentHash(String)` | opaque hex hash; algorithm deliberately unspecified | `tf-cas` |
+| `ContentHash(String)` | opaque hex hash; algorithm deliberately unspecified | `cargoless-cas` |
 | `TargetTriple(String)` | e.g. `wasm32-unknown-unknown` | daemon (from D7) |
 | `Profile { Dev, Release }` | cargo profile; v0 inner loop is always `Dev` | daemon |
-| `BuildIdentity` | the **full input set**: `source_tree` + `cargo_lock` + `rust_toolchain` + `tf_config` + `target` + `profile`, each as its own field | assembled by daemon, hashed by `tf-cas` |
-| `InputHash(String)` | the single derived CAS key | `tf-cas` |
+| `BuildIdentity` | the **full input set**: `source_tree` + `cargo_lock` + `rust_toolchain` + `tf_config` + `target` + `profile`, each as its own field | assembled by daemon, hashed by `cargoless-cas` |
+| `InputHash(String)` | the single derived CAS key | `cargoless-cas` |
 
 The split of `BuildIdentity` into named components (rather than one opaque
 string) is the contract being explicit about **what makes a build distinct**.
 The reduction `BuildIdentity → InputHash` is intentionally *not* in the
-contract: that hashing implementation is `tf-cas`'s, and freezing it here would
+contract: that hashing implementation is `cargoless-cas`'s, and freezing it here would
 couple every crate to a hash choice. The invariant every consumer may rely on:
 **equal `BuildIdentity` ⇒ equal `InputHash` ⇒ substitutable artifact.** This is
 exactly the AC#5 dedupe key and the AC#4 provenance record. Adding a field to
@@ -167,7 +167,7 @@ The publisher is the single new v0 contract surface (ratified ledger):
 - **Pointer file** `.cargoless/latest-green`, written **atomically** —
   temp file + `fsync` + `rename` — so a reader never observes a torn or
   partial pointer, and a crash mid-publish leaves the prior green intact.
-- **tf-proto additive types only** (serde-free, consistent with §4):
+- **cargoless-proto additive types only** (serde-free, consistent with §4):
   `PublishedArtifact { artifact: ArtifactMeta, published_at: UnixSeconds }`
   and `UnixSeconds(u64)`. Additive — the four existing seams
   (`StateEvent` / `BuildTrigger` / `BuildResult` / `ArtifactMeta`) are
@@ -185,15 +185,15 @@ belongs to the v0.1 server adapter. Per-step `Cargo.lock` discipline applies
 
 ## 4. Why dependency-free & serde-free in v0 (D8 sub-decision)
 
-v0 is one process: every consumer links `tf-proto` and passes these by value
+v0 is one process: every consumer links `cargoless-proto` and passes these by value
 over in-memory channels. Nothing crosses a process/network boundary, so nothing
 needs serialization. Adding `serde` now would (a) put a proc-macro dependency in
 the crate the entire workspace depends on — directly taxing the cold-build time
 AC#1/#2 are measured against — and (b) freeze a wire format with zero v0
-consumers. **Decision: `tf-proto` carries no dependencies in v0.** When a
+consumers. **Decision: `cargoless-proto` carries no dependencies in v0.** When a
 boundary genuinely needs the wire — the D3 WebSocket reload channel first,
 remote CAS in v1 — the owning crate adds an **off-by-default `serde` feature**
-to `tf-proto` and derives it on exactly the types that cross that boundary. The
+to `cargoless-proto` and derives it on exactly the types that cross that boundary. The
 shapes above are designed so that is purely additive.
 
 `#![forbid(unsafe_code)]` is set: a pure contract crate has no business with
@@ -210,7 +210,7 @@ shapes above are designed so that is purely additive.
 
 ## 6. Change protocol
 
-`tf-proto` is frozen-by-convention after D8 sign-off. Any field add/remove/
+`cargoless-proto` is frozen-by-convention after D8 sign-off. Any field add/remove/
 rename is a contract change: proposed via the proto-contracts owner, reviewed by
 every affected crate owner, landed before dependents adapt. Cross-crate
 divergence is the specific failure D8 exists to prevent — when in doubt, this

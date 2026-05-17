@@ -32,7 +32,7 @@ accelerator. `never-publish-red` / AC#4 stays fail-closed. Where a tier
 
 ## Tier-1 — allocator (IMPLEMENTED, default-on, RSS-only)
 
-**Site:** `crates/tf-core/src/analyzer.rs` — `rust_analyzer_command()`
+**Site:** `crates/cargoless-core/src/analyzer.rs` — `rust_analyzer_command()`
 now calls `apply_ra_allocator_env(&mut cmd)` before returning the
 `Command`.
 
@@ -63,7 +63,7 @@ of *that*. Exact figure = bench-lead (§Measurement).
 
 ## Tier-2 — RA cache bounding (LRU IMPLEMENTED; others analysed)
 
-**Site:** `crates/tf-core/src/lsp.rs` — `lean_init_options()` now emits
+**Site:** `crates/cargoless-core/src/lsp.rs` — `lean_init_options()` now emits
 `"lru": { "capacity": ra_lru_capacity() }` (default **64** = half RA's
 built-in 128; `TF_RA_LRU_CAP` override, floor 16).
 
