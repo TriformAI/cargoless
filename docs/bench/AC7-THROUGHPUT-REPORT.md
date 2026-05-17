@@ -844,6 +844,14 @@ framing, stage-1 says: cargoless's green-edge/structural model has a
 *tunable, real, seam-validated* additional CPU lever whose magnitude
 scales with exactly the workload cargoless is built for (agents).
 
+**This conditional is now field-resolved — see §9.5.** The
+dogfood-observed rate for the actual cargoless agent fleet came in at
+the *bottom* of the bracket (~0 % on `.rs`), which selects the
+"conservative ⇒ v0.1-nicety" branch above, **not** the
+"moderate-to-aggressive ⇒ material" one. Read §9.5 before citing
+stage-1 in any launch decision: the lever is mechanism-real but its
+*realised* benefit for how this fleet writes is ≈ 0 %.
+
 ### 9.4 Stage-2 (per-tier RSS-delta) — queued
 
 Per the lead's two-stage split, stage-2 (per-tier RSS-delta vs the
@@ -855,6 +863,78 @@ combined {fired-check-reduction, per-tier RSS-delta} is what reshapes
 the held launch-scope (a material RSS drop shrinks/removes the §7
 honest-RSS-caveat rather than merely `--features`-mitigating it). Not
 blocking — stage-1 above is the gating CPU datum and is DELIVERED.
+
+### 9.5 #117 field anchor — DELIVERED (the spectrum point for THIS fleet)
+
+The §9.3 conditional's missing input — *where on the validated
+5/25/45 % bracket does the real cargoless agent fleet actually sit?* —
+measured by dogfood-lead (#117), folded here (bench-lead owns the
+spectrum; dogfood-lead provides the field anchor; predicate stays the
+single shared `is_closed`).
+
+**Method (zero-drift-gated).** Local cargo is hook-blocked Mac-side,
+so the pre-authorised fallback was used: a faithful Python mirror of
+`is_closed`, **oracle-gated against `structural.rs`'s own
+`#[cfg(test)]` block — all 35 assertions PASS before any datum was
+classified** (drift ⇒ the classifier aborts; no measurement on a
+drifted predicate). Dataset: the **survivorship-free** artifact
+(bench-lead find) — N=16 fleet session `.jsonl` transcripts, an
+append-only log that preserves OPEN intermediates git can never show
+(only CLOSED survivors commit). **207 `Write` tool_use events**;
+≤1 Write/assistant-turn for this fleet, so per-Write **IS** the §9.4
+batch-AND figure for this population (not merely a lower bound).
+
+**Result — the headline is a trap; the honest number is domain-scoped.**
+
+| scope | total / open | % OPEN | meaning |
+|---|---:|---:|---|
+| all files (naïve) | 207 / 55 | **26.6 %** | **DO NOT ANCHOR** — Rust-lexer-on-non-Rust artifact |
+| **`.rs` only** | **97 / 0** | **0.0 %** | the trigger's *actual* domain |
+
+The 55 OPENs are almost entirely non-Rust files (`.sh` heredocs/`$()`
+68 %, `.md` code-fences 42 %, `.yml` 100 %) where a Rust balance-lexer
+*correctly* reads normal non-Rust syntax as "unbalanced." That is a
+predicate-domain category error, not real OPEN intermediate code.
+**Verified against the code-under-test:** `model.rs` at the
+`structural.record(all_closed)` call-site filters the coalesced batch
+to `.rs` (`path.extension() … e != "rs"`) *before* `is_closed` —
+cargoless's trigger never evaluates `.sh`/`.md`/`.yml`. The
+methodologically correct anchor is therefore the **`.rs` rate = 0 %
+(0/97, mean 4.3 KB/file — substantive files, not stubs)**.
+
+**Honest reading (revises §9.3 DOWN).** For the cargoless agent fleet
+*as it actually writes* (Claude-family + whole-file-`Write`-dominant
+toolset), realised fired-check-reduction ≈ **~0 %**. These agents
+compose complete, syntactically-closed Rust and `Write` it atomically;
+the OPEN-intermediate-Rust pattern the trigger is built to skip
+(skeleton-then-body, interrupted mid-`.rs` tool calls) **is not how
+this population writes.** The structural trigger is a *real mechanism*
+whose realised benefit is **entirely edit-style-dependent**, and this
+fleet's style gives it essentially nothing to skip. A different
+population that emitted skeleton-then-body `.rs` would land higher on
+the (still-valid) bracket — that is a different fleet, not this one.
+
+**Caveats (stated, per discipline).** Single fleet; single agent
+family; this specific toolset; **`Write`-only** — Edit-tool hunk
+intermediate states are *not* captured (post-edit buffer
+reconstruction was out of scope; a known honest gap, not a silent
+one — an Edit-heavy agent doing many small broken-intermediate hunks
+could differ, and that path is unmeasured). N = 16 sessions / 97 `.rs`
+Writes is small-but-real. Survivorship-free for the `Write` path;
+silent on the Edit path.
+
+**Launch-scope implication (#101) — the honest, less-favourable one.**
+The structural-trigger leg revises from "tunable real CPU lever" to
+**"real mechanism, ≈ 0 % realised benefit for this fleet's edit
+style."** It is a v0.1-nicety / conditional-benefit mechanism for the
+cargoless agent population *as it writes today* — **not** a material
+v0 CPU lever, and (since fired-check-reduction ≈ 0 here) **not** a
+material idle-evict-RAM enabler for this fleet either (the RAM lever
+that matters at fleet scale is Tier-4 idle-evict on the *idle*
+window, measured directly in stage-2/§10 and stage-3/#116 — it does
+not depend on the trigger firing). This does not weaken the §8.5
+two-source ~2× CPU-win vs `trunk` (that stands on its own); it
+narrows the *additional* structural-trigger claim to honest size.
 
 ---
 
