@@ -238,23 +238,49 @@ checking the other 6 checks on the identical tree first).
 
 | ID | Fragility | Class | Status |
 |----|-----------|-------|--------|
-| F-A | Runner-monoculture all-legs wedge | (exemplar) | **RESOLVED `3baf659`** |
-| F-B | No Release object for `gh release upload` | **V0-BLOCK** | fix proposed, pending route (Phase-C Finding #3) |
-| F-C | Cross-cloud verdict read on tag path | V0-RESIDUAL + V0.1 | runbook (now) + Option-2 (v0.1) |
-| F-D | Mirror = silent single point for tag arrival | V0-RESIDUAL + V0.1 | runbook check (now) + monitor (v0.1) |
-| F-E | Verdict producer fails silently (`\|\| true`) | **HARDEN-NOW** | **LANDED this commit** — ci.yml POST asserts HTTP 2xx → fail-loud (run.sh exit-0 evidence semantics preserved) |
-| F-F | CI base-image / apt monoculture | V0.1 + residual | pre-bake+mirror (v0.1) |
-| F-G | Gate-self-reference (`-p` from invoker) | V0-RESIDUAL + V0.1 | → #96 note (now) + self-detect (v0.1) |
-| F-H | 404 log routes (diagnosis MTTR) | V0-RESIDUAL + V0.1 | documented + self-describe (v0.1) |
-| F-I | Single builder pod/PVC | V0-RESIDUAL | dev-velocity only; runbook |
-| F-J | Operator-manual crates.io publish | V0-RESIDUAL + V0.1 | preflight (now) + automate (v0.1) |
-| F-K | Gate-tier non-determinism under concurrent load (OOM/FS-race) | **HARDEN-NOW** | serialize integ + gate-pod mem/concurrency-cap (v0); visible-bounded auto-retry (v0.1). 2 live observations (#122 OOM, #123 FS-race) |
+| F-A | Runner-monoculture all-legs wedge | (exemplar) | ✅ **RESOLVED `3baf659`** (decouple; Phase-C-validated 3×) |
+| F-B | No Release object for `gh release upload` | **V0-BLOCK** | ✅ **RESOLVED `1ef8dab`** (Phase-C Finding #3 — Release create-if-missing + CHANGELOG notes; Phase-C-GREEN end-to-end validated) |
+| F-C | Cross-cloud verdict read on tag path | V0-RESIDUAL + V0.1 | ✅ runbook **LANDED** (PHASE-D §3 operator pre-flight, `2ab448b`); Option-2 verdict-mirror = **v0.1-deferred** |
+| F-D | Mirror = silent single point for tag arrival | V0-RESIDUAL + V0.1 | ✅ runbook **LANDED** (PHASE-D §3 post-push verify+break-glass, `2ab448b`); mirror-health monitor = **v0.1-deferred** |
+| F-E | Verdict producer fails silently (`\|\| true`) | **HARDEN-NOW** | ✅ **RESOLVED `8e7ea43`** — ci.yml POST asserts HTTP 2xx → fail-loud (run.sh exit-0 evidence semantics preserved) |
+| F-F | CI base-image / apt monoculture | V0.1 + residual | **v0.1-deferred** (pre-bake+mirror); transient apt = accepted-residual (re-run) |
+| F-G | Gate-self-reference (`-p` from invoker) | V0-RESIDUAL + V0.1 | → **#96** (builder-infra lane, sequenced post-#97 — not dropped, sequenced); v0.1 self-detect |
+| F-H | 404 log routes (diagnosis MTTR) | V0-RESIDUAL + V0.1 | **accepted-residual** (one-job-granularity + CLAUDE.md diagnose-from-source heuristic); v0.1 self-describe |
+| F-I | Single builder pod/PVC | V0-RESIDUAL | **accepted-residual** — dev-velocity only, NOT launch-correctness (release pipeline is GitHub-side, pod-independent) |
+| F-J | Operator-manual crates.io publish | V0-RESIDUAL + V0.1 | documented PHASE-D §2.2 (sequence + yank-rollback); publish-preflight script = **optional cheap pre-v0.1.0 recommend** (lead-routes); automate = v0.1 |
+| F-K | Gate-tier non-determinism under concurrent load (OOM/FS-race) | **HARDEN-NOW** | addendum **documented `8e7ea43`**; interim *diagnosed*-same-SHA-re-gate **IN USE & working** (#123 step-4 cleared by it); pod serialize/mem+concurrency-cap = **the one still-open HARDEN-NOW — proposed, NOT v0-blocking, lead-routes** (gate flakiness never corrupts the launch artifact; gate is verification not artifact) |
 
-**Recommended before the real `v0.1.0` tag:** F-B (in flight) and **F-E**
-(silent-producer → loud, cheap one-liner), plus the F-C/F-D **operator
-runbook pre-flight checks** folded into PHASE-D §0/§3 at Phase-D-finalize
-(no code, pure de-risk). Everything else is honest v0.1 / accepted
-residual with the rationale above.
+### 2.1 Post-arc HARDEN-NOW disposition (builder-infra audit, 2026-05-18, main `493173a`)
+
+The lead-asked pre-real-v0.1.0 audit. Honest bottom line: **the
+HARDEN-NOW / V0-BLOCK set is closed except one proposed-not-blocking
+item.**
+- **Closed (no further action):** F-A `3baf659` · F-B `1ef8dab`
+  (Phase-C-validated) · F-E `8e7ea43` · F-C/F-D operator pre-flight
+  `2ab448b` (PHASE-D §3). The V0-BLOCK is RESOLVED; the cheap
+  make-it-loud is done; the no-code operator pre-flight is in the
+  launch runbook.
+- **One still-open HARDEN-NOW — F-K pod-cap — PROPOSED, NOT
+  v0-blocking (lead-routes do-now-vs-v0.1):** raise the
+  `cargoless-builder` Deployment memory request/limit and/or serialize
+  the two high-memory integ steps in `scripts/ci-gate` so concurrent
+  gate load can't OOM/FS-race. Cheap + in-lane, but it touches prod
+  gate-infra (blast radius) so it is propose-not-unilaterally-land
+  (same F-E discipline). NOT a launch gate: the release artifact is
+  never corrupted by gate flakiness (the gate verifies, it does not
+  produce the artifact), and the interim diagnosed-same-SHA-re-gate
+  discipline is empirically sufficient (#123 step-4 cleared cleanly).
+  If the lead deems it do-now: I implement + the Deployment change is
+  applied with explicit lead approval (no ci-gate can self-validate a
+  gate-pod resource change — it IS the gate infra).
+- **One optional cheap recommend — F-J publish-preflight:** an
+  operator-run `cargo publish --dry-run` × all crates + token-scope +
+  `cargo metadata` dep-order assertion, to de-risk the irreversible
+  (yank-only) crates.io step. Not blocking (the manual sequence is
+  fully documented); surfaced because the irreversibility makes a
+  pre-flight high-value-for-cheap. Lead-routes.
+- **Everything else legitimately v0.1-deferred / accepted-residual**
+  with the rationale in the table above — not manufactured work.
 
 ## 3. Cross-cutting principle
 
