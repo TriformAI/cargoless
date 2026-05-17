@@ -283,7 +283,10 @@ pub fn check_once(root: &Path) -> io::Result<TreeState> {
 pub struct ModelSession {
     model: Arc<Mutex<Model>>,
     stop: Arc<AtomicBool>,
-    child: Arc<Mutex<Option<std::process::Child>>>,
+    /// Manages rust-analyzer with AC#6 transparent restart: a `kill -9` of RA
+    /// in the live serve loop is recovered without the daemon noticing and
+    /// without dropping subscribers (they live on `model`).
+    supervisor: Option<crate::analyzer::Supervisor>,
     watch: Option<crate::watcher::WatchHandle>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -306,16 +309,17 @@ impl ModelSession {
 
     fn do_shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // Threads loop on 250ms recv timeouts checking `stop`, so they exit
-        // promptly regardless of channel state — safe to join before the
-        // watcher/child are torn down.
+        // Supervisor first: it sets its own shutdown flag (no further
+        // restarts / on_spawn) and kills RA. Killing RA EOFs its stdout, so
+        // each per-instance diagnostics thread ends on its own.
+        if let Some(sup) = self.supervisor.take() {
+            sup.shutdown();
+        }
+        // Drop the notify watcher → the fs thread's batch channel
+        // disconnects so it exits immediately (it also polls `stop`).
+        drop(self.watch.take());
         for t in self.threads.drain(..) {
             let _ = t.join();
-        }
-        drop(self.watch.take()); // stops the notify watcher + its thread
-        if let Some(mut c) = poisoned(&self.child).take() {
-            let _ = c.kill();
-            let _ = c.wait();
         }
     }
 }
@@ -335,65 +339,72 @@ pub fn watch<I: IdentityProvider + 'static>(
     identity: I,
 ) -> io::Result<(ModelSession, Receiver<StateEvent>)> {
     let root = fs::canonicalize(root)?;
-    let mut cmd = crate::analyzer::rust_analyzer_command()?;
-    cmd.current_dir(&root);
-    let mut child = cmd.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
-    let (client, diags) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
-    let client = Arc::new(client);
 
     let model = Arc::new(Mutex::new(Model::new(identity)));
     let events = poisoned(&model).subscribe();
-
-    let ignore = crate::watcher::IgnoreRules::for_root(&root);
-    for f in collect_rs_files(&root, &ignore) {
-        if let Ok(text) = fs::read_to_string(&f) {
-            let _ = client.did_open(&f.to_string_lossy(), &text, 1);
-        }
-    }
-
     let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::new();
 
-    // Diagnostics → model.
-    {
-        let model = Arc::clone(&model);
-        let stop = Arc::clone(&stop);
-        threads.push(
-            thread::Builder::new()
-                .name("tf-model-diags".into())
-                .spawn(move || {
-                    loop {
-                        match diags.recv_timeout(Duration::from_millis(250)) {
-                            Ok(pd) => poisoned(&model).apply_publish(&pd),
-                            Err(RecvTimeoutError::Timeout) => {
-                                if stop.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                            }
-                            Err(RecvTimeoutError::Disconnected) => break,
-                        }
-                    }
-                })
-                .expect("spawn tf-model-diags"),
-        );
-    }
+    // The LSP client for whichever rust-analyzer instance is *currently*
+    // alive. The on_spawn hook swaps it on every (re)start, so the fs thread
+    // always talks to the live process — that is the transparent-restart
+    // seam (AC#6 in the serve loop, not only the integration test).
+    let current: Arc<Mutex<Option<Arc<crate::lsp::LspClient>>>> = Arc::new(Mutex::new(None));
 
-    // Filesystem changes → re-sync RA so it re-checks.
+    // Spawn factory — a fresh rust-analyzer for the initial start and every
+    // restart. Identity/handshake re-establishment is the hook's job.
+    let spawn_root = root.clone();
+    let spawn = move || {
+        let mut cmd = crate::analyzer::rust_analyzer_command()?;
+        cmd.current_dir(&spawn_root);
+        cmd.spawn()
+    };
+
+    // Post-(re)spawn: re-run the LSP handshake against the new RA, re-open
+    // the workspace, publish the new client, and forward THIS instance's
+    // diagnostics into the persistent model. Subscribers live on the model
+    // and are untouched by the restart → transparent.
+    let hook_root = root_str.clone();
+    let hook_model = Arc::clone(&model);
+    let hook_current = Arc::clone(&current);
+    let on_spawn = move |child: &mut std::process::Child| {
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return;
+        };
+        let Ok((client, diags)) = crate::lsp::LspClient::initialize(stdin, stdout, &hook_root)
+        else {
+            return; // RA broke during handshake; supervisor keeps it alive / retries
+        };
+        let client = Arc::new(client);
+        let ig = crate::watcher::IgnoreRules::for_root(Path::new(&hook_root));
+        for f in collect_rs_files(Path::new(&hook_root), &ig) {
+            if let Ok(text) = fs::read_to_string(&f) {
+                let _ = client.did_open(&f.to_string_lossy(), &text, 1);
+            }
+        }
+        *poisoned(&hook_current) = Some(Arc::clone(&client));
+        let m = Arc::clone(&hook_model);
+        // Detached: ends when this RA instance's stdout EOFs (it died); the
+        // next on_spawn invocation starts a fresh forwarder.
+        let _ = thread::Builder::new()
+            .name("tf-model-diags".into())
+            .spawn(move || {
+                while let Ok(pd) = diags.recv() {
+                    poisoned(&m).apply_publish(&pd);
+                }
+            });
+    };
+
+    let supervisor = crate::analyzer::Supervisor::start_with_hook(spawn, on_spawn)?;
+
+    // Filesystem changes → re-sync the *current* RA so it re-checks.
     let (watch_handle, batches) =
         crate::watcher::watch(&root, WATCH_DEBOUNCE).map_err(io::Error::other)?;
+    let mut threads = Vec::new();
     {
         let model = Arc::clone(&model);
         let stop = Arc::clone(&stop);
-        let client = Arc::clone(&client);
+        let current = Arc::clone(&current);
         threads.push(
             thread::Builder::new()
                 .name("tf-model-fs".into())
@@ -402,6 +413,7 @@ pub fn watch<I: IdentityProvider + 'static>(
                     loop {
                         match batches.recv_timeout(Duration::from_millis(250)) {
                             Ok(batch) => {
+                                let client = poisoned(&current).as_ref().cloned();
                                 for path in batch {
                                     if path.extension().is_none_or(|e| e != "rs") {
                                         continue;
@@ -410,8 +422,10 @@ pub fn watch<I: IdentityProvider + 'static>(
                                     match fs::read_to_string(&path) {
                                         Ok(text) => {
                                             version += 1;
-                                            let _ = client.did_change(&p, &text, version);
-                                            let _ = client.did_save(&p);
+                                            if let Some(c) = client.as_ref() {
+                                                let _ = c.did_change(&p, &text, version);
+                                                let _ = c.did_save(&p);
+                                            }
                                         }
                                         Err(_) => poisoned(&model).forget_file(&p),
                                     }
@@ -433,7 +447,7 @@ pub fn watch<I: IdentityProvider + 'static>(
     let session = ModelSession {
         model,
         stop,
-        child: Arc::new(Mutex::new(Some(child))),
+        supervisor: Some(supervisor),
         watch: Some(watch_handle),
         threads,
     };
