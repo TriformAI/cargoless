@@ -81,7 +81,7 @@ pub fn read_message<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
             }
             return Ok(None);
         }
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break; // end of headers
         }
