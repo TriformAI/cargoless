@@ -142,6 +142,16 @@ propagation before the next):
 
 ```bash
 git checkout v0.1.0     # work from the tag, never HEAD
+
+# MANDATORY pre-publish gate (D-CI-RESILIENCE F-J). crates.io is
+# append-only — a packaging/manifest/order error is UNRECOVERABLE once
+# published (you burn the version). This dry-runs every crate + asserts
+# the topo order + token presence FIRST. Non-zero exit ⇒ STOP, fix,
+# re-run; do NOT proceed to the publishes below until it is all-green.
+# (Crate set + order are cargo-metadata-derived, so this is correct
+# whether internals are tf-* or, post-#97, cargoless-*.)
+./scripts/crates-io-preflight        # MUST exit 0 before any line below
+
 cargo publish -p tf-proto --locked     # (internal crate names — see NOTE)
 cargo publish -p tf-cas   --locked
 cargo publish -p tf-core  --locked

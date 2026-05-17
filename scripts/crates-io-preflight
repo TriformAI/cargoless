@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+#
+# crates-io-preflight — MANDATORY rehearsal-insurance before the irreversible
+# operator-run crates.io publish (PHASE-D-OPERATOR-HANDOFF.md §2.2).
+#
+# WHY THIS IS MANDATORY, NOT OPTIONAL
+#   crates.io is append-only: a published version can only be `yank`ed, never
+#   replaced or deleted. A packaging error, a bad manifest, a missing license,
+#   or an out-of-order publish is therefore UNRECOVERABLE once it hits the
+#   registry (you burn the version number and ship v0.1.1). This script
+#   catches that class on a DRY RUN first — the same throwaway-rehearsal
+#   discipline (CWDL-71 Phase C) that peeled 4 real launch-blockers before
+#   the real v0.1.0 tag. D-CI-RESILIENCE F-J.
+#
+# HONEST SCOPE (read this — it is not a correctness proof)
+#   `cargo publish --dry-run` validates: the crate packages cleanly, the
+#   manifest is publish-valid (license, description, repo, version), no
+#   path-only / publish=false dep leaks, and the packaged form builds. It
+#   does NOT prove a not-yet-published workspace dependency resolves FROM
+#   crates.io — `--dry-run` builds against the local workspace, not the
+#   registry. The topological-order assertion (derived from `cargo
+#   metadata`, below) is what guarantees the real §2.2 sequence publishes
+#   each crate only after its deps, so the real run's ~30s propagation
+#   waits resolve. Preflight REDUCES, it does not ELIMINATE, the
+#   irreversibility risk. Treat a green preflight as necessary-not-sufficient.
+#
+# RUN CONTEXT
+#   Operator-run, on the operator's machine, from a checkout AT THE TAG
+#   (`git checkout v0.1.0` first — never HEAD), immediately BEFORE the §2.2
+#   `cargo publish` sequence. This repo's CI never runs cargo (push-to-build
+#   / no-local-cargo); this script is the one operator-time exception and is
+#   intentionally NOT wired into ci-gate.
+#
+# CRATE-SET ROBUSTNESS
+#   The publishable set + publish order are DERIVED from `cargo metadata`,
+#   never hardcoded — so this stays correct across the #97 internal-crate
+#   rename (tf-{proto,cas,core} -> cargoless-{proto,cas,core}) with zero
+#   edits. Publishable = workspace members whose `publish` is not disabled.
+#
+# EXIT: 0 = preflight all-green, safe to proceed to §2.2. Non-zero = STOP,
+#       fix, re-run. Never proceed to the real publish on a non-zero exit.
+
+set -euo pipefail
+
+say()  { printf '%s\n' "$*"; }
+fail() { printf '::preflight:: %s\n' "$*" >&2; exit 1; }
+hr()   { printf '%s\n' "----------------------------------------------------------------------"; }
+
+command -v cargo >/dev/null 2>&1 || fail "cargo not found — run on the operator machine, not CI"
+command -v jq    >/dev/null 2>&1 || fail "jq not found (needed to parse cargo metadata)"
+command -v tsort >/dev/null 2>&1 || fail "tsort not found (coreutils — needed for topo order)"
+
+# Must be at a tag, not a moving branch (§2.2: 'work from the tag, never HEAD').
+if ! git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+  fail "HEAD is not exactly at a tag. Run 'git checkout v<version>' first (§2.2)."
+fi
+TAG="$(git describe --exact-match --tags HEAD)"
+say "Preflight for tag: ${TAG}  (commit $(git rev-parse --short HEAD))"
+hr
+
+# ── 1. Token presence — NAME/existence only, NEVER the value ────────────────
+if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
+  say "[1/4] crates.io token: CARGO_REGISTRY_TOKEN env present ✓ (value never read/printed)"
+elif [ -f "${CARGO_HOME:-$HOME/.cargo}/credentials.toml" ] \
+     && grep -qE '^\[registr(y|ies\.crates-io)\]' "${CARGO_HOME:-$HOME/.cargo}/credentials.toml" 2>/dev/null; then
+  say "[1/4] crates.io token: ${CARGO_HOME:-$HOME/.cargo}/credentials.toml present ✓ (value never read/printed)"
+else
+  fail "[1/4] no crates.io token — set CARGO_REGISTRY_TOKEN or run 'cargo login' (writes ~/.cargo/credentials.toml). The real 'cargo publish' would fail."
+fi
+
+# ── 2. Derive publishable set + topological order from cargo metadata ───────
+META="$(cargo metadata --no-deps --format-version 1)"
+
+# Publishable workspace members: cargo metadata encodes `publish = false` as
+# `"publish": []`; `null` = publishable anywhere; `["crates-io"]` = allowed.
+mapfile -t PUBLISHABLE < <(
+  printf '%s' "$META" | jq -r '
+    .packages[]
+    | select(.publish == null or (.publish | length > 0))
+    | .name'
+)
+[ "${#PUBLISHABLE[@]}" -gt 0 ] || fail "[2/4] cargo metadata found no publishable workspace crates"
+
+# Edges "<dep> <crate>" for every intra-workspace dependency, then tsort.
+EDGES="$(
+  printf '%s' "$META" | jq -r --argjson pub "$(printf '%s\n' "${PUBLISHABLE[@]}" | jq -R . | jq -s .)" '
+    ($pub) as $P
+    | .packages[] | select(.name as $n | $P | index($n)) | .name as $c
+    | .dependencies[]? | select(.name as $d | $P | index($d)) | "\(.name) \(.c // empty)"'
+)"
+# (jq above intentionally simple; build edges robustly in bash instead:)
+EDGES=""
+for c in "${PUBLISHABLE[@]}"; do
+  while read -r d; do
+    [ -n "$d" ] && EDGES+="$d $c"$'\n'
+  done < <(
+    printf '%s' "$META" | jq -r --arg c "$c" --argjson P "$(printf '%s\n' "${PUBLISHABLE[@]}" | jq -R . | jq -s .)" '
+      .packages[] | select(.name==$c) | .dependencies[]?.name
+      | select(. as $d | $P | index($d))'
+  )
+done
+
+if [ -n "${EDGES//[$'\n']/}" ]; then
+  ORDER="$(printf '%s' "$EDGES" | tsort)" || fail "[2/4] dependency cycle among publishable crates (tsort failed) — un-publishable as-is"
+else
+  ORDER=""
+fi
+# tsort lists only crates appearing in an edge; append any publishable
+# crate with no intra-workspace deps and not depended-upon (rare here).
+FINAL_ORDER=()
+while read -r c; do [ -n "$c" ] && FINAL_ORDER+=("$c"); done < <(printf '%s\n' "$ORDER")
+for c in "${PUBLISHABLE[@]}"; do
+  found=0; for o in "${FINAL_ORDER[@]:-}"; do [ "$o" = "$c" ] && found=1 && break; done
+  [ "$found" -eq 0 ] && FINAL_ORDER+=("$c")
+done
+say "[2/4] publishable crates (cargo-metadata-derived; #97-rename-robust):"
+printf '        %s\n' "${FINAL_ORDER[@]}"
+say "       ^ topological publish order — each crate's workspace deps precede it."
+
+# ── 3. Dep-order assertion (defensive: re-verify topo invariant) ────────────
+declare -A POS=(); i=0
+for c in "${FINAL_ORDER[@]}"; do POS["$c"]=$i; i=$((i+1)); done
+viol=0
+for c in "${FINAL_ORDER[@]}"; do
+  while read -r d; do
+    [ -z "$d" ] && continue
+    if [ "${POS[$d]:-9999}" -ge "${POS[$c]:-0}" ]; then
+      say "::preflight:: ORDER VIOLATION: $d must publish before $c"; viol=1
+    fi
+  done < <(
+    printf '%s' "$META" | jq -r --arg c "$c" --argjson P "$(printf '%s\n' "${PUBLISHABLE[@]}" | jq -R . | jq -s .)" '
+      .packages[] | select(.name==$c) | .dependencies[]?.name
+      | select(. as $d | $P | index($d))'
+  )
+done
+[ "$viol" -eq 0 ] && say "[3/4] dep-order invariant holds ✓" || fail "[3/4] topological order is wrong — see violations above"
+
+# ── 4. cargo publish --dry-run per crate, in topo order (NO real publish) ───
+say "[4/4] cargo publish --dry-run --locked, in order (no crate is published):"
+rc_all=0
+for c in "${FINAL_ORDER[@]}"; do
+  hr; say "  --- dry-run: $c"
+  if cargo publish -p "$c" --dry-run --locked; then
+    say "  --- $c: dry-run PASS"
+  else
+    say "::preflight:: $c: dry-run FAIL — packaging/manifest error; fix before the irreversible publish"
+    rc_all=1
+  fi
+done
+hr
+if [ "$rc_all" -eq 0 ]; then
+  say "PREFLIGHT ALL-GREEN for ${TAG} — necessary-not-sufficient: proceed to PHASE-D §2.2"
+  say "(reminder: --dry-run can't prove cross-crate crates.io resolution; the §2.2"
+  say " topo order + ~30s propagation waits handle that. crates.io is append-only.)"
+  exit 0
+else
+  fail "PREFLIGHT RED — DO NOT run the §2.2 publish sequence until every dry-run is green"
+fi
