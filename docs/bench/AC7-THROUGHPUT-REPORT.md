@@ -591,6 +591,108 @@ on that disclosure discipline.
 
 ---
 
+## 8. Two-source cross-check (Component-2 independent methodology)
+
+**Verdict line: PARTIALLY two-source-confirmed — exactly ONE metric
+cleanly hardened; the headline CPU-win is NOT (C2 could not measure
+trunk due to a recon-harness bug); all divergences root-caused, none
+averaged.**
+
+Component-2 (`bench/throughput-recon.sh`: bash+ps+awk, `ps --ppid` BFS,
+`ps -o rss=`, `sed -i` edit, 5 s background ticker, isolated
+`/work/bench-lead-recon-src` + `/cache/target-bench-lead-recon`) run
+against the same corrected accounting (cutime+cstime parity fix
+`670de75` — audited + confirmed in-tree before the run, the
+pre-condition for a valid cross-check). reps=15, 8 s inter-edit.
+
+### 8.1 Cross-source table
+
+| metric | C1 (corrected) | C2 (recon) | Δ | verdict |
+|---|---:|---:|---:|---|
+| cargoless peak RSS | 2.34 GB | 2.14 GB | −9% | **TWO-SOURCE-CONFIRMED** |
+| cargoless RSS growth | 1.70 GB | 1.36 GB | −20% | same order; directionally consistent |
+| cargoless CPU-s/edit | 3.389s | 6.252s | **+84%** | DIVERGENT — cache-warmth (hypothesis) |
+| bacon CPU-s/edit | 0.493s | 0.457s | −7% | numerically close but **C2-CONFOUNDED** (see 8.3) |
+| bacon peak RSS | 238 MB | 67 MB | **−72%** | DIVERGENT — sampling cadence (pre-flagged, confirmed) |
+| trunk (all) | 6.96s / 519 MB | **NO_READY** | — | **C2 COULD-NOT-MEASURE** (recon edit-driver bug) |
+
+### 8.2 The one clean confirmation
+
+**cargoless peak RSS is two-source-hardened: ~2.2 GB** (C1 2.34, C2
+2.14, Δ−9% — well within cross-methodology variance). This is robust
+*because* RSS is dominated by RA's resident footprint, which is
+insensitive to both the cadence difference AND the recon edit-driver
+bug (those change *what* RA analyzes, not *how much RAM it holds*).
+The headline "cargoless's default footprint is RA-dominated ~2 GB" and
+the §5 `--features csr`→0.53 GB mitigation are safe to cite with
+two-source provenance.
+
+### 8.3 Divergences — root-caused, NOT averaged (per the brief)
+
+1. **cargoless CPU/edit +84% (3.39s→6.25s): cache-warmth.** C2 isolates
+   `RECON_TARGET=/cache/target-bench-lead-recon` — a *cold* cargo
+   target. Evidence: C2 cargoless warm=**19 s** (C1 4.5 s), baseline
+   cpu_j already 7370 (RA indexing a cold workspace), mean CPU 77.5%
+   (C1 42.2%). Cold-isolated cache makes RA + cargo-check do
+   materially more work per edit. The *qualitative* "cargoless is
+   RA-heavy" is confirmed by BOTH; the *absolute* CPU/edit is
+   **cache-state-sensitive — report as a range: ~3.4 s warm-shared /
+   ~6.3 s cold-isolated**, not a point estimate.
+2. **bacon peak RSS −72% (238→67 MB): sampling cadence — the
+   pre-flagged hypothesis, CONFIRMED.** Commit `670de75` predicted
+   verbatim: "If RSS-peak diverges, the 5s-vs-250ms cadence is the
+   ready hypothesis." bacon's `cargo check` subprocess peaks for
+   <1 s; C1's 250 ms tracker catches it, C2's 5 s ticker misses it.
+   **C1's 238 MB is the more accurate peak**; C2's 67 MB is a
+   cadence artifact. Methodology-difference-explained, not a
+   contradiction.
+3. **trunk C2 NO_READY: a recon-harness bug, NOT a trunk fact.**
+   The recon's `flip_edit` uses `sed -i 's|^.*BENCH_TRAIT_ANCHOR.*|…|'`
+   — a **whole-line** replace, lossy vs C1's precise
+   `str.replace(ANCHOR, FLIP, 1)` substring swap. It corrupted the
+   isolated fixture source; trunk's *real* `cargo build
+   --target=wasm32` then failed (`error: could not compile … expected
+   one of ! or ::`, exit 101) → NO_READY at the 900 s ceiling.
+   **Consequence: C2 never measured trunk**, so the headline
+   **cargoless-CPU-win-vs-trunk is single-source (C1 only) — NOT
+   two-source-hardened.**
+4. **bacon CPU/edit −7% is C2-CONFOUNDED, not a clean confirmation.**
+   bacon ran *after* cargoless's 15 sed-edits + restore on the shared
+   recon copy; the lossy restore likely left the source corrupted
+   (same bug as #3). bacon's `ready` patterns include `could not
+   compile`/`error[`, so bacon "warmed" on the *broken* source and
+   its 0.457 s is cargo-check-of-corrupt-source, not clean. The
+   numeric closeness to C1's 0.493 s is **coincidental** (a fast
+   parse-error check costs ≈ a fast clean incremental check) and
+   must NOT be cited as a clean two-source confirmation.
+
+### 8.4 Honest net + recommendation
+
+- **Two-source-hardened, citable now:** cargoless default peak RSS
+  ~2.2 GB (and therefore the RA-dominated-footprint framing + the §5
+  `--features csr` 75% mitigation).
+- **NOT two-source-hardened:** the cargoless-vs-trunk CPU-win
+  headline. C1's number is internally consistent + physically
+  plausible (trunk 86% mean CPU during wasm rebundle), but C2 could
+  not reproduce trunk because the recon edit-driver corrupted the
+  source. Until a clean C2 trunk number exists, the CPU-win claim
+  must ship with **single-source (C1) provenance + the cache-state
+  caveat**, not as a two-source fact.
+- **Recon-harness bug is itself a launch-material finding** (per the
+  brief: a divergence is a finding). Fix = replace the recon's
+  whole-line `sed -i` with a precise substring swap (matching C1's
+  driver) + run C2 on a warm-shared cache (C1-parity) so trunk
+  actually builds. That is a ~30-45 min fix-and-rerun; it is the
+  recommended hardening step **before** any launch blog cites the
+  cross-tool CPU figures. Flagged for the operator launch-scope
+  decision — NOT silently iterated, NOT averaged-over.
+
+This §8 makes the report's claims provenance-explicit: the RSS story
+is two-source-solid; the CPU-win story is single-source-pending-clean-C2.
+Honest beats favorable.
+
+---
+
 ## Appendix A: invocation reproducer
 
 ```bash
