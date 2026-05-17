@@ -92,7 +92,7 @@ impl Bundle {
 
     /// The document served for `/`. Prefers `index.html`; falls back to the
     /// single entry if the bundle has exactly one file.
-    pub fn index(&self) -> Option<&[u8]> {
+    pub fn document(&self) -> Option<&[u8]> {
         if let Some(b) = self.files.get("index.html") {
             return Some(b);
         }
@@ -297,6 +297,14 @@ impl ServerHandle {
         self.shared.served.lock().unwrap().current.is_some()
     }
 
+    /// Whether the watched tree is currently red. **Status only** — this
+    /// never gates what is served (AC#4: a red tree keeps the last green
+    /// bytes). Exposed so the CLI/`status` can surface it and the AC#4 test
+    /// can assert "red flag set, bytes unchanged" simultaneously.
+    pub fn tree_is_red(&self) -> bool {
+        self.shared.served.lock().unwrap().tree_red
+    }
+
     /// Stop accepting connections and join the accept thread.
     pub fn shutdown(mut self) {
         self.stop();
@@ -485,7 +493,7 @@ fn route(req: &Request, shared: &Arc<Shared>) -> (&'static str, &'static str, Ve
     };
     let path = req.path.split('?').next().unwrap_or("/");
     if path == "/" || path == "/index.html" {
-        return match bundle.index() {
+        return match bundle.document() {
             Some(html) => (
                 "200 OK",
                 "text/html; charset=utf-8",
@@ -572,6 +580,11 @@ fn holding_page() -> Vec<u8> {
 // Minimal RFC 6455 WebSocket (server push only)
 // ---------------------------------------------------------------------------
 
+// We deliberately do not reassemble client→server frames: the reload channel
+// is entirely server-driven (decision D5, full reload), so a client frame is
+// only ever interesting as "the peer is closing/gone". Partial reads are
+// therefore irrelevant here — `unused_io_amount` does not apply.
+#[allow(clippy::unused_io_amount)]
 fn serve_websocket(stream: TcpStream, req: &Request, shared: Arc<Shared>) -> io::Result<()> {
     let Some(key) = req.headers.get("sec-websocket-key") else {
         return Ok(());
@@ -857,8 +870,10 @@ mod tests {
             "serves the green artifact"
         );
 
-        // 3. Tree goes RED. The promise: bytes do NOT change.
+        // 3. Tree goes RED. The promise: the red flag flips, but the served
+        //    bytes do NOT change — both observed in the same instant.
         srv.notify_state(&StateEvent::BecameRed);
+        assert!(srv.tree_is_red(), "red is observable as status");
         let (_, body_after_red) = http_get(addr, "/");
         assert!(
             String::from_utf8_lossy(&body_after_red).contains("GREEN-ONE"),
