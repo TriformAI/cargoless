@@ -109,9 +109,10 @@ terminal — the unreadable-Forgejo-logs problem disappears.
 **How the lead / agents invoke it** (from the cargoless repo root):
 
 ```
-scripts/ci-gate <ref>        # verify a branch/sha before integration
-scripts/ci-gate origin/main  # default ref if omitted
-scripts/ci-gate --provision  # (re)apply the builder manifest if it drifts
+scripts/ci-gate <ref>          # verify a branch/sha before integration
+scripts/ci-gate origin/main    # default ref if omitted
+scripts/ci-gate --bench <ref>  # run S1/AC#2 bench + publish s1-ac2-verdict
+scripts/ci-gate --provision    # (re)apply the builder manifest if it drifts
 ```
 
 The `<ref>` must exist in the local clone — `ci-gate` never fetches/pulls

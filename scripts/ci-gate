@@ -7,9 +7,9 @@
 #   that is shared with tf-multiverse + ~12 agents (often ~40min backlogged)
 #   and whose job logs are NOT readable over the Forgejo REST API. That makes
 #   it useless as a fast pre-integration merge gate. This script runs the
-#   exact same four checks on a dedicated, isolated k8s pod and prints the
-#   real per-check PASS/FAIL **and the actual compiler/test output to stdout**
-#   — kubectl-exec stdout IS readable, which is the whole point.
+#   exact same checks on a dedicated, isolated k8s pod and prints the real
+#   per-check PASS/FAIL **and the actual compiler/test output to stdout** —
+#   kubectl-exec stdout IS readable, which is the whole point.
 #
 #   The builder is fully independent of tf-multiverse's `triform-builder`
 #   namespace and of the Forgejo runner. See deploy/cargoless-builder.k8s.yaml.
@@ -21,7 +21,10 @@
 #   the cargo-safety hook's sanctioned escape for operator-approved builds.
 #
 # USAGE
-#   scripts/ci-gate [<git-ref>]      # default: origin/main
+#   scripts/ci-gate [<git-ref>]      # 4-check merge gate (default ref origin/main)
+#   scripts/ci-gate --bench <ref>    # run the S1/AC#2 bench harness for <ref>
+#                                    #   and publish the `s1-ac2-verdict`
+#                                    #   Forgejo commit status for that sha
 #   scripts/ci-gate --provision      # (re)apply the builder manifest, then exit
 #   scripts/ci-gate --help
 #
@@ -30,13 +33,25 @@
 #   that ref is `git archive`-streamed into the pod over `kubectl exec` stdin
 #   (no in-pod git, no registry auth, deterministic — tracked files only).
 #
+#   --bench exists because the CI `bench` job (which publishes the
+#   `s1-ac2-verdict` commit status gating the project's #1 risk, D-A2/AC#2)
+#   is `if: github.ref == refs/heads/main` AND sits behind the ~40min shared
+#   runner. This runs bench/run.sh in the dedicated pod NOW and POSTs the
+#   verdict as the commit status from the local machine (Forgejo token read
+#   via the documented `git credential fill` path — never placed in the pod).
+#   bench/run.sh always exits 0 by contract (evidence, not a gate), so
+#   --bench's exit code reflects only transport success, not the verdict.
+#
 # ENV
 #   BUILDER_NS    default cargoless-builder
 #   BUILDER_SEL   default app.kubernetes.io/name=cargoless-builder
 #   CI_GATE_KEEP_GOING=1  run all four checks even after one fails (default:
 #                         keep going — a gate should report every failure)
+#   FJ_API        default https://forgejo.triform.dev/api/v1
+#   FJ_REPO       default triform/cargoless
 #
-# EXIT: 0 iff all four checks pass; 1 otherwise; 2 on setup/transport error.
+# EXIT: gate mode  → 0 iff all four checks pass; 1 if any red; 2 on setup err.
+#       --bench    → 0 if the verdict was captured + status POSTed; 2 on error.
 
 set -euo pipefail
 
@@ -47,11 +62,14 @@ BUILDER_CONTAINER="builder"
 MANIFEST="$REPO_ROOT/deploy/cargoless-builder.k8s.yaml"
 CI_GATE_KEEP_GOING="${CI_GATE_KEEP_GOING:-1}"
 APPROVE="TRIFORM_OPERATOR_APPROVED_BUILD=1"   # operator-sanctioned build escape
+FJ_API="${FJ_API:-https://forgejo.triform.dev/api/v1}"
+FJ_REPO="${FJ_REPO:-triform/cargoless}"
+REMOTE_SRC="/work/src"
 
 usage() { sed -n '2,/^set -euo pipefail/p' "$0" | sed -e 's/^# \?//' -e '$d'; }
-
 die() { echo "[ci-gate] ERROR: $*" >&2; exit 2; }
 
+MODE="gate"
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   --provision)
@@ -62,6 +80,7 @@ case "${1:-}" in
     kubectl -n "$BUILDER_NS" rollout status deploy/cargoless-builder --timeout=240s
     echo "[ci-gate] builder provisioned."
     exit 0 ;;
+  --bench) MODE="bench"; shift ;;
 esac
 
 REF="${1:-origin/main}"
@@ -77,21 +96,59 @@ POD="$(kubectl -n "$BUILDER_NS" get pod -l "$BUILDER_SEL" \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 [ -n "$POD" ] || die "no Running cargoless builder pod (try: scripts/ci-gate --provision)"
 
-echo "[ci-gate] ref=$REF sha=$SHORT pod=$BUILDER_NS/$POD"
-echo "[ci-gate] streaming tree into pod (git archive | kubectl exec tar -x)..."
+kexec()  { kubectl exec      -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- "$@"; }
+kexec_i() { kubectl exec -i   -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- "$@"; }
 
 # Fresh source dir per run; CARGO_TARGET_DIR lives OUTSIDE this dir (on the
 # PVC) so the warm target cache survives the wipe — only a relink, not a
-# from-scratch rebuild, on each run.
-REMOTE_SRC="/work/src"
-kubectl exec -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- \
-  bash -c "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC" \
-  || die "could not reset $REMOTE_SRC in pod"
+# from-scratch rebuild, on each run. git archive => tracked files only.
+stream_tree() {
+  echo "[ci-gate] ref=$REF sha=$SHORT pod=$BUILDER_NS/$POD"
+  echo "[ci-gate] streaming tree into pod (git archive | kubectl exec tar -x)..."
+  kexec bash -c "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC" \
+    || die "could not reset $REMOTE_SRC in pod"
+  git -C "$REPO_ROOT" archive --format=tar "$SHA" \
+    | kexec_i tar -x -C "$REMOTE_SRC" \
+    || die "source transfer failed"
+}
 
-git -C "$REPO_ROOT" archive --format=tar "$SHA" \
-  | kubectl exec -i -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- \
-      tar -x -C "$REMOTE_SRC" \
-  || die "source transfer failed"
+# ───────────────────────── --bench: S1/AC#2 verdict ─────────────────────────
+if [ "$MODE" = "bench" ]; then
+  stream_tree
+  echo
+  echo "======================================================================"
+  echo "=== bench :: bench/run.sh (S1 / AC#2 latency harness)  sha=$SHORT"
+  echo "======================================================================"
+  set +e
+  BENCH_OUT="$(kexec_i bash -c \
+    "cd $REMOTE_SRC && $APPROVE bash bench/run.sh 2>&1")"
+  set -e
+  printf '%s\n' "$BENCH_OUT"
+  VERDICT="$(printf '%s\n' "$BENCH_OUT" | grep -m1 '^S1_VERDICT:' || true)"
+  [ -n "$VERDICT" ] || VERDICT="S1_VERDICT: BLOCKER=no-verdict-line AC2=UNKNOWN D-A2=BLOCKED"
+  echo
+  echo "[ci-gate] captured: $VERDICT"
+
+  # Forgejo token via the documented read path (macOS keychain credential).
+  # Never written into the pod — the status is POSTed from here.
+  TOKEN="$(printf 'protocol=https\nhost=forgejo.triform.dev\n\n' \
+    | git credential fill 2>/dev/null | sed -n 's/^password=//p')"
+  [ -n "$TOKEN" ] || die "could not read Forgejo token via git credential fill"
+
+  DESC="$(printf '%s' "$VERDICT" | cut -c1-255)"
+  BODY="$(python3 -c 'import json,sys; print(json.dumps({"state":"success","context":"s1-ac2-verdict","description":sys.argv[1]}))' "$DESC")"
+  CODE="$(curl -sS -o /tmp/ci-gate-s1resp.json -w '%{http_code}' \
+    -X POST -H "Authorization: token ${TOKEN}" -H "Content-Type: application/json" \
+    "${FJ_API}/repos/${FJ_REPO}/statuses/${SHA}" -d "$BODY" || true)"
+  echo "[ci-gate] POST ${FJ_API}/repos/${FJ_REPO}/statuses/${SHA} -> HTTP ${CODE}"
+  case "$CODE" in
+    2??) echo "=== bench: verdict published as commit status 's1-ac2-verdict' for $SHORT"; exit 0 ;;
+    *)   echo "=== bench: STATUS POST FAILED (HTTP $CODE)"; head -c 400 /tmp/ci-gate-s1resp.json 2>/dev/null; echo; exit 2 ;;
+  esac
+fi
+
+# ───────────────────────── default: 4-check merge gate ──────────────────────
+stream_tree
 
 # Each check: prefixed with the operator-approved build escape, run in the
 # streamed tree, full output captured and echoed. rust-toolchain.toml pins
@@ -103,16 +160,11 @@ run_check() {
   echo "=== $name :: cargo ${cmd}"
   echo "======================================================================"
   set +e
-  out="$(kubectl exec -i -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- \
-    bash -c "cd $REMOTE_SRC && $APPROVE cargo ${cmd} 2>&1")"
+  out="$(kexec_i bash -c "cd $REMOTE_SRC && $APPROVE cargo ${cmd} 2>&1")"
   rc=$?
   set -e
   printf '%s\n' "$out"
-  if [ "$rc" -eq 0 ]; then
-    echo "--- $name: PASS"
-  else
-    echo "--- $name: FAIL (exit $rc)"
-  fi
+  if [ "$rc" -eq 0 ]; then echo "--- $name: PASS"; else echo "--- $name: FAIL (exit $rc)"; fi
   return "$rc"
 }
 
