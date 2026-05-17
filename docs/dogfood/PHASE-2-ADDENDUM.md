@@ -180,6 +180,62 @@ operator wants it, not launch-gating). N small-but-real.
 - **F3b RA-zombie residual** — improved to ~1.0/check; the remaining
   double-fork-class escapees are v1 territory.
 
+## 7. #126 — proc-macro-off-default safety field-verify (Leg-B RAM rung)
+
+Field-validation that converts the §4 measured −56% RSS
+(`--proc-macro disabled` = −55.7%) from *measured-but-unsafe-as-default*
+into a **shippable launch RAM claim**. SCOPE: correctness/safety, NOT a
+re-measurement. Binary `cargoless 0.0.0` @ main `493173a` (Tier-3
+`33f0838`, flag `TF_RA_PROCMACRO_OFF=1`, default-off). Substrate:
+dogfood-realapp Leptos — **20 files / 38 `view!` proc-macro call-sites**
+(the genuine worst case for proc-macro-off). Ground truth: `cargo check`
+rc=0 on the green tree.
+
+| Test | Result |
+|---|---|
+| CONTROL — default (proc-macro ON), green tree | green, rc=0, 4.82s |
+| **(a)** `TF_RA_PROCMACRO_OFF=1`, green tree → must stay GREEN | ✅ **PASS** — `ok green — every tracked file compiles`, rc=0; **zero `view!`/unresolved/macro mentions leaked into the verdict**. RA cannot expand `view!` without the proc-macro server, but the verdict is rustc-sourced and stays correctly GREEN — no hallucination. |
+| **(a-watch)** `TF_RA_PROCMACRO_OFF=1 watch`, steady-state | ✅ **PASS** — settles `GREEN — tree compiles`; **0 RED-summary lines** on the known-green view!-heavy tree (no false-RED flap/transient) |
+| **(b)** real error + `TF_RA_PROCMACRO_OFF=1` → must RED | ✅ **PASS** — `cargo check` rc=101, cargoless rc=1, both RED, agree; diagnostics rustc/syntax-sourced. No false-GREEN. |
+
+**Verdict: proc-macro-off-as-default is SAFE on real `view!`-macro-heavy
+Leptos.** dev-fixer's no-wrong-verdict proof holds in the field on the
+real project (not just the fixture): does not false-RED a green Leptos
+tree, does not false-GREEN a broken one. **Leg-B (−56% RAM safety rung)
+CONFIRMED.**
+
+### (c) Latency — predicted tradeoff INVERTED to a bonus
+
+| Mode | latency edit→RED |
+|---|---|
+| default (proc-macro ON) | 25.8s |
+| `TF_RA_PROCMACRO_OFF=1` | 5.1s |
+
+proc-macro-off was ~5× **faster** to the RED verdict, not slower —
+mechanistically, the proc-macro server's `view!` expansion sits on the
+verdict critical-path on macro-heavy code; removing it shortens the path.
+The design proof conservatively predicted a fast-RED latency *cost*; the
+field shows a latency *improvement* here.
+
+> **Load-bearing honest-scoping caveat (must travel with the number):**
+> this is the dogfood-realapp measurement — ONE real `view!`-heavy
+> project, **n=1 per mode**. The direction is unambiguous and
+> mechanistically expected on macro-heavy code, but the claim is framed
+> as *"no latency penalty observed; faster on macro-heavy projects"* —
+> **NOT a universal speedup guarantee**. A non-macro-heavy project would
+> not show this inversion and could exhibit the originally-predicted
+> small fast-RED latency cost; that case is unmeasured here.
+
+**Launch-claim shape (recommended):** *"proc-macro-off default: −56% RSS
+on a real view!-heavy Leptos project, verdict-correctness preserved
+(rustc authority), with faster (not slower) red-verdict latency on
+macro-heavy code"* — with the n=1 caveat above attached. The tiered RAM
+ladder's middle rung (§4) is now load-bearing-safe.
+
+**Provenance:** aggregate verdicts + latencies only; no raw
+transcript/source content. Verification: `/tmp/verify_126.sh` (+ logs);
+reproducible from the committed scaffold.
+
 ---
 
 **Reporter:** `dogfood-lead` (Claude Opus 4.7, 1M context, agent role)
@@ -187,4 +243,6 @@ operator wants it, not launch-gating). N small-but-real.
 **Companion source-of-truth docs:** [`PHASE-2-REPORT.md`](PHASE-2-REPORT.md) ·
 [`../launch/NAMING-DRIFT-FIELD-CROSS-CHECK.md`](../launch/NAMING-DRIFT-FIELD-CROSS-CHECK.md) ·
 bench-lead §9.5 (#117 anchor) · D-RAM-TIERS / #118 / #126 (RAM ladder)
-**Generated:** 2026-05-18, in the session that produced all the above measurements.
+**Generated:** 2026-05-18, in the session that produced all the above
+measurements. §1–6 committed @ `493173a`; §7 (#126 field-verify) appended
+post-tier3-relay, same session, routed for the same docs-pickup pattern.
