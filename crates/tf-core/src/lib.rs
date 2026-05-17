@@ -11,6 +11,7 @@
 
 pub mod analyzer;
 pub mod build;
+pub mod idle;
 pub mod lsp;
 pub mod model;
 pub mod structural;
