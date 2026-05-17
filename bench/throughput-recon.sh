@@ -39,10 +39,22 @@ REPS=${REPS:-30}
 INTER_EDIT_SEC=${INTER_EDIT_SEC:-10}
 WARM_TIMEOUT_SEC=${WARM_TIMEOUT_SEC:-1200}
 SAMPLE_TICK_SEC=${SAMPLE_TICK_SEC:-5}
-CARGOLESS_BIN=${CARGOLESS_BIN:-$repo/target/release/tftrunk}
-# Separate working copy + target dir for true isolation from Component 1.
-RECON_SRC=${RECON_SRC:-/work/bench-lead-recon-src}
-RECON_TARGET=${RECON_TARGET:-/cache/target-bench-lead-recon}
+CARGOLESS_BIN=${CARGOLESS_BIN:-$repo/target/release/cargoless}
+# C1-CACHE-PARITY (clean-C2, #109): default to the SAME warm source +
+# target Component-1 used, NOT an isolated cold copy. The first C2 pass
+# isolated RECON_SRC + a COLD RECON_TARGET; that cold cache (a)
+# inflated cargoless CPU/edit +84% (warm 19s vs C1 4.5s — a
+# cache-state artifact, not a real divergence) and (b) made trunk's
+# from-scratch wasm build exceed the 900s warm-timeout → NO_READY, so
+# the CPU-win could not be cross-verified. Methodology INDEPENDENCE is
+# preserved where it belongs — in the measurement CODE (bash+ps+awk vs
+# Python; `ps --ppid` BFS vs /proc enum; `ps -o rss=` vs statm; 5s
+# ticker vs 250ms) — NOT in the filesystem path. C1 already finished;
+# running C2 sequentially on the same warm tree is contamination-free
+# and is the only way to get an apples-to-apples cross-check. Both
+# still overridable for a deliberately-isolated run.
+RECON_SRC=${RECON_SRC:-$here/fixture}
+RECON_TARGET=${RECON_TARGET:-/cache/target-bench-lead}
 
 TARGET_REL="src/domain/model.rs"
 ANCHOR='self.entries.len() /* BENCH_TRAIT_ANCHOR */'
@@ -73,13 +85,29 @@ EOF
 case "$1" in -h|--help|help) usage; exit 0 ;; esac
 
 # ---------------------------------------------------------------------
-# Set up isolated working copy + target dir
-# ---------------------------------------------------------------------
-log "preparing isolated working copy at $RECON_SRC (mirrors fixture content but separate inode)"
-rm -rf "$RECON_SRC"
-mkdir -p "$RECON_SRC"
-cp -a "$fixture_src/." "$RECON_SRC/"
+# Set up working source + target dir.
+#
+# DEFAULT (C1-parity): RECON_SRC == the live fixture dir ($here/fixture)
+# — the SAME tree + the SAME model.rs Component-1 edited, on the SAME
+# warm RECON_TARGET. We edit IN PLACE; the precise clean-baseline
+# snapshot (captured below, stored in /tmp outside the watched tree)
+# makes in-place safe + losslessly restorable. We MUST NOT rm/recopy
+# here — that would delete the streamed fixture.
+#
+# OVERRIDE (deliberate isolation): if the caller points RECON_SRC at a
+# fresh path != fixture_src, restore the old "mirror into a separate
+# inode" behavior (cold cache, methodology-isolated — but that
+# reintroduces the cache-state divergence the clean-C2 run exists to
+# eliminate, so it's opt-in only).
 mkdir -p "$RECON_TARGET"
+if [ "$RECON_SRC" = "$fixture_src" ]; then
+  log "C1-parity: editing the LIVE fixture in place at $RECON_SRC (warm shared cache $RECON_TARGET)"
+else
+  log "ISOLATION override: mirroring fixture into separate inode $RECON_SRC (cold cache — reintroduces cache-state divergence)"
+  rm -rf "$RECON_SRC"
+  mkdir -p "$RECON_SRC"
+  cp -a "$fixture_src/." "$RECON_SRC/"
+fi
 log "RECON_SRC=$RECON_SRC RECON_TARGET=$RECON_TARGET"
 
 # Honest-size guard reasserted (same floor as run-comparative.sh)
@@ -186,9 +214,29 @@ sample_tree() {
 }
 
 # ---------------------------------------------------------------------
-# Edit driver: direct overwrite (single write(2)). printf > file is
-# the editor-save shape every notify-rs watcher handles cleanly.
+# Edit driver: PRECISE substring-swap from a captured clean baseline,
+# then a single direct write — EXACT Component-1 parity.
+#
+# The earlier `sed -i 's|^.*BENCH_TRAIT_ANCHOR.*|…|'` was a WHOLE-LINE
+# replace: lossy vs C1's `clean.replace(ANCHOR, FLIP, 1)` precise
+# substring swap. It corrupted the fixture source across reps →
+# trunk's real `cargo build --target=wasm32` failed (exit 101,
+# "expected one of ! or ::") → C2 NO_READY on trunk, so the
+# cargoless-vs-trunk CPU-win could not be two-source-verified (#102
+# §8). Fix: snapshot the clean file ONCE (outside the watched tree so
+# the snapshot itself never triggers the watcher), and every rep write
+# `clean_content.replace(ANCHOR, FLIP_x, 1)` via a single
+# open(truncate)+write+fsync — byte-for-byte the same operation
+# C1's FixtureEditor performs. Restore = write the clean snapshot back.
+# python3 (stdlib only; present in the pod) does the precise replace +
+# fsync, matching C1's open+write+flush+os.fsync exactly.
 # ---------------------------------------------------------------------
+RECON_CLEAN_SNAPSHOT="/tmp/recon-clean-baseline-$$.rs"
+
+capture_clean_baseline() {
+  cp "$RECON_SRC/$TARGET_REL" "$RECON_CLEAN_SNAPSHOT"
+}
+
 flip_edit() {
   local rep=$1
   local target="$RECON_SRC/$TARGET_REL"
@@ -198,17 +246,24 @@ flip_edit() {
   else
     flip="$FLIP_B"
   fi
-  # Use sed to substitute the anchor in-place; sed -i creates a temp
-  # named target.XXXXXX (random suffix) and renames — empirically
-  # works with cargoless's watcher (verified in #36 5th iteration
-  # manual probe). NOT the same FS-event pattern as Component 1's
-  # direct write — intentional methodology difference.
-  sed -i "s|^.*BENCH_TRAIT_ANCHOR.*|        $flip|" "$target" 2>/dev/null
+  ANCHOR="$ANCHOR" FLIP="$flip" SNAP="$RECON_CLEAN_SNAPSHOT" TGT="$target" \
+    python3 - <<'PY' 2>/dev/null
+import os
+clean = open(os.environ["SNAP"]).read()
+anchor = os.environ["ANCHOR"]
+flip = os.environ["FLIP"]
+body = clean.replace(anchor, flip, 1)  # precise single-occurrence swap (C1-parity)
+with open(os.environ["TGT"], "w") as f:
+    f.write(body)
+    f.flush()
+    os.fsync(f.fileno())
+PY
 }
 
 restore_edit() {
-  local target="$RECON_SRC/$TARGET_REL"
-  sed -i "s|^.*BENCH_TRAIT_ANCHOR.*|        $ANCHOR|" "$target" 2>/dev/null
+  # Write the exact clean snapshot back (lossless — no regex, no
+  # accumulated mutation).
+  cp "$RECON_CLEAN_SNAPSHOT" "$RECON_SRC/$TARGET_REL" 2>/dev/null
 }
 
 # Sanity: make sure the anchor is present in the recon copy
@@ -217,6 +272,23 @@ ANCHOR_LINE=$(grep -c "BENCH_TRAIT_ANCHOR" "$RECON_SRC/$TARGET_REL" 2>/dev/null 
   log "ERROR: anchor missing from recon source ($RECON_SRC/$TARGET_REL)"
   exit 1
 }
+# Verify the precise substring (not just the bare anchor token) is
+# present exactly once — flip_edit/restore_edit depend on a clean,
+# single-occurrence baseline. If a prior aborted run left the file
+# flipped, restore from a still-present snapshot first.
+if [ -f "$RECON_CLEAN_SNAPSHOT" ] && ! grep -qF "$ANCHOR" "$RECON_SRC/$TARGET_REL" 2>/dev/null; then
+  log "prior run left fixture flipped — restoring from snapshot before re-capture"
+  cp "$RECON_CLEAN_SNAPSHOT" "$RECON_SRC/$TARGET_REL" 2>/dev/null || true
+fi
+# Capture the clean baseline ONCE, now, while the fixture is known
+# clean. flip_edit reads THIS (never the possibly-mutated target);
+# restore_edit writes THIS back losslessly. Stored in /tmp so the
+# snapshot file itself never lands inside the watched tree.
+capture_clean_baseline
+log "clean baseline snapshot: $RECON_CLEAN_SNAPSHOT ($(wc -c <"$RECON_CLEAN_SNAPSHOT" 2>/dev/null) bytes)"
+# Always restore + drop the snapshot on exit, even on a mid-run abort,
+# so the shared live fixture is never left dirty for the next consumer.
+trap 'restore_edit; rm -f "$RECON_CLEAN_SNAPSHOT" 2>/dev/null' EXIT INT TERM
 
 # ---------------------------------------------------------------------
 # Run a single tool: spawn, warm, sample, kill
