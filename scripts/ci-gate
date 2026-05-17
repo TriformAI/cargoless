@@ -199,10 +199,13 @@ HEAVY_LOCK="${CI_GATE_HEAVY_LOCK:-/tmp/cargoless-cigate-heavy.lock}"
 HEAVY_LOCK_WAIT="${CI_GATE_HEAVY_LOCK_WAIT:-2400}"   # 40m: > any single heavy step
 
 run_check() {
-  local name="$1" cmd="$2" serialize="${3:-0}" rc=0 out incmd
+  local name="$1" cmd="$2" serialize="${3:-0}" rc=0 out incmd tag=""
+  # NB: `${serialize:+...}` would print for serialize="0" too ("0" is
+  # set+non-empty) — the label must reflect ONLY the real flock'd steps.
+  [ "$serialize" = "1" ] && tag="  [F-K serialized]"
   echo
   echo "======================================================================"
-  echo "=== $name :: cargo ${cmd}${serialize:+  [F-K serialized]}"
+  echo "=== $name :: cargo ${cmd}${tag}"
   echo "======================================================================"
   if [ "$serialize" = "1" ]; then
     # Robust shell flock idiom: fd-redirection CREATES the lockfile (plain
