@@ -11,7 +11,15 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://forgejo.triform.dev/triform/cargoless"
+# Canonical public source URL — resolved per D-RELEASE §8 #8 (operator picked
+# option (b) GitHub mirror; URL confirmed 2026-05-17).
+# Forgejo (forgejo.triform.dev/triform/cargoless) remains the internal
+# integration-CI side: dedicated cargoless-builder pod, scripts/ci-gate,
+# Forgejo Actions PR-gate, S1/AC#2 bench commit-status. See D-RELEASE §1.1.
+# Mirror direction (§8 #9): Forgejo→GitHub push-mirror RECOMMENDED (operator
+# call still pending; manual dual-push also viable as bootstrap).
+# Also resolves: §8 #2 Mac builder via GH Actions free-tier macos-{13,14}.
+repository = "https://github.com/TriformAI/cargoless"
 # NOTE: the published product name is open decision D1 (Plane CWDL-12).
 # The repo/working identifier is "cargoless"; the shipping name is still the
 # formal D1 decision. `tf` is NOT it — it collides with Terraform.

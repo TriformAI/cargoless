@@ -66,7 +66,7 @@ in-`Cargo.toml` surface that needs to match the draft.
 |---|---|---|
 | Per-branch CI gate (PRs, ci-gate, S1/AC#2 bench, etc.) | **Forgejo** | `.forgejo/workflows/ci.yml` (UNCHANGED) + `scripts/ci-gate` (dedicated k8s builder pod) |
 | Release pipeline (tag → prebuilts → release-page assets) | **GitHub Actions** | `.github/workflows/release.yml` (NEW — currently `.draft`) |
-| Source of truth | **GitHub (canonical) + Forgejo (mirror)** | TBD-ORG/cargoless on github.com; push-mirrored from forgejo.triform.dev/triform/cargoless |
+| Source of truth | **GitHub (canonical) + Forgejo (mirror)** | TriformAI/cargoless on github.com; push-mirrored from forgejo.triform.dev/triform/cargoless |
 
 The PR/integration loop stays on Forgejo because that's where the dedicated
 `cargoless-builder` pod + ci-gate live (kubectl-readable logs, warm PVC
@@ -126,7 +126,7 @@ or `ubuntu-latest` (for GH Actions release matrix).
 ### 3.1 Universal source install (every Rust platform)
 
 ```
-cargo install --git https://github.com/TBD-ORG/cargoless --tag v0.1.0
+cargo install --git https://github.com/TriformAI/cargoless --tag v0.1.0
 ```
 
 **Or, once published to crates.io:**
@@ -141,13 +141,15 @@ Intel/ARM, even Windows for the brave (Windows is v1 parking-lot for
 basis). This is the **headline install path** in the README. Slow
 (local compile of the dep graph) but universal.
 
-> **Note on the URL.** `TBD-ORG` is a placeholder until the operator creates
-> the GitHub org/repo (one clarifying question in flight at time of writing).
-> Lock the actual org/repo into `[workspace.package].repository` in the root
-> `Cargo.toml` once it lands; the `{repo}` template in `[package.metadata.
-> binstall]` resolves from that one field. Forgejo
-> (`forgejo.triform.dev/triform/cargoless`) remains the integration-CI side
-> but is NOT the canonical user-facing URL after §8 #8 resolution.
+> **URL confirmed.** `TriformAI` is the operator-confirmed GitHub org
+> (2026-05-17). `[workspace.package].repository` in the root `Cargo.toml`
+> now points at `https://github.com/TriformAI/cargoless`; the `{repo}`
+> template in `[package.metadata.binstall]` resolves from that one field.
+> Forgejo (`forgejo.triform.dev/triform/cargoless`) remains the
+> integration-CI side but is NOT the canonical user-facing URL after §8 #8
+> resolution. The GitHub repo currently has only an initial commit
+> (LICENSE + README); mirror direction (§8 #9) is the operator's next
+> setup step.
 
 ### 3.2 Prebuilts via `cargo binstall` — three targets at first release
 
@@ -364,7 +366,7 @@ with the design — not hidden in the operator's head.
 5. `[workspace.package].version` bumped from missing → `0.1.0`; all crates
    inherit (§4.1).
 6. `[workspace.package].repository` set to `https://github.com/<ORG>/cargoless`
-   (the real org/repo, no longer `TBD-ORG`).
+   (the real org/repo, no longer `TriformAI`).
 7. `CHANGELOG.md` has a `## 0.1.0` heading committed.
 8. GitHub repo created; Forgejo→GitHub push-mirror configured (or operator
    manually pushes); first throwaway test tag `v0.0.1-rc.1` fired to verify
@@ -463,7 +465,7 @@ called out, not invented.
 | 5 | **crates.io token automation timeline.** Operator-run for `0.1.0` is approved. Is `0.2.0`-automatable, or is human-in-the-loop the permanent model? | operator | Whether `publish-*` jobs ever lose `if: false`. |
 | 6 | **GitHub release-asset URL shape.** The `pkg-url` template in §7 assumes GitHub's canonical `/{owner}/{repo}/releases/download/v{version}/{file}` shape — verified shape; a one-time throwaway test fire on `v0.0.1-rc.1` against the actual GitHub release should still confirm end-to-end before locking the production tag. | operator (one-time) | binstall first-fire correctness. |
 | 7 | **GPG signing of release tags + tarball signatures.** v1 parking-lot per CLAUDE.md non-goals. Recorded here for the record — when someone asks "why no .asc files?" the answer is "deliberate 0.1.0 scope decision; see D-RELEASE §9." | lead | Nothing in v0.1.0; trust model for downstream packagers. |
-| 8 | ~~**Canonical install URL / public-source-access strategy.**~~ **CLOSED 2026-05-17 — operator picked (b) GitHub mirror.** Canonical public URL becomes `https://github.com/<ORG>/cargoless` (org name TBD, operator question in flight). Per-repo Forgejo flip from earlier in the day (`private: false`) stays in place but is not load-bearing — the Forgejo instance's site-wide `[service].REQUIRE_SIGNIN_VIEW = true` setting overrides per-repo visibility; outside users access the project via GitHub. Forgejo remains the integration-CI side (cargoless-builder pod, ci-gate, S1 bench). Compound benefit realized: §8 #2 (Mac builder) ALSO closes via GH Actions free-tier macOS runners. See §1.1 for the runner-split summary. Final URL locks into `[workspace.package].repository` when the org name lands. | — (resolved; one URL-confirmation in flight) | URL value in Cargo.toml + README; flips on URL confirmation. |
+| 8 | ~~**Canonical install URL / public-source-access strategy.**~~ **FULLY CLOSED 2026-05-17 — operator picked (b) GitHub mirror; URL confirmed `https://github.com/TriformAI/cargoless`.** `[workspace.package].repository` flipped from forgejo to the GitHub URL; README install commands rewritten to point at GitHub; CONTRIBUTING.md split into outside-contributor (GitHub PR target) and agent-team (Forgejo integration-CI workflow) sections. Per-repo Forgejo flip from earlier in the day (`private: false`) stays in place but is not load-bearing — the Forgejo instance's site-wide `[service].REQUIRE_SIGNIN_VIEW = true` setting overrides per-repo visibility; outside users access the project via GitHub. Forgejo remains the integration-CI side (cargoless-builder pod, ci-gate, S1 bench). Compound benefit realized: §8 #2 (Mac builder) ALSO closes via GH Actions free-tier macOS runners. See §1.1 for the runner-split summary. **GitHub repo currently has only an initial commit (LICENSE + README) — operator's mirror-setup step (§8 #9) is the remaining mechanical work to populate cargoless content on the GitHub side.** Anonymous-probe verification 2026-05-17: HTML 200 / `git ls-remote HEAD` returns SHA / `info/refs?service=git-upload-pack` returns 200 on GET. The install path is structurally unblocked. | — (resolved) | — |
 | 9 | **Forgejo → GitHub mirror direction.** Does the operator (a) configure a Forgejo push-mirror (Forgejo auto-pushes to GitHub on each push to main + tags) or (b) push to both remotes manually from their machine? (a) is more automation but ties Forgejo's outbound credentials to a GitHub PAT held server-side; (b) is more explicit but requires discipline never to push to one without the other. | operator | Branch/tag synchronization mechanics. Doesn't block design; affects §6 operator playbook precise commands. |
 
 ---
@@ -502,11 +504,17 @@ discussions, not silent re-additions to `release.yml`.
 [ ] Hoist version → [workspace.package].version = "0.1.0"; crates inherit.
 [ ] Update path-deps to include version (publish-ready); Cargo.lock regenerated.
 [ ] CHANGELOG.md format chosen; ## 0.1.0 section seeded.
-[ ] §8 #8 GitHub URL confirmed; operator creates github.com/<ORG>/cargoless;
-    [workspace.package].repository updated from forgejo to the GitHub URL;
+[x] §8 #8 GitHub URL confirmed: `https://github.com/TriformAI/cargoless`.
+    Operator created the repo (currently initial-commit-only; cargoless
+    content awaits §8 #9 mirror setup).
+    [workspace.package].repository updated from forgejo to the GitHub URL
+    (commit landed on agent/builder-infra).
     README/CONTRIBUTING URLs updated in the same commit.
 [ ] §8 #9 mirror direction decided (push-mirror server-side vs manual dual-push);
     if push-mirror, configured in Forgejo with appropriate GitHub PAT.
+    Mirror activated → cargoless content lands on GitHub side; anonymous
+    `cargo install --git https://github.com/TriformAI/cargoless.git` returns
+    a real Rust workspace (not just LICENSE+README).
 [ ] release.yml.draft → release.yml at `.github/workflows/release.yml`; remove
     `if: false` from build/validate jobs (keep on publish-* until 0.2.0 token-
     automation lands).
