@@ -6,136 +6,131 @@
 > (project blog, dev.to, personal blog, GitHub release notes, etc.)
 > gets a frozen copy at publish time.
 >
-> **TBD markers:** `<!-- TBD-NUMBERS -->` and `<!-- TBD-POSITIONING -->`
-> mark spots where the final copy depends on (a) the AC#7 comparative
-> benchmark's reported numbers and (b) the operator's final
-> positioning decision (architectural-honesty vs speed framing). Both
-> get resolved via small follow-up edits before publish.
+> **TBD markers:** `<!-- TBD-NUMBERS -->` marks spots where the final
+> copy depends on bench-lead's throughput report (CPU-seconds, RSS,
+> saves-per-CPU-minute on the Leptos fixture) and the perf-recon
+> agent's independent cross-check. Both ETA ~60-90min from
+> 2026-05-17 15:11; both slot into the placeholders via a small
+> follow-up commit when they land.
 >
-> **Two framings are scaffolded.** The body text below uses
-> **Framing B (architectural honesty)** as the default, with
-> **Framing A (speed)** alternative passages in HTML comments
-> immediately adjacent. The operator picks one and removes the other
-> in the publish-time edit pass.
+> **Positioning:** locked to **Framing C — throughput, not speed.**
+> The earlier Framing A (speed) and Framing B (architectural-honesty)
+> scaffolding has been removed; this draft commits to "cargoless
+> doesn't burn your CPU" as the differentiator.
 
 ---
 
-<!--
-TBD-POSITIONING — Framing B headline (DEFAULT, leading candidate):
--->
+# cargoless v0: the dev loop that doesn't burn your CPU
 
-# cargoless — the codebase always knows what works
+Open three terminals. One for `trunk serve`. One for `bacon` or
+`cargo-watch`. One for the actual code. Save a file. Listen.
 
-<!--
-TBD-POSITIONING — Framing A headline (commented-out alternative):
+The fans spin up. The battery drops a percentage. Your laptop is now
+warm to the touch. `trunk serve` is rebuilding the whole WASM bundle —
+again, just like the last time, even though the only thing that
+changed was a comment. `bacon` is spawning a fresh `cargo check`
+process — again, throwing away the type-graph it computed two saves
+ago. Both tools are doing real work; neither is doing **necessary**
+work.
 
-# cargoless — sub-second feedback for Rust+WASM, without lying about it
--->
-
-<!-- TBD-POSITIONING (Framing B, default) — hook paragraph: -->
-
-`trunk serve` will happily serve you a broken WASM bundle. `bacon`
-will show you a red status bar from a terminal you closed two hours
-ago. `cargo-watch` will rebuild on file save but it doesn't know whether
-the artifact it just produced is something an outside consumer should
-trust. The thread that runs through every Rust+WASM dev loop is this:
-*the tool tells you something is true, and you have to verify it
-yourself anyway.*
-
-cargoless takes a different bet. The product's whole pitch is one
-sentence:
+This is what we mean when we say cargoless was built to a vision cut:
 
 > **The codebase always knows what works, and tells you the moment it
-> doesn't.**
+> doesn't — without burning your CPU to do so.**
 
 Today we're shipping cargoless v0 — the headless continuous checker
-and latest-green publisher that delivers that pitch as small a surface
-as possible. v0 is intentionally small: it watches your source tree,
-runs `rust-analyzer` warm in a daemon, tells you the green/red verdict
-on every save, and atomically publishes the latest known-green WASM
+and latest-green publisher that does *less work per save* than the
+alternatives, on the architectural bet that most saves don't change
+the picture and shouldn't trigger a full rebuild. The differentiator
+isn't sub-second save→verdict (cargo-check dominates that wall-clock,
+regardless of who wraps it). The differentiator is **CPU-seconds per
+save** — and therefore, over a day of dev cycles, how many edit-cycles
+you get out of the same battery.
+
+v0 is intentionally small: it watches your source tree, runs
+`rust-analyzer` warm in a daemon, tells you the green/red verdict on
+every save, and atomically publishes the latest known-green WASM
 artifact to a pointer file. It does not serve a browser. It does not
 hot-swap. It does not replace `cargo` or `trunk build`. Those are
-deliberate cuts.
-
-<!--
-TBD-POSITIONING — Framing A (speed-first) hook alternative:
-
-`trunk serve` rebuilds for every save and serves whatever falls out —
-red or green. `bacon` shows you a verdict in a terminal you can't
-script against. `cargo-watch` does neither, faster.
-
-cargoless is what you get if you treat the inner loop as a latency
-problem AND a trust problem at the same time. The vision claim is one
-sentence:
-
-> The codebase always knows what works, and tells you the moment it
-> doesn't.
-
-Today we're shipping cargoless v0 — sub-second save→verdict on Rust+WASM
-projects, plus a `.cargoless/latest-green` pointer that only ever
-advances on a servable green build.
-
--->
+deliberate cuts — every type and decision in the project is justified
+by either sharpening the codebase's self-knowledge or shortening the
+latency from brokenness to signal. Anything that does neither isn't
+here.
 
 ---
 
-## The problem
+## The problem nobody benchmarks
 
-A modern Rust+WASM inner loop has three feedback latencies, not one:
+A modern Rust+WASM inner loop has three latency dimensions and one
+**throughput** dimension nobody talks about:
 
-1. **Save→verdict latency**: how fast do I find out whether the file I
-   just saved compiles?
-2. **Save→artifact latency**: how fast can the WASM bundle that
-   represents my latest green code be served to a browser or shipped
-   to a CI consumer?
-3. **Verdict→trust latency**: how confident can I be that the verdict
-   is right and the artifact is the right artifact?
+1. **Save→verdict latency** — how fast do I find out whether the file
+   I just saved compiles?
+2. **Save→artifact latency** — how fast can the WASM bundle that
+   represents my latest green code be served to a consumer?
+3. **Verdict→trust latency** — how confident can I be that the
+   verdict is right and the artifact is the right artifact?
+4. **Throughput: CPU-seconds per save** — how much work is being done,
+   per save, that doesn't need to be done?
 
-Existing tools optimize one or two of these and assume the third away:
+Existing tools optimize one or two of (1)-(3) and assume (4) away
+entirely:
 
 - **`trunk serve`** owns (2) — fast in-browser reload of the latest
-  build. But it serves on every cycle, red or green. If you have an
-  agent or CI process consuming `dist/`, it sees broken artifacts on
-  every red cycle. That's a (3) problem, not a (2) problem.
+  build. But it shells out to `cargo build` on every cycle and serves
+  whatever falls out, red or green. CPU cost per save: the full WASM
+  rebuild, every time. (3)-cost: serves red builds to your browser
+  and to any CI consumer reading `dist/`.
 - **`bacon`** owns (1) — fast save→verdict in a terminal. But it
-  produces no artifact, and its verdict lives in a terminal session
-  that can't be queried or consumed by anything other than a human
-  looking at the screen.
-- **`cargo-watch`** owns a slice of (1) — re-runs `cargo check`
-  faster than you would. No artifact, no verdict stream, no
-  cross-process observability.
+  spawns a fresh `cargo check` per cycle, throwing away the
+  type-graph each time. CPU cost per save: a fresh cargo process'
+  worth of work. (2)-cost: nothing — there's no artifact.
+- **`cargo-watch`** owns a slice of (1). Same fresh-cargo cost; same
+  no-artifact result.
 
-For a real Rust+WASM project the result is: you keep three terminals
-open, one for `trunk serve`, one for `bacon` or `cargo-watch`, and
-one for `cargo test`. Each tells a different fraction of the truth.
-The verdict in the corner of your eye isn't an answer; it's a
-heuristic you cross-check before trusting.
+For a real Rust+WASM project the day-to-day result is: three terminal
+windows, three running cargo-ish processes, fans audibly working,
+battery dropping fast. Each tool tells a different fraction of the
+truth — the verdict in the corner of your eye isn't an answer; it's
+a heuristic you cross-check by hand. And worse, *most of that
+ambient CPU cost is paying for work that's already been done.*
 
-## The cargoless approach
+## The cargoless architecture: do less, trust more
 
-cargoless picks **(1) save→verdict + (3) verdict→trust** as the v0
-target, and explicitly defers (2) save→artifact to a later phase. The
-shape this takes:
+cargoless picks **(1)+(3)+(4)** as the v0 target. The shape:
 
-**A long-lived daemon with a warm rust-analyzer.** No cold-start
-penalty on save; the analyzer's index is already in memory. When you
-save, the LSP `publishDiagnostics` events flow into the daemon's
-state model and a verdict pops out on the next debouncer tick.
+**A long-lived daemon with a warm `rust-analyzer`.** RA's multi-second
+cold start happens **once** per session — when the daemon comes up
+— and then never again. Every save reuses the already-indexed
+type-graph. `trunk serve` doesn't use RA at all (it shells out to
+cargo); `bacon` spawns a fresh cargo process per cycle. cargoless's
+warm-LSP architecture is the single biggest CPU-per-save reduction
+on the table.
+
+**Content-addressed dedupe of the full input set.** cargoless hashes
+the source tree + `Cargo.lock` + the rust toolchain version + the
+target triple + the config — all of it. When you save a file with a
+formatting-only change, or you `git checkout` a branch you had open
+five minutes ago, the input hash matches a previous cycle's
+**and the build is skipped entirely**. Not rebuilt-faster; **not
+rebuilt at all**. `trunk serve` and `bacon` rebuild unconditionally,
+no matter how identical the input.
 
 **A continuous verdict stream with per-file granularity.** `tftrunk
-watch` is a long-running command whose stdout is a timestamped stream
-of file-level verdicts. You see *which* file went red, not just *that*
-the tree went red.
+watch` is a long-running command whose stdout is a timestamped
+stream of file-level verdicts. You see *which* file went red, not
+just *that* the tree went red. The stream is plain text; you can
+`grep`, `tee`, pipe into a tmux pane, or have an agent subscribe.
 
 **An atomic `.cargoless/latest-green` pointer.** When a verdict turns
-green, the build runs (or hits the content-addressed cache and
-skips), and the latest-green pointer advances via a temp-file + fsync
-+ rename pattern. When the tree is red, the pointer **does not
-move** — byte-unchanged. Anything reading the pointer
-(a static server, a CI step, an agent inspector) is guaranteed never
-to see a broken artifact. That's verdict→trust collapsed to zero.
+green, the build runs (or hits the CAS and skips), and the
+latest-green pointer advances via a temp-file + fsync + rename
+pattern. When the tree is red, the pointer **does not move** —
+byte-unchanged. Anything reading the pointer (a static server, a CI
+step, an agent inspector) is guaranteed never to see a broken
+artifact. That's verdict→trust collapsed to zero.
 
-**Verdict→exit-code coherence.** `tftrunk check` exits 0 on green,
+**Verdict↔exit-code coherence.** `tftrunk check` exits 0 on green,
 non-zero on red, with diagnostics formatted file:line:col + severity
 + code + message. This is the boring corner the project spent the
 most field-bug iterations on: the exit code and the printed
@@ -153,84 +148,79 @@ a half-baked verdict layer. Better to ship one honest small thing.
 
 ## Honest performance comparison
 
-<!--
-TBD-NUMBERS — fill in from the AC#7 comparative benchmark when it
-reports. The bench/run.sh harness in this repo measures save→verdict
-and save→publish latencies for cargoless, trunk serve, and bacon on
-an identical Leptos fixture. The numbers below will be populated from
-the bench's commit-status verdict.
+The metric that matters for cargoless's positioning is **CPU-seconds
+per save** — the headline throughput number. Latency is a secondary
+concern; it's bounded by cargo-check no matter which tool you wrap
+around it. The numbers tell a throughput story.
 
-If the AC#7 bench reports INCONCLUSIVE-WITH-CAUSE (the current
-expectation per the operator's defer-positioning decision), this
-section keeps the honest-framing copy and reports cargoless's
-defensible standalone numbers without claiming a head-to-head win
-on speed.
+**Qualitative comparison** (numbers follow):
+
+| Tool | CPU per save | Peak RSS | Verdict honesty |
+|---|---|---|---|
+| cargoless | LOW — CAS skips identical inputs; warm RA avoids cold-start per cycle | LOW — no HTTP/WS server overhead | publishes green only; pointer atomic |
+| `trunk serve` | HIGH — rebuilds-everything per save | MEDIUM — HTTP + WS + browser-keepalive | serves on every build, red or green |
+| `bacon` | MEDIUM — spawns fresh cargo per cycle | LOW — terminal-only | terminal-only |
+
+<!--
+TBD-NUMBERS — fill in from bench-lead's throughput report (CPU%/RSS/
+CPU-seconds on Leptos fixture, 3 tools) + perf-recon agent's
+independent cross-check. Both ETA ~60-90min from 2026-05-17 15:11.
+The numeric tables below get populated from those two reports.
 -->
 
-<!-- TBD-POSITIONING (Framing B, default) — honest-framing copy: -->
+**Measured numbers** (TBD — from `bench/run.sh` + independent
+cross-check):
 
-cargoless's design priority is **verdict honesty**, not raw
-save→verdict speed. The numbers tell that story.
-
-| Tool | Save→verdict (median) | Save→artifact published | Verdict honesty |
+| Tool | CPU-seconds per save (median) | Peak RSS (MB) | Saves per CPU-minute |
 |---|---|---|---|
-| cargoless | _TBD_ | _TBD_ | publishes green only; pointer atomic |
-| `trunk serve` | _TBD_ | _TBD_ | serves on every build, red or green |
-| `bacon` | _TBD_ | n/a (terminal-only) | terminal-only |
+| cargoless | _TBD_ | _TBD_ | _TBD_ |
+| `trunk serve` | _TBD_ | _TBD_ | _TBD_ |
+| `bacon` | _TBD_ | _TBD_ | _TBD_ |
 
-On a real Leptos project, cargoless's save→verdict latency lands at
-_TBD_ — driven by cargo-check's authoritative-tier compilation step,
-which dominates the wall-clock no matter which tool wraps it. **This
-is not a clean speed win** against bacon's terminal-output cycle:
-bacon writes to a terminal pseudo-tty; cargoless writes to a process
-event stream that other tools can subscribe to. Different
-trade-offs.
-
-Where cargoless's numbers stand out is the **save→publish-of-green**
-column: no other tool here publishes a green-only pointer. `trunk
-serve` publishes everything; `bacon` publishes nothing. The cargoless
-column is the only one where downstream consumers can rely on the
-artifact being servable.
-
-<!--
-TBD-POSITIONING (Framing A, speed-first) — alternative honest copy:
-
-cargoless prioritized save→verdict latency from day one. The numbers:
+For raw save→verdict latency (the inner-loop responsiveness number,
+secondary to throughput for cargoless's positioning):
 
 | Tool | Save→verdict (median) | Save→artifact published |
 |---|---|---|
-| cargoless | _TBD — sub-1s_ | _TBD_ |
+| cargoless | _TBD_ | _TBD_ |
 | `trunk serve` | _TBD_ | _TBD_ |
-| `bacon` | _TBD_ | n/a |
+| `bacon` | _TBD_ | n/a (terminal-only) |
 
-cargoless wins (1) save→verdict against `trunk serve` by _TBDx_
-because it doesn't rebuild on every save — it queries a warm rust-
-analyzer. It loses against `bacon` on raw verdict latency because
-bacon does less (no artifact, no cross-process consumer), but it
-wins (2) save→artifact because cargoless can dedupe via its
-content-addressed cache when the source state hasn't really changed.
-
-Headline: faster than `trunk serve` on the inner loop, honest about
-what it doesn't replace.
--->
+On a real Leptos project, save→verdict for all three tools lands
+within the cargo-check-bound band — none of them are racing each
+other on raw wall-clock. **The interesting wins are on the
+throughput rows.** When the input set hasn't changed, cargoless does
+~zero work; the other two redo the full build's worth of work
+because they don't know it's already been done. Over a day of
+dev-cycles, that compounds — into measurable battery life, into
+measurable fan-noise, into measurable thermal headroom for the rest
+of your local stack.
 
 **Methodology** (because numbers without methodology are decoration):
 
 - **Bench fixture:** a real Leptos CSR `cdylib + rlib` project, ≥17
   files / 922 LOC. The bench harness refuses to shrink the fixture
   for flatter numbers.
-- **Two-mode reporting:** checker mode (save→verdict) and artifact
-  mode (save→publish) reported **separately**, never blended into a
-  single "median latency" number. cargoless makes no sub-second
-  artifact-publish claim.
-- **Identical driver:** the same save events on the same fixture
-  feed all three tools; `(t_verdict - t_save)` is sampled from a
-  monotonic clock.
+- **Throughput measurement:** CPU-seconds + peak RSS sampled from
+  the OS over a full edit session (N saves at fixed interval,
+  including a mix of substantive and no-op edits to exercise the
+  CAS-skip path). Reported as per-save median and peak. Driver
+  records `getrusage()` deltas around each save event.
+- **Two-mode latency reporting:** checker mode (save→verdict) and
+  artifact mode (save→publish) reported **separately**, never
+  blended into a single "median latency" number. cargoless makes no
+  sub-second artifact-publish claim.
+- **Identical driver across tools:** the same save events on the
+  same fixture feed cargoless, `trunk serve`, and `bacon`. Wall-clock
+  measurements use a monotonic clock.
+- **Independent cross-check:** a second host runs the same harness
+  against the same fixture to confirm the numbers reproduce off the
+  primary builder pod.
 - **Reproducible:** the harness lives at `bench/run.sh` in the repo;
-  rerun it on your machine.
+  rerun it on your machine and tell us if you see different numbers.
 
-The full bench report and the AC#7 verdict commit-status live at
-`s1-ac2-verdict` and `ac7-verdict` keys on the release SHA.
+The full report and verdict commit-status live at `s1-ac2-verdict`
+and `ac7-verdict` keys on the release SHA.
 
 ---
 
@@ -405,12 +395,17 @@ the tool report when it breaks.
 > the ≥2 reviewers (one outside the team) have a concrete checklist
 > for AC#9 sign-off.
 
-- [ ] Headline value-prop matches the operator-locked TBD-POSITIONING
-      decision (Framing A or Framing B) — the alternative is removed,
-      not commented-out.
-- [ ] All `<!-- TBD -->` markers replaced with concrete copy.
-- [ ] AC#7 bench numbers populated in the comparison table + body
-      paragraphs; methodology paragraph matches actual bench shape.
+- [ ] Headline value-prop matches the operator-locked **Framing C**
+      ("cargoless doesn't burn your CPU" — throughput-not-speed) and
+      the throughput-first comparison tables are intact.
+- [ ] All `<!-- TBD-NUMBERS -->` markers replaced with concrete copy
+      from bench-lead's throughput report + perf-recon cross-check.
+- [ ] Throughput numbers (CPU-seconds per save, peak RSS, saves per
+      CPU-minute) populated in the comparison tables + body
+      paragraphs; methodology paragraph matches the actual bench
+      shape used to produce them.
+- [ ] Latency table populated (cargo-check-bound on all three tools;
+      no sub-second artifact-publish claim).
 - [ ] D1 product name resolved; every `<pubname>` and `cargoless` /
       `tftrunk` instance audited for consistency with the picked
       name.
