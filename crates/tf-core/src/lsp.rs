@@ -90,14 +90,23 @@ impl PublishDiagnostics {
     }
 }
 
-/// What the reader thread streams to the model: either a diagnostics
-/// notification or the boundary of a completed flycheck (`cargo check`) pass.
+/// What the reader thread streams to the model: a diagnostics notification,
+/// the boundary of a completed flycheck (`cargo check`) pass, or the
+/// boundary of RA's initial workspace indexing (FIELD FINDING #3a).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspEvent {
     Diagnostics(PublishDiagnostics),
     /// RA reported a flycheck/`cargo check` `$/progress` `end`. The set of
     /// `source:"rustc"` diagnostics as of now is an AUTHORITATIVE snapshot.
     FlycheckEnded,
+    /// FIELD FINDING #3a: RA reported `$/progress` `end` for its initial
+    /// project-indexing (workspace scan / proc-macro server bring-up /
+    /// dependency analysis). Before this signal, RA is publishing diagnostics
+    /// from an *incomplete* model and the one-shot check loop must NOT
+    /// settle-early on its quiet windows. This is what "project ready"
+    /// means in LSP terms — the same signal a human IDE waits for before
+    /// trusting "Go to Definition".
+    IndexingEnded,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,26 +262,17 @@ pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
     })
 }
 
-/// True iff `v` is a `$/progress` notification ending a flycheck /
-/// `cargo check` pass. RA's flycheck progress carries `"check"` in its token
-/// or title; matching generously on that (case-insensitive) is safe because
-/// a missed end only degrades to the model's settle/timeout path — it can
-/// never manufacture a false green (the model needs a *seen* end to upgrade
-/// to authoritative).
-pub fn extract_flycheck_end(v: &Value) -> bool {
+/// Common pre-check: `v` is a `$/progress` notification with `kind: "end"`.
+/// Returns the lowercased (`token`, `title`) tuple for the caller's
+/// generous matching, or `None` if `v` is not such a notification.
+fn progress_end_token_title(v: &Value) -> Option<(String, String)> {
     if v.get("method").and_then(Value::as_str) != Some("$/progress") {
-        return false;
+        return None;
     }
-    let params = match v.get("params") {
-        Some(p) => p,
-        None => return false,
-    };
-    let value = match params.get("value") {
-        Some(x) => x,
-        None => return false,
-    };
+    let params = v.get("params")?;
+    let value = params.get("value")?;
     if value.get("kind").and_then(Value::as_str) != Some("end") {
-        return false;
+        return None;
     }
     let token = params
         .get("token")
@@ -284,7 +284,54 @@ pub fn extract_flycheck_end(v: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
+    Some((token, title))
+}
+
+/// True iff `v` is a `$/progress` notification ending a flycheck /
+/// `cargo check` pass. RA's flycheck progress carries `"check"` in its token
+/// or title; matching generously on that (case-insensitive) is safe because
+/// a missed end only degrades to the model's settle/timeout path — it can
+/// never manufacture a false green (the model needs a *seen* end to upgrade
+/// to authoritative).
+pub fn extract_flycheck_end(v: &Value) -> bool {
+    let Some((token, title)) = progress_end_token_title(v) else {
+        return false;
+    };
+    // Guard: the indexing-end is also a `$/progress`/`end`; it is NOT a
+    // flycheck end. Without this, RA's first indexing-end would falsely
+    // trip the flycheck-end path and let the check loop upgrade to
+    // Authoritative without a real cargo-check pass.
+    if title.contains("indexing") || title.contains("scanning") || token.contains("indexing") {
+        return false;
+    }
     token.contains("check") || title.contains("check") || title.contains("flycheck")
+}
+
+/// FIELD FINDING #3a: true iff `v` is a `$/progress` notification ending RA's
+/// initial workspace indexing (or the related roots-scanning / proc-macro
+/// server bring-up phases that gate "the model is ready"). Generous matching
+/// on the lowercased token/title so RA version bumps that rename
+/// `rustAnalyzer/Indexing` → `rust-analyzer/indexing` (or similar) keep
+/// working. False positives are SAFE here — the worst case is allowing the
+/// check loop to settle-early as it did before the fix; false negatives are
+/// the trust-broken case (cold-start false-red), so we accept slightly more
+/// permissive matching than `extract_flycheck_end`.
+pub fn extract_indexing_end(v: &Value) -> bool {
+    let Some((token, title)) = progress_end_token_title(v) else {
+        return false;
+    };
+    // Exclude flycheck/check ends — those are signalled separately and the
+    // model treats them with very different authority.
+    if title.contains("check") || token.contains("check") {
+        return false;
+    }
+    token.contains("indexing")
+        || token.contains("rootscanning")
+        || token.contains("rootsscanned")
+        || title.contains("indexing")
+        || title.contains("roots scanned")
+        || title.contains("scanning")
+        || title.contains("loading")
 }
 
 /// `/abs/path` → `file:///abs/path`. v0: assumes an already-absolute,
@@ -463,6 +510,8 @@ fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>) {
                     LspEvent::Diagnostics(pd)
                 } else if extract_flycheck_end(&v) {
                     LspEvent::FlycheckEnded
+                } else if extract_indexing_end(&v) {
+                    LspEvent::IndexingEnded
                 } else {
                     continue;
                 };
@@ -635,6 +684,67 @@ mod tests {
         assert!(!pd.has_authoritative_error());
         assert_eq!(pd.advisory_errors, 1);
         assert!(!pd.is_green());
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #3a — indexing-end detection + flycheck-end disambiguation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn indexing_end_detection_matches_ra_progress_tokens() {
+        // The canonical RA indexing token + an `end` event.
+        let v: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/Indexing",
+                "value":{"kind":"end","title":"Indexing"}}}"#,
+        )
+        .unwrap();
+        assert!(extract_indexing_end(&v), "canonical Indexing/end");
+
+        // Roots-scanned (RA's pre-indexing phase) also gates project-ready.
+        let v2: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/RootsScanned",
+                "value":{"kind":"end","title":"Roots Scanned"}}}"#,
+        )
+        .unwrap();
+        assert!(extract_indexing_end(&v2));
+
+        // Begin/report on the same token is NOT an end.
+        let v3: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/Indexing",
+                "value":{"kind":"begin","title":"Indexing"}}}"#,
+        )
+        .unwrap();
+        assert!(!extract_indexing_end(&v3));
+
+        // A flycheck end is NOT an indexing end (they ride the same
+        // `$/progress`/`end` shape; the cargo-check token must not leak).
+        let v4: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/cargoCheck",
+                "value":{"kind":"end","title":"cargo check"}}}"#,
+        )
+        .unwrap();
+        assert!(!extract_indexing_end(&v4));
+    }
+
+    #[test]
+    fn flycheck_end_does_not_match_indexing_end() {
+        // The reverse direction: an indexing end must NOT be misread as a
+        // flycheck end (the bug the #43 fix exists to prevent — RA's first
+        // indexing-end firing before any real cargo-check pass would let the
+        // check loop upgrade to Authoritative on incomplete data).
+        let idx: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/Indexing",
+                "value":{"kind":"end","title":"Indexing"}}}"#,
+        )
+        .unwrap();
+        assert!(!extract_flycheck_end(&idx), "indexing end is NOT flycheck");
+        // Roots-scanned likewise.
+        let rs: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/RootsScanned",
+                "value":{"kind":"end","title":"Roots Scanned"}}}"#,
+        )
+        .unwrap();
+        assert!(!extract_flycheck_end(&rs));
     }
 
     #[test]

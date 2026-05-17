@@ -244,6 +244,18 @@ impl Model {
                 self.reconcile();
                 self.emit_advisory();
             }
+            LspEvent::IndexingEnded => {
+                // FIELD FINDING #3a: the watch-mode model's authoritative
+                // GREEN is already correctly gated on `flycheck_done` (the
+                // #21 rule), and a real RA only fires a flycheck pass AFTER
+                // indexing completes — so the model itself does not need to
+                // gate on indexing here. The signal exists in this enum to
+                // un-stick the one-shot `check_*` loops (which were
+                // settle-early-breaking before the first flycheck on cold
+                // RA); the watch loop sees it pass through and ignores it.
+                // A future "still warming up" UI signal could light up off
+                // this — out of #43 scope.
+            }
         }
     }
 
@@ -393,6 +405,13 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
     let mut auth: BTreeMap<String, FileState> = BTreeMap::new();
     let mut flycheck_seen = false;
     let mut got_any = false;
+    // FIELD FINDING #3a: RA fires advisory `publishDiagnostics` during
+    // indexing (got_any=true), then goes quiet for 5-10s while the rest of
+    // indexing/proc-macro-bringup completes; the old code's "if got_any
+    // and Timeout, break early" path fired during THAT quiet and reported
+    // the unproven red. Gate the early-break on `indexing_done` so cold
+    // RA gets the project-ready signal it deserves before we give up.
+    let mut indexing_done = false;
     while !flycheck_seen {
         let now = Instant::now();
         if now >= deadline {
@@ -414,9 +433,15 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
             Ok(LspEvent::FlycheckEnded) => {
                 flycheck_seen = true;
             }
+            Ok(LspEvent::IndexingEnded) => {
+                indexing_done = true;
+            }
             Err(RecvTimeoutError::Timeout) => {
-                if got_any {
-                    break; // settled without an authoritative pass
+                // Only allow settle-early once RA has actually finished
+                // indexing — otherwise the quiet IS the indexing window
+                // and breaking here false-reds a green tree (#43).
+                if got_any && indexing_done {
+                    break;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break, // RA exited
@@ -504,6 +529,12 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
     let mut diagnostics: BTreeMap<String, Vec<Diagnostic>> = BTreeMap::new();
     let mut flycheck_seen = false;
     let mut got_any = false;
+    // FIELD FINDING #3a: identical gate to `check_verdict`. The false-red
+    // on a cold green tree happens because RA fires advisory diags during
+    // indexing, then goes silent — the old settle-early-on-got_any path
+    // mistook the silence for completion. `indexing_done` blocks the
+    // early-break until RA has actually announced project-ready.
+    let mut indexing_done = false;
     while !flycheck_seen {
         let now = Instant::now();
         if now >= deadline {
@@ -530,9 +561,12 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
             Ok(LspEvent::FlycheckEnded) => {
                 flycheck_seen = true;
             }
+            Ok(LspEvent::IndexingEnded) => {
+                indexing_done = true;
+            }
             Err(RecvTimeoutError::Timeout) => {
-                if got_any {
-                    break; // settled without an authoritative pass
+                if got_any && indexing_done {
+                    break; // settled, project ready, no authoritative pass
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break, // RA exited
