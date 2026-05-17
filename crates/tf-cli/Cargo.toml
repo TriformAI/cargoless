@@ -21,7 +21,7 @@ tf-core = { path = "../tf-core" }
 # cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)
 #
 # Cargo treats [package.metadata.*] as opaque (it does NOT validate the
-# contents), so this stub lands TODAY without touching any compile/test/fmt/
+# contents), so this stub lands without touching any compile/test/fmt/
 # clippy gate. Only `cargo-binstall` itself reads these keys, at install
 # time on a user's machine, to fetch a prebuilt tarball instead of compiling
 # from source.
@@ -38,26 +38,32 @@ tf-core = { path = "../tf-core" }
 #   {target}          — target triple, e.g. x86_64-unknown-linux-gnu
 #   {archive-suffix}  — derived from pkg-fmt, e.g. ".tgz"
 #
-# TODO(D-RELEASE §8 #8 — launch-blocker, dogfood-lead 2026-05-17):
+# §8 #8 RESOLUTION (2026-05-17, operator picked (b) GitHub mirror):
 #   `{repo}` resolves from `[workspace.package].repository` in the root
-#   Cargo.toml (currently `https://forgejo.triform.dev/triform/cargoless`).
-#   forgejo.triform.dev is auth-walled on git protocol endpoints — anonymous
-#   `cargo install --git` AND anonymous binstall asset-fetch may both 401.
-#   Reserved operator decision pending: (a) flip Forgejo repo to public, (b)
-#   mirror to github.com and re-point repository=, (c) document auth. Until
-#   resolved, the URL template stays templated — flipping the value is a
-#   one-line root Cargo.toml change. If (b) chosen, this ALSO resolves the
-#   Mac-builder open question (§8 #2) via GH Actions free-tier macOS runners.
+#   Cargo.toml. Currently `https://forgejo.triform.dev/triform/cargoless`
+#   (legacy from pre-§8-#8 design). After the operator confirms the GitHub
+#   org/repo name (clarifying question in flight), root Cargo.toml's
+#   `repository` flips to `https://github.com/<ORG>/cargoless` and the
+#   {repo} template re-resolves to GitHub release-asset URLs — no change
+#   needed here. The flip is a one-line edit; this template stays templated.
+#   Compound bonus: §8 #8 (b) ALSO resolves §8 #2 (Mac builder) via GH
+#   Actions free-tier macOS runners. See D-RELEASE §1.1 for runner split.
 #
-# First release ships exactly one prebuilt: Linux x86_64-gnu. On macOS, no
-# asset matches and binstall gracefully degrades to `cargo install` (its
-# documented fallback). That is INTENTIONAL HONESTY for 0.1.0; see
-# D-RELEASE §3.2 / §8 #2 for the Mac-builder operator-decision.
+# First release ships THREE prebuilts (D-RELEASE §3):
+#   - x86_64-unknown-linux-gnu  (GH Actions ubuntu-latest)
+#   - aarch64-apple-darwin       (GH Actions macos-14, Apple Silicon)
+#   - x86_64-apple-darwin        (GH Actions macos-13, Intel)
+# All three follow the same tarball layout, so ONE pkg-url template + ONE
+# bin-dir entry covers all targets — no per-target overrides needed for
+# 0.1.0. (Overrides example below is for hypothetical future Windows etc.)
 # ──────────────────────────────────────────────────────────────────────────
 [package.metadata.binstall]
-# Forgejo release-asset URL shape: GitHub-compatible
-# /{repo}/releases/download/v{version}/{filename}.
-# TODO(D-RELEASE §8 #6): verify on one throwaway test tag before first real fire.
+# GitHub release-asset URL shape: /{owner}/{repo}/releases/download/v{version}/{file}
+# Same shape as Forgejo's (Gitea follows GitHub's convention), so the template
+# is portable — only the {repo} value changes when [workspace.package].repository
+# flips from Forgejo to GitHub.
+# TODO(D-RELEASE §8 #6): verify on one throwaway test tag (e.g., v0.0.1-rc.1)
+# before first real fire.
 pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target}{archive-suffix}"
 pkg-fmt = "tgz"
 
@@ -67,14 +73,16 @@ pkg-fmt = "tgz"
 #     README.md
 #     LICENSE
 # TODO(D1/CWDL-12): if D1 renames the binary from `tftrunk`, update both
-# this `bin-dir` AND release.yml.draft's `strip` + tarball-package step.
-# These three places MUST stay in sync; the design doc and the workflow
-# draft both reference `tftrunk` as the same placeholder.
+# this `bin-dir` AND .github/workflows/release.yml.draft's `strip` + tarball
+# package step. These places MUST stay in sync; the design doc and the
+# workflow draft both reference `tftrunk` as the same placeholder.
 bin-dir = "{name}-v{version}-{target}/tftrunk"
 
-# When macOS prebuilts ship (post-§8 #2 decision, release 0.2.0+), add:
-#   [package.metadata.binstall.overrides."aarch64-apple-darwin"]
-#   pkg-url = "..."
-#   bin-dir = "..."
-# Same for x86_64-apple-darwin if both Mac targets get prebuilts. Until
-# then, omission is correct: binstall falls back to `cargo install`.
+# Per-target overrides not needed for 0.1.0 — all three triples
+# (x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin)
+# share the same tarball layout. If a future target needs a different
+# layout (e.g., Windows .zip post-v1), add:
+#   [package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]
+#   pkg-fmt = "zip"
+#   bin-dir = "{name}-v{version}-{target}/tftrunk.exe"
+# Windows is v1 parking-lot per CLAUDE.md — not in 0.1.0 scope.
