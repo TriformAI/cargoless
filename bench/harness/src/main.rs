@@ -54,7 +54,7 @@ fn main() {
         fixture: PathBuf::from(env_or("FIXTURE_DIR", "bench/fixture")),
         reps: env_ms("REPS", 7) as usize,
         edit_timeout: Duration::from_millis(env_ms("EDIT_TIMEOUT_MS", 8000)),
-        warm_timeout: Duration::from_millis(env_ms("WARM_TIMEOUT_MS", 240_000)),
+        warm_timeout: Duration::from_millis(env_ms("WARM_TIMEOUT_MS", 600_000)),
         settle: Duration::from_millis(env_ms("SETTLE_MS", 2500)),
         ac2_budget_ms: env_ms("AC2_BUDGET_MS", 1000),
     };
@@ -118,17 +118,28 @@ fn main() {
     init.push_str(&format!(
         r#""workspaceFolders":[{{"uri":"{root_uri}","name":"fixture"}}],"#
     ));
-    init.push_str(r#""capabilities":{"textDocument":{"synchronization":{"didSave":true},"#);
-    init.push_str(r#""publishDiagnostics":{"relatedInformation":false}},"#);
-    init.push_str(r#""workspace":{"configuration":true,"workspaceFolders":true}},"#);
+    init.push_str(r#""capabilities":{"window":{"workDoneProgress":true},"#);
+    init.push_str(r#""textDocument":{"synchronization":{"didSave":true},"#);
+    init.push_str(r#""publishDiagnostics":{"relatedInformation":false}}},"#);
+    // NOTE: we deliberately do NOT advertise `workspace.configuration`.
+    // A bare initialize (proven to work in a standalone LSP probe against
+    // this exact RA + fixture) avoids RA pulling config and keeps the
+    // session minimal; initializationOptions below are honored regardless.
     init.push_str(r#""initializationOptions":{"checkOnSave":false,"#);
     init.push_str(r#""cargo":{"buildScripts":{"enable":true},"features":["csr"]},"#);
     init.push_str(r#""procMacro":{"enable":true},"#);
     init.push_str(r#""diagnostics":{"enable":true}}}"#);
+    let dbg = std::env::var("RA_DEBUG").is_ok();
+    if dbg {
+        eprintln!("[dbg] initialize sent ({} bytes)", init.len());
+    }
     lsp.request("initialize", &init);
 
     // Drain until the initialize *response* (id echoed) comes back.
-    lsp.await_response(1, Duration::from_secs(60));
+    let init_ok = lsp.await_response(1, Duration::from_secs(60));
+    if dbg {
+        eprintln!("[dbg] initialize response received = {init_ok}");
+    }
     lsp.notify("initialized", "{}");
 
     // ---- targets -------------------------------------------------------
@@ -204,12 +215,17 @@ fn spawn_ra(bin: &str, cwd: &Path) -> std::io::Result<Ra> {
         }
     });
 
-    // Drain stderr so RA never blocks on a full pipe; discard contents.
+    // Drain stderr so RA never blocks on a full pipe. Normally discarded;
+    // if $RA_STDERR_LOG is set, tee it to that file for diagnosis.
     if let Some(err) = child.stderr.take() {
+        let log = std::env::var("RA_STDERR_LOG").ok();
         thread::spawn(move || {
             let mut r = BufReader::new(err);
             let mut sink = String::new();
             let _ = r.read_to_string(&mut sink);
+            if let Some(path) = log {
+                let _ = std::fs::write(path, sink.as_bytes());
+            }
         });
     }
 
@@ -415,38 +431,57 @@ fn warm_up(lsp: &mut Lsp, max: Duration, settle: Duration) -> (Duration, &'stati
     let start = Instant::now();
     let deadline = start + max;
     let mut saw_index_end = false;
+    let mut saw_diag = false;
 
-    // Phase 1: wait for an indexing/cache-priming progress to *end*.
+    // Phase 1: a leptos workspace (≈197 crates) primes cold for ~45-60s,
+    // emitting thousands of $/progress notifications. RA is "ready" when
+    // it has (a) ENDed an Indexing/cachePriming/Building/Loading progress
+    // AND (b) published diagnostics for an opened doc at least once
+    // (empirically verified against this RA + fixture). That pair is the
+    // honest warm gate — NOT global silence (RA may stay chatty), and NOT
+    // a fixed sleep. Cold prime time is setup, not the AC#2 metric.
     while Instant::now() < deadline {
         match lsp.recv(deadline.saturating_duration_since(Instant::now())) {
             Some(raw) => {
                 if raw.contains("\"$/progress\"")
                     && raw.contains("\"kind\":\"end\"")
-                    && (raw.contains("ndex") || raw.contains("rime") || raw.contains("oadi"))
+                    && (raw.contains("ndex")
+                        || raw.contains("rime")
+                        || raw.contains("uild")
+                        || raw.contains("oad"))
                 {
                     saw_index_end = true;
+                }
+                if raw.contains("\"textDocument/publishDiagnostics\"") {
+                    saw_diag = true;
+                }
+                if saw_index_end && saw_diag {
                     break;
                 }
             }
+            None => break, // RA fell silent
+        }
+    }
+
+    // Phase 2: brief grace drain so any trailing post-index analysis
+    // flushes before we start measuring (bounded; not the readiness gate).
+    while Instant::now() < deadline {
+        match lsp.recv(settle) {
+            Some(_) => continue,
             None => break,
         }
     }
 
-    // Phase 2: settle — drain until `settle` of total silence.
-    while Instant::now() < deadline {
-        match lsp.recv(settle) {
-            Some(_) => continue,
-            None => {
-                let why = if saw_index_end {
-                    "indexing ended + quiet"
-                } else {
-                    "quiet (no indexing-end seen)"
-                };
-                return (start.elapsed(), why);
-            }
-        }
-    }
-    (start.elapsed(), "warm timeout hit")
+    let why = if saw_index_end && saw_diag {
+        "indexing-end + diagnostics seen"
+    } else if saw_index_end {
+        "indexing-end seen (no diagnostics)"
+    } else if Instant::now() >= deadline {
+        "warm timeout hit"
+    } else {
+        "RA fell silent early"
+    };
+    (start.elapsed(), why)
 }
 
 struct ScenarioResult {
@@ -603,14 +638,24 @@ fn diag_count(raw: &str) -> usize {
     raw.matches("\"severity\"").count()
 }
 
+// JSON-RPC discrimination. A RESPONSE carries `result`/`error`; a server→
+// client REQUEST carries `method` + `id` and NO result/error. RA's
+// initialize *result* embeds capability strings that can contain the
+// substring "method" (e.g. command names), so keying "is this a request?"
+// purely on a "method" substring mis-fired and made the harness reply a
+// bogus Response to RA's initialize result — RA then aborted with
+// `expected initialized notification, got: Response`. The result/error
+// guard is the fix: a message with result/error is NEVER a request.
+fn is_response(raw: &str) -> bool {
+    (raw.contains("\"result\"") || raw.contains("\"error\"")) && has_top_level_id(raw)
+}
+
 fn is_server_request(raw: &str) -> bool {
-    raw.contains("\"method\"") && has_top_level_id(raw)
+    raw.contains("\"method\"") && has_top_level_id(raw) && !is_response(raw)
 }
 
 fn is_response_to(raw: &str, id: i64) -> bool {
-    !raw.contains("\"method\"")
-        && (raw.contains("\"result\"") || raw.contains("\"error\""))
-        && extract_id(raw).as_deref() == Some(&id.to_string())
+    is_response(raw) && extract_id(raw).as_deref() == Some(&id.to_string())
 }
 
 fn has_top_level_id(raw: &str) -> bool {
