@@ -237,13 +237,16 @@ pub(crate) fn cargo_toml_signals_proc_macro(text: &str) -> bool {
 ///      snippets.custom, assist.expressionFillDefault, references.
 ///      excludeImports — all idle-cost reductions on signals cargoless
 ///      doesn't consume.
-/// #112-B Tier-2 — RA salsa LRU cap. Default 64 (half RA's built-in
-/// 128): a deliberate RAM↔recompute trade for cargoless's batchy
-/// agent-edit access pattern. Correctness-neutral (eviction →
-/// recompute → identical result). `TF_RA_LRU_CAP` overrides for
-/// bench-lead's RSS/recompute sweep; clamped to ≥16 so a fat-finger
-/// value cannot drive pathological thrash, and a non-numeric value
-/// falls back to the default rather than erroring.
+/// #112-B Tier-2 — RA salsa LRU cap. Default is 64, deliberately half
+/// of rust-analyzer's built-in default of 128: a RAM-vs-recompute trade
+/// tuned for cargoless's batchy agent-edit access pattern.
+/// Correctness-neutral — LRU eviction triggers recompute that yields the
+/// identical query result, so this can never change a diagnostic or the
+/// verdict, only latency/CPU (a non-issue between agent batches).
+/// `TF_RA_LRU_CAP` overrides it for bench-lead's RSS/recompute sweep;
+/// the value is clamped to a floor of 16 so a fat-finger setting cannot
+/// drive pathological thrash, and a non-numeric setting falls back to
+/// the default rather than erroring.
 fn ra_lru_capacity() -> u32 {
     const DEFAULT: u32 = 64;
     const FLOOR: u32 = 16;
