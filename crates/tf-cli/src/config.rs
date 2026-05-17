@@ -110,7 +110,10 @@ impl std::error::Error for ConfigError {}
 
 impl Config {
     fn defaults(root: PathBuf, detection: Detection) -> Self {
-        let cache_dir = root.join(".cargoless").join("cache");
+        // Out-of-tree by mandate: build-cas's CAS dedupe (AC#5) breaks if the
+        // cache lives under the watched project root. Default to the user
+        // cache dir, namespaced per canonical project path.
+        let cache_dir = cache_root(&root);
         Self {
             root,
             target: "wasm32-unknown-unknown".to_string(),
@@ -241,6 +244,41 @@ fn unquote(s: &str) -> String {
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(s)
         .to_string()
+}
+
+/// The **out-of-tree** content-addressed cache root for `project_root`.
+///
+/// build-cas requires the CAS to live outside the watched tree (its source
+/// hasher would otherwise fold the cache into the artifact identity and
+/// break AC#5 dedupe). build-cas explicitly delegates the location to the
+/// CLI, so the convention is owned here: the XDG user cache dir (falling
+/// back to `$HOME/.cache`, then the OS temp dir if neither is set),
+/// `cargoless/`, then a stable per-project key so distinct projects never
+/// collide. `clean` and `build --watch` MUST agree — both call this.
+pub fn cache_root(project_root: &Path) -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    let key = format!("{:016x}", fnv1a(&project_root.display().to_string()));
+    base.join("cargoless").join(key)
+}
+
+/// FNV-1a 64-bit — a tiny, stable, dependency-free hash. Used only to derive
+/// a collision-resistant cache subdirectory name from the project path; it
+/// is NOT a content/identity hash (that is build-cas's domain).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 #[cfg(test)]
