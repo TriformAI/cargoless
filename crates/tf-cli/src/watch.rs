@@ -75,9 +75,15 @@ fn print_diagnostics(root: &Path, diags: &[tf_core::Diagnostic]) {
 
 pub fn run(cfg: &Config) -> ExitCode {
     let t0 = Instant::now();
+    // §gap-3 / #89: read the single canonical identity from
+    // `tf_core::BUILD_ID` instead of building a second "cargoless
+    // {ver}" banner off CARGO_PKG_VERSION here. Before #89 this line
+    // was the divergent site — `--version` said "tf-trunk {ver}" while
+    // this said "cargoless {ver}", same binary two names. One source
+    // now; the D1 rename is one literal in tf-core.
     ui::step(format!(
-        "cargoless {} — watching {} ({})",
-        env!("CARGO_PKG_VERSION"),
+        "{} — watching {} ({})",
+        tf_core::BUILD_ID,
         cfg.root.display(),
         cfg.detection.describe()
     ));
