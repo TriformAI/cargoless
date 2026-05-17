@@ -42,11 +42,15 @@ divergence root-caused + fixed + reconciled, none averaged).
 **CPU hog** (~6.9s — it rebundles wasm every save), cargoless does
 **~half** that on both the watch (3.4s) and build (3.7s) paths
 because its state-model rebuilds only on a green-edge. cargoless's
-real weakness is **RSS** (RA-resident ~2 GB default, loses to both).
-Net: **clean two-source CPU win vs trunk on 2 axes, clean RSS loss
-vs both, not like-for-like vs bacon (a checker, not a build+publish
-tool) → MARGINAL** (§7), an
-operator-reserved launch-scope decision.
+real weakness is **RSS** (RA-resident; ~2 GB pre-#114 → **~1.71 GB
+shipped default post-#114 stage-2, −19 % behaviour-neutral**, §10;
+still loses to both in absolute terms). Net: **clean two-source CPU
+win vs trunk on 2 axes, RSS loss vs both but materially shrunk by
+default (not only via `--features`), not like-for-like vs bacon (a
+checker, not a build+publish tool) → MARGINAL** (§7), an
+operator-reserved launch-scope decision. (Stage-1 §9 + #117 anchor
+§9.5 + stage-2 §10 all DELIVERED; stage-3 #116 fleet-scale = the
+remaining Leg-C idle-evict existence answer.)
 
 **Headline numbers (corrected, complete):**
 
@@ -533,10 +537,11 @@ complete data (§2) + the within-cargoless sweep (§5):
 |---|---:|---:|---:|---|
 | CPU-s/edit (watch) | 3.39s | 6.96s | 0.49s | **WIN vs trunk**, LOSE vs bacon |
 | CPU-s/edit (build) | 3.68s | 6.94s | n/a | **WIN vs trunk** (§4 confirmed) |
-| Peak RSS | 2.1-2.3 GB | ~0.5-0.6 GB | 0.24 GB | LOSE vs both |
+| Peak RSS, pre-#114 (the original caveat) | 2.1-2.3 GB | ~0.5-0.6 GB | 0.24 GB | LOSE vs both |
+| **Peak RSS, shipped `ab0d51b` default (#114 Tier-1/2, §10)** | **~1.71 GB** | ~0.5-0.6 GB | 0.24 GB | **LOSE vs both, but −19 % vs pre-#114, behaviour-neutral, no opt-in** |
 | RSS growth | 1.6-1.7 GB | ~13 MB | ~0 | LOSE vs both |
 | CPU-s/edit, **tuned** `--features csr` | **0.24s** | 6.96s | 0.49s | **WIN vs BOTH** |
-| Peak RSS, **tuned** `--features csr` | **0.53 GB** | ~0.55 GB | 0.24 GB | **~TIE/WIN vs trunk**, LOSE vs bacon |
+| Peak RSS, **tuned** `--features csr` (stacks on #114) | **0.53 GB** | ~0.55 GB | 0.24 GB | **~TIE/WIN vs trunk**, LOSE vs bacon |
 
 ### The honest synthesis
 
@@ -546,10 +551,18 @@ complete data (§2) + the within-cargoless sweep (§5):
    trunk rebundles wasm on every save. This is the §4
    architectural-asymmetry, measured and confirmed. **2 contested
    wins vs trunk.**
-2. **cargoless's default RSS is its real weakness** — ~2 GB,
-   RA-resident, monotonic-growth-shaped. It loses RSS vs both trunk
-   and bacon at default config. This is the F5/D-A2 cost in
-   throughput terms; it is honest and must not be hidden.
+2. **cargoless's default RSS is its real weakness — but #114
+   materially shrank it, by default, behaviour-neutrally.** Pre-#114:
+   ~2 GB, RA-resident, monotonic-growth-shaped. **Post-#114 shipped
+   default (§10 stage-2): ~1.71 GB (−19 %)** — driven entirely by
+   Tier-1 `MALLOC_ARENA_MAX=2` reclaiming glibc per-thread-arena
+   fragmentation with zero functional effect (Tier-2 LRU is
+   negligible-on-peak). It still LOSES RSS vs both trunk and bacon in
+   absolute terms — honest, not hidden — but the default gap narrowed
+   ~0.4 GB with no `--features` opt-in, and `--features csr` (point 3)
+   stacks further on top. The fleet-scale "does N×1.71 GB fit a real
+   box" question is Leg C / Tier-4 idle-evict (#116 stage-3), separate
+   from this single-instance figure.
 3. **The shipped `--features csr` knob closes the RSS gap** — tuned,
    cargoless is 0.53 GB / 0.24s, which **wins both axes vs trunk** and
    approaches bacon. The default does NOT auto-narrow (proc-macro-auto
@@ -567,9 +580,10 @@ complete data (§2) + the within-cargoless sweep (§5):
 **Defensible, no-spin:** *"cargoless does roughly half the per-edit CPU
 of `trunk serve` — it rebuilds on confirmed-green edges, not blindly
 on every keystroke like trunk re-bundles. Its memory footprint is
-rust-analyzer-dominated (~2 GB default on proc-macro-heavy projects);
-the shipped `--features` knob cuts that ~75% and a v0.1
-auto-narrowing change moves the default there."*
+rust-analyzer-dominated; the shipped default already reclaims ~19 % of
+that behaviour-neutrally (#114 allocator-arena tuning, ~1.7 GB on
+proc-macro-heavy projects), the `--features` knob cuts a further ~75 %,
+and a v0.1 auto-narrowing change moves the default there."*
 
 This is a **growth-path, CPU-win, honest-RSS-caveat** story. It is NOT
 a clean AC#7 PASS (RSS loses at default) and NOT a FAIL (a real,
@@ -852,17 +866,21 @@ the *bottom* of the bracket (~0 % on `.rs`), which selects the
 stage-1 in any launch decision: the lever is mechanism-real but its
 *realised* benefit for how this fleet writes is ≈ 0 %.
 
-### 9.4 Stage-2 (per-tier RSS-delta) — queued
+### 9.4 Stage-2 (per-tier RSS-delta) — DELIVERED → see §10
 
 Per the lead's two-stage split, stage-2 (per-tier RSS-delta vs the
-§8.5 two-source ~2.0–2.3 GB baseline, for dev-fixer's #114 RAM tiers:
-allocator/jemalloc, lru-cap + #74-knobs-default, proc-macro-off-default,
-idle-evict-RA) is double-gated on the lead's "tiers-ready @ &lt;sha&gt;"
-relay and runs as a SECOND pass on the same harness shape. Its
-combined {fired-check-reduction, per-tier RSS-delta} is what reshapes
-the held launch-scope (a material RSS drop shrinks/removes the §7
-honest-RSS-caveat rather than merely `--features`-mitigating it). Not
-blocking — stage-1 above is the gating CPU datum and is DELIVERED.
+§8.5 two-source ~2.0–2.3 GB baseline, for dev-fixer's #114 RAM tiers)
+ran as a SECOND pass on the same harness shape, gated on the lead's
+"tiers-ready @ `ab0d51b`" relay. **DELIVERED — full 2×2 factorial
+result, validity gate, interaction term, and the §7 honest-RSS-caveat
+reassessment are in §10.** Headline: the shipped `ab0d51b` default
+reclaims **−19 % peak RSS behaviour-neutrally** (Tier-1
+`MALLOC_ARENA_MAX=2` is the load-bearing rung; Tier-2 LRU negligible
+on peak) — this *shrinks* the §7 caveat at default config, it does
+not merely `--features`-mitigate it. Stage-1 (§9.1-9.3) + its #117
+field anchor (§9.5) + stage-2 (§10) are all DELIVERED; stage-3
+(#116 fleet-scale, the Leg-C idle-evict existence answer) self-
+sequences next.
 
 ### 9.5 #117 field anchor — DELIVERED (the spectrum point for THIS fleet)
 
@@ -935,6 +953,98 @@ window, measured directly in stage-2/§10 and stage-3/#116 — it does
 not depend on the trigger firing). This does not weaken the §8.5
 two-source ~2× CPU-win vs `trunk` (that stands on its own); it
 narrows the *additional* structural-trigger claim to honest size.
+
+---
+
+## 10. Stage-2 — per-tier RSS-delta (#119, dev-fixer tiers @ `ab0d51b`) — DELIVERED
+
+The §9.4 second pass: the launch-scope-load-bearing question — *does
+dev-fixer's #114 tiered RAM ladder materially shrink cargoless's
+honest-RSS weakness (§7), behaviour-neutrally, by default?* Measured
+as a clean **2×2 factorial** (Tier-1 {off,on} × Tier-2 LRU {128,64})
++ the combined shipped default.
+
+**Provenance / controls.** Code-under-test pinned `ab0d51b` (Tier-1
+`apply_ra_allocator_env` + Tier-2 `ra_lru_capacity`, verified
+present); instrument `bench/throughput.py @ agent/bench-lead` — the
+*same instrument that produced the §8.5 anchor* (reps=15, 8 s
+inter-edit, `watch` mode). Structural-trigger **OFF** (isolates pure
+Tier-1/2 vs the no-trigger §8.5 anchor; the §9.5 ~0 % trigger result
+is orthogonal). Identical binary across all four arms
+(`bin_sha16=576b34e6581dc19f`, single distinct value — provenance
+proven, not a per-arm rebuild). Builder box **230 GB / 64-core** (not
+16 GB localhost) ⇒ peak RSS is pure *demand*, no memory-pressure /
+swap confound. A4 jemalloc arm **not measurable** (no libjemalloc on
+the builder) — honestly dropped, not fabricated. v2 re-run after a
+disclosed harness bug (throughput.py's SIGKILL `_reap` orphaned
+`.cargoless/cli-status` → #93 dual-watch guard refused arms 2-4;
+v1 discarded, not salvaged); v2 per-arm `.cargoless/` pre-clean makes
+every arm run the *real shipped first-watcher path* (guard NOT
+disabled) — all 4 arms `root-clean=YES`, daemon "verdict pipeline
+live", zero refusals.
+
+**Validity gate (A0 in-band).** A0 (pre-tier: `TF_RA_ALLOC=off` +
+`TF_RA_LRU_CAP=128`) = **2,119,148 kb ≈ 2.12 GB**, squarely inside the
+§8.5 two-source ~2.0–2.3 GB band (and ≈ the §5/§8-A2 post-RA-polish
+default 2.08 GB). The instrument + `ab0d51b` binary reproduce the
+anchor ⇒ the per-tier deltas below are trustworthy as **pure tier
+effects**, not instrument/substrate drift.
+
+| Arm | Tier-1 (`MALLOC_ARENA_MAX=2`) | Tier-2 (RA LRU) | peak RSS (kb) | Δ vs A0 | cpu-s/edit |
+|---|---|---|---:|---:|---:|
+| **A0** pre-tier | off (`TF_RA_ALLOC=off`) | 128 | 2,119,148 | — baseline | 3.265 |
+| **A1** Tier-1 only | **on** (default) | 128 | 1,689,368 | **−429,780 (−20.3 %)** | 3.498 |
+| **A2** Tier-2 only | off | **64** (default) | 2,074,108 | **−45,040 (−2.1 %)** | 3.453 |
+| **A3** combined = **shipped `ab0d51b` default** | **on** | **64** | 1,710,952 | **−408,196 (−19.3 %)** | 3.265 |
+
+**Isolated tier deltas + interaction (the factorial's payoff):**
+- **Tier-1 (`MALLOC_ARENA_MAX=2`) is the entire story: −420 MiB /
+  −20.3 % alone.** dev-fixer's glibc-per-thread-arena-fragmentation
+  hypothesis is **empirically confirmed** — RA is heavily
+  multithreaded; capping glibc arenas to 2 reclaims ~0.4 GB of pure
+  fragmentation with **zero functional effect** (`MALLOC_ARENA_MAX` is
+  consumed by glibc malloc only; never touches analysis output).
+- **Tier-2 (RA LRU 128→64): −44 MiB / −2.1 % alone, ≈ 0 on top of
+  Tier-1.** Predicted-additive reduction = 22.4 %; actual combined
+  = 19.3 % ⇒ **sub-additive interaction +66 MiB**: once Tier-1's
+  arena-cap shrinks the heap, the LRU-cap has little incremental
+  *peak* to reclaim. Tier-2's real value is the working-set /
+  recompute trade, **not** peak RSS — reported as measured, not as
+  hoped.
+- Combined (shipped default) ≈ Tier-1 alone (A3 1.711 GB vs A1
+  1.689 GB; the 22 MiB gap is within single-run peak-RSS
+  max-statistic noise, ~1 %).
+- **CPU/​RAM trade:** Tier-1 costs ~+7 % cpu-s/edit (3.265→3.498;
+  marginal allocator contention from fewer arenas) for −20.3 % peak
+  RSS. Given operator priority #1 = RAM, this is a strongly favourable
+  trade; A3 combined returns to 3.265 (within noise).
+
+**Honest reading — the §7 RSS-caveat shrinks materially, by default.**
+The shipped `ab0d51b` default (A3: Tier-1 default-on + Tier-2
+default-64) reclaims **~0.41 GB / −19 % peak RSS, behaviour-neutrally,
+with NO `--features` opt-in**. cargoless's *default* peak RSS is now
+**~1.71 GB, not ~2.12 GB**. This is the "shrinks/removes the §7
+honest-RSS-caveat rather than merely `--features`-mitigating it"
+outcome: the caveat is now smaller **at default config** for every
+project, with the `--features csr` tuned path (§5: 0.53 GB) stacking
+*on top* for narrowable proc-macro projects. It does **not** flip the
+AC#7 RSS verdict — cargoless at 1.71 GB still LOSES vs `trunk`
+(~0.5 GB) / `bacon` (~0.24 GB) in absolute terms — but the default gap
+narrowed ~0.4 GB with zero functional change. **Leg B (the tiered RAM
+ladder) is now quantified: Tier-1 is the single load-bearing rung;
+Tier-2 is negligible-on-peak.**
+
+**Caveats (per discipline).** Single run per arm (peak RSS is a
+max-statistic; ~1-2 % run-to-run variance — the A1↔A3 22 MiB gap is
+within it; NOT multi-rep-averaged, reported honestly as a single
+clean factorial, not a confidence interval). Structural-trigger off
+(pure Tier-1/2; the §9.5 ~0 % trigger result is a separate leg and
+does not interact here). Fleet-scale RAM — whether ~1.71 GB × N
+agents fits a real box — is **Leg C / Tier-4 idle-evict**, measured
+in stage-3 (#116), *independent* of these single-instance tier
+deltas and of the trigger (idle-evict acts on the idle window; see
+§9.5 scope note). jemalloc (Tier-1 opt-in swap) unmeasured on this
+builder.
 
 ---
 
