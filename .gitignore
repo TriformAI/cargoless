@@ -9,3 +9,7 @@ Cargo.lock.orig
 # open source — the key must NEVER be committed. Keep .mcp.json untracked.
 .mcp.json
 .env
+# Local agent tooling (currently a bulk copy of tf-multiverse's .claude).
+# Internal config + permission lists — must never enter this OSS-bound repo.
+# The project contract lives in /CLAUDE.md (root) + docs/EXECUTION.md instead.
+.claude/
