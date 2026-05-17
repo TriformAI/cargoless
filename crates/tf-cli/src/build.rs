@@ -203,9 +203,29 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
     };
 
     write_status(verdict_of(session.tree_state()));
+    // FIELD FINDING #13b (#88): the publisher watch loop has the SAME
+    // orphan risk as `tftrunk watch` — `tftrunk build --watch --out
+    // dist &` then closing the shell would leave a ~2GB orphan
+    // holding RA + cargo + trunk. Same parent-death guard.
+    let parent = crate::orphan::ParentWatch::capture();
     ui::wait("Ctrl-C to stop. Building latest-green on each green edge…");
 
     loop {
+        // FIELD FINDING #13b: parent-death check first. Graceful
+        // shutdown (session.shutdown reaps RA; statusfile::clear
+        // removes the ghost). Exit 0 — deliberate clean shutdown,
+        // no parent left to read a code anyway.
+        if parent.orphaned() {
+            statusfile::clear(&project_root);
+            ui::warn(
+                "parent process exited — shutting down so no orphaned \
+                 build daemon is left holding rust-analyzer/cargo/trunk \
+                 (FIELD FINDING #13b).",
+            );
+            session.shutdown();
+            return ExitCode::SUCCESS;
+        }
+
         match events.recv_timeout(HEARTBEAT) {
             Ok(tf_core::StateEvent::BecameGreen { identity }) => {
                 ui::ok("GREEN — building");

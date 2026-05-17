@@ -25,6 +25,7 @@ mod build;
 mod check;
 mod clean;
 mod config;
+mod orphan;
 mod statusfile;
 mod ui;
 mod watch;

@@ -139,6 +139,13 @@ pub fn run(cfg: &Config) -> ExitCode {
     // alongside the existing verdict events; mpsc Receivers aren't `Sync`,
     // so we keep them both in this single thread.
     let lifecycle = session.subscribe_lifecycle();
+    // FIELD FINDING #13b (#88): snapshot the parent pid BEFORE the loop.
+    // `tftrunk watch &` then closing the shell would otherwise leave
+    // this daemon orphaned, holding rust-analyzer + cargo + ~2GB RSS,
+    // until the user `pkill`s it by hand. Polled cheaply each loop
+    // iteration; on parent-death we run the same graceful shutdown the
+    // Disconnected path uses.
+    let parent = crate::orphan::ParentWatch::capture();
     ui::wait("Ctrl-C to stop. Streaming verdicts…");
 
     // Single-thread drain (Receiver is not Sync). recv_timeout = heartbeat:
@@ -155,6 +162,25 @@ pub fn run(cfg: &Config) -> ExitCode {
     // surfaced to the user inside one HEARTBEAT, even if the verdict
     // stream stays silent during the post-restart reindex window.
     loop {
+        // FIELD FINDING #13b (#88): parent-death check FIRST — if the
+        // shell that launched us is gone, do NOT keep running as a
+        // ~2GB orphan. Same graceful shutdown as the Disconnected
+        // path (session.shutdown() reaps RA via the AC#6 Supervisor +
+        // #44/#61 ReapOnDrop; statusfile::clear removes the ghost so a
+        // later `status` doesn't show F10-style live-for-a-dead-tree).
+        // Exit 0: this is a deliberate clean shutdown, not an error
+        // (and there's no parent left to read an exit code anyway).
+        if parent.orphaned() {
+            statusfile::clear(&root);
+            ui::warn(format!(
+                "{}parent process exited — shutting down so no orphaned \
+                 daemon is left holding rust-analyzer (FIELD FINDING #13b).",
+                stamp(t0)
+            ));
+            session.shutdown();
+            return ExitCode::SUCCESS;
+        }
+
         // Lifecycle drain — cheap, non-blocking, no allocations on the
         // empty path. Belongs OUTSIDE the verdict-event match because a
         // restart can fire while the verdict stream is mid-reindex-silence.
