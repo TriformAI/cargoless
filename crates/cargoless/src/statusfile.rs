@@ -770,7 +770,11 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let mut root = std::env::temp_dir();
-        root.push(format!("cargoless-128-{}-{}", std::process::id(), now_unix()));
+        root.push(format!(
+            "cargoless-128-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
