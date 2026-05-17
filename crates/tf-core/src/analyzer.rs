@@ -43,8 +43,18 @@ struct SupState {
     restarts: u64,
 }
 
+/// Post-(re)spawn hook: invoked with the freshly-spawned child *before* it is
+/// stored, on the initial spawn and on every transparent restart. For
+/// rust-analyzer this is where the LSP `initialize` handshake + document
+/// re-open are re-run so a `kill -9` restart is invisible to subscribers
+/// (the AC#6 guarantee, now in the live serve loop — not just the test).
+/// Called WITHOUT the supervisor state lock held, so it may block on the LSP
+/// handshake without stalling liveness monitoring.
+pub type OnSpawnFn = dyn FnMut(&mut Child) + Send + 'static;
+
 struct Shared {
     spawn: Box<SpawnFn>,
+    on_spawn: Mutex<Box<OnSpawnFn>>,
     state: Mutex<SupState>,
     shutdown: AtomicBool,
 }
@@ -62,8 +72,22 @@ impl Supervisor {
     where
         F: Fn() -> io::Result<Child> + Send + Sync + 'static,
     {
+        Self::start_with_hook(spawn, |_child: &mut Child| {})
+    }
+
+    /// Like [`Supervisor::start`] but also runs `on_spawn` against every
+    /// (re)spawned child before it is stored — the seam the live `watch()`
+    /// pipeline uses to re-establish the LSP session on each transparent
+    /// restart, so AC#6 holds in the real serve loop and not only in the
+    /// integration test.
+    pub fn start_with_hook<F, H>(spawn: F, on_spawn: H) -> io::Result<Self>
+    where
+        F: Fn() -> io::Result<Child> + Send + Sync + 'static,
+        H: FnMut(&mut Child) + Send + 'static,
+    {
         let shared = Arc::new(Shared {
             spawn: Box::new(spawn),
+            on_spawn: Mutex::new(Box::new(on_spawn)),
             state: Mutex::new(SupState {
                 child: None,
                 last_pid: None,
@@ -72,7 +96,8 @@ impl Supervisor {
             shutdown: AtomicBool::new(false),
         });
 
-        let first = (shared.spawn)()?;
+        let mut first = (shared.spawn)()?;
+        invoke_on_spawn(&shared, &mut first);
         {
             let mut st = lock(&shared.state);
             st.last_pid = Some(first.id());
@@ -137,6 +162,14 @@ impl Drop for Supervisor {
     }
 }
 
+/// Run the post-spawn hook against `child`. The `on_spawn` mutex is held
+/// only for the call; the supervisor *state* lock is deliberately NOT held
+/// (the hook may block on an LSP handshake).
+fn invoke_on_spawn(shared: &Shared, child: &mut Child) {
+    let mut hook = shared.on_spawn.lock().unwrap_or_else(|e| e.into_inner());
+    (*hook)(child);
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A poisoned supervisor mutex means a thread panicked holding daemon
     // state; recovering the guard is the least-bad option (the alternative
@@ -186,7 +219,11 @@ fn monitor_loop(shared: Arc<Shared>) {
         }
 
         match (shared.spawn)() {
-            Ok(child) => {
+            Ok(mut child) => {
+                // Re-establish the LSP session on the new process BEFORE it
+                // is visible as the current child — this is what makes the
+                // restart transparent to subscribers (AC#6 in the live loop).
+                invoke_on_spawn(&shared, &mut child);
                 let mut st = lock(&shared.state);
                 st.last_pid = Some(child.id());
                 st.child = Some(child);
@@ -281,6 +318,63 @@ mod tests {
         assert!(sup.current_pid().is_some());
         assert_eq!(sup.restart_count(), 0);
         assert!(sup.is_alive());
+        sup.shutdown();
+    }
+
+    /// The live-pipeline guarantee: the post-spawn hook (where watch()
+    /// re-establishes the LSP session) fires on the initial spawn AND again
+    /// on every transparent restart after a `kill -9`. No rust-analyzer
+    /// needed — a `sleep` stand-in, like the AC#6 test.
+    #[cfg(unix)]
+    #[test]
+    fn on_spawn_hook_fires_on_initial_and_after_kill9_restart() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let sup = Supervisor::start_with_hook(
+            || {
+                Command::new("sleep")
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            },
+            move |_child: &mut Child| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect("start_with_hook");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "hook must fire once on the initial spawn"
+        );
+        let pid1 = sup.current_pid().expect("first pid");
+
+        assert!(
+            Command::new("kill")
+                .arg("-9")
+                .arg(pid1.to_string())
+                .status()
+                .expect("invoke kill(1)")
+                .success()
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if sup.restart_count() >= 1 && calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sup.restart_count() >= 1, "supervisor must have restarted");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "hook must re-fire on the transparent restart (re-init LSP)"
+        );
         sup.shutdown();
     }
 }
