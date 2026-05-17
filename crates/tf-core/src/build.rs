@@ -102,9 +102,16 @@ impl Compiler for TrunkCompiler {
     }
 }
 
+/// Magic+version prefix of the v0 CAS artifact blob. Bumping it is a
+/// deliberate, repo-visible format change — [`unpack_artifact`] rejects any
+/// other header rather than mis-expanding an old blob into `--out`.
+const DIST_BLOB_HEADER: &[u8] = b"tf-core/dist/v1\n";
+
 /// Deterministically serialize a directory tree into one byte blob (sorted,
 /// length-prefixed) so an identical `dist/` always produces identical CAS
-/// bytes. Not a general archive format — just a stable, unambiguous dump.
+/// bytes. Not a general archive format — just a stable, unambiguous dump whose
+/// only reader is [`unpack_artifact`] (the blob layout is owned here; the CLI
+/// never parses CAS internals).
 fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
         let mut kids: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
@@ -133,7 +140,7 @@ fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut buf = Vec::new();
-    buf.extend_from_slice(b"tf-core/dist/v1\n");
+    buf.extend_from_slice(DIST_BLOB_HEADER);
     for (rel, bytes) in &files {
         buf.extend_from_slice(&(rel.len() as u64).to_be_bytes());
         buf.extend_from_slice(rel.as_bytes());
@@ -141,6 +148,122 @@ fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
         buf.extend_from_slice(bytes);
     }
     Ok(buf)
+}
+
+/// Expand a v0 CAS artifact blob (the [`pack_dir`] framing produced by
+/// [`TrunkCompiler`]) into `out_dir`, faithfully recreating the original
+/// `dist/` tree. This is the **inverse of the packer and the only sanctioned
+/// reader of the blob layout** — the CLI calls this so it never has to know
+/// the container format (the open flag cli-ux raised for `build --watch
+/// --out`).
+///
+/// Strict: a wrong/absent header, a truncated record, or a length that
+/// overruns the buffer ⇒ `Err` (a corrupt artifact is never half-expanded into
+/// a servable dir). Path-safe: each entry path is rebuilt from its
+/// forward-slash components with `.`/`..`/absolute/empty segments rejected, so
+/// a malformed blob can never escape `out_dir`. Existing files at the same
+/// relative paths are overwritten; unrelated pre-existing files are left as-is
+/// (v0-simple — the caller owns whether to clear `out_dir` first).
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] for a malformed blob; the underlying
+/// [`io::Error`] for a filesystem failure under `out_dir`.
+pub fn unpack_artifact(blob: &[u8], out_dir: &Path) -> io::Result<()> {
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+
+    let mut cur = blob
+        .strip_prefix(DIST_BLOB_HEADER)
+        .ok_or_else(|| bad("not a cargoless dist blob (bad/absent header)"))?;
+
+    let take = |cur: &mut &[u8], n: usize| -> io::Result<Vec<u8>> {
+        if cur.len() < n {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "artifact blob truncated",
+            ));
+        }
+        let (head, tail) = cur.split_at(n);
+        *cur = tail;
+        Ok(head.to_vec())
+    };
+    let take_u64 = |cur: &mut &[u8]| -> io::Result<u64> {
+        Ok(u64::from_be_bytes(
+            take(cur, 8)?
+                .try_into()
+                .map_err(|_| bad("short length field"))?,
+        ))
+    };
+
+    while !cur.is_empty() {
+        let rel_len =
+            usize::try_from(take_u64(&mut cur)?).map_err(|_| bad("path length exceeds usize"))?;
+        let rel = String::from_utf8(take(&mut cur, rel_len)?)
+            .map_err(|_| bad("entry path is not UTF-8"))?;
+        let content_len = usize::try_from(take_u64(&mut cur)?)
+            .map_err(|_| bad("content length exceeds usize"))?;
+        let content = take(&mut cur, content_len)?;
+
+        // Rebuild the destination from sanitized components — never trust the
+        // blob to stay inside out_dir.
+        let mut dest = out_dir.to_path_buf();
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return Err(bad("unsafe component in artifact path"));
+            }
+            dest.push(seg);
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, &content)?;
+    }
+    Ok(())
+}
+
+/// Outcome of [`materialize_latest_green`] — distinct so the CLI can render
+/// honest `status` / `build --watch --out` states without guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Materialized {
+    /// No green build has been published yet (pointer absent).
+    NoGreen,
+    /// The pointer is present but the CAS no longer holds the bytes (cache
+    /// evicted / `clean`'d). Nothing was written to `out_dir`; the caller
+    /// should treat this as "no green — re-trigger a build".
+    Evicted(PublishedArtifact),
+    /// `out_dir` now contains the published `dist/` tree for this artifact.
+    Materialized(PublishedArtifact),
+}
+
+/// One-call read path for the CLI (`build --watch --out`, `status`): read the
+/// canonical pointer, fetch the blob from the caller-supplied `store`, and
+/// expand it into `out_dir`. Keeps the blob layout entirely inside this crate
+/// — `tf-cli` never reaches into CAS internals (the option-(b) seam cli-ux
+/// asked for).
+///
+/// Both `store` (the cli-ux-configured out-of-tree cache) and `project_root`
+/// (where `.cargoless/latest-green` lives) are caller-supplied — nothing is
+/// derived here.
+///
+/// # Errors
+/// A corrupt pointer or a malformed blob is [`io::ErrorKind::InvalidData`]; a
+/// CAS or filesystem failure is the underlying [`io::Error`]. A *missing*
+/// pointer or an *evicted* blob is **not** an error — it is
+/// [`Materialized::NoGreen`] / [`Materialized::Evicted`].
+pub fn materialize_latest_green<S: ContentStore>(
+    store: &S,
+    project_root: &Path,
+    out_dir: &Path,
+) -> io::Result<Materialized> {
+    let Some(pa) = read_latest_green(project_root)? else {
+        return Ok(Materialized::NoGreen);
+    };
+    match store.get(&pa.artifact.input_hash)? {
+        None => Ok(Materialized::Evicted(pa)),
+        Some(blob) => {
+            unpack_artifact(&blob, out_dir)?;
+            Ok(Materialized::Materialized(pa))
+        }
+    }
 }
 
 fn hash_optional_file(path: &Path, kind: &str) -> io::Result<tf_proto::ContentHash> {
@@ -572,5 +695,119 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `trunk` that emits a real packed-dist blob (CI has no trunk), so
+    /// the full publish → store → materialize path is exercised end-to-end.
+    struct DistCompiler {
+        blob: Vec<u8>,
+    }
+    impl Compiler for DistCompiler {
+        fn compile(&self, _r: &Path, _i: &BuildIdentity) -> Result<Vec<u8>, String> {
+            Ok(self.blob.clone())
+        }
+    }
+
+    fn make_dist(tag: &str) -> (PathBuf, Vec<u8>) {
+        let d = scratch(tag).join("dist");
+        fs::create_dir_all(d.join("assets")).unwrap();
+        fs::write(d.join("index.html"), b"<body>hi</body>").unwrap();
+        fs::write(d.join("app_bg.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        fs::write(d.join("assets/app.css"), b".x{}").unwrap();
+        let blob = pack_dir(&d).unwrap();
+        (d, blob)
+    }
+
+    #[test]
+    fn unpack_artifact_round_trips_pack_dir() {
+        let (src, blob) = make_dist("rt-src");
+        let out = scratch("rt-out");
+        unpack_artifact(&blob, &out).unwrap();
+        assert_eq!(
+            fs::read(out.join("index.html")).unwrap(),
+            b"<body>hi</body>"
+        );
+        assert_eq!(
+            fs::read(out.join("app_bg.wasm")).unwrap(),
+            b"\0asm\x01\0\0\0"
+        );
+        assert_eq!(fs::read(out.join("assets/app.css")).unwrap(), b".x{}");
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn unpack_artifact_rejects_corruption_and_traversal() {
+        let out = scratch("bad-out");
+        assert_eq!(
+            unpack_artifact(b"not-a-blob", &out).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        // Header OK but truncated length field.
+        let mut t = DIST_BLOB_HEADER.to_vec();
+        t.extend_from_slice(&[0, 0, 0]);
+        assert!(unpack_artifact(&t, &out).is_err());
+        // Header OK, a path that tries to escape out_dir.
+        let mut e = DIST_BLOB_HEADER.to_vec();
+        let rel = b"../escape.txt";
+        e.extend_from_slice(&(rel.len() as u64).to_be_bytes());
+        e.extend_from_slice(rel);
+        e.extend_from_slice(&(3u64).to_be_bytes());
+        e.extend_from_slice(b"pwn");
+        assert_eq!(
+            unpack_artifact(&e, &out).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!out.parent().unwrap().join("escape.txt").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn materialize_latest_green_no_green_evicted_and_done() {
+        let project = scratch("mat-proj");
+        fs::create_dir_all(&project).unwrap();
+        let cache = scratch("mat-cache");
+        let out = scratch("mat-out");
+
+        // No pointer yet ⇒ NoGreen.
+        assert_eq!(
+            materialize_latest_green(&LocalDiskStore::new(&cache), &project, &out).unwrap(),
+            Materialized::NoGreen
+        );
+
+        // Publish a real dist blob through the orchestrator.
+        let (distdir, blob) = make_dist("mat-dist");
+        let orch =
+            BuildOrchestrator::new(LocalDiskStore::new(&cache), DistCompiler { blob }, &project);
+        assert_eq!(
+            orch.run(&BuildTrigger { identity: ident() }).outcome,
+            BuildOutcome::Compiled
+        );
+
+        // Pointer + blob present ⇒ Materialized, files faithfully expanded.
+        match materialize_latest_green(&LocalDiskStore::new(&cache), &project, &out).unwrap() {
+            Materialized::Materialized(pa) => {
+                assert_eq!(pa.artifact.input_hash, input_hash(&ident()));
+            }
+            other => panic!("expected Materialized, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(out.join("index.html")).unwrap(),
+            b"<body>hi</body>"
+        );
+        assert_eq!(fs::read(out.join("assets/app.css")).unwrap(), b".x{}");
+
+        // Wipe the cache (simulate `clean`) — pointer dangles ⇒ Evicted.
+        fs::remove_dir_all(&cache).unwrap();
+        match materialize_latest_green(&LocalDiskStore::new(&cache), &project, &out).unwrap() {
+            Materialized::Evicted(pa) => {
+                assert_eq!(pa.artifact.input_hash, input_hash(&ident()))
+            }
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&project);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(distdir.parent().unwrap());
     }
 }
