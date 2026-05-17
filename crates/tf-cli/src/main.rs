@@ -56,10 +56,7 @@ fn main() -> ExitCode {
         // Not-yet-implemented subcommands exit non-zero so scripts and CI do
         // not mistake the skeleton for a working tool.
         Command::Serve | Command::Check | Command::Status | Command::Clean => {
-            eprintln!(
-                "`{}` is not implemented yet — tracked in Plane CWDL Epic 5.",
-                "tftrunk subcommand"
-            );
+            eprintln!("that subcommand is not implemented yet — tracked in Plane CWDL Epic 5.");
             ExitCode::from(69) // EX_UNAVAILABLE
         }
     }
