@@ -30,6 +30,25 @@ behavior.
 (All measurements on `bench/fixture` — 17-file / ~1009-LOC Leptos CSR
 project; honest-size floor reasserted per `bench/run.sh` convention.)
 
+### Pre-polish cargoless memory-growth signal (already captured, calls for the post-polish A/B)
+
+The Component-1 pre-polish cargoless run shows **RSS growth of ~1.75 GB
+over 30 edits** (baseline 527 MB → final 2.28 GB; peak = final, so the
+growth is monotonic, not spiking and recovering). This is a
+memory-leak-shape pattern — RA's incremental cache + proc-macro server
+hold every analysis they've ever produced, even for code paths the
+user is no longer editing. Bounded-cache or LRU eviction would show
+a sawtooth instead.
+
+This is precisely what the RA weight-shedding work (#74) targets:
+`cachePriming=off` + `inlayHints.*=off` + cargo `features` narrowed
+should materially reduce both peak RSS and the growth rate. The
+post-polish A/B (Component 3 of this report) is the deliverable that
+quantifies how much. If the delta is large, "shipped lean by default"
+becomes a credible launch headline; if small, we'll have evidence the
+growth is fundamentally inherent to RA-on-Leptos rather than
+cargoless's wiring choices — also useful data.
+
 ---
 
 ## 1. Methodology
@@ -302,7 +321,54 @@ falls on the architectural axes regardless.
 
 ---
 
-## 6. Verdict (populated when all sections land)
+## 6. Caveats + limits
+
+Recorded so the numbers stay honest under scrutiny:
+
+- **Single fixture.** All numbers are against the 17-file / 1009-LOC
+  bench fixture. A different project shape (more crates, more
+  proc-macro use, larger codebase) would produce different absolute
+  numbers; the *direction* of the comparison (which tool wins which
+  axis) is likely robust, but the magnitudes are fixture-specific.
+- **Single-host environment.** All runs on the dedicated
+  `cargoless-builder` k8s pod; nothing else running. A laptop with
+  background browser tabs / Slack / IDE would show different RSS +
+  CPU patterns. Throughput numbers here are "best-case isolated
+  measurement", not "typical-user-on-laptop".
+- **30 reps / 5-minute windows, not full work-day sessions.** Memory
+  growth observed at 30 edits may extrapolate or may plateau; we
+  cannot conclude from this whether RA's cache eventually evicts after
+  N hundreds of edits. The signal "growth was monotonic in the first
+  30" is honest; "growth would continue indefinitely" would be a leap.
+- **CPU sampled cumulatively (jiffies delta) — not pid-sliced.**
+  cargoless's CPU number aggregates `tftrunk` + `rust-analyzer` + 
+  `rust-analyzer-proc-macro-srv`. trunk's aggregates `trunk` + cargo +
+  rustc workers. We don't separate which sub-process is responsible
+  for what fraction; the comparison is "total CPU for the tool's
+  whole ecosystem", which is the right user-facing view but blurs
+  attribution.
+- **Sampling cadence is finite.** Component 1 samples once per edit
+  (every 10s); Component 2's background ticker samples every 5s. CPU
+  spikes shorter than the tick are smoothed in the running average.
+  The cumulative `cpu_seconds_per_edit` figure is exact (jiffies-
+  cumulative differs by sample boundary, not by content); the per-tick
+  `mean_cpu_pct` is approximate.
+- **Comparators run their default mode.** `trunk watch` (not `trunk
+  serve` — we chose the compile loop without HTTP-server overhead);
+  `bacon --headless --job check` (not `bacon clippy` or `bacon test`
+  which are different workloads). A user running `trunk serve` would
+  pay additional HTTP/WS CPU/RSS on top of these numbers.
+- **The fixture's `index.html` + `Trunk.toml` were added by the bench
+  iteration**, not by the operator's actual app. Real Leptos projects
+  ship these by default; bench-fixture-as-skeleton needed them
+  retrofitted. This affects neither the comparison nor the absolute
+  numbers since all tools start from the same fixture.
+- **Cargoless not gated through ci-gate's gate-cache-staleness path.**
+  The throughput runs use direct cargo invocations in the pod, not the
+  ci-gate fingerprinting machinery, so the dev-fixer-flagged
+  mtime=commit-time skip-rebuild bug does not apply here.
+
+## 7. Verdict (populated when all sections land)
 
 _PENDING_
 
