@@ -1,6 +1,6 @@
 [package]
 name = "tf-cli"
-version = "0.0.0"
+version.workspace = true  # CWDL-71 Phase B: inherits from [workspace.package]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -44,7 +44,7 @@ name = "tftrunk"
 path = "src/main.rs"
 
 [dependencies]
-tf-core = { path = "../tf-core" }
+tf-core = { path = "../tf-core", version = "0.0.0" }  # publish-ready
 
 # ──────────────────────────────────────────────────────────────────────────
 # cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)
@@ -88,8 +88,8 @@ pkg-fmt = "tgz"
 #     README.md
 #     LICENSE
 # TODO(D1/CWDL-12): if D1 renames the binary from `tftrunk`, update both
-# this `bin-dir` AND .github/workflows/release.yml.draft's `strip` + tarball
-# package step. These two places MUST stay in sync.
+# this `bin-dir` AND `.github/workflows/release.yml`'s `BIN=` var in the
+# Package tarball step. These two places MUST stay in sync.
 bin-dir = "{name}-v{version}-{target}/tftrunk"
 
 # Per-target overrides not needed for 0.1.0 — all three triples

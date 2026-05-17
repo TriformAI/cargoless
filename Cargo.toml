@@ -11,6 +11,13 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
+# CWDL-71 Phase B (2026-05-17): version hoisted into [workspace.package]
+# per D-RELEASE §4.1. One number in one place — every crate inherits via
+# `version.workspace = true`. The release.yml `tag-validate` job grep-extracts
+# this value and asserts it matches the cut tag's semver; drift = hard fail.
+# Bump in lockstep with every release tag. (0.0.0 = pre-launch state; first
+# real release will be 0.1.0.)
+version = "0.0.0"
 # Canonical public source URL — resolved per D-RELEASE §8 #8 (operator picked
 # option (b) GitHub mirror; URL confirmed 2026-05-17).
 # Forgejo (forgejo.triform.dev/triform/cargoless) remains the internal
