@@ -9,6 +9,9 @@
 //! Skeleton only exposes a build identifier so the workspace links and CI is
 //! green-on-empty (decision D10).
 
+pub mod analyzer;
+pub mod watcher;
+
 pub use tf_cas::{ContentStore, LocalDiskStore};
 pub use tf_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, ContentHash, FileState,
