@@ -330,6 +330,67 @@ existing invariant intact.
 
 ---
 
+## 6b. Future-work recommendations (v0.1+ candidates)
+
+### R6 — `tftrunk`-owned cargo check (decouple verdict from RA's flycheck)
+
+Today's mechanism: RA runs cargo check via its own `checkOnSave`
+on save; emits `$/progress` end on the cargo-check token; the
+model captures that as `LspEvent::FlycheckEnded`. cargoless owns
+the verdict bit (model decides GREEN/RED) but RA owns the
+invocation cadence (when cargo check runs, how often, with what
+arguments). This works — but couples AC#2b's latency floor to
+RA's flycheck scheduling.
+
+**The R6 architectural shift:** make cargoless invoke cargo check
+as a tftrunk-managed subprocess, parse the JSON output directly
+for severity:Error + source, and route those into the same
+verdict-tree the model uses today. RA's checkOnSave becomes
+either disabled (the original setting #1 framing, NOW SAFE under
+this architecture because the verdict has its own path) or kept
+on as a fast hint for editor users sharing the LSP session.
+
+**Pros:**
+- AC#2b latency improvable: cargoless can start cargo check on
+  the save-event itself, not after RA's own debounce-then-flycheck
+  pipeline. Potential meaningful cut in the cargo-check tier's
+  effective latency on top of the cargo-runtime floor.
+- Eliminates the duplicate cargo-check overhead (the v0 polish
+  setting #1 wanted this; the R6 path is the prerequisite that
+  makes that polish safe).
+- Cleaner architectural separation: model owns verdict source-of-
+  truth, RA owns advisory diagnostics. Both tiers become first-
+  class with explicit ownership.
+
+**Cons:**
+- Substantial scope: ~500-1000 LOC change touching analyzer.rs,
+  model.rs, build.rs, and new cargo-output parsing logic.
+- #21/F8-redo invariants need re-encoding against the new
+  cargo-output JSON path (the severity-from-any-source rule
+  becomes severity-from-(our-cargo-check OR RA-native), which
+  needs the same care).
+- Loses RA's incremental-state benefits on the flycheck side
+  (RA reuses its parsed/typed state to skip work; an independent
+  cargo invocation doesn't have that state-sharing benefit).
+- Risk: another launch-blocker class of bug if the verdict path
+  re-implementation has any subtle bug (the F8 → F8-redo arc
+  shows this lane is unforgiving of even small mis-classifications).
+
+**Not v0.** The honest-split AC#2a/AC#2b documented above is the
+right v0 framing — accurate to the architecture, sub-1s on Tier
+A holds, Tier B is cargo-bounded and honest about it. R6 is a
+v0.1+ design topic worth its own design doc.
+
+**Decision frame:** ADOPT R6 if and only if (a) field measurement
+post-v0-launch confirms the cargo-check tier is the user-pain
+floor (not just the slow but honest reality users accept), AND
+(b) there's evidence that cargo-output JSON parsing is stable
+enough across cargo versions to be a reliable verdict source
+(some past cargo releases have shifted JSON shape; need a
+compatibility plan).
+
+---
+
 ## 7. Recommendation
 
 ADOPT the split. Specifically:
