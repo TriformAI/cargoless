@@ -3,10 +3,10 @@
 //! ## The bug
 //!
 //! `tftrunk watch &` then close the terminal / kill the shell: the
-//! daemon SURVIVES as an orphan, still holding rust-analyzer + cargo
-//! + ~2GB RSS. The user has to `pkill` it by hand. It also feeds the
-//! F10 stale-daemon confusion — sometimes a "stale" status file is
-//! actually a live orphan, not a dead pid.
+//! daemon SURVIVES as an orphan, still holding rust-analyzer, cargo,
+//! and ~2GB RSS. The user has to `pkill` it by hand. It also feeds
+//! the F10 stale-daemon confusion — sometimes a "stale" status file
+//! is actually a live orphan, not a dead pid.
 //!
 //! ## The fix
 //!
@@ -145,95 +145,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn orphan_detected_when_real_parent_dies() {
-        // End-to-end: a child shell backgrounds a grandchild that
-        // polls ParentWatch and writes a marker file when it detects
-        // orphaning; we kill the CHILD (the grandchild's parent),
-        // then assert the grandchild noticed within a bounded window.
+    fn orphaned_true_when_baseline_no_longer_matches_live_parent() {
+        // The positive edge: `orphaned()` must read `true` the instant
+        // the recorded baseline stops matching the live `getppid()` —
+        // that divergence IS the reparent signal in production.
         //
-        // Implemented with `sh -c` + a tiny Rust-free poller so the
-        // test doesn't need to re-exec the test binary. The poller is
-        // a shell loop comparing $PPID — semantically identical to
-        // ParentWatch's getppid()-comparison — proving the mechanism
-        // the struct relies on actually fires on this platform.
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
-
-        let marker = std::env::temp_dir().join(format!(
-            "tf-orphan-test-{}-{}",
-            std::process::id(),
-            // nanos for uniqueness across rapid re-runs
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_file(&marker);
-        let marker_s = marker.to_string_lossy().into_owned();
-
-        // Child: spawn a grandchild poller, print the grandchild pid,
-        // then sleep (stay alive until we kill it).
-        let script = format!(
-            r#"
-            (
-              orig=$PPID
-              while :; do
-                if [ "$PPID" != "$orig" ]; then
-                  echo orphaned > "{marker}"
-                  exit 0
-                fi
-                # also handle the reparent-to-1 fast case
-                if [ "$(ps -o ppid= -p $$ | tr -d ' ')" = "1" ]; then
-                  echo orphaned > "{marker}"
-                  exit 0
-                fi
-                sleep 0.1
-              done
-            ) &
-            echo $!
-            sleep 30
-            "#,
-            marker = marker_s
-        );
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            // No POSIX shell (unlikely on unix CI/dev) ⇒ skip cleanly.
-            Err(_) => return,
-        };
-
-        // Give the grandchild a moment to start its poll loop, then
-        // kill the CHILD so the grandchild is reparented.
-        std::thread::sleep(Duration::from_millis(300));
-        let _ = child.kill();
-        let _ = child.wait();
-
-        // The grandchild should detect the reparent + write the
-        // marker within a couple seconds (its poll is 100ms).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut seen = false;
-        while Instant::now() < deadline {
-            if std::fs::read_to_string(&marker)
-                .map(|s| s.contains("orphaned"))
-                .unwrap_or(false)
-            {
-                seen = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = std::fs::remove_file(&marker);
+        // We assert it deterministically by constructing a ParentWatch
+        // whose baseline can never equal a live parent pid (0 is not a
+        // valid parent for any running process on Unix — real pids are
+        // ≥ 1). `orphaned()` then exercises the real code path
+        // (`current_ppid() != self.orig_ppid`, i.e. a live `getppid()`
+        // syscall compared against the recorded value) and must flip
+        // true. Same-module test ⇒ we can seed the private field.
+        //
+        // Why not a fork/kill end-to-end test: a cargo test process
+        // cannot cleanly get itself reparented, and the earlier shell
+        // proxy used POSIX `$PPID`, which is frozen at subshell birth
+        // and does NOT track reparenting the way `getppid()` does — so
+        // it tested a different mechanism than the code and flaked.
+        // The honest, faithful coverage is: `capture()` records a real
+        // ppid (`capture_records_a_plausible_ppid`), a fresh capture is
+        // not orphaned (`freshly_captured_is_not_orphaned`), it stays
+        // stable while the parent lives
+        // (`orphaned_is_stable_across_repeated_calls_when_parent_alive`),
+        // and a baseline that cannot match the live parent reads
+        // orphaned (this test). That fully pins the one-line
+        // comparison without a flaky subprocess proxy.
+        let pw = ParentWatch { orig_ppid: 0 };
         assert!(
-            seen,
-            "the orphaned grandchild must detect parent-death \
-             (getppid/PPID change) within the bounded window — this \
-             is the exact mechanism ParentWatch::orphaned() relies on"
+            pw.orphaned(),
+            "a baseline that can never equal the live getppid() must \
+             read orphaned — this is the exact reparent signal the \
+             watch loop relies on to self-terminate"
         );
     }
 }
