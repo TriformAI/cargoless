@@ -44,6 +44,11 @@ pub fn Counter(#[prop(optional)] bounds: Option<CounterBounds>) -> impl IntoView
         }
     });
 
+    // Hoisted OUT of the macro: a bare `>=`/`>` inside a component prop
+    // closure (`<Show when=move || a >= b>`) makes the leptos-0.6.15 rsx
+    // parser treat the first `>` as the tag close, truncating the closure.
+    let at_max = move || value.get() >= bounds.max;
+
     view! {
         <section class="counter">
             <h3>"Counter"</h3>
@@ -79,10 +84,7 @@ pub fn Counter(#[prop(optional)] bounds: Option<CounterBounds>) -> impl IntoView
                     }
                 />
             </label>
-            <Show
-                when=move || value.get() >= bounds.max
-                fallback=|| view! { <span/> }
-            >
+            <Show when=at_max fallback=|| ()>
                 <p class="counter-warn">"at maximum"</p>
             </Show>
         </section>

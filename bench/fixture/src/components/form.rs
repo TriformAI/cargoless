@@ -25,6 +25,17 @@ pub fn ProfileForm() -> impl IntoView {
     // without move conflicts (a plain closure could not).
     let valid = create_memo(move |_| report.get().is_ok());
 
+    // Pre-collect error <li>s outside the macro (no `<For>`/`let:` — kept
+    // to the conservative leptos-0.6.15 rsx subset that parses reliably).
+    let error_items = move || {
+        report
+            .get()
+            .errors
+            .into_iter()
+            .map(|e| view! { <li>{e}</li> })
+            .collect::<Vec<_>>()
+    };
+
     view! {
         <section class="form">
             <h3>"Profile"</h3>
@@ -66,20 +77,12 @@ pub fn ProfileForm() -> impl IntoView {
                 when=move || !report.get().errors.is_empty()
                 fallback=|| view! { <p class="form-ok">"looks good"</p> }
             >
-                <ul class="form-errors">
-                    <For
-                        each=move || report.get().errors.clone()
-                        key=|e| e.clone()
-                        let:e
-                    >
-                        <li>{e}</li>
-                    </For>
-                </ul>
+                <ul class="form-errors">{error_items}</ul>
             </Show>
 
             <Show
                 when=move || submitted.get() && valid.get()
-                fallback=|| view! { <span/> }
+                fallback=|| ()
             >
                 <p class="form-saved">"saved"</p>
             </Show>

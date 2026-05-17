@@ -19,6 +19,18 @@ pub fn AboutPage() -> impl IntoView {
         Fact { label: "approx lines", value: 1100 },
     ];
 
+    // Pre-collect the rows OUTSIDE the macro (no `<For>`, no turbofish in
+    // attribute position — leptos 0.6.15 rsx rejects both).
+    let rows = move || {
+        facts
+            .iter()
+            .map(|f| {
+                let (l, v) = (f.label, f.value);
+                view! { <tr><td>{l}</td><td>{thousands(v)}</td></tr> }
+            })
+            .collect::<Vec<_>>()
+    };
+
     view! {
         <div class="page page-about">
             <header class="page-head">
@@ -32,23 +44,7 @@ pub fn AboutPage() -> impl IntoView {
                 <thead>
                     <tr><th>"metric"</th><th>"value"</th></tr>
                 </thead>
-                <tbody>
-                    <For
-                        each=move || {
-                            facts
-                                .iter()
-                                .map(|f| (f.label, f.value))
-                                .collect::<Vec<_>>()
-                        }
-                        key=|(l, _)| *l
-                        let:row
-                    >
-                        <tr>
-                            <td>{row.0}</td>
-                            <td>{thousands(row.1)}</td>
-                        </tr>
-                    </For>
-                </tbody>
+                <tbody>{rows}</tbody>
             </table>
         </div>
     }
