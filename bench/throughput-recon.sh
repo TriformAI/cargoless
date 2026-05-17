@@ -159,14 +159,24 @@ sample_tree() {
       # ps -o rss= prints RSS in KB (kernel-side same data as /proc/<pid>/statm)
       local rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
       [ -n "$rss" ] && total_rss=$((total_rss + rss))
-      # /proc/<pid>/stat fields 14+15 = utime, stime (jiffies)
+      # /proc/<pid>/stat CPU = utime+stime+cutime+cstime. After slicing
+      # past "<comm>) " the remaining f[] is 1-indexed from `state`
+      # (field 3), so field N = f[N-2]: f[12]=utime(14), f[13]=stime(15),
+      # f[14]=cutime(16), f[15]=cstime(17). cutime+cstime (reaped-child
+      # CPU) is LOAD-BEARING and MUST match the corrected Component-1
+      # accounting (5d3caeb) — bacon/trunk spawn-compile-EXIT children
+      # whose CPU is reaped into the parent; summing only utime+stime
+      # would reproduce the SAME asymmetric under-count C1 had, making
+      # this cross-check falsely "agree" with the BUGGY C1 instead of
+      # validating the corrected numbers. Parity is the whole point of
+      # a two-source check.
       if [ -r "/proc/$pid/stat" ]; then
         local cpu=$(awk 'NR==1 {
           # comm field can contain spaces inside parens; slice past last ")"
           s=$0
           while (sub(/^[^)]*\) /, "", s) == 0) break
           n=split(s, f, " ")
-          print f[12]+f[13]
+          print f[12]+f[13]+f[14]+f[15]
         }' /proc/$pid/stat 2>/dev/null)
         [ -n "$cpu" ] && total_cpu_j=$((total_cpu_j + cpu))
       fi
