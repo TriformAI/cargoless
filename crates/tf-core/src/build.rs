@@ -182,6 +182,7 @@ pub(crate) fn extract_trunk_failure_reason(
 ///   * `error:`           — cargo / rustc plain
 ///   * `error[E0277]:`    — rustc with code
 ///   * `ERROR` (any case) — trunk's `ERROR ❌ …` prefix
+///
 /// Crucially, cargo's `Finished` / `Compiling` / `Building` SUCCESS
 /// markers do NOT match this — that's the #12 invariant.
 fn is_error_prefix_line(line: &str) -> bool {
@@ -697,9 +698,14 @@ mod tests {
         // doesn't false-positive (e.g. "failure 1" would otherwise be a
         // substring of "failure 16" — exactly the test bug the first
         // self-gate revealed).
-        let stderr: String = (1..=20)
-            .map(|i| format!("error: failure #{i}# marker\n"))
-            .collect();
+        // Use fold rather than map+collect+format to satisfy clippy's
+        // `format_collect` lint (`-D warnings`); semantically identical
+        // but allocates one String once instead of one per element.
+        let stderr: String = (1..=20).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "error: failure #{i}# marker");
+            s
+        });
         let got = extract_trunk_failure_reason("", &stderr, Some(101));
         // The LAST 5 (numbers 16..=20) MUST appear in the surfaced message.
         for i in 16..=20 {
