@@ -68,10 +68,46 @@ End users immediately get:
 | Forgejo → GitHub tag/branch mirror | ✅ automated | Push-mirror, `sync_on_commit` (§8 #9) |
 | `cargo install --git` install path | ✅ works on tag | No operator action; users run it |
 | `cargo binstall` prebuilt fetch | ✅ works on tag | Asset URL matches binstall metadata (verified §8 #6) |
-| **crates.io publish** (`cargo publish`) | ❌ **OPERATOR-MANUAL** | **§8 #5 — the ONE thing needing operator hands before first publish.** See §2.1. |
+| **`FORGEJO_READONLY_TOKEN` secret** (`tag-validate`) | ❌ **OPERATOR-MANUAL** | **NEARER operator gate.** CWDL-71 Phase C confirmed `tag-validate`'s s1-ac2-verdict read is a HARD gate on every real tag (Forgejo `REQUIRE_SIGNIN_VIEW`). See §2.1. |
+| **crates.io publish** (`cargo publish`) | ❌ **OPERATOR-MANUAL** | **LATER operator gate.** §8 #5 — operator hands needed before first publish. See §2.2. |
 | GPG-signed tags / `.asc` tarball sigs | ❌ not done | §8 #7 — v1+ parking-lot per CLAUDE.md. Trust model = operator's crates.io account + GitHub TLS. |
 
-### 2.1 crates.io publish — the operator-manual step (§8 #5)
+> **Two operator-time credentials, distinct stages** (record per CWDL-71
+> Phase C): **Stage 1 = `FORGEJO_READONLY_TOKEN`** (§2.1) — the *nearer*
+> gate; blocks Phase-C-green and every real release tag. **Stage 2 =
+> crates.io token** (§2.2) — the *later* gate; blocks first `cargo
+> publish` only. Stage 1 is needed strictly before Stage 2.
+
+### 2.1 `FORGEJO_READONLY_TOKEN` — the NEARER operator-credential stage
+
+**Stage 1 of two operator-time credentials. Gates Phase-C-green AND every
+real release tag** — strictly before the crates.io token (§2.2).
+
+`release.yml`'s `tag-validate` asserts the tagged SHA carries an
+`s1-ac2-verdict` Forgejo commit status. Forgejo runs site-wide
+`REQUIRE_SIGNIN_VIEW`, so the statuses API is **not anonymously readable**
+(returns `{"message":"Only signed in user is allowed to call APIs."}` — a
+JSON object). **CWDL-71 Phase C confirmed this is a hard launch-blocker**:
+the prior anonymous `curl` crashed `jq` (`Cannot index string with
+string "context"`) and false-failed *every* tag with "no s1-ac2-verdict"
+when the status actually existed. `release.yml` (commit `c033aa3`) now
+reads it authenticated + validates the JSON shape; the operator must
+pre-stage the token once:
+
+1. **forgejo.triform.dev** → User Settings → Applications → "Generate New
+   Token". Name `cargoless-ci-readonly`. Scope: **read-only repository**
+   (enough to GET commit statuses on `triform/cargoless`; no write).
+2. **github.com/TriformAI/cargoless** → Settings → Secrets and variables →
+   Actions → "New repository secret". Name **exactly**
+   `FORGEJO_READONLY_TOKEN`. Value = the token from step 1.
+
+No code change needed (`release.yml` already consumes
+`secrets.FORGEJO_READONLY_TOKEN`). Never committed; GH masks it in logs.
+**Option 2** (also publish the verdict as a GitHub commit status /
+release asset so GH Actions never crosses to Forgejo) is a **0.2.0+**
+hardening — parked, deliberately not launch-blocking.
+
+### 2.2 crates.io publish — the LATER operator-credential stage (§8 #5)
 
 For `0.1.0`, crates.io publish is **operator-run from their laptop**, NOT
 automated (the `publish-*` jobs in release.yml are `if: false`). Sequence,
@@ -119,7 +155,8 @@ State as of skeleton-draft 2026-05-17 (✅ done / ⏳ pending / TBD = fill at fi
 [✅] CWDL-71 Phase B — version hoisted to [workspace.package]
 [⏳] CWDL-71 Phase C — v0.0.0 rehearsal: GH Actions 3-runner matrix
      verified end-to-end (TBD: rehearsal outcome — fill after Phase C)
-[⏳] §8 #5 crates.io token — operator-configured (operator-time, §2.1)
+[⏳] §8 #5 crates.io token — operator-configured (operator-time, §2.2 — the LATER credential stage)
+[⏳] FORGEJO_READONLY_TOKEN secret — operator-configured (operator-time, §2.1 — the NEARER gate; CWDL-71 Phase C #100)
 [ ] §8 #7 GPG signing — v1+ parking-lot (intentionally NOT a 0.1.0 gate)
 [TBD] AC#7 comparative verdict — bench-lead (#36); throughput numbers in README
 [TBD] D-A2 / AC#2 renegotiation — operator decision (#48); honest
@@ -162,7 +199,7 @@ If `v0.1.0` ships and a launch-blocker is discovered post-tag:
 
 **Pre-publish rollback is cheap** (delete tag+release, no yank needed —
 nothing consumed it yet). **Post-`cargo publish` rollback is yank-only**
-(crates.io is append-only by design). This asymmetry is why §2.1's
+(crates.io is append-only by design). This asymmetry is why §2.2's
 operator-manual publish is deliberately the LAST step, after the
 GitHub-release artifacts have been smoke-tested.
 
