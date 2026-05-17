@@ -56,8 +56,26 @@ const CHECK_HARD_CAP: Duration = Duration::from_secs(180);
 /// Quiet window: once events have arrived and none have for this long without
 /// an authoritative pass, the one-shot check gives up (→ Red/Advisory).
 const CHECK_SETTLE: Duration = Duration::from_secs(2);
-/// Debounce for the streaming [`watch`] pipeline.
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Default debounce for the streaming [`watch`] pipeline. The save-burst
+/// quiet window before a [`crate::watcher`] batch is emitted to the model.
+/// Tuned to keep mid-edit reds quiet without making the post-save verdict
+/// feel laggy; user-overridable via `TF_DEBOUNCE_MS` (set by the
+/// `--debounce-ms` CLI flag — FIELD FINDING #5 / #49).
+const DEFAULT_WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Resolve the live debounce duration: `TF_DEBOUNCE_MS` env override iff
+/// parseable as a positive `u64` milliseconds, else [`DEFAULT_WATCH_DEBOUNCE`].
+/// Zero is rejected (would cause the watcher to spin); too-large values are
+/// honored — dogfood tuning may legitimately want a long quiet window for
+/// flicker-free large-refactor runs. Pure (only reads env, no side effects).
+fn resolve_watch_debounce() -> Duration {
+    std::env::var("TF_DEBOUNCE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_WATCH_DEBOUNCE)
+}
 
 // ---------------------------------------------------------------------------
 // #21 additive provenance types (tf_core::model, serde-free — NOT tf-proto)
@@ -720,7 +738,7 @@ pub fn watch<I: IdentityProvider + 'static>(
     let supervisor = crate::analyzer::Supervisor::start_with_hook(spawn, on_spawn)?;
 
     let (watch_handle, batches) =
-        crate::watcher::watch(&root, WATCH_DEBOUNCE).map_err(io::Error::other)?;
+        crate::watcher::watch(&root, resolve_watch_debounce()).map_err(io::Error::other)?;
     let mut threads = Vec::new();
     {
         let model = Arc::clone(&model);
@@ -1002,6 +1020,80 @@ mod tests {
         m.apply_event(&diag("untitled:Untitled-1", 5, 5));
         assert_eq!(m.file_state("untitled:Untitled-1"), None);
         assert_eq!(m.tree_state(), TreeState::Red);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #5 (#49) — TF_DEBOUNCE_MS env override semantics
+    //
+    // Per-test env mutation is unavoidable here (the function reads the
+    // process env on purpose) — `set_var` is `unsafe` on Edition 2024 due
+    // to the multi-threaded-read hazard; serializing tests + the
+    // remove_var-on-exit guard below keeps them deterministic.
+    // -----------------------------------------------------------------------
+
+    /// RAII guard: set `TF_DEBOUNCE_MS` for the test's scope, restore the
+    /// pre-test value (or unset) on drop.
+    struct EnvGuard {
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("TF_DEBOUNCE_MS").ok();
+            // SAFETY: tests gated on `#[cfg(test)]`; this module's tests do
+            // not spawn threads that read the env.
+            unsafe { std::env::set_var("TF_DEBOUNCE_MS", value) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("TF_DEBOUNCE_MS", v),
+                    None => std::env::remove_var("TF_DEBOUNCE_MS"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watch_debounce_defaults_when_env_unset() {
+        // Belt-and-braces: clear first, then probe the default.
+        let _g = EnvGuard::set("");
+        unsafe { std::env::remove_var("TF_DEBOUNCE_MS") };
+        let d = resolve_watch_debounce();
+        assert_eq!(d, Duration::from_millis(150), "default = 150ms");
+        // Restore via guard's Drop (sets to "", which the parser rejects →
+        // also falls back to default — that's fine for the next test).
+    }
+
+    #[test]
+    fn watch_debounce_honors_valid_env_override() {
+        let _g = EnvGuard::set("300");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn watch_debounce_rejects_zero_and_garbage() {
+        // Zero ⇒ spinloop hazard, rejected → default.
+        let _g0 = EnvGuard::set("0");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(150));
+        drop(_g0);
+        // Non-numeric ⇒ rejected → default. (No fail-loud; the CLI parser
+        // rejects bad input upstream; here we fail-safe on accidental env
+        // pollution.)
+        let _g1 = EnvGuard::set("nope");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(150));
+    }
+
+    #[test]
+    fn watch_debounce_accepts_large_values_for_flicker_free_refactor() {
+        // Sweet spot per F5 is 300-1000ms but dogfood may want longer for
+        // a noisy multi-file refactor; no artificial upper bound.
+        let _g = EnvGuard::set("2500");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(2500));
     }
 
     #[test]
