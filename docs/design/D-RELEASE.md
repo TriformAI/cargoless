@@ -103,11 +103,26 @@ strategy. The first release ships an honest matrix that reflects that.
 cargo install --git https://forgejo.triform.dev/triform/cargoless --tag v0.1.0
 ```
 
+> ⚠ **The above URL is broken for outside users today.** dogfood-lead
+> confirmed (2026-05-17, direct git+curl probes from the cluster pod) that
+> `forgejo.triform.dev` is **auth-walled on every git protocol endpoint**
+> (HTTP 401 + `www-authenticate: Basic Gitea` on anonymous git fetch). An
+> anonymous `cargo install --git https://forgejo.triform.dev/...` fails at
+> first byte. **This is a hard launch-blocker** for the OSS install pitch
+> and is recorded as §8 #8. The URL template stays templated here; the
+> *canonical* install URL is locked when the operator picks (a) flip
+> Forgejo public, (b) mirror to github.com, or (c) document auth.
+
 **Or, once published to crates.io:**
 
 ```
 cargo install <pubname>           # <pubname> = TBD per D1/CWDL-12
 ```
+
+The crates.io path is unaffected by §8 #8 (crates.io vends the published
+tarball, not a git fetch from forgejo.triform.dev) — but it requires the
+tagged release to already be published, which still needs §8 #8 resolved
+because the operator must be able to consult the public source at the tag.
 
 Works on **every platform with rustc** — Linux x86_64/aarch64, macOS
 Intel/ARM, even Windows for the brave (Windows is v1 parking-lot for
@@ -395,6 +410,7 @@ called out, not invented.
 | 5 | **crates.io token automation timeline.** Operator-run for `0.1.0` is approved. Is `0.2.0`-automatable, or is human-in-the-loop the permanent model? | operator | Whether `publish-*` jobs ever lose `if: false`. |
 | 6 | **Forgejo release-asset URL shape.** The `pkg-url` template in §7 assumes `/{repo}/releases/download/v{version}/{file}` — Forgejo follows GitHub's convention, but a placeholder release should be cut on a non-production tag (e.g., `v0.0.1-test`) to verify before locking the template. | operator (one-time) | binstall first-fire correctness. |
 | 7 | **GPG signing of release tags + tarball signatures.** v1 parking-lot per CLAUDE.md non-goals. Recorded here for the record — when someone asks "why no .asc files?" the answer is "deliberate 0.1.0 scope decision; see D-RELEASE §9." | lead | Nothing in v0.1.0; trust model for downstream packagers. |
+| 8 | **Canonical install URL / public-source-access strategy** *(launch-blocker, surfaced by dogfood-lead 2026-05-17)*. Current Forgejo repo is **auth-walled on every git protocol endpoint** (HTTP 401 + `www-authenticate: Basic Gitea` on anonymous fetch — confirmed by direct git+curl probes from the cluster pod). Anonymous `cargo install --git https://forgejo.triform.dev/...` fails at first byte; the OSS-claim install path is technically broken today. Three reserved real options: **(a) flip Forgejo repo to public** (Gitea per-repo "publicly visible" toggle; minimal surgery, keeps source of truth on Forgejo, does NOT solve Mac-builder); **(b) mirror to github.com** and document GitHub as the canonical public-source URL (compound benefit: ALSO solves §8 #2 Mac builder via GH Actions free-tier macOS runners + provides discoverability — collapses two opens into one decision); **(c) document HTTP-Basic auth with a public-read deploy token** (defeats the OSS pitch; not recommended). The release pipeline cannot fire until this resolves. **If (b) is chosen, §8 #2 collapses into this decision and `build-macos` re-enters the workflow as a GitHub Actions job.** Until resolved, the `pkg-url` template stays templated (`{repo}` resolves from `[workspace.package].repository`) — flipping its value is a one-line `Cargo.toml` change post-decision. | operator + lead | `cargo install --git` install path; README install instructions; `pkg-url` template's `{repo}` substitution; potentially §8 #2 (compound resolution if (b)); the "OSS pitch" claim in launch blog (CWDL-9). |
 
 ---
 
@@ -431,8 +447,11 @@ discussions, not silent re-additions to `release.yml`.
 [ ] Hoist version → [workspace.package].version = "0.1.0"; crates inherit.
 [ ] Update path-deps to include version (publish-ready); Cargo.lock regenerated.
 [ ] CHANGELOG.md format chosen; ## 0.1.0 section seeded.
+[ ] §8 #8 canonical install URL decided (Forgejo-public / GitHub-mirror /
+    documented-auth). If GitHub-mirror, also resolves §8 #2 (Mac builder).
+    [workspace.package].repository updated to the chosen canonical URL.
 [ ] Mac builder strategy decided (§8 #2) — even if the decision is "no macOS
-    prebuilt in 0.1.0", record it.
+    prebuilt in 0.1.0", record it. (Collapses into §8 #8 if (b) GitHub-mirror.)
 [ ] release.yml.draft → release.yml; remove `if: false` from build/validate
     jobs (keep on publish-* until 0.2.0 token-automation lands).
 [ ] One throwaway test fire on `v0.0.1-rc.1` against a test release page to

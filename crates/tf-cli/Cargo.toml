@@ -38,6 +38,17 @@ tf-core = { path = "../tf-core" }
 #   {target}          — target triple, e.g. x86_64-unknown-linux-gnu
 #   {archive-suffix}  — derived from pkg-fmt, e.g. ".tgz"
 #
+# TODO(D-RELEASE §8 #8 — launch-blocker, dogfood-lead 2026-05-17):
+#   `{repo}` resolves from `[workspace.package].repository` in the root
+#   Cargo.toml (currently `https://forgejo.triform.dev/triform/cargoless`).
+#   forgejo.triform.dev is auth-walled on git protocol endpoints — anonymous
+#   `cargo install --git` AND anonymous binstall asset-fetch may both 401.
+#   Reserved operator decision pending: (a) flip Forgejo repo to public, (b)
+#   mirror to github.com and re-point repository=, (c) document auth. Until
+#   resolved, the URL template stays templated — flipping the value is a
+#   one-line root Cargo.toml change. If (b) chosen, this ALSO resolves the
+#   Mac-builder open question (§8 #2) via GH Actions free-tier macOS runners.
+#
 # First release ships exactly one prebuilt: Linux x86_64-gnu. On macOS, no
 # asset matches and binstall gracefully degrades to `cargo install` (its
 # documented fallback). That is INTENTIONAL HONESTY for 0.1.0; see
