@@ -88,19 +88,26 @@ pub fn run(cfg: &Config) -> ExitCode {
         cfg.detection.describe()
     ));
 
-    // FIELD FINDING #13a (#93): refuse a SECOND watcher on the same
-    // root. Two `cargoless watch` on one tree both heartbeat the
-    // `.cargoless/cli-status` file; pid flaps and `status` reports
-    // whichever wrote last. Checked HERE — before the costly
-    // rust-analyzer bring-up — so a refused start is instant. Only
-    // refuses against a *live* process that is *another instance of
-    // this binary*: stale files, dead pids, and pids recycled to some
-    // other program all proceed (never false-refuse a lone watcher).
-    if let statusfile::WatchAdmission::Refuse(c) =
-        statusfile::admission(&cfg.root, std::process::id())
-    {
-        ui::error(c.message());
-        return ExitCode::from(2);
+    // FIELD FINDING #13a (#93) + #128: dual-watch admission, checked
+    // HERE (before the costly RA bring-up) so it is instant. Refuse
+    // ONLY a genuinely-live sibling (heartbeat-fresh AND pid-alive AND
+    // same-binary — the F10 composite `status` uses). A SIGKILL'd /
+    // zombie / dead / pid-reused prior daemon left an orphaned
+    // `cli-status`: auto-recover (take it over) with an actionable note
+    // — never a bare refuse (agent fleets hard-kill daemons routinely).
+    match statusfile::admission(&cfg.root, std::process::id()) {
+        statusfile::WatchAdmission::Refuse(c) => {
+            ui::error(c.message());
+            return ExitCode::from(2);
+        }
+        statusfile::WatchAdmission::Recover { stale_pid } => {
+            ui::warn(format!(
+                "recovered: prior cli-status (pid {stale_pid}) is \
+                 stale/dead — its daemon was SIGKILL'd or aged out, \
+                 not running. Taking over this root."
+            ));
+        }
+        statusfile::WatchAdmission::Proceed => {}
     }
 
     // `watch()` blocks on rust-analyzer's initialize handshake (seconds);

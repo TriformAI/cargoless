@@ -154,11 +154,22 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
     // root). The refusal is per-status-file, not per-subcommand — guard
     // here too, before --out creation and the rust-analyzer bring-up,
     // so a refused start is instant and side-effect-free.
-    if let statusfile::WatchAdmission::Refuse(c) =
-        statusfile::admission(&cfg.root, std::process::id())
-    {
-        ui::error(c.message());
-        return ExitCode::from(2);
+    // #128: same F10-composite admission as `watch` — Refuse only a
+    // demonstrably-live sibling; auto-recover an orphaned (SIGKILL'd /
+    // stale / dead-pid) cli-status with an actionable note rather than
+    // bare-refusing.
+    match statusfile::admission(&cfg.root, std::process::id()) {
+        statusfile::WatchAdmission::Refuse(c) => {
+            ui::error(c.message());
+            return ExitCode::from(2);
+        }
+        statusfile::WatchAdmission::Recover { stale_pid } => {
+            ui::warn(format!(
+                "recovered: prior cli-status (pid {stale_pid}) is \
+                 stale/dead — taking over this root."
+            ));
+        }
+        statusfile::WatchAdmission::Proceed => {}
     }
     if let Err(e) = std::fs::create_dir_all(out) {
         ui::error(format!(
