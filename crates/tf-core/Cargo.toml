@@ -19,3 +19,10 @@ tf-cas = { path = "../tf-cas" }
 # than pulling notify-debouncer-* / the ignore crate, keeping the dep tree
 # minimal for the CI-only build model.
 notify = "6"
+# Owner-added (daemon-core, Epic 2 / CWDL #4). serde_json for LSP JSON-RPC:
+# we emit controlled requests but must robustly parse rust-analyzer's
+# publishDiagnostics (nested arrays, escaped strings) — hand-rolled JSON there
+# is a latent-bug factory. Uses Value + json! only (no serde_derive
+# proc-macro), keeping cold-build cost (AC#1/#2) low. tf-proto stays
+# serde-free; this dep is tf-core-local.
+serde_json = "1"
