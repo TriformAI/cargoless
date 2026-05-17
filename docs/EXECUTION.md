@@ -89,10 +89,16 @@ green on `main` — branch-only work is In Progress, never Done.
 - **D-A3**: the benchmark substrate is pulled forward (the S1 harness), not
   deferred; it is two-mode (checker save→verdict + artifact save→publish,
   reported separately).
-- **Contract status**: the `tf-proto` seams (StateEvent / BuildTrigger /
-  BuildResult / ArtifactMeta) are frozen on `main` and unchanged; the
-  latest-green publisher is the **only additive v0 contract surface**.
-  `server::Bundle` is **not** in v0.
+- **Contract status (ratified ledger)**: the four `tf-proto` seams
+  (StateEvent / BuildTrigger / BuildResult / ArtifactMeta) are frozen on
+  `main` and unchanged. The latest-green publisher is the **only additive v0
+  contract surface**: additive serde-free types `PublishedArtifact { artifact:
+  ArtifactMeta, published_at: UnixSeconds }` + `UnixSeconds(u64)`; the
+  `.cargoless/latest-green` pointer is written atomically (temp + fsync +
+  rename) and surfaces input_hash/profile/target/timestamp human-readable; the
+  v0 data-flow ends at the publisher (no browser sink). `server::Bundle` is
+  **not** in v0. Per-step `Cargo.lock` discipline (committed lock, `--locked`
+  CI) applies to every change. Sequencing follows the #26 integration plan.
 - v0.1 (NOT v0): HTTP/WS dev-server, reload protocol, browser shim, holding
   page, browser never-serve-red, `serve`.
 - v1 parking lot (NOT v0 or v0.1): salsa/RA-as-library, remote CAS, team/auth,

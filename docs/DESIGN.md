@@ -99,8 +99,12 @@ watcher → analyzer → model ──StateEvent──▶ all subscribers (verdic
                        │
                        └─on BecameGreen──▶ BuildTrigger ─▶ build / tf-cas
                                                                   │
-                       server ◀──BuildResult── build / tf-cas ◀───┘
+              latest-green publisher ◀──BuildResult── build/tf-cas┘
 ```
+
+The v0 data-flow **ends at the publisher** — there is no browser/server sink
+in v0. A future v0.1 serve adapter consumes the published output (the
+`.cargoless/latest-green` pointer) without any core rewrite.
 
 ### 3.1 Content identity
 
@@ -158,13 +162,26 @@ caused by a `BecameGreen`, never a red input (AC#4 by construction).
 
 ### 3.4 The latest-green publisher (the only additive v0 surface)
 
-The publisher is the single new v0 contract surface: on a servable green
-`BuildResult` it advances `.cargoless/latest-green` (pointer/dir) and records
-`{input_hash, identity, timestamp, profile, target}`; on red/`Failed` it does
-not move. The existing seams (`StateEvent` / `BuildTrigger` / `BuildResult` /
-`ArtifactMeta`) are **frozen on `main` and unchanged** — the publisher is
-*additive*, not a reshape. `server::Bundle` is **not** part of v0 (the v0.1
-server owns artifact framing).
+The publisher is the single new v0 contract surface (ratified ledger):
+
+- **Pointer file** `.cargoless/latest-green`, written **atomically** —
+  temp file + `fsync` + `rename` — so a reader never observes a torn or
+  partial pointer, and a crash mid-publish leaves the prior green intact.
+- **tf-proto additive types only** (serde-free, consistent with §4):
+  `PublishedArtifact { artifact: ArtifactMeta, published_at: UnixSeconds }`
+  and `UnixSeconds(u64)`. Additive — the four existing seams
+  (`StateEvent` / `BuildTrigger` / `BuildResult` / `ArtifactMeta`) are
+  **frozen on `main` and unchanged**; this is not a reshape.
+- The on-disk pointer surfaces `input_hash` / `profile` / `target` /
+  `timestamp` in a **human-readable** form (so `status` and a human can read
+  it without the binary).
+- **Invariant = AC#4 never-publish-red:** on a servable green `BuildResult`
+  the pointer advances; on `Failed` or a red tree the pointer is left
+  **byte-unmoved**. Verified headless.
+
+`server::Bundle` is **not** part of v0 — artifact framing for a browser
+belongs to the v0.1 server adapter. Per-step `Cargo.lock` discipline applies
+(committed lock, `--locked`).
 
 ## 4. Why dependency-free & serde-free in v0 (D8 sub-decision)
 
