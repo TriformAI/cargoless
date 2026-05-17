@@ -1,0 +1,25 @@
+# cargoless S1 / AC#2 latency harness.
+#
+# Standalone workspace, ZERO external dependencies on purpose: the harness
+# itself must not add a build/network/lock surface that would muddy the very
+# latency it measures, and std-only keeps it reproducible in the constrained
+# CI image. It speaks LSP (JSON-RPC over stdio) to a real `rust-analyzer`
+# process by hand.
+[workspace]
+
+[package]
+name = "cargoless-bench-harness"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ra-latency"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

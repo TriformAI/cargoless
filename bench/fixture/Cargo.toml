@@ -1,0 +1,35 @@
+# cargoless S1 / AC#2 reference fixture.
+#
+# This is the "D9 reference project" the spike (Plane CWDL-22) and AC#2
+# (CWDL-3) are measured against. It is DELIBERATELY not trivially tiny: a
+# trivially small project would flatter rust-analyzer latency numbers and make
+# the AC#2 / D-A2 verdict dishonest. bench/run.sh enforces an honest-size
+# guard (file + LOC floor) so this cannot silently shrink.
+#
+# Standalone workspace on purpose: it has a real external dependency (leptos)
+# and MUST NOT be pulled into the root cargoless workspace, whose build/test/
+# clippy jobs are zero-dependency by contract.
+[workspace]
+
+[package]
+name = "cargoless-bench-fixture"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# Pinned exactly for determinism. There is no committed Cargo.lock in the repo
+# yet (see .forgejo/workflows/ci.yml rationale); an exact top-level pin is the
+# strongest determinism available until a lock lands. The macro-heavy `view!`
+# surface is the whole point — it is rust-analyzer's documented weak spot.
+leptos = { version = "=0.6.15", features = ["csr"] }
+
+[[bin]]
+name = "cargoless-bench-fixture"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 0
+debug = true
