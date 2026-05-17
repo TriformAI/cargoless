@@ -238,6 +238,13 @@ impl Model {
         self.tree
     }
 
+    /// #122 Tier-4: has ≥1 authoritative `cargo check` (flycheck) pass
+    /// completed? The idle-evict trigger gates on this so the cold
+    /// first authoritative pass is never interrupted by an eviction.
+    pub fn flycheck_done(&self) -> bool {
+        self.flycheck_done
+    }
+
     /// The full reported verdict incl. provenance. Additive (#21).
     pub fn last_verdict(&self) -> Verdict {
         Verdict {
@@ -729,6 +736,9 @@ pub struct ModelSession {
     /// #112 structural-trigger spike — bench-lead measurement hook
     /// (D-OPENCLOSED §4.2). Additive; not part of any frozen seam.
     structural_counters: Arc<crate::structural::StructuralCounters>,
+    /// #122 Tier-4 idle-evict — bench-lead measurement hook
+    /// (composes with #116 stage-3). Additive; no frozen seam.
+    idle_evict_counters: Arc<crate::idle::IdleEvictCounters>,
 }
 
 impl ModelSession {
@@ -778,6 +788,16 @@ impl ModelSession {
     /// frozen seam.
     pub fn structural_counters(&self) -> (u64, u64) {
         self.structural_counters.snapshot()
+    }
+
+    /// #122 Tier-4 idle-evict — bench-lead measurement hook
+    /// (composes with #116 stage-3 fleet-scale). `(evictions,
+    /// suspended_ms)`: `suspended_ms` ≈ the time-averaged ~2 GB RA RSS
+    /// reclaimed. `(0, 0)` while `TF_RA_IDLE_EVICT` is unset
+    /// (default-off ⇒ no eviction, prior path byte-identical).
+    /// Additive — touches no frozen seam.
+    pub fn idle_evict_counters(&self) -> (u64, u64) {
+        self.idle_evict_counters.snapshot()
     }
 
     /// Explicit graceful shutdown (also runs on drop).
@@ -881,6 +901,10 @@ pub fn watch<I: IdentityProvider + 'static>(
     };
 
     let supervisor = crate::analyzer::Supervisor::start_with_hook(spawn, on_spawn)?;
+    // #122 Tier-4 idle-evict: cheap clonable handle so the fs-batch
+    // loop can suspend/resume RA without owning the Supervisor (which
+    // ModelSession owns). Only ever exercised when `TF_RA_IDLE_EVICT=1`.
+    let suspend_handle = supervisor.suspend_handle();
 
     let (watch_handle, batches) =
         crate::watcher::watch(&root, resolve_watch_debounce()).map_err(io::Error::other)?;
@@ -889,20 +913,54 @@ pub fn watch<I: IdentityProvider + 'static>(
     // while `TF_STRUCTURAL_TRIGGER=1` (the gated branch); dormant (0,0)
     // when default-off so an instrumented run is opt-in.
     let structural_counters = Arc::new(crate::structural::StructuralCounters::new());
+    // #122 Tier-4 bench hook (composes with #116 stage-3). Dormant
+    // (0,0) when default-off so an instrumented run is opt-in.
+    let idle_counters = Arc::new(crate::idle::IdleEvictCounters::new());
     let mut threads = Vec::new();
     {
         let model = Arc::clone(&model);
         let stop = Arc::clone(&stop);
         let current = Arc::clone(&current);
         let structural = Arc::clone(&structural_counters);
+        let idle_counters = Arc::clone(&idle_counters);
+        let suspend_handle = suspend_handle.clone();
         threads.push(
             thread::Builder::new()
                 .name("tf-model-fs".into())
                 .spawn(move || {
                     let mut version: i64 = 2;
+                    // #122 Tier-4 idle-evict tracking. Only consulted
+                    // when TF_RA_IDLE_EVICT=1; inert otherwise.
+                    let mut last_activity = std::time::Instant::now();
+                    let mut suspended_since: Option<std::time::Instant> = None;
                     loop {
                         match batches.recv_timeout(Duration::from_millis(250)) {
                             Ok(batch) => {
+                                // #122 Tier-4: if RA was idle-evicted,
+                                // bring it back BEFORE touching the
+                                // client. resume() respawns via the
+                                // unchanged AC#6 path (LSP re-init +
+                                // re-did_open at CURRENT content); wait
+                                // (bounded by the AC#1 bring-up budget)
+                                // for the fresh child so this batch's
+                                // verdict comes from the SAME
+                                // post-restart path ac6_kill9 proves
+                                // correct. Zero syscalls when
+                                // default-off.
+                                if crate::idle::enabled() && suspend_handle.is_suspended() {
+                                    suspend_handle.resume();
+                                    let deadline =
+                                        std::time::Instant::now() + Duration::from_secs(35);
+                                    while !suspend_handle.child_alive()
+                                        && std::time::Instant::now() < deadline
+                                    {
+                                        thread::sleep(Duration::from_millis(50));
+                                    }
+                                    if let Some(since) = suspended_since.take() {
+                                        idle_counters.add_suspended(since.elapsed());
+                                    }
+                                }
+                                last_activity = std::time::Instant::now();
                                 let client = poisoned(&current).as_ref().cloned();
                                 if crate::structural::enabled() {
                                     // #112 (D-OPENCLOSED): gate the cargo-check
@@ -964,6 +1022,23 @@ pub fn watch<I: IdentityProvider + 'static>(
                                 if stop.load(Ordering::SeqCst) {
                                     break;
                                 }
+                                // #122 Tier-4: reclaim RA's ~2 GB during
+                                // the long, provably check-free
+                                // agent-idle gaps. Gated on
+                                // `flycheck_done` so the cold first
+                                // authoritative pass is NEVER
+                                // interrupted; only once idle ≥ the
+                                // window and not already suspended.
+                                // Zero syscalls when default-off.
+                                if crate::idle::enabled()
+                                    && !suspend_handle.is_suspended()
+                                    && poisoned(&model).flycheck_done()
+                                    && last_activity.elapsed() >= crate::idle::idle_window()
+                                {
+                                    suspend_handle.suspend();
+                                    idle_counters.record_eviction();
+                                    suspended_since = Some(std::time::Instant::now());
+                                }
                             }
                             Err(RecvTimeoutError::Disconnected) => break,
                         }
@@ -980,6 +1055,7 @@ pub fn watch<I: IdentityProvider + 'static>(
         watch: Some(watch_handle),
         threads,
         structural_counters,
+        idle_evict_counters: idle_counters,
     };
     Ok((session, events))
 }

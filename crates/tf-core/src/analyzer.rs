@@ -57,6 +57,12 @@ struct Shared {
     on_spawn: Mutex<Box<OnSpawnFn>>,
     state: Mutex<SupState>,
     shutdown: AtomicBool,
+    /// #122 Tier-4 idle-evict. When `true`, a dead child is reaped (RAM
+    /// freed) but NOT auto-respawned — the monitor parks until
+    /// [`SuspendHandle::resume`]. Default `false` ⇒ the monitor behaves
+    /// byte-identically (the AC#6 crash-respawn path is unchanged); only
+    /// a deliberate `TF_RA_IDLE_EVICT` eviction ever sets it.
+    suspended: AtomicBool,
 }
 
 /// Owns a supervised child + its monitor thread. Drop = graceful shutdown.
@@ -94,6 +100,7 @@ impl Supervisor {
                 restarts: 0,
             }),
             shutdown: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
         });
 
         let mut first = (shared.spawn)()?;
@@ -114,6 +121,18 @@ impl Supervisor {
             shared,
             monitor: Some(monitor),
         })
+    }
+
+    /// #122 Tier-4 idle-evict: a cheap, `Clone`-able handle to
+    /// suspend/resume the supervised RA from another thread (the
+    /// `watch()` fs-batch loop) without moving the [`Supervisor`]
+    /// itself (which the [`ModelSession`](crate::model) owns). Shares
+    /// the same `Arc<Shared>`; dropping handles never affects the
+    /// supervisor.
+    pub fn suspend_handle(&self) -> SuspendHandle {
+        SuspendHandle {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// PID of the current (or most recent) child, if any has spawned.
@@ -159,6 +178,64 @@ impl Supervisor {
 impl Drop for Supervisor {
     fn drop(&mut self) {
         self.do_shutdown();
+    }
+}
+
+/// #122 Tier-4 idle-evict — a `Clone`-able remote control for the
+/// supervised RA, obtained via [`Supervisor::suspend_handle`]. Lets the
+/// `watch()` fs-batch loop reclaim RA's ~2 GB during agent-idle gaps
+/// without owning the [`Supervisor`].
+///
+/// ## No-wrong-verdict contract (load-bearing)
+///
+/// [`suspend`](Self::suspend) only ever *delays* a future check; it can
+/// never change a verdict. The authoritative green/red is the
+/// cargo-check / F8-redo tier — a transient subprocess, zero resident
+/// cost — so a suspended (absent) RA cannot make a tree wrongly green or
+/// hide a red. [`resume`](Self::resume) respawns through the unchanged
+/// AC#6 path (`spawn` + `invoke_on_spawn` ⇒ LSP re-init + re-`did_open`
+/// every file at its CURRENT content), identical to a `kill -9`
+/// transparent restart. Worst case of a mistimed evict is a slower
+/// next check, never a wrong/missing one; `never-publish-red` is
+/// untouched (the latest-green pointer only ever advances on a fresh
+/// CLOSED-batch flycheck, which by construction runs only while RA is
+/// resumed).
+#[derive(Clone)]
+pub struct SuspendHandle {
+    shared: Arc<Shared>,
+}
+
+impl SuspendHandle {
+    /// Evict the resident RA: set the suspend flag, then SIGKILL the
+    /// live child. The monitor reaps it (freeing ~2 GB) and, seeing the
+    /// flag, parks instead of respawning. Idempotent.
+    pub fn suspend(&self) {
+        self.shared.suspended.store(true, Ordering::SeqCst);
+        let mut st = lock(&self.shared.state);
+        if let Some(c) = st.child.as_mut() {
+            let _ = c.kill();
+        }
+    }
+
+    /// Lift the suspend: the monitor's park loop exits and respawns RA
+    /// through the AC#6 transparent path (re-init + re-`did_open`).
+    /// Idempotent; cheap (the actual respawn + LSP handshake happens on
+    /// the supervisor's monitor thread).
+    pub fn resume(&self) {
+        self.shared.suspended.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether RA is currently evicted.
+    pub fn is_suspended(&self) -> bool {
+        self.shared.suspended.load(Ordering::SeqCst)
+    }
+
+    /// True iff a respawned child is alive again (the fs loop polls this
+    /// after [`resume`](Self::resume) to know RA is back before
+    /// forwarding the batch — bounded by the AC#1 bring-up budget).
+    pub fn child_alive(&self) -> bool {
+        let mut st = lock(&self.shared.state);
+        matches!(st.child.as_mut().map(|c| c.try_wait()), Some(Ok(None)))
     }
 }
 
@@ -211,6 +288,19 @@ fn monitor_loop(shared: Arc<Shared>) {
             if let Some(mut old) = st.child.take() {
                 let _ = old.wait();
             }
+        }
+
+        // #122 Tier-4 idle-evict: if this death was a deliberate
+        // suspend (TF_RA_IDLE_EVICT), the ~2 GB is now reclaimed (corpse
+        // reaped above) — do NOT auto-respawn. Park here until
+        // `resume()` clears the flag or the daemon shuts down, then
+        // fall through to the SAME spawn + `invoke_on_spawn` path a
+        // crash takes (AC#6 transparent re-init/re-`did_open`). When
+        // `suspended` is never set (default-off), this `while` is a
+        // zero-iteration no-op ⇒ the crash-respawn path is byte-
+        // identical to pre-#122.
+        while shared.suspended.load(Ordering::SeqCst) && !shared.shutdown.load(Ordering::SeqCst) {
+            thread::sleep(POLL_INTERVAL);
         }
 
         thread::sleep(backoff);
@@ -766,6 +856,76 @@ mod tests {
         assert!(
             calls.load(Ordering::SeqCst) >= 2,
             "hook must re-fire on the transparent restart (re-init LSP)"
+        );
+        sup.shutdown();
+    }
+
+    /// #122 Tier-4: suspend() must reclaim (child dies and is NOT
+    /// auto-respawned while suspended); resume() must respawn through
+    /// the same hook path (re-init). Deterministic via bounded polls;
+    /// `sleep` stand-in like the AC#6 test (no rust-analyzer needed).
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_suspend_reclaims_then_resume_respawns() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let sup = Supervisor::start_with_hook(
+            || {
+                Command::new("sleep")
+                    .arg("60")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            },
+            move |_child: &mut Child| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect("start_with_hook");
+        let h = sup.suspend_handle();
+        assert!(h.child_alive(), "alive on initial spawn");
+        assert!(!h.is_suspended());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "hook fired once (spawn)");
+
+        // Suspend: child must die AND stay dead (NOT auto-respawned —
+        // that would defeat the ~2 GB reclaim). Poll a bounded window;
+        // then assert it remains dead a while longer + restart_count
+        // did not move (no respawn).
+        h.suspend();
+        assert!(h.is_suspended());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while h.child_alive() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!h.child_alive(), "suspend() must reap the child");
+        let restarts_at_suspend = sup.restart_count();
+        // Stays dead while suspended (no auto-respawn) — sample past a
+        // few monitor poll intervals + a backoff.
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            !h.child_alive(),
+            "a suspended RA must NOT be auto-respawned (RAM stays reclaimed)"
+        );
+
+        // Resume: monitor's park loop exits → respawn via the SAME
+        // hook path (the AC#6 transparent re-init).
+        h.resume();
+        assert!(!h.is_suspended());
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !h.child_alive() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(h.child_alive(), "resume() must respawn RA");
+        assert!(
+            sup.restart_count() > restarts_at_suspend,
+            "resume respawn must count as a restart"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "on_spawn hook must re-fire on resume (LSP re-init/re-did_open)"
         );
         sup.shutdown();
     }
