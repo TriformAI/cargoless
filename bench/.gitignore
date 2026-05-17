@@ -9,7 +9,11 @@ harness/target/
 # under `fixture/dist/` (trunk default; cargoless's build orchestrator
 # hardcodes project_root/dist so we use trunk's default everywhere).
 fixture/.cargoless-bench-out/
+fixture/.cargoless-tput-out/
+# trunk's dist (default `dist/`) + the legacy override path, both
+# build artifacts, never source.
+fixture/dist/
 fixture/trunk-dist/
 # cargoless publisher pointer + CAS — written under the fixture root by
-# `tftrunk build --watch` in artifact-mode benches; never source.
+# the cargoless `build --watch` artifact-mode benches; never source.
 fixture/.cargoless/
