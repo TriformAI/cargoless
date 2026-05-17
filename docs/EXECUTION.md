@@ -28,8 +28,41 @@ Forgejo CI (`.forgejo/workflows/ci.yml`) on `triform/cargoless`. Workflow:
    merges CI-green branches. Agents do **not** push to `main`, do not
    pull/merge/rebase (the lead integrates).
 
-`rustfmt <files>` may be run locally to make formatting deterministic before a
-push (it is the one allowed local toolchain command).
+`rustfmt` may be run locally to make formatting deterministic before a push
+(it is the one allowed local toolchain command). **Always pass
+`--edition 2024`** — this is an Edition-2024 workspace and the CI `fmt`
+gate runs `cargo fmt` (which infers `style_edition = 2024`). Bare
+`rustfmt <file>` silently defaults to **edition 2015**, whose import-sort
+rules differ — it will *regress* already-correct code and turn the `fmt`
+gate RED while build/test/clippy stay green (a confusing, builder-round-
+wasting failure that has bitten ≥2 agents: dev-fixer #93,
+docs-launch-lead pre-#87).
+
+**Self-gate checklist — before every push, in addition to running
+`scripts/ci-gate`:**
+
+```
+1. rustfmt --edition 2024 --check crates/**/*.rs   # MUST be clean (exit 0, no diff)
+2. scripts/ci-gate > full.log 2>&1 ; grep -nE 'error|warning|FAIL' full.log
+3. inserted a free `fn` next to a documented item? re-read the diff hunk
+```
+
+1. **rustfmt edition pre-gate.** Free, instant, catches the exact
+   edition-2015-vs-2024 trap above before a `fmt` builder round is spent.
+   To *fix* (not just check): `rustfmt --edition 2024 <files>`.
+2. **Never pipe/tail the gate — grep the file.** Redirect `scripts/ci-gate`
+   to a file and grep the file; do **not** `| tail`/`| head`/`| grep`
+   inline. A streamed filter can drop the one clippy diagnostic that is
+   the actual diagnosis (this build exposes no REST logs, so the gate's
+   own full output is the only ground truth — dev-fixer lost a clippy
+   diagnosis to its own inline filter twice). Read `full.log` whole.
+3. **Free-fn-next-to-doc-item: verify the rustdoc didn't split.** When you
+   insert a free `fn` adjacent to a documented item, anchoring an `Edit`
+   on `pub fn X` can land the new fn *between* `X`'s `///` block and `X`,
+   silently producing `clippy::doc_lazy_continuation` — `fmt`/`build`
+   stay green, only `clippy` reddens. Re-read the post-edit hunk and
+   confirm every `///` block still abuts its item (root cause of 2 of
+   dev-fixer's 4 self-gate red rounds on #114).
 
 ## Crate ownership (disjoint)
 
