@@ -1,16 +1,22 @@
-# cargoless release pipeline — DRAFT (CWDL-71)
+# cargoless release pipeline — ACTIVE (CWDL-71)
 #
 # ============================================================================
-#                                THIS IS A DRAFT
-# ============================================================================
-# Filename `.yml.draft` is intentional: GitHub Actions scans for `*.yml` and
-# `*.yaml` only, so this file CANNOT fire. Do NOT rename to `release.yml`
-# until every open decision in docs/design/D-RELEASE.md §8 is resolved and
-# team-lead ratifies. Renaming is the literal switch-on operation.
+# This file is ACTIVATED (was `release.yml.draft` pre-CWDL-71 Phase A,
+# 2026-05-17). GitHub Actions WILL pick it up and fire on tag pushes matching
+# `v[0-9]+.*`. Edits here have real consequences for the release pipeline —
+# make them carefully.
 #
 # Read docs/design/D-RELEASE.md before editing this file. The doc is the
 # spec; this file is the mechanical-readable form. If they disagree, the
 # doc wins — fix this file to match.
+#
+# §8 open decisions blocking FIRST-tag-cut (vs activating the pipeline):
+#   - #1 D1 product name (operator) — gates everything
+#   - #3 crates.io crate-name resolution (operator + lead, post-D1)
+#   - #5 crates.io token automation (operator; publish-* jobs stay `if: false`)
+#   - #7 GPG signing (v1+ parking-lot per CLAUDE.md)
+# The pipeline activates here; the operator's first tag cut is gated on the
+# §10 path-to-real-fire checklist in D-RELEASE.md.
 #
 # §1.1 runner split (post-§8 #8 (b) GitHub mirror):
 #   - PR-gate / S1 bench / ci-gate    -> Forgejo (.forgejo/workflows/ci.yml,

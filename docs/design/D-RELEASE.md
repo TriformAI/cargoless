@@ -525,9 +525,13 @@ discussions, not silent re-additions to `release.yml`.
     Every push to Forgejo main auto-replicates to GitHub within ~3–15s.
     Verified across launch-readiness push (e9ef58d) and dev-fixer-2 push
     (2f19b52).
-[ ] release.yml.draft → release.yml at `.github/workflows/release.yml`; remove
-    `if: false` from build/validate jobs (keep on publish-* until 0.2.0 token-
-    automation lands).
+[x] release.yml.draft → release.yml at `.github/workflows/release.yml`
+    (CWDL-71 Phase A, 2026-05-17). Workflow is ACTIVE on GitHub Actions and
+    will fire on tag push matching `v[0-9]+.*`. `build`/`tag-validate`/
+    `attach-release-assets` jobs all live; `publish-*` jobs remain
+    `if: false` until §8 #5 token-automation lands. First-tag-cut still
+    gated on §10 checklist items (D1 name, version-hoist done in CWDL-71
+    Phase B, throwaway-tag verification in CWDL-71 Phase C).
 [x] §8 #6 asset-URL shape verified via static analysis 2026-05-17 (cheaper +
     surfaced the workflow PKG/BIN mismatch bug before any real release fire;
     see §8 #6 row for the fix). Throwaway-tag end-to-end test for the GH
