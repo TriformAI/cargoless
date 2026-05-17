@@ -305,7 +305,68 @@ pub fn rust_analyzer_command() -> io::Result<Command> {
             });
         }
     }
+    apply_ra_allocator_env(&mut cmd);
     Ok(cmd)
+}
+
+/// #112-B Tier-1 — RSS-only, behavior-neutral allocator tuning for the
+/// rust-analyzer child. RA is heavily multithreaded; glibc's malloc
+/// grows up to `8 × ncpu` per-thread arenas, and arena fragmentation is
+/// a dominant contributor to RA's ~2 GB RSS with **zero** functional
+/// effect (RA upstream ships jemalloc precisely for this, but the
+/// rustup/distro binary cargoless spawns links system glibc malloc).
+///
+/// `MALLOC_ARENA_MAX` is consumed by glibc malloc only; musl and macOS
+/// ignore it (harmless no-op) — so this is safe to apply unconditionally
+/// and cannot change any verdict (it only affects the child's heap
+/// arena count, never analysis output). The authoritative cargo-check /
+/// F8-redo tier is untouched.
+///
+/// Conservative escape hatches: never overrides an operator-set
+/// `MALLOC_ARENA_MAX`; `TF_RA_ALLOC=off` disables the whole tier;
+/// jemalloc preload is **opt-in** (`TF_RA_JEMALLOC=1`) for the spike —
+/// allocator *swap* is empirically safe (RA ships it) but kept opt-in
+/// until bench-lead's RSS delta justifies a default (see D-RAM-TIERS).
+fn apply_ra_allocator_env(cmd: &mut Command) {
+    if matches!(std::env::var("TF_RA_ALLOC").as_deref(), Ok("off")) {
+        return;
+    }
+    // Cap glibc arenas unless the operator already chose a value.
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        cmd.env("MALLOC_ARENA_MAX", "2");
+    }
+    // Opt-in jemalloc preload (only if a libjemalloc is discoverable and
+    // the operator has not already set LD_PRELOAD — we never clobber it).
+    if matches!(std::env::var("TF_RA_JEMALLOC").as_deref(), Ok("1"))
+        && std::env::var_os("LD_PRELOAD").is_none()
+    {
+        if let Some(so) = find_jemalloc() {
+            cmd.env("LD_PRELOAD", so);
+        }
+    }
+}
+
+/// Locate a `libjemalloc` shared object for the opt-in Tier-1 preload.
+/// `TF_RA_JEMALLOC_SO` is an explicit override; otherwise probe the
+/// common multiarch/dev paths. Returns `None` (⇒ no preload, glibc
+/// arena cap still applies) if none exist — never an error.
+fn find_jemalloc() -> Option<std::ffi::OsString> {
+    if let Some(p) = std::env::var_os("TF_RA_JEMALLOC_SO") {
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    const CANDIDATES: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
+        "/usr/lib/aarch64-linux-gnu/libjemalloc.so.2",
+        "/usr/local/lib/libjemalloc.so.2",
+        "/usr/lib/libjemalloc.so.2",
+        "/lib/x86_64-linux-gnu/libjemalloc.so.2",
+    ];
+    CANDIDATES
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(std::ffi::OsString::from)
 }
 
 /// FIELD FINDING #3b: a scope-bound guard around a rust-analyzer [`Child`]

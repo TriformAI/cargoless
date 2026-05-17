@@ -13,6 +13,7 @@ pub mod analyzer;
 pub mod build;
 pub mod lsp;
 pub mod model;
+pub mod structural;
 pub mod watcher;
 
 pub use model::LifecycleEvent;
