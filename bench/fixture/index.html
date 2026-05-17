@@ -1,0 +1,24 @@
+<!--
+  Trunk needs index.html to build a wasm cdylib + dist bundle. This is the
+  minimum-viable Leptos CSR template — trunk discovers the wasm-bindgen
+  invocation from `data-trunk` + the Cargo.toml binary target, then emits
+  the bundled JS/wasm into the dist/ directory configured by `--dist`.
+
+  Both trunk (the comparator) and `tftrunk build --watch --out` (which
+  internally invokes trunk per FIELD FINDING #54) depend on this file.
+  Without it, trunk exits within ~20ms complaining about a missing input —
+  which surfaced as NO_READY for trunk in the first comparative run.
+
+  The file lives in the bench/ fixture root, alongside Cargo.toml, where
+  trunk looks for it by default. NOT counted against the honest-size floor
+  (which gates `*.rs` LOC under src/).
+-->
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>cargoless bench fixture</title>
+    <link data-trunk rel="rust" data-bin="cargoless-bench-fixture" />
+  </head>
+  <body></body>
+</html>

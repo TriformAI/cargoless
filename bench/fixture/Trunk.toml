@@ -1,0 +1,26 @@
+# Trunk config for the bench fixture.
+#
+# Both the trunk comparator and `tftrunk build --watch --out` (which
+# delegates to trunk per FIELD FINDING #54) use this when building the
+# wasm bundle. Kept deliberately MINIMAL — pinning `dist = "trunk-dist"`
+# only because the comparative harness watches `trunk-dist/index.html`'s
+# mtime as the artifact-publish witness; everything else is trunk default.
+#
+# `release = false` because the bench measures inner-loop edit-save
+# latency, not release optimization time — matches the v0 plan AC#3
+# wording "no wasm-opt on the inner loop".
+
+[build]
+dist = "trunk-dist"
+release = false
+
+[watch]
+# Default ignore list plus the harness's own scratch dirs so an artifact
+# update inside .cargoless-bench-out doesn't loop back into trunk's
+# watcher (its --dist also lives under fixture root in this benchmark).
+ignore = [
+    "trunk-dist",
+    ".cargoless-bench-out",
+    ".cargoless",
+    "target",
+]

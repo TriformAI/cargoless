@@ -86,19 +86,34 @@ impl Tool {
 /// name) of the cargoless binary to test, `cargoless_out` is the artifact
 /// `--out` directory to materialize into.
 ///
-/// Static-string signals work for all three v0 tools — promoted from raw
-/// observation of their stdout, NOT from clever regex. We pick noun-banner
-/// words rather than punctuation or emoji because terminals strip those
-/// inconsistently:
+/// SIGNAL DISCIPLINE (revised after the first run found NO_READY/NO_SIGNAL
+/// for all three tools — root cause: the original `ready` lists matched
+/// daemon-startup signals like cargoless's "verdict pipeline live"
+/// [LSP-handshake-done, NOT compile-done] and trunk's "starting build"
+/// [first banner, NOT first success]. The harness then started its
+/// measurement loop on a still-cold workspace, where 60s edit_timeout was
+/// hopelessly under the cold-Leptos first-edit→verdict time):
 ///
-///  * cargoless: `ui::ok("GREEN — tree compiles")` /
-///    `ui::error("RED — tree does not compile")` (stderr) and
-///    `ui::ok("published <hash> → <dir>")` / `ui::warn("RED — holding
-///    last green")` (in build mode).
-///  * trunk:    `INFO compilation finished`/`SUCCESS` on green;
-///              `ERROR`/`build failed`/`error[E` on red.
-///  * bacon:    `Success!` on green; `Failure.`/`Errors found`/`error[E`
-///              on red.
+///   * `ready` matches ONLY the first REAL compile-complete signal. For
+///     cargoless that is "GREEN — tree compiles" (watch) / "GREEN —
+///     building" + "published " (build). For trunk it is "success" (post-
+///     build banner). For bacon it is one of "Success!" / "Failure." /
+///     "Errors found" (the post-cargo-check banner).
+///   * `green` / `red` lists are the steady-state signals on save edges —
+///     they reuse the same banner vocabulary so a green ready hit and a
+///     subsequent green save both match the same string.
+///
+/// Watch-tier signal vocabulary on main as of #45 (timestamps on every
+/// verdict line) + #55 (tier-filter F8 fix) + #57 (default=integration):
+///
+///  * cargoless watch (stderr):  `ok {ts}GREEN — tree compiles`
+///                               `xx {ts}RED — tree does not compile`
+///  * cargoless build (stderr):  `ok GREEN — building`
+///                               `ok published <hash> → <dir> (at <s>s)`
+///                               `xx build failed — holding last green:…`
+///                               `!! RED — holding last green (AC#4)`
+///  * trunk watch (stderr):      `INFO  📦 success`/`success` banner per build
+///  * bacon --headless (stdout): `Success!` / `Failure.` / `Errors found.`
 pub fn registry(cargoless_bin: &str, cargoless_out: &Path) -> Vec<Tool> {
     let cargoless_out_s = cargoless_out.to_string_lossy().into_owned();
     vec![
@@ -122,24 +137,37 @@ pub fn registry(cargoless_bin: &str, cargoless_out: &Path) -> Vec<Tool> {
                 ".cargoless/latest-green",
             )),
             signals: Signals {
-                ready: &[
-                    "verdict pipeline live",
-                    "Streaming verdicts",
-                    "Building latest-green",
-                    "GREEN", // first cold green also counts as ready
+                // STRICT: only the post-compile banners. "verdict pipeline
+                // live" / "Streaming verdicts" / "Building latest-green"
+                // are pre-compile setup banners — matching them was the
+                // original NO_SIGNAL bug.
+                //
+                // Both modes' banners are listed: in checker mode the
+                // "GREEN — tree compiles" line lands (watch.rs); in
+                // artifact mode the "GREEN — building" line lands first
+                // (build.rs) and then "published <hash>" once the
+                // publisher advances `.cargoless/latest-green`. The
+                // artifact-mode driver also watches the pointer-file
+                // directly as the authoritative witness, so the banner is
+                // belt + suspenders for warm gating.
+                ready: &["GREEN — tree compiles", "GREEN — building", "published "],
+                green: &["GREEN — tree compiles", "GREEN — building", "published "],
+                red: &[
+                    "RED — tree does not compile",
+                    "RED — holding",
+                    "build failed",
                 ],
-                green: &["GREEN", "published "],
-                red: &["RED", "build failed"],
             },
-            note: Some("cargoless v0 headless watcher + latest-green publisher"),
+            note: Some(
+                "cargoless v0 headless watcher + latest-green publisher \
+                 (default debouncer 150ms post-#49)",
+            ),
         },
         Tool {
             name: "trunk",
             // `trunk watch` rebuilds on edit but does NOT start a HTTP
             // server — the same compile loop as `trunk serve` without the
             // server overhead that would skew the artifact measurement.
-            // `--no-autoreload` keeps it from injecting reload JS, which
-            // doesn't affect compile latency but keeps output minimal.
             checker_argv: vec!["trunk".to_string(), "watch".to_string()],
             artifact_argv: Some(vec![
                 "trunk".to_string(),
@@ -151,11 +179,17 @@ pub fn registry(cargoless_bin: &str, cargoless_out: &Path) -> Vec<Tool> {
             ]),
             artifact_witness: PublishWitness::FileMtime(PathBuf::from("trunk-dist/index.html")),
             signals: Signals {
-                ready: &["success", "applying new distribution", "starting build"],
+                // STRICT: only post-build banners. "starting build" was
+                // the original false-ready match.
+                ready: &["success", "applying new distribution"],
                 green: &["success", "applying new distribution"],
-                red: &["error", "failed", "panicked"],
+                // Be specific: "error" alone matched warning lines from
+                // any sub-tool. `error[E` is rustc's stable error prefix;
+                // `build failed` is trunk's banner; `wasm-bindgen error`
+                // is the bundler's banner.
+                red: &["error[E", "build failed", "wasm-bindgen"],
             },
-            note: None,
+            note: Some("trunk 0.21.x; needs index.html + Trunk.toml in fixture root"),
         },
         Tool {
             name: "bacon",
@@ -172,10 +206,10 @@ pub fn registry(cargoless_bin: &str, cargoless_out: &Path) -> Vec<Tool> {
             artifact_argv: None,
             artifact_witness: PublishWitness::None,
             signals: Signals {
-                // bacon prints `Success!` / `Failure.` / `Errors found.`
-                // banners; `Job ` is the per-run divider that fires on
-                // every edit.
-                ready: &["Success!", "Failure.", "Errors found", "warning"],
+                // STRICT: only post-cargo-check banners. "warning" was the
+                // original false-ready match — it fires on any cargo
+                // warning line, well before the first check completes.
+                ready: &["Success!", "Failure.", "Errors found"],
                 green: &["Success!"],
                 red: &["Failure.", "Errors found", "error[E"],
             },

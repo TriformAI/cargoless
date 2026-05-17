@@ -32,7 +32,7 @@
 //! that prevented capture. Mirrors `bench/run.sh`'s "evidence, not gate"
 //! contract — gating happens in task #36, downstream of this binary.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -421,6 +421,7 @@ fn usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
