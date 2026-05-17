@@ -3,7 +3,7 @@
 //! The cache is **out-of-tree** (build-cas mandate — see
 //! [`crate::config::cache_root`]): by default
 //! `${XDG_CACHE_HOME:-$HOME/.cache}/cargoless/<project-key>`. Removing the
-//! directory tree is layout-agnostic and safe to own here. The tf-cli status
+//! directory tree is layout-agnostic and safe to own here. The cargoless status
 //! file lives in-tree at `<root>/.cargoless/cli-status` — a different place
 //! entirely — so `clean` never blinds a running daemon's `status`.
 //!

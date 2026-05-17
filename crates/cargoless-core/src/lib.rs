@@ -33,7 +33,7 @@ pub use model::LifecycleEvent;
 /// Before #89 the binary rendered TWO different product names depending
 /// on the command: `--version` / `help` showed `tf-trunk <ver>` (this
 /// constant), while `watch` built its own `cargoless <ver>` banner
-/// straight off `CARGO_PKG_VERSION` in `tf-cli`. Same binary, two
+/// straight off `CARGO_PKG_VERSION` in `cargoless`. Same binary, two
 /// names — dogfood-lead's §gap-3 finding. Every banner now reads THIS
 /// constant (`cargoless_core::BUILD_ID`), so the binary speaks one name.
 ///

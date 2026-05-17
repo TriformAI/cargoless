@@ -1,11 +1,11 @@
 //! `build --watch --out <dir>` — maintain the latest-green artifact output.
 //!
 //! Lead RULING 2 + build-cas's verbatim contract (agent/build-cas-publisher
-//! @ 9fa947d): on `StateEvent::BecameGreen { identity }`, tf-cli calls
+//! @ 9fa947d): on `StateEvent::BecameGreen { identity }`, cargoless calls
 //! `BuildOrchestrator::run(&BuildTrigger { identity })`. On
 //! `Compiled`/`Deduplicated` build-cas has ALREADY atomically advanced the
 //! canonical `.cargoless/latest-green` pointer (AC#4 fail-closed: a `Failed`
-//! build leaves it byte-untouched). tf-cli then reads the pointer
+//! build leaves it byte-untouched). cargoless then reads the pointer
 //! (`read_latest_green`), fetches the CAS blob by `input_hash`, and
 //! materializes it into the user's `--out <dir>`. We meet build-cas ONLY
 //! through `cargoless_proto::PublishedArtifact` + those `cargoless_core::build` fns.
@@ -24,7 +24,7 @@
 //! build-cas shipped `cargoless_core::build::materialize_latest_green` (frozen seam
 //! @ build-cas-publisher 5b4b7f9): one call does read_latest_green → CAS get
 //! → faithful `dist/` expansion into `out_dir`. The blob/container format
-//! stays entirely build-cas's; tf-cli never parses CAS internals. v0 uses
+//! stays entirely build-cas's; cargoless never parses CAS internals. v0 uses
 //! build-cas's non-destructive default (overwrite, do not delete unrelated
 //! pre-existing files in `--out`) — a documented v0-simple behavior, not a
 //! guess; a pristine `--out` is the user's responsibility for now.
@@ -305,7 +305,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 
 /// Materialize the just-published latest-green tree into `out` via
 /// build-cas's frozen `materialize_latest_green` seam (option (b)). The
-/// blob/container format stays entirely build-cas's — tf-cli never parses
+/// blob/container format stays entirely build-cas's — cargoless never parses
 /// CAS internals. NoGreen/Evicted are normal states (no crash, --out
 /// untouched); Err is only a genuinely corrupt pointer/blob or real FS/CAS
 /// failure — surfaced, never panicked, --out left as the path-safe helper

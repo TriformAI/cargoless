@@ -25,13 +25,13 @@
 //! The #8-redo invariant: **the verdict and the diagnostic stream MUST
 //! agree on green/red**. The fix is in two coordinated halves:
 //!
-//! 1. tf-core::model: any `severity:Error` from any source (rustc OR
+//! 1. cargoless-core::model: any `severity:Error` from any source (rustc OR
 //!    rust-analyzer-native) flips the file Red. GREEN gating is
 //!    unchanged — still requires a completed flycheck with zero errors
 //!    of any source. The asymmetry is honest: RA's "saw an error" is
 //!    strictly stronger evidence than "didn't see one" because RA's
 //!    analysis is partial.
-//! 2. tf-cli::check (this file): `is_authoritative` is now severity-
+//! 2. cargoless::check (this file): `is_authoritative` is now severity-
 //!    based — `severity:Error` from any source is verdict-driving and
 //!    rendered; warnings/info/hints stay source-filtered (rustc-source
 //!    kept as authoritative; rust-analyzer-native suppressed in `check`

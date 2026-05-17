@@ -3,14 +3,14 @@
 //! Rationale for hand-rolling instead of pulling `sha2`/`blake3`: the whole
 //! workspace builds CI-only with **no committed `Cargo.lock`** and a
 //! deliberately minimal dependency tree — the same reasoning that makes
-//! `tf-proto` refuse `serde` and daemon-core hand-roll its debounce/ignore
+//! `cargoless-proto` refuse `serde` and daemon-core hand-roll its debounce/ignore
 //! logic (cold-build time is what AC#1/#2 are measured against). SHA-256 is a
 //! fixed, ~120-line, `#![forbid(unsafe_code)]`-clean algorithm whose output is
 //! pinned by the FIPS 180-4 test vectors exercised in this module's tests. It
 //! is a *stable* hash with zero supply-chain or cold-build cost, which is
 //! exactly what the CAS key contract needs.
 //!
-//! The contract (`tf-proto`) deliberately leaves the hash algorithm
+//! The contract (`cargoless-proto`) deliberately leaves the hash algorithm
 //! unspecified and owned here; this module is that choice.
 
 use core::fmt::Write as _;

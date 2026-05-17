@@ -155,14 +155,14 @@ mod tests {
 
     #[test]
     fn reasonable_cache_dir_is_accepted() {
-        assert!(guard_cache_root(Path::new("/home/u/.cache/tf-cas")).is_ok());
+        assert!(guard_cache_root(Path::new("/home/u/.cache/cargoless-cas")).is_ok());
         assert!(guard_cache_root(Path::new("/var/lib/tf/cache")).is_ok());
     }
 
     #[test]
     fn clean_wipes_contents_but_leaves_an_empty_dir() {
         let mut root: PathBuf = std::env::temp_dir();
-        root.push(format!("tf-cas-clean-{}", std::process::id()));
+        root.push(format!("cargoless-cas-clean-{}", std::process::id()));
         root.push("cache");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn clean_on_missing_root_is_ok() {
         let mut root: PathBuf = std::env::temp_dir();
-        root.push(format!("tf-cas-clean-absent-{}", std::process::id()));
+        root.push(format!("cargoless-cas-clean-absent-{}", std::process::id()));
         root.push("nested-cache");
         let _ = fs::remove_dir_all(&root);
         assert!(clean_cache(&root).is_ok());

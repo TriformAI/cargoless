@@ -1,7 +1,7 @@
-//! `tf-proto` — the cross-crate contract for cargoless.
+//! `cargoless-proto` — the cross-crate contract for cargoless.
 //!
 //! This crate is the seam the daemon (`watcher`/`analyzer`/`model`), the build
-//! pipeline + CAS (`build`/`tf-cas`), the dev server (`server`), the CLI, and
+//! pipeline + CAS (`build`/`cargoless-cas`), the dev server (`server`), the CLI, and
 //! future remote backends communicate through. Cross-boundary data flows as
 //! these types; nobody reaches across a module boundary with a direct call.
 //! Authoring this jointly and freezing it early is the whole point of Plane
@@ -10,7 +10,7 @@
 //! ## Why dependency-free and serde-free in v0 (decision of record)
 //!
 //! v0 is single-machine, single-process: every consumer of these types links
-//! `tf-proto` directly and passes them in-memory (channels / function args).
+//! `cargoless-proto` directly and passes them in-memory (channels / function args).
 //! Nothing crosses a process or network boundary, so nothing needs to be
 //! serialized. Adding `serde` now would (a) put a non-trivial dependency in the
 //! crate every other crate depends on, slowing the cold build that AC#1/#2 are
@@ -48,7 +48,7 @@ use core::fmt;
 ///
 /// The *algorithm* (blake3, sha256, …) and the *hashing implementation* are
 /// deliberately **not** part of this contract — they belong to the CAS owner
-/// (`tf-cas`). `tf-proto` only carries the resulting identity so producers and
+/// (`cargoless-cas`). `cargoless-proto` only carries the resulting identity so producers and
 /// consumers agree on what equality means without agreeing on how it is
 /// computed. Comparison is byte-exact on the hex string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -154,7 +154,7 @@ pub struct BuildIdentity {
 ///
 /// Opaque newtype so a caller cannot pass a raw string where a verified key is
 /// expected. The reduction `BuildIdentity → InputHash` is performed by the CAS
-/// owner; `tf-proto` only guarantees that equal `BuildIdentity` ⇒ equal
+/// owner; `cargoless-proto` only guarantees that equal `BuildIdentity` ⇒ equal
 /// `InputHash` is the invariant every consumer may rely on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InputHash(String);
@@ -398,9 +398,9 @@ pub struct CheckResult {
 // ---------------------------------------------------------------------------
 
 /// Wall-clock seconds since the Unix epoch (UTC). A newtype so a timestamp
-/// cannot be transposed with any other `u64` at a call site. `tf-proto` is
+/// cannot be transposed with any other `u64` at a call site. `cargoless-proto` is
 /// deliberately dependency-free, so there is no `chrono`/`time` here: the
-/// producer (`tf-core::build`) fills this from `std::time::SystemTime`; this
+/// producer (`cargoless-core::build`) fills this from `std::time::SystemTime`; this
 /// crate only carries the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnixSeconds(pub u64);
