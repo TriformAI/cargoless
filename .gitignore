@@ -5,3 +5,7 @@ Cargo.lock.orig
 # Local CAS / daemon scratch dirs (real paths come from config).
 .tf-trunk-cache/
 *.log
+# Local-only MCP config carries a Plane API key. This repo is destined for
+# open source — the key must NEVER be committed. Keep .mcp.json untracked.
+.mcp.json
+.env

@@ -102,6 +102,11 @@ mod tests {
     #[test]
     fn missing_key_is_none() {
         let store = LocalDiskStore::new(default_scratch_root());
-        assert!(store.get(&InputHash::new("nope-not-here")).unwrap().is_none());
+        assert!(
+            store
+                .get(&InputHash::new("nope-not-here"))
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -89,6 +89,9 @@ mod tests {
 
     #[test]
     fn unknown_is_unknown() {
-        assert_eq!(parse(&v(&["frobnicate"])), Command::Unknown("frobnicate".into()));
+        assert_eq!(
+            parse(&v(&["frobnicate"])),
+            Command::Unknown("frobnicate".into())
+        );
     }
 }
