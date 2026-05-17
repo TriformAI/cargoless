@@ -86,10 +86,11 @@ on manual UI dispatch, not on a release branch. One tag → one release. The
 discipline mirrors `.forgejo/workflows/ci.yml`'s `on: push:` minimalism (it
 takes the whole space; release takes only tagged points).
 
-The tag is pushed to BOTH remotes (operator runs `git push origin v0.1.0 &&
-git push github v0.1.0`, or the Forgejo push-mirror handles GitHub
-automatically — see §8 #9 for the mirror-direction operator decision). The
-`.github/workflows/release.yml` triggers on GitHub's receipt of the tag.
+The tag is pushed to Forgejo (`git push origin v0.1.0`); Forgejo's
+push-mirror (configured per §8 #9, option (a) — `sync_on_commit: true`)
+auto-replicates main and tags to GitHub within seconds. The operator
+does NOT need to manually `git push github`. `.github/workflows/release.yml`
+triggers on GitHub's receipt of the mirrored tag.
 
 Why tag-only:
 
@@ -147,9 +148,11 @@ basis). This is the **headline install path** in the README. Slow
 > template in `[package.metadata.binstall]` resolves from that one field.
 > Forgejo (`forgejo.triform.dev/triform/cargoless`) remains the
 > integration-CI side but is NOT the canonical user-facing URL after §8 #8
-> resolution. The GitHub repo currently has only an initial commit
-> (LICENSE + README); mirror direction (§8 #9) is the operator's next
-> setup step.
+> resolution. Forgejo→GitHub push-mirror (§8 #9 option (a)) is **live**:
+> every push to Forgejo `main` auto-replicates to GitHub within seconds
+> (`sync_on_commit: true`). End-to-end install proven anonymously:
+> `cargo install --git https://github.com/TriformAI/cargoless.git tf-cli
+> --branch main --locked` succeeds in a clean env.
 
 ### 3.2 Prebuilts via `cargo binstall` — three targets at first release
 
@@ -465,8 +468,8 @@ called out, not invented.
 | 5 | **crates.io token automation timeline.** Operator-run for `0.1.0` is approved. Is `0.2.0`-automatable, or is human-in-the-loop the permanent model? | operator | Whether `publish-*` jobs ever lose `if: false`. |
 | 6 | **GitHub release-asset URL shape.** The `pkg-url` template in §7 assumes GitHub's canonical `/{owner}/{repo}/releases/download/v{version}/{file}` shape — verified shape; a one-time throwaway test fire on `v0.0.1-rc.1` against the actual GitHub release should still confirm end-to-end before locking the production tag. | operator (one-time) | binstall first-fire correctness. |
 | 7 | **GPG signing of release tags + tarball signatures.** v1 parking-lot per CLAUDE.md non-goals. Recorded here for the record — when someone asks "why no .asc files?" the answer is "deliberate 0.1.0 scope decision; see D-RELEASE §9." | lead | Nothing in v0.1.0; trust model for downstream packagers. |
-| 8 | ~~**Canonical install URL / public-source-access strategy.**~~ **FULLY CLOSED 2026-05-17 — operator picked (b) GitHub mirror; URL confirmed `https://github.com/TriformAI/cargoless`.** `[workspace.package].repository` flipped from forgejo to the GitHub URL; README install commands rewritten to point at GitHub; CONTRIBUTING.md split into outside-contributor (GitHub PR target) and agent-team (Forgejo integration-CI workflow) sections. Per-repo Forgejo flip from earlier in the day (`private: false`) stays in place but is not load-bearing — the Forgejo instance's site-wide `[service].REQUIRE_SIGNIN_VIEW = true` setting overrides per-repo visibility; outside users access the project via GitHub. Forgejo remains the integration-CI side (cargoless-builder pod, ci-gate, S1 bench). Compound benefit realized: §8 #2 (Mac builder) ALSO closes via GH Actions free-tier macOS runners. See §1.1 for the runner-split summary. **GitHub repo currently has only an initial commit (LICENSE + README) — operator's mirror-setup step (§8 #9) is the remaining mechanical work to populate cargoless content on the GitHub side.** Anonymous-probe verification 2026-05-17: HTML 200 / `git ls-remote HEAD` returns SHA / `info/refs?service=git-upload-pack` returns 200 on GET. The install path is structurally unblocked. | — (resolved) | — |
-| 9 | **Forgejo → GitHub mirror direction.** Does the operator (a) configure a Forgejo push-mirror (Forgejo auto-pushes to GitHub on each push to main + tags) or (b) push to both remotes manually from their machine? (a) is more automation but ties Forgejo's outbound credentials to a GitHub PAT held server-side; (b) is more explicit but requires discipline never to push to one without the other. | operator | Branch/tag synchronization mechanics. Doesn't block design; affects §6 operator playbook precise commands. |
+| 8 | ~~**Canonical install URL / public-source-access strategy.**~~ **FULLY CLOSED 2026-05-17 — operator picked (b) GitHub mirror; URL confirmed `https://github.com/TriformAI/cargoless`; cargoless content seeded to GitHub via force-push from `IggyGG@laptop` (HTTPS+PAT path, operator's keychain credential, admin permission verified). End-to-end anonymous install proven in clean cargoless-builder pod env: `cargo install --git https://github.com/TriformAI/cargoless.git tf-cli --branch main --locked` succeeded in 7s, produced working `tftrunk` binary.** `[workspace.package].repository` flipped from forgejo to the GitHub URL; README install commands rewritten to point at GitHub; CONTRIBUTING.md split into outside-contributor (GitHub PR target) and agent-team (Forgejo integration-CI workflow) sections. Per-repo Forgejo flip from earlier in the day (`private: false`) stays in place but is not load-bearing — the Forgejo instance's site-wide `[service].REQUIRE_SIGNIN_VIEW = true` setting overrides per-repo visibility; outside users access the project via GitHub. Forgejo remains the integration-CI side (cargoless-builder pod, ci-gate, S1 bench). Compound benefit realized: §8 #2 (Mac builder) ALSO closes via GH Actions free-tier macOS runners. See §1.1 for the runner-split summary. Anonymous-probe verification 2026-05-17: HTML 200 / `git ls-remote HEAD` returns SHA / `info/refs?service=git-upload-pack` returns 200 on GET. The install path is structurally unblocked. | — (resolved) | — |
+| 9 | ~~**Forgejo → GitHub mirror direction.**~~ **CLOSED 2026-05-17 — option (a) push-mirror selected and operational.** Configured via Forgejo API (`POST /api/v1/repos/triform/cargoless/push_mirrors`) with HTTPS+PAT shape (`remote_username: IggyGG, remote_password: <PAT-from-keychain>, use_ssh: false, interval: 8h0m0s, sync_on_commit: true, branch_filter: ""`). Every push to Forgejo `main` (and any tags) auto-replicates to GitHub within ~3–15s wall-clock; verified empirically across the launch-readiness push (e9ef58d) and dev-fixer-2 cherry-pick push (2f19b52) — both landed on GitHub without manual intervention. Forgejo daemon's outbound credentials carry a single GitHub PAT scoped to the TriformAI/cargoless repo only — small, well-defined auth surface. Manual dual-push (option b) is no longer used; it remains documented in commit history as the bootstrap alternative. | — (resolved) | — |
 
 ---
 
@@ -505,16 +508,20 @@ discussions, not silent re-additions to `release.yml`.
 [ ] Update path-deps to include version (publish-ready); Cargo.lock regenerated.
 [ ] CHANGELOG.md format chosen; ## 0.1.0 section seeded.
 [x] §8 #8 GitHub URL confirmed: `https://github.com/TriformAI/cargoless`.
-    Operator created the repo (currently initial-commit-only; cargoless
-    content awaits §8 #9 mirror setup).
-    [workspace.package].repository updated from forgejo to the GitHub URL
-    (commit landed on agent/builder-infra).
-    README/CONTRIBUTING URLs updated in the same commit.
-[ ] §8 #9 mirror direction decided (push-mirror server-side vs manual dual-push);
-    if push-mirror, configured in Forgejo with appropriate GitHub PAT.
-    Mirror activated → cargoless content lands on GitHub side; anonymous
-    `cargo install --git https://github.com/TriformAI/cargoless.git` returns
-    a real Rust workspace (not just LICENSE+README).
+    [workspace.package].repository updated from forgejo to the GitHub URL.
+    README/CONTRIBUTING URLs updated.
+    cargoless content seeded to GitHub via force-push from local
+    (IggyGG@laptop HTTPS+PAT; operator-cleared after license-vs-MIT
+    placeholder reconciliation; Apache-2.0 per CLAUDE.md preserved).
+    End-to-end `cargo install --git https://github.com/TriformAI/
+    cargoless.git tf-cli --branch main --locked` verified in a clean
+    cargoless-builder pod env (7s install, working `tftrunk` binary).
+[x] §8 #9 mirror direction: option (a) push-mirror — LIVE.
+    Forgejo `POST /api/v1/repos/triform/cargoless/push_mirrors` configured
+    with `use_ssh: false, remote_username: IggyGG, sync_on_commit: true`.
+    Every push to Forgejo main auto-replicates to GitHub within ~3–15s.
+    Verified across launch-readiness push (e9ef58d) and dev-fixer-2 push
+    (2f19b52).
 [ ] release.yml.draft → release.yml at `.github/workflows/release.yml`; remove
     `if: false` from build/validate jobs (keep on publish-* until 0.2.0 token-
     automation lands).
