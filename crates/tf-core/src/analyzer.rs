@@ -250,6 +250,13 @@ fn monitor_loop(shared: Arc<Shared>) {
 /// first (matches the active toolchain), then bare `rust-analyzer` on PATH,
 /// then the `RUST_ANALYZER` env override. stdio is piped for the LSP layer.
 ///
+/// On Unix, the command is also configured to spawn into a new process
+/// group (`setpgid(0, 0)`) so the one-shot check path can later send
+/// SIGKILL to `-pgid` and reap every grandchild — `rust-analyzer` spawns
+/// one `rust-analyzer-proc-macro-srv` per proc-macro crate in the dep
+/// graph, and the FIELD FINDING #3b zombie pileup is exactly those
+/// grandchildren outliving the parent's `child.kill(); child.wait()`.
+///
 /// This does not spawn anything — it returns a ready [`Command`] so the
 /// supervisor's spawn closure stays a one-liner and is the unit of restart.
 pub fn rust_analyzer_command() -> io::Result<Command> {
@@ -258,7 +265,93 @@ pub fn rust_analyzer_command() -> io::Result<Command> {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // pgid=0 ⇒ "make this child the leader of a new process group with
+        // pgid == its pid". Lets us SIGKILL the whole group (RA + every
+        // proc-macro-srv it forks) in `ReapOnDrop::drop`.
+        cmd.process_group(0);
+    }
     Ok(cmd)
+}
+
+/// FIELD FINDING #3b: a scope-bound guard around a rust-analyzer [`Child`]
+/// that kill-reaps on Drop, even on the early-return (`?`) paths of the
+/// one-shot check loop. `std::process::Child` deliberately does NOT reap
+/// on drop (documented behavior), so a `client.initialize()?` failure
+/// after spawn used to leak the child silently.
+///
+/// On Unix the kill is dispatched to the WHOLE process group (`-pgid`),
+/// so every `rust-analyzer-proc-macro-srv` grandchild dies with the
+/// parent — the zombie pileup the dogfood reproducer caught (26 defunct
+/// processes from 7 invocations ≈ 3-4 per call ≈ one parent + ~3
+/// proc-macro grandchildren on a Leptos project). On non-Unix targets
+/// (Windows, doc-only for v0) the guard falls back to killing just the
+/// immediate child, matching the prior behavior.
+///
+/// `into_parts()` lets the caller take ownership of stdin/stdout for the
+/// LSP handshake while keeping the guard alive — the guard still owns
+/// `Child` and so still reaps on drop.
+pub struct ReapOnDrop(Option<std::process::Child>);
+
+impl ReapOnDrop {
+    /// Wrap a freshly-spawned child. After this call, scope-exit (panic,
+    /// early-return, or normal Drop) reliably reaps RA + its proc-macro
+    /// grandchildren on Unix.
+    pub fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// Take the stdin/stdout pipes for the LSP layer to drive, leaving
+    /// the [`Child`] inside the guard so its lifecycle still ends on
+    /// scope exit. Returns `None` if `take()` was already called.
+    pub fn take_stdio(&mut self) -> Option<(std::process::ChildStdin, std::process::ChildStdout)> {
+        let child = self.0.as_mut()?;
+        let stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        Some((stdin, stdout))
+    }
+}
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            // The Command above set pgid==pid, so the negated pid IS the
+            // group id. SIGKILL to -pgid takes out RA + every
+            // proc-macro-srv grandchild in one syscall.
+            // libc-free implementation via the nix-friendly raw syscall:
+            // std::process::Child::id() gives the immediate pid; we
+            // re-derive the negative-pid argument and call kill(2)
+            // through the std::os::unix shim.
+            let pid = child.id() as i32;
+            // Safety: kill(2) is documented and the pgid==pid invariant
+            // is established at spawn time via process_group(0).
+            unsafe {
+                // libc::kill via a tiny extern decl avoids pulling the
+                // libc crate as a tf-core dep (the workspace dep tree is
+                // intentionally minimal — see Cargo.toml rationale).
+                unsafe extern "C" {
+                    fn kill(pid: i32, sig: i32) -> i32;
+                }
+                const SIGKILL: i32 = 9;
+                // Best effort: a process group of dead/orphaned procs is
+                // ESRCH, which is fine — we just want a successful reap
+                // afterward.
+                let _ = kill(-pid, SIGKILL);
+            }
+        }
+        // Belt-and-braces: kill the immediate child too. On Unix the
+        // SIGKILL above usually already terminated it; on non-Unix this
+        // is the only kill we do. Then reap so the OS does not hold the
+        // PID slot.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn resolve_rust_analyzer() -> io::Result<OsString> {
@@ -295,6 +388,81 @@ fn rustup_which_rust_analyzer() -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #3b — ReapOnDrop kills + reaps on scope exit
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_on_drop_kills_the_child_on_scope_exit() {
+        // Long-lived process via the same `sleep` stand-in the AC#6 test
+        // uses (rust-analyzer is not in the CI image). The child must be
+        // dead-and-reaped after the guard's Drop runs.
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        {
+            let _guard = ReapOnDrop::new(child);
+            // Process is alive while guard is in scope.
+            assert!(
+                pid_is_alive(pid),
+                "child should be alive while ReapOnDrop guard exists"
+            );
+        }
+        // Drop ran — give the OS a brief moment to actually deliver SIGKILL
+        // and the kernel a moment to update /proc. ~200ms is generous.
+        for _ in 0..40 {
+            if !pid_is_alive(pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("ReapOnDrop guard exited but pid {pid} still alive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_on_drop_take_stdio_returns_pipes_once() {
+        // `take_stdio()` must hand back stdin+stdout on the first call and
+        // `None` on the second — exactly the contract `check_verdict`
+        // depends on (one take, then guard drops at scope exit).
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep with piped stdio");
+        let mut guard = ReapOnDrop::new(child);
+        let first = guard.take_stdio();
+        assert!(first.is_some(), "first take_stdio yields the pipes");
+        // Holding the pipes alongside the guard — what check_verdict does.
+        let second = guard.take_stdio();
+        assert!(second.is_none(), "second take_stdio is None");
+        // Pipes drop when `first` goes out of scope; guard drops at end.
+        drop(first);
+        drop(guard);
+    }
+
+    /// Minimal best-effort liveness probe: `kill(pid, 0)` returns 0 if the
+    /// pid is live (or a zombie owned by us), `-1` ESRCH if it does not
+    /// exist. We only call this in unix-cfg tests so the libc declaration
+    /// stays local.
+    #[cfg(unix)]
+    fn pid_is_alive(pid: i32) -> bool {
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            kill(pid, 0) == 0
+        }
+    }
 
     #[test]
     fn rust_analyzer_command_is_resolvable_and_piped() {

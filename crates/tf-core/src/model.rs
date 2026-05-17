@@ -377,15 +377,14 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
     let root = fs::canonicalize(root)?;
     let mut cmd = crate::analyzer::rust_analyzer_command()?;
     cmd.current_dir(&root);
-    let mut child = cmd.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    // FIELD FINDING #3b: wrap the child in a `ReapOnDrop` BEFORE any
+    // `?` early-return path so a failing LSP handshake (handshake EOF,
+    // pipe error, etc.) no longer leaks the child + its proc-macro-srv
+    // grandchildren on Unix.
+    let mut guard = crate::analyzer::ReapOnDrop::new(cmd.spawn()?);
+    let (stdin, stdout) = guard
+        .take_stdio()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdio unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
     let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
 
@@ -447,8 +446,12 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
             Err(RecvTimeoutError::Disconnected) => break, // RA exited
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    // `guard` drops here — `ReapOnDrop` SIGKILLs RA's whole process group
+    // on Unix (RA + every proc-macro-srv grandchild) and waits to reap;
+    // on non-Unix it falls back to killing just the immediate child.
+    // The explicit `drop(guard)` makes the scope-end deterministic and
+    // documents the reap point.
+    drop(guard);
 
     if flycheck_seen {
         let tree = if auth.values().any(|s| *s == FileState::Red) {
@@ -496,15 +499,14 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
     let root = fs::canonicalize(root)?;
     let mut cmd = crate::analyzer::rust_analyzer_command()?;
     cmd.current_dir(&root);
-    let mut child = cmd.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    // FIELD FINDING #3b: same guard as `check_verdict` — Drop-based reap
+    // covers every early-return path (handshake EOF, pipe error, etc.)
+    // and on Unix takes out the whole RA process group so
+    // `rust-analyzer-proc-macro-srv` grandchildren do not accumulate.
+    let mut guard = crate::analyzer::ReapOnDrop::new(cmd.spawn()?);
+    let (stdin, stdout) = guard
+        .take_stdio()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdio unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
     let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
 
@@ -572,8 +574,8 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
             Err(RecvTimeoutError::Disconnected) => break, // RA exited
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    // Same deterministic reap-point as `check_verdict` (see comment there).
+    drop(guard);
 
     let tree = if flycheck_seen {
         if auth.values().any(|s| *s == FileState::Red) {
