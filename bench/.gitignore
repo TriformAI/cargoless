@@ -6,7 +6,8 @@ harness/target/
 
 # Comparative-bench artifact `--out` (cargoless `build --watch --out`
 # materializes the latest-green dist here; trunk's --dist sibling lives
-# under `fixture/trunk-dist/` by registry default).
+# under `fixture/dist/` (trunk default; cargoless's build orchestrator
+# hardcodes project_root/dist so we use trunk's default everywhere).
 fixture/.cargoless-bench-out/
 fixture/trunk-dist/
 # cargoless publisher pointer + CAS — written under the fixture root by

@@ -169,15 +169,14 @@ pub fn registry(cargoless_bin: &str, cargoless_out: &Path) -> Vec<Tool> {
             // server — the same compile loop as `trunk serve` without the
             // server overhead that would skew the artifact measurement.
             checker_argv: vec!["trunk".to_string(), "watch".to_string()],
-            artifact_argv: Some(vec![
-                "trunk".to_string(),
-                "watch".to_string(),
-                "--dist".to_string(),
-                // trunk's --dist is project-relative; the artifact driver
-                // resolves the witness against the same project root.
-                "trunk-dist".to_string(),
-            ]),
-            artifact_witness: PublishWitness::FileMtime(PathBuf::from("trunk-dist/index.html")),
+            // Use trunk's DEFAULT dist (`dist/`) — NOT a `--dist trunk-dist`
+            // override. cargoless's build orchestrator hardcodes
+            // `project_root.join("dist")`; a non-default dist made
+            // cargoless's own build-path fail every rep. Aligning the
+            // comparator on trunk's default keeps the fixture single-
+            // Trunk.toml + matches what real users get.
+            artifact_argv: Some(vec!["trunk".to_string(), "watch".to_string()]),
+            artifact_witness: PublishWitness::FileMtime(PathBuf::from("dist/index.html")),
             signals: Signals {
                 // STRICT: only post-build banners. "starting build" was
                 // the original false-ready match.

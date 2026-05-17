@@ -11,7 +11,15 @@
 # wording "no wasm-opt on the inner loop".
 
 [build]
-dist = "trunk-dist"
+# Use trunk's DEFAULT dist directory (`dist/`). cargoless's build
+# orchestrator (tf-core/src/build.rs) hardcodes `project_root.join("dist")`
+# when it wraps `trunk build` — pinning a non-default dist here ("trunk-dist")
+# made cargoless's `build --watch --out` fail EVERY rep with
+# "`trunk build` succeeded but produced no dist/ directory" (Axis-B
+# CAS-publish-fail, throughput investigation). Real users get trunk's
+# default `dist/` too, so this is also the honest config. The
+# comparative-latency artifact-driver's trunk witness is updated to
+# `dist/index.html` to match (bench/harness/src/tools.rs).
 release = false
 
 [watch]
