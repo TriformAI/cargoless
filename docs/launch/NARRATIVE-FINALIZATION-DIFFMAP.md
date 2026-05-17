@@ -43,7 +43,13 @@ verbatim block" or "re-open the dual-tier split" — those are frozen.
    estimates → confirmed figures; the structural-trigger
    5/25/45% spectrum (#115/#116) anchored by dogfood-lead's real
    agent-OPEN-batch rate (#117). Until both, every numeric cell stays
-   `_PENDING_` (unchanged discipline).
+   `_PENDING_` (unchanged discipline). **The #117 anchor is, per
+   dogfood-lead's honest flag, a small-N number with survivorship-bias
+   caveat — the narrative presents it as a caveated bracket-locator
+   ("real loops sit near the low/mid end of bench-lead's validated
+   5/25/45% spectrum"), NEVER as a confident point estimate. The
+   diff-map slot for it is a *caveated-anchor* slot, not a number
+   slot.**
 
 The finalization commit is branched off **then-current main** (which
 will include this prep branch via builder-infra's post-Phase-C docs
@@ -65,9 +71,9 @@ bundles may shift them; anchor on the **header text**, not the number).
 |---|---|---|---|
 | `# cargoless` + the `> **The codebase always knows…**` epigraph (L1-4) | **REFRAME** | Keep the vision line verbatim; add a one-clause gloss that the "you" includes **the agent**: "…tells you — or the agent driving the loop — the moment it doesn't." Do **not** drop the human reading; widen it. | none (frame is known) |
 | `## What cargoless v0 is (and isn't)` (L33) | **REFRAME** | Add a single lead sentence: primary consumer = an agent writing whole files atomically; the `check`/`watch`/`build` surface is the agent-edit-batch verdict loop. Existing v0/v0.1 bullets unchanged. | none |
-| `## Performance vs alternatives` (L154) | **ADD (numbers) + REFRAME (lead only)** | The verbatim bench-lead Framing-C block + the dual-tier AC#2a/2b paragraphs are **FROZEN — do not touch**. Add *above* the qualitative table one paragraph: "cost unit is per agent-edit-batch; the structural-completeness trigger cargo-checks only confirmed-CLOSED batches" → cite the spectrum. Fill `_PENDING_` cells only when gate-2 clears. | `~half`/`~2 GB`/`~75%` (#102); 5/25/45% spectrum (#115/#116) × #117 anchor |
+| `## Performance vs alternatives` (L154) | **ADD (numbers) + REFRAME (lead only)** | The verbatim bench-lead Framing-C block + the dual-tier AC#2a/2b paragraphs are **FROZEN — do not touch**. Add *above* the qualitative table one paragraph: "cost unit is per agent-edit-batch; the structural-completeness trigger cargo-checks only confirmed-CLOSED batches" → cite the spectrum **as a caveated bracket (real loops near low/mid of 5/25/45%), not a confident point** (§3 caveated-anchor rule). Fill `_PENDING_` cells only when gate-2 clears. | `~half`/`~2 GB`/`~75%` (#102); 5/25/45% spectrum (#115/#116) × #117 caveated anchor |
 | `## Workspace` (L286) | none | crate-name table is post-#97 (builder-infra). Out of scope. | — |
-| `## Status` (L315) | **REFRAME** | If gate-1 = v0-only: status line stays. If v0+v0.1: add the v0.1-RAM-roadmap one-liner (Tier-1/2 shipped → Tier-3/4 = fleet-scale RAM answer). | gate-1 |
+| `## Status` (L315) | **REFRAME** | If gate-1 = v0-only: status line stays. If v0+v0.1: add the v0.1-RAM-roadmap one-liner (Tier-1/2 shipped → Tier-3 validated + Tier-4 **prototyped+measured** per #122/#125 → fleet-scale RAM answer). | gate-1 |
 
 ### 2.2 `ROADMAP.md`
 
@@ -75,7 +81,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 |---|---|---|---|
 | `### v0 capabilities (available today on main)` (L31) | **REFRAME** | Add a bullet: agent-edit-batch as the cost unit; structural-trigger seam is **default-off spike in v0** (#113), not a v0 claim. | none |
 | `### The nine acceptance criteria` (L53) | none | AC#2a/2b split already staged (C1). Frozen. | — |
-| `### v0.1 perf follow-up — auto-narrow --features` (L119) | **ADD** | Extend this section into the full **#118 v0.1-RAM-roadmap growth-path**: v0 = Tier-1/2 (landed, verdict-neutral) + structural-trigger spectrum + two-source ~2× CPU; **v0.1 = validated Tier-3 (proc-macro-off-default + RA-native-downrank proof) + Tier-4 idle-evict-RA (~2 GB reclaimed per idle gap) = the fleet-scale RAM answer.** Source: `docs/design/D-RAM-TIERS.md` verdict table. Keep auto-narrow as the named single highest-leverage *flag* change; Tier-4 idle-evict as the highest-leverage *architectural* change. | D-RAM-TIERS lands on main (dev-fixer/bench ff); Tier-3/4 numbers PENDING |
+| `### v0.1 perf follow-up — auto-narrow --features` (L119) | **ADD** | Extend this section into the full **#118 v0.1-RAM-roadmap growth-path**: v0 = Tier-1/2 (landed, verdict-neutral) + structural-trigger spectrum + two-source ~2× CPU; **v0.1 = validated Tier-3 (proc-macro-off-default + RA-native-downrank proof) + Tier-4 idle-evict-RA (~2 GB reclaimed per idle gap) = the fleet-scale RAM answer.** Source: `docs/design/D-RAM-TIERS.md` verdict table. Keep auto-narrow as the named single highest-leverage *flag* change; Tier-4 idle-evict as the highest-leverage *architectural* change. **Tier-4 framing precision (lead steer):** dev-fixer is pulling Tier-4 forward under #122/#125 as a **default-off prototype + no-wrong-verdict proof + measured RSS delta** — so the growth-path reads "**designed + prototyped + measured**", NOT "designed only". This strengthens the roadmap claim from aspiration to demonstrated-mechanism-deferred-by-scope; do not overstate it as *shipped* in v0 (it is default-off prototype, v0.1-DESIGN verdict). | D-RAM-TIERS lands on main (dev-fixer/bench ff); Tier-3 numbers PENDING; Tier-4 = #122/#125 prototype+proof+RSS-delta PENDING |
 | `## v1 — parking lot` (L135) | none | unchanged | — |
 
 ### 2.3 `docs/launch/BLOG-DRAFT.md`
@@ -84,7 +90,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 |---|---|---|---|
 | Title `# cargoless v0: the dev loop that doesn't burn your CPU` (L26) | **REFRAME (candidate)** | Offer the lead a title variant that leads with the agent frame, e.g. *"the dev loop your agents can trust"* / keep CPU subtitle. **Do not unilaterally retitle** — present both; operator/lead picks (this is the headline, narrative-finalization-gated). | gate-1 + lead/operator title call |
 | `## The problem nobody benchmarks` (L65) | **REFRAME** | Add the agent-input framing: the three-terminals-human picture still opens, but the turn is "and now the loop's primary user is an agent emitting whole-file writes in batches — per-keystroke optimization is the wrong axis entirely." Composes with existing throughput thesis. | none |
-| `## The cargoless architecture: do less, trust more` (L101) | **REFRAME + ADD** | Recenter on the **agent-edit-batch / structural-completeness** model (D-OPENCLOSED): CLOSED-batch-gated cargo-check, OPEN/NEUTRAL skip, the F8-redo asymmetry preserved. This is the architectural spine of the agent frame. ADD the structural-trigger spectrum as the quantified payoff. | D-OPENCLOSED on main; spectrum numbers PENDING |
+| `## The cargoless architecture: do less, trust more` (L101) | **REFRAME + ADD** | Recenter on the **agent-edit-batch / structural-completeness** model (D-OPENCLOSED): CLOSED-batch-gated cargo-check, OPEN/NEUTRAL skip, the F8-redo asymmetry preserved. This is the architectural spine of the agent frame. ADD the structural-trigger spectrum as the quantified payoff — **as a caveated bracket-locator, not a confident point (§3 caveated-anchor rule); honesty about the small-N #117 measurement is itself on-brand for the agent audience**. | D-OPENCLOSED on main; spectrum PENDING; #117 anchor = caveated small-N |
 | `## Honest performance comparison` (L152) | **FROZEN** | The verbatim Framing-C block, dual-tier latency tables, memory-honesty bullet, bacon footnote, PENDING cells — **all frozen exactly as staged in C1.** Only fill `_PENDING_` when gate-2 clears. No prose rewrite. | gate-2 numbers |
 | `## Roadmap` (L325) | **ADD** | Mirror ROADMAP.md §2.2: the v0.1-RAM-roadmap growth-path one-paragraph. Keep v0/v0.1/v1 phasing exactly. | gate-1; D-RAM-TIERS |
 | `## What we are honest about` (L354) | **REFRAME** | Add one bullet: "Built for an agent loop; the human-facing `trunk serve` browser experience is explicitly v0.1, not v0 — we did not pretend the agent tool is a human live-reload replacement." Composes with the existing memory-honesty + INCONCLUSIVE-speed bullets (do not weaken those). Also fold dogfood-lead's **§gap-3 flagged→fixed→field-verified** data point as a "the two-tier method worked end-to-end" credibility line. | none (both inputs known) |
@@ -110,7 +116,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 | `~2 GB` default RSS | README/BLOG memory framing | bench-lead #102/#119 §8.5 | two-source RSS (already solid; confirm wording) |
 | `~75%` `--features` cut | README/BLOG + ROADMAP | bench-lead #102 | two-source |
 | 5/25/45% structural-trigger spectrum | README/BLOG architecture | bench-lead #115/#116 | spectrum validated |
-| real agent-OPEN-batch rate (pins the spectrum point) | same paragraph as spectrum | dogfood-lead #117 | #117 field-measure lands |
+| real agent-OPEN-batch rate — **honest-caveated small-N anchor, NOT a confident point** | same paragraph as spectrum | dogfood-lead #117 | #117 field-measure lands |
 | Tier-3/Tier-4 RAM deltas | ROADMAP/BLOG v0.1-roadmap | dev-fixer #119/#122/#125; D-RAM-TIERS | tiers measured + D-RAM-TIERS ff'd to main |
 | v0-only vs v0+v0.1 framing | README Status / BLOG Roadmap / title | operator (CWDL/#101) | scope decision |
 
