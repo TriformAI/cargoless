@@ -139,6 +139,14 @@ pub fn clear(root: &Path) {
 
 /// `status` command. Exit `0` = daemon live, `3` = no/stale daemon — so a
 /// script can gate on "is cargoless watching this project?".
+///
+/// FIELD FINDING #10 (#56): freshness alone is not sufficient. The status
+/// file's `updated` field is heartbeated every [`HEARTBEAT`] (5s) by the
+/// running watch process; if a user kills the watch and runs `status`
+/// within the [`STALE_AFTER`] (15s) window, the file looks fresh even
+/// though the daemon is dead. We additionally ask the kernel
+/// (`kill(pid, 0)`) whether `st.pid` is still a live process; if it is
+/// not, treat the entry as stale regardless of file age.
 pub fn run_status(cfg: &Config) -> ExitCode {
     let Ok(text) = std::fs::read_to_string(path(&cfg.root)) else {
         ui::warn(format!(
@@ -152,8 +160,21 @@ pub fn run_status(cfg: &Config) -> ExitCode {
 
     let st = Status::parse(&text);
     let now = now_unix();
-    let fresh = st.is_fresh(now);
+    let file_fresh = st.is_fresh(now);
     let age = now.saturating_sub(st.updated);
+    // FIELD FINDING #10: cross-check freshness against pid liveness.
+    // `pid_is_alive` returns Some(bool) on Unix; None on non-Unix
+    // (where we trust the file-freshness rule unchanged).
+    let pid_alive = pid_is_alive(st.pid);
+    // A daemon is "live" iff the heartbeat is fresh AND we believe the
+    // process exists. On Unix: a dead pid invalidates a fresh file —
+    // the dogfood reproducer's exact case.
+    let fresh = match (file_fresh, pid_alive) {
+        (true, Some(true)) => true,
+        (true, Some(false)) => false, // stale-via-kernel (#10)
+        (true, None) => true,         // non-Unix: trust the file (legacy)
+        (false, _) => false,          // heartbeat aged out — stale
+    };
 
     if fresh {
         ui::ok(format!(
@@ -162,7 +183,21 @@ pub fn run_status(cfg: &Config) -> ExitCode {
             Verdict::parse(&st.verdict_str).as_str(),
             age
         ));
+    } else if file_fresh && pid_alive == Some(false) {
+        // The dogfood reproducer's exact case: file says fresh (e.g.
+        // "(6s ago)"), but kill(pid, 0) says the pid doesn't exist.
+        // Be EXPLICIT about why we don't trust the file — a vague
+        // "stale" message would suggest the daemon hadn't heartbeated,
+        // when in fact the process died. Clarifying the discrepancy
+        // is what makes status trustworthy again.
+        ui::warn(format!(
+            "stale status: pid {} is no longer running (file claims \
+             {age}s ago, but the process exited / was killed). \
+             `cargoless watch` to restart.",
+            st.pid
+        ));
     } else {
+        // Heartbeat actually aged past STALE_AFTER. The original message.
         ui::warn(format!(
             "stale status (last heartbeat {age}s ago > {}s) — daemon likely \
              stopped; `cargoless watch` to restart.",
@@ -176,6 +211,44 @@ pub fn run_status(cfg: &Config) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(3)
+    }
+}
+
+/// FIELD FINDING #10 (#56): `kill(pid, 0)` liveness probe. Returns:
+/// * `Some(true)`  — pid exists and we may signal it (Unix);
+/// * `Some(false)` — pid does not exist (Unix);
+/// * `None`        — non-Unix target; caller falls back to file-freshness
+///   (the legacy v0 behavior — unchanged for any non-Unix port).
+///
+/// Signal 0 is the POSIX `kill(2)` "probe without signalling" pattern.
+/// EPERM (pid exists but we lack permission) is theoretically possible
+/// but implausible for cargoless's own daemon under the user's own uid;
+/// we treat any non-zero return as "dead" because the conservative
+/// outcome (false-stale) is the safer trust answer than the alternative
+/// (false-claiming live) — same false-suppress-vs-false-contradict
+/// asymmetry that drove #55's classification design.
+fn pid_is_alive(pid: u32) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            // pid 0 is the "every process in our group" target — not a
+            // real daemon pid. Defensive against a malformed status file.
+            return Some(false);
+        }
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            // r == 0 → exists; r == -1 → ESRCH or EPERM (we treat both
+            // as "not our live daemon"; see fn-level comment on the
+            // EPERM-implausibility decision).
+            Some(kill(pid as i32, 0) == 0)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -230,6 +303,52 @@ mod tests {
             assert_eq!(Verdict::parse(v.as_str()), v);
         }
         assert_eq!(Verdict::parse("garbage"), Verdict::Unknown);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #10 (#56) — pid liveness probe via kill(pid, 0)
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_returns_true_for_our_own_pid() {
+        // The test process itself is the canonical example of "live pid".
+        let me = std::process::id();
+        assert_eq!(pid_is_alive(me), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_returns_false_for_pid_zero() {
+        // Defensive case — pid 0 isn't a real daemon pid (it's the
+        // process-group target on kill). A malformed status file with
+        // pid=0 must NOT be reported live.
+        assert_eq!(pid_is_alive(0), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_is_alive_returns_false_for_known_dead_pid() {
+        // Spawn `true` (exits immediately), wait for it, then probe its
+        // pid — guaranteed ESRCH (we reaped it). Deterministic dead-pid
+        // case without needing to invent a pid number.
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        let _ = child.wait();
+        assert_eq!(pid_is_alive(pid), Some(false));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn pid_is_alive_is_none_on_non_unix() {
+        // Non-Unix legacy contract: probe returns None so the caller
+        // falls back to file-freshness — same behavior as pre-#56.
+        assert_eq!(pid_is_alive(std::process::id()), None);
     }
 
     #[test]

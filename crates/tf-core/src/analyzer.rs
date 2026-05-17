@@ -250,12 +250,23 @@ fn monitor_loop(shared: Arc<Shared>) {
 /// first (matches the active toolchain), then bare `rust-analyzer` on PATH,
 /// then the `RUST_ANALYZER` env override. stdio is piped for the LSP layer.
 ///
-/// On Unix, the command is also configured to spawn into a new process
-/// group (`setpgid(0, 0)`) so the one-shot check path can later send
-/// SIGKILL to `-pgid` and reap every grandchild — `rust-analyzer` spawns
-/// one `rust-analyzer-proc-macro-srv` per proc-macro crate in the dep
-/// graph, and the FIELD FINDING #3b zombie pileup is exactly those
-/// grandchildren outliving the parent's `child.kill(); child.wait()`.
+/// On Unix, the command sets up TWO concentric escape-resistant containers
+/// for the child + every descendant it might spawn (FIELD FINDING #3b
+/// follow-up — dogfood-lead measured 1.75 zombies-per-check still escaping
+/// the #44 first try, which used pgid alone):
+///
+/// 1. `process_group(0)` — new process group, `pgid == pid`. SIGKILL to
+///    `-pgid` takes out RA + every child that INHERITS the pgid (i.e. the
+///    common case for `rust-analyzer-proc-macro-srv`).
+/// 2. `setsid()` via `pre_exec` — child becomes the leader of a new
+///    SESSION too. Sessions are a strict superset of process groups: a
+///    descendant that calls `setpgid()` itself (escaping the pgid kill)
+///    is STILL in our session, and `pgrep -s <sid>` enumerates them all.
+///    [`ReapOnDrop::drop`] uses both: SIGKILL `-pgid` for speed, then
+///    `pgrep -s` + individual SIGKILLs as defense-in-depth for escapees.
+///
+/// On non-Unix targets (Windows, parking-lot per CLAUDE.md), the guard
+/// falls back to killing just the immediate child.
 ///
 /// This does not spawn anything — it returns a ready [`Command`] so the
 /// supervisor's spawn closure stays a one-liner and is the unit of restart.
@@ -270,8 +281,29 @@ pub fn rust_analyzer_command() -> io::Result<Command> {
         use std::os::unix::process::CommandExt as _;
         // pgid=0 ⇒ "make this child the leader of a new process group with
         // pgid == its pid". Lets us SIGKILL the whole group (RA + every
-        // proc-macro-srv it forks) in `ReapOnDrop::drop`.
+        // proc-macro-srv it forks that doesn't call setpgid itself) in
+        // `ReapOnDrop::drop`.
         cmd.process_group(0);
+        // setsid in pre_exec → child becomes session leader with sid == pid.
+        // Any descendant that escapes the pgid via setpgid is STILL in our
+        // session and findable via `pgrep -s <pid>` — the defense in depth
+        // the #44 first try was missing (dogfood-lead's 1.75 zombies/check).
+        //
+        // SAFETY: pre_exec runs AFTER fork() but BEFORE exec(); we are in
+        // a single-threaded child process at that moment and may only
+        // call async-signal-safe functions. setsid(2) IS async-signal-safe
+        // (POSIX SS_FN list). Errors from setsid (EPERM only — if the
+        // child were already a session leader) are swallowed: best-effort,
+        // process_group(0) above is the load-bearing line.
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                let _ = setsid();
+                Ok(())
+            });
+        }
     }
     Ok(cmd)
 }
@@ -282,23 +314,42 @@ pub fn rust_analyzer_command() -> io::Result<Command> {
 /// on drop (documented behavior), so a `client.initialize()?` failure
 /// after spawn used to leak the child silently.
 ///
-/// On Unix the kill is dispatched to the WHOLE process group (`-pgid`),
-/// so every `rust-analyzer-proc-macro-srv` grandchild dies with the
-/// parent — the zombie pileup the dogfood reproducer caught (26 defunct
-/// processes from 7 invocations ≈ 3-4 per call ≈ one parent + ~3
-/// proc-macro grandchildren on a Leptos project). On non-Unix targets
-/// (Windows, doc-only for v0) the guard falls back to killing just the
-/// immediate child, matching the prior behavior.
+/// ## Unix reap strategy (FIELD FINDING #3b follow-up)
 ///
-/// `into_parts()` lets the caller take ownership of stdin/stdout for the
-/// LSP handshake while keeping the guard alive — the guard still owns
-/// `Child` and so still reaps on drop.
+/// The dogfood field measurement on the #44 first try found 1.75
+/// zombies-per-check still escaping — about half the original ~3.7. The
+/// pgid SIGKILL caught the common case (proc-macro-srv inheriting RA's
+/// pgid) but missed descendants that called `setpgid()` themselves
+/// (escaping the group) or that double-fork into init's reparenting.
+///
+/// The deepened reap, in order:
+///
+/// 1. **Snapshot session members BEFORE killing.** RA's spawn sets
+///    `setsid()` so `sid == ra_pid`; `pgrep -s <sid>` lists every
+///    process in the session — a STRICT superset of the process group
+///    (setpgid escapees stay in the same session). Snapshot here so the
+///    listing is taken while everything is still alive and findable.
+/// 2. **SIGKILL `-pgid`** (the existing fast path).
+/// 3. **SIGKILL each session member individually** (the escapees the
+///    pgid kill missed). Order-safe: SIGKILL to a dead pid is ESRCH,
+///    harmless. Order-bounded: pgrep snapshot is taken at step 1, so
+///    we never grow the kill list with reparented orphans.
+/// 4. **Reap the immediate child** with `child.wait()` to free its PID
+///    slot. Belt-and-braces for non-Unix where steps 1-3 are no-ops.
+///
+/// Double-fork escapees (rare; mostly daemon-style services, not RA's
+/// build tooling) are not catchable without a full `/proc` walk; that
+/// is a documented v1+ refinement. For v0 launch, the session-member
+/// walk closes the dogfood-observed gap (target: 0 zombies/check).
+///
+/// On non-Unix targets (Windows, parking-lot per CLAUDE.md), the guard
+/// falls back to killing just the immediate child.
 pub struct ReapOnDrop(Option<std::process::Child>);
 
 impl ReapOnDrop {
     /// Wrap a freshly-spawned child. After this call, scope-exit (panic,
     /// early-return, or normal Drop) reliably reaps RA + its proc-macro
-    /// grandchildren on Unix.
+    /// grandchildren on Unix (incl. setpgid escapees).
     pub fn new(child: std::process::Child) -> Self {
         Self(Some(child))
     }
@@ -321,37 +372,67 @@ impl Drop for ReapOnDrop {
         };
         #[cfg(unix)]
         {
-            // The Command above set pgid==pid, so the negated pid IS the
-            // group id. SIGKILL to -pgid takes out RA + every
-            // proc-macro-srv grandchild in one syscall.
-            // libc-free implementation via the nix-friendly raw syscall:
-            // std::process::Child::id() gives the immediate pid; we
-            // re-derive the negative-pid argument and call kill(2)
-            // through the std::os::unix shim.
             let pid = child.id() as i32;
-            // Safety: kill(2) is documented and the pgid==pid invariant
-            // is established at spawn time via process_group(0).
+            // Step 1: snapshot session members BEFORE killing. RA was set
+            // up as a session leader via setsid in pre_exec, so the
+            // session id equals the pid. `pgrep -s` is on every modern
+            // Linux + macOS (procps-ng + BSD procps); a missing pgrep
+            // (musl minimal containers) just makes step 3 a no-op —
+            // step 2's pgid kill still runs.
+            let session_members = snapshot_session_members(pid);
+            // Step 2: SIGKILL the whole process group (the fast path —
+            // catches every descendant that inherited the pgid).
             unsafe {
-                // libc::kill via a tiny extern decl avoids pulling the
-                // libc crate as a tf-core dep (the workspace dep tree is
-                // intentionally minimal — see Cargo.toml rationale).
                 unsafe extern "C" {
                     fn kill(pid: i32, sig: i32) -> i32;
                 }
                 const SIGKILL: i32 = 9;
-                // Best effort: a process group of dead/orphaned procs is
-                // ESRCH, which is fine — we just want a successful reap
-                // afterward.
+                // Best effort: ESRCH is fine — we just want a successful
+                // reap afterward.
                 let _ = kill(-pid, SIGKILL);
+                // Step 3: SIGKILL each session-member individually (the
+                // setpgid escapees missed by step 2). Skip pid itself
+                // (already killed via -pid above). ESRCH for any already-
+                // dead member is harmless.
+                for m in session_members {
+                    if m != pid {
+                        let _ = kill(m, SIGKILL);
+                    }
+                }
             }
         }
-        // Belt-and-braces: kill the immediate child too. On Unix the
-        // SIGKILL above usually already terminated it; on non-Unix this
-        // is the only kill we do. Then reap so the OS does not hold the
-        // PID slot.
+        // Step 4: belt-and-braces immediate-child kill + wait. On Unix
+        // the SIGKILL above usually already terminated it; the wait
+        // here is what frees the PID slot.
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// FIELD FINDING #3b follow-up: snapshot every PID in `sid`'s session
+/// via `pgrep -s`. Empty Vec if pgrep is missing, exits non-zero, or
+/// outputs no PIDs — all are safe degradations (the pgid SIGKILL still
+/// runs; this is defense in depth).
+///
+/// Cost: ~1 process spawn (pgrep is small + warm in distro caches). Runs
+/// once per ReapOnDrop drop, i.e. once per `tftrunk check`. Not on a
+/// hot path.
+#[cfg(unix)]
+fn snapshot_session_members(sid: i32) -> Vec<i32> {
+    let Ok(output) = Command::new("pgrep")
+        .arg("-s")
+        .arg(sid.to_string())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .collect()
 }
 
 fn resolve_rust_analyzer() -> io::Result<OsString> {
@@ -462,6 +543,89 @@ mod tests {
             }
             kill(pid, 0) == 0
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #3b follow-up — session snapshot + reap covers escapees
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_session_members_returns_self_for_own_session() {
+        // The test process is itself a session member; `pgrep -s` of the
+        // current session SHOULD include our own pid — unless pgrep is
+        // missing, in which case we degrade safely (empty Vec) and the
+        // test still passes (the safe-degradation contract).
+        let my_pid = std::process::id() as i32;
+        // Resolve our own sid via `ps -o sid= -p <pid>`. Portable: works
+        // on macOS BSD ps and Linux procps-ng. If ps is missing too, the
+        // test silently passes — we can't probe what we can't probe.
+        let Ok(out) = Command::new("ps")
+            .arg("-o")
+            .arg("sid=")
+            .arg("-p")
+            .arg(my_pid.to_string())
+            .output()
+        else {
+            return;
+        };
+        let Some(sid) = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<i32>()
+            .ok()
+        else {
+            return;
+        };
+        let members = snapshot_session_members(sid);
+        // If pgrep is available, the snapshot is non-empty and includes
+        // at least us. If pgrep is missing, members.is_empty() is the
+        // safe-degradation contract — both outcomes are acceptable.
+        if !members.is_empty() {
+            assert!(
+                members.contains(&my_pid),
+                "session snapshot {members:?} should include our own pid {my_pid}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_session_members_for_unknown_sid_is_empty_not_panic() {
+        // A nonsense sid (way above PID_MAX on any sensible system) must
+        // not crash; pgrep exits non-zero (no matches) and we return empty.
+        let v = snapshot_session_members(0x7FFF_FFFF);
+        assert!(v.is_empty(), "nonsense sid → empty Vec, got {v:?}");
+    }
+
+    /// The deepened ReapOnDrop path (snapshot + pgid-SIGKILL + session-
+    /// walk + immediate-child wait) must still kill the immediate child
+    /// reliably — the regression that would matter most is if the new
+    /// snapshot/walk steps broke the existing reap. Use `sleep` as the
+    /// child stand-in (CI image has no rust-analyzer; same pattern as the
+    /// AC#6 supervisor test).
+    #[cfg(unix)]
+    #[test]
+    fn reap_on_drop_with_session_walk_still_kills_immediate_child() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        {
+            let _g = ReapOnDrop::new(child);
+            assert!(pid_is_alive(pid), "alive while guard in scope");
+        }
+        // After drop: SIGKILL + reap delivered. ~200ms grace for kernel.
+        for _ in 0..40 {
+            if !pid_is_alive(pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("deepened ReapOnDrop still must kill the immediate child; pid {pid} alive");
     }
 
     #[test]
