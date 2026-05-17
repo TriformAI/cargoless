@@ -658,19 +658,19 @@ mod tests {
     #[test]
     fn names_match_exact_and_bounded_truncation_only() {
         // Exact.
-        assert!(names_match("tftrunk", "tftrunk"));
+        assert!(names_match("cargoless", "cargoless"));
         // The critical false-positive guard: `cargo` must NOT match
         // `cargoless` (this tool runs literally next to cargo).
         assert!(!names_match("cargoless", "cargo"));
         assert!(!names_match("cargo", "cargoless"));
         // Genuine Linux 15-char comm truncation of a longer real name
         // (e.g. the `cargo test` runner binary on the CI builder).
-        let long = "tftrunk-0123456789abcdef"; // 24 chars
+        let long = "cargoless-0123456789abcdef"; // 26 chars
         let trunc = &long[..15]; // exactly TASK_COMM_LEN-1
         assert_eq!(trunc.len(), 15);
         assert!(names_match(long, trunc));
         // A short prefix that is NOT a 15-char truncation never matches.
-        assert!(!names_match("tftrunkXX", "tftrunk"));
+        assert!(!names_match("cargolessXX", "cargoless"));
     }
 
     #[cfg(unix)]
