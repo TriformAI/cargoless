@@ -335,11 +335,26 @@ jobs:
           tar -czf "dist/${BASE}.tgz" -C dist "${BASE}"
           (sha256sum "dist/${BASE}.tgz" 2>/dev/null \
             || shasum -a 256 "dist/${BASE}.tgz") > "dist/${BASE}.tgz.sha256"
-          # Self-upload: the release is auto-created on tag push; --clobber
-          # makes this idempotent and independent of attach-release-assets.
+          # Self-upload, race-safe with attach-release-assets. CWDL-71
+          # Phase C Finding #3: a tag push does NOT auto-create a Release
+          # object — create-if-missing first (same CHANGELOG-notes shape
+          # as attach-release-assets so notes are identical whichever job
+          # wins the race); --clobber upload then works in either order.
+          REPO="${{ github.repository }}"
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            awk -v ver="$VERSION" '
+              $0 ~ ("^## +\\[?" ver "\\]?([^0-9]|$)") {f=1; next}
+              f && /^## +/ {exit}
+              f {print}
+            ' CHANGELOG.md > /tmp/relnotes.md || true
+            [ -s /tmp/relnotes.md ] || printf "Release %s.\n" "$TAG" > /tmp/relnotes.md
+            gh release create "$TAG" --repo "$REPO" \
+              --title "cargoless $TAG" \
+              --notes-file /tmp/relnotes.md --verify-tag || true
+          fi
           gh release upload "$TAG" \
             "dist/${BASE}.tgz" "dist/${BASE}.tgz.sha256" \
-            --clobber --repo "${{ github.repository }}"
+            --clobber --repo "$REPO"
           echo "Intel-Mac prebuilt attached (bonus)."
 
   # ─────────────────────────────────────────────────────────────────────────
@@ -384,6 +399,10 @@ jobs:
     permissions:
       contents: write   # required to attach assets to the release
     steps:
+      - name: Checkout (for CHANGELOG → release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -392,19 +411,41 @@ jobs:
           merge-multiple: true
       - name: List artifacts
         run: ls -la dist/
-      - name: Upload assets to GitHub release
+      - name: Ensure release exists, then upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          REPO="${{ github.repository }}"
           TAG="${GITHUB_REF#refs/tags/}"
-          # `gh release upload <tag> file1 file2 ...` attaches assets to the
-          # release. --clobber lets re-runs overwrite existing assets (safer
-          # for retries after a transient API blip).
+          VERSION="${TAG#v}"
+          # CWDL-71 Phase C Finding #3 (2026-05-17): a tag push creates a
+          # TAG, NOT a GitHub Release object. `gh release upload <tag>`
+          # requires an existing Release → "release not found" → zero
+          # assets shipped despite green builds. Create-if-missing first;
+          # idempotent + race-safe with the decoupled besteffort
+          # self-upload (whoever wins creates it; --clobber upload then
+          # works in either order). Release notes = the CHANGELOG section
+          # for this version (tag-validate already asserts it exists) so
+          # the real v0.x release is a substantive launch artifact, not a
+          # stub (lead Phase-D/§8 real-launch refinement).
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            awk -v ver="$VERSION" '
+              $0 ~ ("^## +\\[?" ver "\\]?([^0-9]|$)") {f=1; next}
+              f && /^## +/ {exit}
+              f {print}
+            ' CHANGELOG.md > /tmp/relnotes.md || true
+            [ -s /tmp/relnotes.md ] || printf "Release %s.\n" "$TAG" > /tmp/relnotes.md
+            gh release create "$TAG" --repo "$REPO" \
+              --title "cargoless $TAG" \
+              --notes-file /tmp/relnotes.md --verify-tag || true
+          fi
+          # --clobber lets re-runs / the besteffort job overwrite assets
+          # safely (idempotent after a transient API blip or either order).
           gh release upload "$TAG" \
             dist/*.tgz dist/*.tgz.sha256 \
             --clobber \
-            --repo "${{ github.repository }}"
+            --repo "$REPO"
 
   # ─────────────────────────────────────────────────────────────────────────
   # publish-* — crates.io publish, topological order.
