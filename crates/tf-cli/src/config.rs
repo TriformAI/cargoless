@@ -68,10 +68,6 @@ pub enum ConfigError {
         line: String,
         why: String,
     },
-    BadTfTomlValue {
-        key: String,
-        why: String,
-    },
 }
 
 impl fmt::Display for ConfigError {
@@ -99,9 +95,6 @@ impl fmt::Display for ConfigError {
                 "tf.toml: {why} (line {line_no}: `{line}`).\n  \
                  Supported: [project] root/target, [cache] dir. `#` comments."
             ),
-            ConfigError::BadTfTomlValue { key, why } => {
-                write!(f, "tf.toml: key `{key}` {why}.")
-            }
         }
     }
 }

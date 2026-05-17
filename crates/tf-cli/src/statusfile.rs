@@ -192,7 +192,7 @@ fn report_latest_green(root: &Path) {
             p.display()
         ));
     } else {
-        ui::wait("latest-green: none yet (no green build published)".to_string());
+        ui::wait("latest-green: none yet (no green build published)");
     }
 }
 
