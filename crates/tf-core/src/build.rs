@@ -27,6 +27,18 @@
 //! that must be proven in CI. So compilation is abstracted behind
 //! [`Compiler`]: [`TrunkCompiler`] is the real shell-out; tests inject a
 //! counting fake and assert the second identical trigger never calls it.
+//!
+//! ## Artifact framing — `tf_proto::Bundle` (build↔server seam)
+//!
+//! A WASM dev build is several files (HTML shell, JS loader, `_bg.wasm`,
+//! assets) but the CAS contract stores **one opaque blob per
+//! [`InputHash`](tf_proto::InputHash)**. The blob this layer stores is
+//! therefore exactly `tf_proto::Bundle::pack(<dist tree>)`, and the dev server
+//! recovers the files with `tf_proto::Bundle::unpack` — one shared framing,
+//! owned by the contract crate, never a parallel format. The byte layout
+//! (4-byte BE entry count; per entry 2-byte BE path-len, UTF-8 path, 8-byte BE
+//! content-len, content; entries ordered by the bundle's `BTreeMap` key) is
+//! the contract; this crate only *produces* it from the `dist/` tree.
 
 use std::fs;
 use std::io;
@@ -34,7 +46,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tf_proto::{
-    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, Profile, TargetTriple,
+    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, Bundle, Profile,
+    TargetTriple,
 };
 
 use tf_cas::{ContentStore, absent_marker, content_hash, hash_source_tree, input_hash};
@@ -51,7 +64,8 @@ pub trait Compiler {
 }
 
 /// Real compiler: shells out to `trunk build` in debug / no-`wasm-opt` mode and
-/// packs the resulting `dist/` into a single deterministic blob for the CAS.
+/// packs the resulting `dist/` into a [`tf_proto::Bundle`] blob for the CAS —
+/// the exact bytes the dev server `Bundle::unpack`s back.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TrunkCompiler;
 
@@ -83,14 +97,22 @@ impl Compiler for TrunkCompiler {
         if !dist.is_dir() {
             return Err("`trunk build` succeeded but produced no dist/ directory".to_owned());
         }
-        pack_dir(&dist).map_err(|e| format!("could not read trunk dist/: {e}"))
+        let entries =
+            collect_dist_entries(&dist).map_err(|e| format!("could not read trunk dist/: {e}"))?;
+        // The CAS blob *is* the server's Bundle: store `Bundle::pack` bytes so
+        // the dev server can `Bundle::unpack` straight out of the CAS. The
+        // bundle's `BTreeMap` gives a deterministic order, so an identical
+        // `dist/` always yields identical CAS bytes (and an identical
+        // `InputHash`-keyed entry).
+        Ok(Bundle::from_entries(entries).pack())
     }
 }
 
-/// Deterministically serialize a directory tree into one byte blob (sorted,
-/// length-prefixed) so an identical `dist/` always produces identical CAS
-/// bytes. Not a general archive format — just a stable, unambiguous dump.
-fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
+/// Walk `root` (the `dist/` tree) into `(forward-slash relpath, bytes)` pairs
+/// for [`Bundle::from_entries`]. Order does not matter — the bundle re-keys
+/// into a `BTreeMap` — but the walk is still deterministic. Symlinks are not
+/// followed (a dev `dist/` is plain files; this avoids escaping the tree).
+fn collect_dist_entries(root: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
         let mut kids: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
         kids.sort_by_key(std::fs::DirEntry::file_name);
@@ -115,17 +137,7 @@ fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
 
     let mut files = Vec::new();
     walk(root, root, &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"tf-core/dist/v1\n");
-    for (rel, bytes) in &files {
-        buf.extend_from_slice(&(rel.len() as u64).to_be_bytes());
-        buf.extend_from_slice(rel.as_bytes());
-        buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        buf.extend_from_slice(bytes);
-    }
-    Ok(buf)
+    Ok(files)
 }
 
 fn hash_optional_file(path: &Path, kind: &str) -> io::Result<tf_proto::ContentHash> {
@@ -367,5 +379,36 @@ mod tests {
         // Absent tf.toml (D6 open) must not break assembly.
         assert!(!proj.join("tf.toml").exists());
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn dist_packs_into_a_server_unpackable_bundle() {
+        // De-risks the build↔server seam: the bytes TrunkCompiler stores in
+        // the CAS must be exactly what the dev server `Bundle::unpack`s. We
+        // can't run real `trunk` in CI, so drive `collect_dist_entries` over a
+        // hand-built `dist/` and round-trip through the shared contract type.
+        let dist = scratch("dist").join("dist");
+        fs::create_dir_all(dist.join("assets")).unwrap();
+        fs::write(dist.join("index.html"), b"<body>hi</body>").unwrap();
+        fs::write(dist.join("app_bg.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        fs::write(dist.join("assets/logo.svg"), b"<svg/>").unwrap();
+
+        let entries = collect_dist_entries(&dist).unwrap();
+        let packed = Bundle::from_entries(entries).pack();
+
+        // Identical tree ⇒ identical CAS bytes (so the InputHash-keyed entry
+        // is stable and AC#5 dedupe holds on the real compile path too).
+        let packed_again = Bundle::from_entries(collect_dist_entries(&dist).unwrap()).pack();
+        assert_eq!(packed, packed_again, "dist pack must be deterministic");
+
+        // The server side recovers every file, addressed by request path.
+        let b = Bundle::unpack(&packed).expect("server can unpack build output");
+        assert_eq!(b.get("index.html"), Some(&b"<body>hi</body>"[..]));
+        assert_eq!(b.get("app_bg.wasm"), Some(&b"\0asm\x01\0\0\0"[..]));
+        assert_eq!(b.get("assets/logo.svg"), Some(&b"<svg/>"[..]));
+        assert_eq!(b.get("/index.html"), Some(&b"<body>hi</body>"[..]));
+        assert_eq!(b.len(), 3);
+
+        let _ = fs::remove_dir_all(dist.parent().unwrap());
     }
 }
