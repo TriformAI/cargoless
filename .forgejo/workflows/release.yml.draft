@@ -1,0 +1,304 @@
+# cargoless release pipeline — DRAFT (CWDL-71)
+#
+# ============================================================================
+#                                THIS IS A DRAFT
+# ============================================================================
+# Filename `.yml.draft` is intentional: Forgejo Actions scans for `*.yml` and
+# `*.yaml` only, so this file CANNOT fire. Do NOT rename to `release.yml`
+# until every open decision in docs/design/D-RELEASE.md §8 is resolved and
+# team-lead ratifies. Renaming is the literal switch-on operation.
+#
+# Read docs/design/D-RELEASE.md before editing this file. The doc is the
+# spec; this file is the mechanical-readable form. If they disagree, the
+# doc wins — fix this file to match.
+#
+# Naming discipline (D-RELEASE §0):
+#   - "release semver 0.1.0" is the first crates.io / binstall release.
+#   - "internal phase v0.1" is the server/browser-reload epic (CWDL-40–45).
+#   The strings v0.1 and 0.1.0 are NOT interchangeable. Never use the phase
+#   token as a semver here.
+#
+# Job granularity discipline mirrors .forgejo/workflows/ci.yml:
+# Forgejo's REST API 404s on per-job logs, so the failing-job-NAME is the
+# only diagnosis. One job per check. Anti-pattern: a megajob that
+# validates + builds + uploads + publishes — undebuggable.
+#
+# Trigger: tag-only, semver shape `v[0-9]+.*`. Never `main` merges.
+# See D-RELEASE §2 for rationale.
+# ============================================================================
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # tag-validate — assert the tag and tree agree on the release version.
+  #
+  # Refuses to proceed on:
+  #   - tag != v$WORKSPACE_VERSION
+  #   - any crates/*/Cargo.toml version != $WORKSPACE_VERSION
+  #   - CHANGELOG.md missing a heading for $WORKSPACE_VERSION
+  #   - the tagged SHA having no green ci.yml run on record
+  #   - the tagged SHA having no `s1-ac2-verdict` commit status
+  #
+  # PASSING THIS JOB is the moment the team commits to releasing this SHA.
+  # Every downstream job assumes the tag/tree/CI agreement this job enforces.
+  # ─────────────────────────────────────────────────────────────────────────
+  tag-validate:
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - name: Setup (node for checkout + git safe.dir)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends nodejs jq curl
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history to verify tag points at a real SHA
+      - name: Derive version from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (semver $VERSION)"
+      - name: Assert workspace version matches tag
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The release model assumes [workspace.package].version is the single
+          # source of truth and crates inherit via version.workspace = true.
+          # See D-RELEASE §4.1.
+          WS_VER=$(grep -A1 '^\[workspace.package\]' Cargo.toml | grep '^version' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$WS_VER" != "$VERSION" ]; then
+            echo "::error::workspace.package.version=$WS_VER but tag=v$VERSION"
+            exit 1
+          fi
+          # Each crate must inherit (not override) so the single source holds.
+          for crate in crates/*/Cargo.toml; do
+            grep -q '^version\.workspace[[:space:]]*=[[:space:]]*true' "$crate" \
+              || { echo "::error::$crate does not inherit version.workspace = true"; exit 1; }
+          done
+          echo "tag $VERSION == [workspace.package].version $WS_VER ✓"
+      - name: Assert CHANGELOG.md has section for this version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -f CHANGELOG.md ] || { echo "::error::CHANGELOG.md missing"; exit 1; }
+          # Accept either `## 0.1.0` or `## [0.1.0]` (keepachangelog style).
+          grep -E "^##[[:space:]]+\[?${VERSION}\]?" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          echo "CHANGELOG.md has ## $VERSION section ✓"
+      - name: Assert SHA has green ci.yml + s1-ac2-verdict commit status
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          FJ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="$GITHUB_SHA"
+          API="https://forgejo.triform.dev/api/v1/repos/triform/cargoless"
+          STATUSES=$(curl -sS -H "Authorization: token ${FJ_TOKEN}" \
+            "${API}/commits/${SHA}/statuses?limit=50")
+          # The s1-ac2-verdict context MUST exist (set by ci.yml bench job on
+          # main, or by `scripts/ci-gate --bench` from the lead's machine).
+          echo "$STATUSES" | jq -e '[.[] | select(.context=="s1-ac2-verdict")] | length > 0' \
+            > /dev/null || { echo "::error::SHA $SHA has no s1-ac2-verdict commit status"; exit 1; }
+          # Don't gate on the verdict's payload — that's an evidence string, not
+          # a pass/fail flag (per D-A2). Existence alone proves the SHA has
+          # been benched. Pass/fail is enforced at AC#7 GATE (#36) upstream.
+          echo "SHA $SHA has s1-ac2-verdict ✓"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # build-linux — release-profile build, x86_64-unknown-linux-gnu.
+  #
+  # Release profile exercises different codegen paths from ci-gate's dev
+  # profile. A clean dev-profile build can still red-line a release build
+  # (LTO, optimization-level edge cases). Don't skip.
+  #
+  # Produces: <pubname>-v$VERSION-x86_64-unknown-linux-gnu.tgz at top of
+  # artifact archive. Layout matches the binstall bin-dir template in
+  # crates/tf-cli/Cargo.toml.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-linux:
+    needs: tag-validate
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - name: Setup
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends nodejs
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v4
+      - name: cargo build --release -p tf-cli --locked
+        run: |
+          set -euo pipefail
+          cargo build -p tf-cli --release --locked --target x86_64-unknown-linux-gnu
+          # TODO(D1/CWDL-12): if the binary name changes from `tftrunk`,
+          # update both the strip path AND the bin-dir in
+          # crates/tf-cli/Cargo.toml [package.metadata.binstall].
+          BIN=target/x86_64-unknown-linux-gnu/release/tftrunk
+          strip "$BIN"
+          file "$BIN"
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          # TODO(D1/CWDL-12): replace 'tftrunk' below with the picked product
+          # binary name. Affects tarball name, dir name, and binstall bin-dir.
+          NAME="tftrunk"
+          TARGET="x86_64-unknown-linux-gnu"
+          BASE="${NAME}-v${VERSION}-${TARGET}"
+          mkdir -p "dist/${BASE}"
+          cp target/x86_64-unknown-linux-gnu/release/tftrunk "dist/${BASE}/${NAME}"
+          cp README.md LICENSE "dist/${BASE}/"
+          tar -czf "dist/${BASE}.tgz" -C dist "${BASE}"
+          sha256sum "dist/${BASE}.tgz" > "dist/${BASE}.tgz.sha256"
+          echo "tarball=dist/${BASE}.tgz"        >> "$GITHUB_OUTPUT"
+          echo "sha256=dist/${BASE}.tgz.sha256" >> "$GITHUB_OUTPUT"
+      - name: Upload artifact (intra-CI)
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-x86_64
+          path: dist/*
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # build-macos — DROPPED FOR 0.1.0 per team-lead 2026-05-17.
+  #
+  # The cluster pod is x86_64-linux with no Darwin SDK / cctools / codesign
+  # chain. Cross-compiling aarch64-apple-darwin from here is NOT solvable in
+  # scope. The "where Mac builds run" question is a reserved operator-decision
+  # (D-RELEASE §8 #2): GitHub Actions free-tier macOS runner, operator-laptop
+  # one-shot, or ship-source-only-and-honest. Pick one before re-adding.
+  #
+  # TODO(operator-decision): Mac builder strategy. Re-add build-macos job once
+  # the §8 #2 decision is recorded. macOS users get cargo install for 0.1.0;
+  # cargo binstall gracefully degrades to cargo install when no asset matches
+  # (binstall documented behavior). This is INTENTIONAL HONESTY, not a bug.
+  # ─────────────────────────────────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # attach-release-assets — post the tarball + sha256 to the Forgejo release.
+  #
+  # Forgejo auto-creates a release record for a pushed tag; this job attaches
+  # the prebuilt + checksum as downloadable assets. URL shape after this:
+  #   https://forgejo.triform.dev/triform/cargoless/releases/download/v0.1.0/
+  #     tftrunk-v0.1.0-x86_64-unknown-linux-gnu.tgz
+  #
+  # The pkg-url template in crates/tf-cli/Cargo.toml binstall metadata
+  # depends on this exact URL shape. Verify once on a throwaway test tag
+  # (D-RELEASE §8 #6) before first real fire.
+  # ─────────────────────────────────────────────────────────────────────────
+  attach-release-assets:
+    needs: build-linux
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - name: Setup
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends nodejs jq curl
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: linux-x86_64
+          path: dist
+      - name: Upload assets to Forgejo release
+        env:
+          FJ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          API="https://forgejo.triform.dev/api/v1/repos/triform/cargoless"
+          RELEASE_ID=$(curl -sS -H "Authorization: token ${FJ_TOKEN}" \
+            "${API}/releases/tags/${TAG}" | jq -r '.id')
+          [ -n "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ] \
+            || { echo "::error::no Forgejo release for tag ${TAG}"; exit 1; }
+          for f in dist/*.tgz dist/*.tgz.sha256; do
+            echo "Attaching $f to release ${RELEASE_ID}"
+            curl -sS -X POST \
+              -H "Authorization: token ${FJ_TOKEN}" \
+              -F "attachment=@${f}" \
+              "${API}/releases/${RELEASE_ID}/assets?name=$(basename $f)"
+          done
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # publish-* — crates.io publish, topological order.
+  #
+  # MARKED `if: false` FOR 0.1.0. The first crates.io publish is OPERATOR-RUN
+  # from their laptop (D-RELEASE §4.3 / §6). Automating injection of
+  # CARGO_REGISTRY_TOKEN into the Forgejo runner is deferred to release 0.2.0
+  # — token rotation strategy needs design first.
+  #
+  # The jobs are declarative documentation of the publish order. When
+  # automation lands, drop `if: false` and add:
+  #     env:
+  #       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+  #
+  # Dep order verified via cargo metadata on origin/main @ 3cfc835:
+  #   tf-proto → tf-cas → tf-core → tf-cli
+  # Each depends on its predecessor; crates.io needs ~30s propagation between
+  # publishes before the next crate can resolve its deps.
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-tf-proto:
+    needs: tag-validate
+    if: false  # operator-run for 0.1.0; flip when 0.2.0 automation lands
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo publish -p tf-proto --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  publish-tf-cas:
+    needs: publish-tf-proto
+    if: false
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: sleep 30 && cargo publish -p tf-cas --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  publish-tf-core:
+    needs: publish-tf-cas
+    if: false
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: sleep 30 && cargo publish -p tf-core --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  publish-tf-cli:
+    needs: publish-tf-core
+    if: false
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: sleep 30 && cargo publish -p tf-cli --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

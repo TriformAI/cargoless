@@ -16,3 +16,54 @@ path = "src/main.rs"
 
 [dependencies]
 tf-core = { path = "../tf-core" }
+
+# ──────────────────────────────────────────────────────────────────────────
+# cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)
+#
+# Cargo treats [package.metadata.*] as opaque (it does NOT validate the
+# contents), so this stub lands TODAY without touching any compile/test/fmt/
+# clippy gate. Only `cargo-binstall` itself reads these keys, at install
+# time on a user's machine, to fetch a prebuilt tarball instead of compiling
+# from source.
+#
+# Stub status: PLACEHOLDER values. Locked when D1/CWDL-12 picks the public
+# product name (which determines the binary name, crate name, and the URL
+# template). DO NOT cut a real release tag with these placeholder values
+# unresolved — see D-RELEASE §8.
+#
+# What binstall expects (template variables it resolves):
+#   {repo}            — package.repository (workspace-inherited)
+#   {name}            — package.name (the published crate name)
+#   {version}         — package.version (without leading "v")
+#   {target}          — target triple, e.g. x86_64-unknown-linux-gnu
+#   {archive-suffix}  — derived from pkg-fmt, e.g. ".tgz"
+#
+# First release ships exactly one prebuilt: Linux x86_64-gnu. On macOS, no
+# asset matches and binstall gracefully degrades to `cargo install` (its
+# documented fallback). That is INTENTIONAL HONESTY for 0.1.0; see
+# D-RELEASE §3.2 / §8 #2 for the Mac-builder operator-decision.
+# ──────────────────────────────────────────────────────────────────────────
+[package.metadata.binstall]
+# Forgejo release-asset URL shape: GitHub-compatible
+# /{repo}/releases/download/v{version}/{filename}.
+# TODO(D-RELEASE §8 #6): verify on one throwaway test tag before first real fire.
+pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target}{archive-suffix}"
+pkg-fmt = "tgz"
+
+# Inside the tarball, layout is:
+#   {name}-v{version}-{target}/
+#     tftrunk         ← the binary (renamed at D1)
+#     README.md
+#     LICENSE
+# TODO(D1/CWDL-12): if D1 renames the binary from `tftrunk`, update both
+# this `bin-dir` AND release.yml.draft's `strip` + tarball-package step.
+# These three places MUST stay in sync; the design doc and the workflow
+# draft both reference `tftrunk` as the same placeholder.
+bin-dir = "{name}-v{version}-{target}/tftrunk"
+
+# When macOS prebuilts ship (post-§8 #2 decision, release 0.2.0+), add:
+#   [package.metadata.binstall.overrides."aarch64-apple-darwin"]
+#   pkg-url = "..."
+#   bin-dir = "..."
+# Same for x86_64-apple-darwin if both Mac targets get prebuilts. Until
+# then, omission is correct: binstall falls back to `cargo install`.
