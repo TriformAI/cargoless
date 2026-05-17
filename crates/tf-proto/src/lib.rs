@@ -291,6 +291,135 @@ pub struct BuildResult {
     pub artifact: Option<ArtifactMeta>,
 }
 
+// ---------------------------------------------------------------------------
+// Latest-green publisher seam (the ONLY additive v0 surface — D-A1 / AC#4)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock seconds since the Unix epoch (UTC). A newtype so a timestamp
+/// cannot be transposed with any other `u64` at a call site. `tf-proto` is
+/// deliberately dependency-free, so there is no `chrono`/`time` here: the
+/// producer (`tf-core::build`) fills this from `std::time::SystemTime`; this
+/// crate only carries the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixSeconds(pub u64);
+
+impl fmt::Display for UnixSeconds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The latest-green publisher record (decision D-A1; AC#4 "never publish
+/// red"). The build/CAS layer writes this beside the canonical pointer file
+/// `.cargoless/latest-green` on every servable green build; the CLI `status`
+/// reads it back. This is the **only additive v0 contract surface** — it does
+/// not touch the four frozen seams (`StateEvent` / `BuildTrigger` /
+/// `BuildResult` / `ArtifactMeta`) and adds no dependency: the on-disk form is
+/// a hand-rolled, versioned text codec ([`render`](Self::render) /
+/// [`parse`](Self::parse)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedArtifact {
+    /// What was published: the CAS key + full input provenance. `profile` and
+    /// `target` live inside `artifact.identity` — not duplicated here.
+    pub artifact: ArtifactMeta,
+    /// When the pointer was advanced to this artifact.
+    pub published_at: UnixSeconds,
+}
+
+/// Returned by [`PublishedArtifact::parse`] when the pointer file is not the
+/// expected `cargoless-latest-green/v1` shape. Dependency-free (no
+/// `thiserror`); a corrupt pointer is treated as "no green yet", never
+/// half-decoded into a wrong artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerFormatError(pub String);
+
+impl fmt::Display for PointerFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid latest-green pointer: {}", self.0)
+    }
+}
+
+impl std::error::Error for PointerFormatError {}
+
+/// The frozen on-disk schema version. Bumping it is a deliberate, repo-visible
+/// contract change — old pointer files then fail [`parse`](PublishedArtifact::parse)
+/// loudly rather than being silently misread.
+const POINTER_SCHEME: &str = "cargoless-latest-green/v1";
+
+impl PublishedArtifact {
+    /// Serialize to the canonical pointer-file text: a scheme-version header
+    /// line, then `key=value` lines. Deliberately flat and human-inspectable
+    /// (the nested type is the in-memory contract; the file is its faithful,
+    /// stable projection). Every value (hex hash, target triple,
+    /// `dev`/`release`, decimal `u64`) is free of `=`/newline, so the framing
+    /// is unambiguous.
+    pub fn render(&self) -> String {
+        use core::fmt::Write as _;
+        let id = &self.artifact.identity;
+        let mut s = String::new();
+        s.push_str(POINTER_SCHEME);
+        s.push('\n');
+        // Infallible: writing to a String never errors.
+        let _ = writeln!(s, "input_hash={}", self.artifact.input_hash.as_str());
+        let _ = writeln!(s, "source_tree={}", id.source_tree.as_str());
+        let _ = writeln!(s, "cargo_lock={}", id.cargo_lock.as_str());
+        let _ = writeln!(s, "rust_toolchain={}", id.rust_toolchain.as_str());
+        let _ = writeln!(s, "tf_config={}", id.tf_config.as_str());
+        let _ = writeln!(s, "target={}", id.target.as_str());
+        let _ = writeln!(s, "profile={}", id.profile.as_str());
+        let _ = writeln!(s, "published_at={}", self.published_at.0);
+        s
+    }
+
+    /// Inverse of [`render`](Self::render). Strict: wrong header, a missing
+    /// key, a non-numeric timestamp, or an unknown profile all ⇒ `Err`.
+    pub fn parse(text: &str) -> Result<Self, PointerFormatError> {
+        let err = |m: &str| PointerFormatError(m.to_string());
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(h) if h == POINTER_SCHEME => {}
+            _ => return Err(err("missing or unknown scheme header")),
+        }
+        let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let (k, v) = line
+                .split_once('=')
+                .ok_or_else(|| err("line is not key=value"))?;
+            map.insert(k.to_string(), v.to_string());
+        }
+        let get = |k: &str| -> Result<String, PointerFormatError> {
+            map.get(k)
+                .cloned()
+                .ok_or_else(|| err(&format!("missing key `{k}`")))
+        };
+        let profile = match get("profile")?.as_str() {
+            "dev" => Profile::Dev,
+            "release" => Profile::Release,
+            other => return Err(err(&format!("unknown profile `{other}`"))),
+        };
+        let published_at = get("published_at")?
+            .parse::<u64>()
+            .map_err(|_| err("published_at is not a u64"))?;
+        Ok(Self {
+            artifact: ArtifactMeta {
+                input_hash: InputHash::new(get("input_hash")?),
+                identity: BuildIdentity {
+                    source_tree: ContentHash::new(get("source_tree")?),
+                    cargo_lock: ContentHash::new(get("cargo_lock")?),
+                    rust_toolchain: ContentHash::new(get("rust_toolchain")?),
+                    tf_config: ContentHash::new(get("tf_config")?),
+                    target: TargetTriple::new(get("target")?),
+                    profile,
+                },
+            },
+            published_at: UnixSeconds(published_at),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +524,53 @@ mod tests {
         assert_eq!(Profile::Dev.as_str(), "dev");
         assert_eq!(Profile::Release.to_string(), "release");
         assert_ne!(TreeState::Green, TreeState::Red);
+    }
+
+    fn sample_published() -> PublishedArtifact {
+        PublishedArtifact {
+            artifact: ArtifactMeta {
+                input_hash: InputHash::new("0123abcd"),
+                identity: sample_identity(),
+            },
+            published_at: UnixSeconds(1_747_000_000),
+        }
+    }
+
+    #[test]
+    fn published_artifact_round_trips_through_the_pointer_codec() {
+        let p = sample_published();
+        let text = p.render();
+        // Human-inspectable, versioned, flat.
+        assert!(text.starts_with("cargoless-latest-green/v1\n"));
+        assert!(text.contains("input_hash=0123abcd\n"));
+        assert!(text.contains("profile=dev\n"));
+        assert!(text.contains("published_at=1747000000\n"));
+        // Exact inverse: parse(render(x)) == x (the producer/reader contract).
+        assert_eq!(PublishedArtifact::parse(&text).unwrap(), p);
+    }
+
+    #[test]
+    fn pointer_parse_is_strict() {
+        // Wrong/absent header ⇒ Err (never a half-decoded artifact).
+        assert!(PublishedArtifact::parse("").is_err());
+        assert!(PublishedArtifact::parse("not-a-pointer\ninput_hash=x\n").is_err());
+        // Missing a required key ⇒ Err.
+        assert!(PublishedArtifact::parse("cargoless-latest-green/v1\ninput_hash=x\n").is_err());
+        // Unknown profile / non-numeric timestamp ⇒ Err.
+        let mut bad = sample_published()
+            .render()
+            .replace("profile=dev", "profile=fast");
+        assert!(PublishedArtifact::parse(&bad).is_err());
+        bad = sample_published()
+            .render()
+            .replace("published_at=1747000000", "published_at=soon");
+        assert!(PublishedArtifact::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn unix_seconds_is_a_distinct_newtype() {
+        assert_eq!(UnixSeconds(42).to_string(), "42");
+        assert!(UnixSeconds(1) < UnixSeconds(2));
+        assert_eq!(UnixSeconds(7), UnixSeconds(7));
     }
 }
