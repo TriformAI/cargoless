@@ -110,12 +110,18 @@ tool_ready_re() {
   case "$1" in
     cargoless) echo 'GREEN — tree compiles|GREEN — building|published ' ;;
     trunk)     echo 'success|applying new distribution' ;;
-    # bacon 3.22.0 passes cargo's own "Finished `dev`" / "Finished
-    # `release`" completion line through verbatim and prints `error[` /
-    # "could not compile" on failure — it does NOT emit literal
-    # "Success!"/"Warnings."/"Errors found" banners (verified from the
-    # actual pod run; the earlier pattern timed out forever).
-    bacon)     echo 'Finished .dev.|Finished .release.|could not compile|error\[' ;;
+    # bacon 3.22.0 passes cargo's "Finished `dev`/`release`" completion
+    # line + prints `error[`/"could not compile" on failure. It does NOT
+    # emit literal "Success!"/"Warnings."/"Errors found". CRITICAL: bacon
+    # emits ANSI color codes EVEN when piped (TUI framework, ignores
+    # non-TTY), and the codes splice INTO the banner — raw bytes are
+    # `ESC[1m ESC[32m    Finished ESC[0m \`dev\``. So a `Finished.*dev`
+    # regex fails (the `ESC[0m ` is wedged in). The word "Finished" is
+    # itself contiguous between `ESC[32m    ` and `ESC[0m`, so match the
+    # BARE word — ANSI-safe. Same for cargo's `error[` (rustc emits it
+    # contiguous). The grep below also runs the log through an ANSI
+    # stripper for belt+suspenders.
+    bacon)     echo 'Finished|could not compile|error\[' ;;
     *)         echo ""; return 1 ;;
   esac
 }
@@ -232,7 +238,12 @@ run_tool() {
   local t0=$(date +%s)
   local warm_secs=$WARM_TIMEOUT_SEC
   while [ $(($(date +%s) - t0)) -lt $WARM_TIMEOUT_SEC ]; do
-    if grep -qE "$ready_re" "$logfile" 2>/dev/null; then
+    # Strip ANSI CSI sequences before matching: bacon (TUI framework)
+    # emits color codes even into a pipe and they splice into the
+    # banner text, defeating a raw substring/regex match. `sed` ANSI
+    # filter then grep — belt+suspenders with the bare-word patterns.
+    if sed 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' "$logfile" 2>/dev/null \
+         | grep -qE "$ready_re" 2>/dev/null; then
       warm_secs=$(($(date +%s) - t0))
       break
     fi

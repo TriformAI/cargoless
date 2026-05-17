@@ -321,9 +321,28 @@ class ToolResult:
         return self.wall_secs() / self.reps_done
 
 
+# ANSI/VT100 control-sequence stripper. bacon is a TUI framework and
+# emits SGR color codes EVEN when its stdout is a pipe (it does not
+# honor non-TTY / NO_COLOR). Those codes splice into the middle of the
+# banner text we substring-match: the raw bytes for bacon's completion
+# line are `ESC[1m ESC[32m    Finished ESC[0m \`dev\` profile ...`, so a
+# naive match for "Finished `dev`" fails because `ESC[0m ` is wedged
+# between "Finished" and "`dev`". Stripping ALL CSI sequences before
+# matching makes every tool's substring match ANSI-robust (general fix,
+# not a bacon-specific patch). This is the root cause of bacon's
+# repeated NO_READY across the throughput iterations.
+_ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(s: str) -> str:
+    return _ANSI_CSI.sub("", s)
+
+
 def wait_for_ready(log_path: Path, patterns: list[str], deadline_s: float) -> float:
     """Tail the log file until ANY pattern matches OR deadline. Returns
-    elapsed seconds (≥ deadline_s means timeout)."""
+    elapsed seconds (≥ deadline_s means timeout). ANSI-stripped before
+    matching so TUI tools (bacon) that colorize piped output don't
+    defeat the substring match."""
     start = time.monotonic()
     matchers = [re.escape(p) for p in patterns]
     pattern_re = re.compile("|".join(matchers))
@@ -333,7 +352,7 @@ def wait_for_ready(log_path: Path, patterns: list[str], deadline_s: float) -> fl
             with open(log_path, "r", errors="replace") as f:
                 f.seek(last_size)
                 chunk = f.read()
-                if chunk and pattern_re.search(chunk):
+                if chunk and pattern_re.search(strip_ansi(chunk)):
                     return time.monotonic() - start
                 last_size = f.tell()
         except FileNotFoundError:
