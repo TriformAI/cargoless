@@ -127,6 +127,12 @@ pub fn run(cfg: &Config) -> ExitCode {
         );
     };
     write_status(verdict_of(session.tree_state()));
+    // FIELD FINDING #6-NEG-A (#51): subscribe to the lifecycle channel
+    // BEFORE entering the loop so the very first transparent RA restart is
+    // already observable. Drained non-blockingly inside the loop body
+    // alongside the existing verdict events; mpsc Receivers aren't `Sync`,
+    // so we keep them both in this single thread.
+    let lifecycle = session.subscribe_lifecycle();
     ui::wait("Ctrl-C to stop. Streaming verdicts…");
 
     // Single-thread drain (Receiver is not Sync). recv_timeout = heartbeat:
@@ -137,7 +143,17 @@ pub fn run(cfg: &Config) -> ExitCode {
     // watch-start (`t0`) so a user can read save→verdict latency directly
     // from any pair of adjacent lines, and so scripted post-hoc analysis no
     // longer needs `awk` line-stamping.
+    //
+    // FIELD FINDING #6-NEG-A: drain the lifecycle channel on every iteration
+    // (event branch AND timeout branch) so a transparent RA restart is
+    // surfaced to the user inside one HEARTBEAT, even if the verdict
+    // stream stays silent during the post-restart reindex window.
     loop {
+        // Lifecycle drain — cheap, non-blocking, no allocations on the
+        // empty path. Belongs OUTSIDE the verdict-event match because a
+        // restart can fire while the verdict stream is mid-reindex-silence.
+        drain_lifecycle(t0, &lifecycle);
+
         match events.recv_timeout(HEARTBEAT) {
             Ok(ev) => {
                 let ts = stamp(t0);
@@ -181,6 +197,27 @@ pub fn run(cfg: &Config) -> ExitCode {
                 ui::warn(format!("{}verdict pipeline stopped — exiting.", stamp(t0)));
                 session.shutdown();
                 return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// FIELD FINDING #6-NEG-A (#51): drain every pending lifecycle event into
+/// timestamped, user-facing lines. Runs on EVERY watch-loop iteration so
+/// the worst-case latency from "RA restarted" to "user sees the message"
+/// is bounded by `HEARTBEAT` (250ms) — not 30-60s of silent reindex.
+fn drain_lifecycle(t0: Instant, lifecycle: &std::sync::mpsc::Receiver<tf_core::LifecycleEvent>) {
+    while let Ok(ev) = lifecycle.try_recv() {
+        match ev {
+            tf_core::LifecycleEvent::AnalyzerRestarting => {
+                // `ui::warn` (yellow) over `ui::step` (cyan) because this is
+                // a degraded-mode signal: AC#6 transparent restart, but the
+                // user is staring at a silent stream until reindex
+                // completes. Color-cues the unusualness.
+                ui::warn(format!(
+                    "{}rust-analyzer restarted — re-indexing; next verdict when ready",
+                    stamp(t0)
+                ));
             }
         }
     }

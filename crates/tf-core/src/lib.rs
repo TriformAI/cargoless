@@ -15,6 +15,7 @@ pub mod lsp;
 pub mod model;
 pub mod watcher;
 
+pub use model::LifecycleEvent;
 pub use tf_cas::{ContentStore, LocalDiskStore};
 pub use tf_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
