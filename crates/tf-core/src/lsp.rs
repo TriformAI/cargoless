@@ -237,6 +237,22 @@ pub(crate) fn cargo_toml_signals_proc_macro(text: &str) -> bool {
 ///      snippets.custom, assist.expressionFillDefault, references.
 ///      excludeImports — all idle-cost reductions on signals cargoless
 ///      doesn't consume.
+/// #112-B Tier-2 — RA salsa LRU cap. Default 64 (half RA's built-in
+/// 128): a deliberate RAM↔recompute trade for cargoless's batchy
+/// agent-edit access pattern. Correctness-neutral (eviction →
+/// recompute → identical result). `TF_RA_LRU_CAP` overrides for
+/// bench-lead's RSS/recompute sweep; clamped to ≥16 so a fat-finger
+/// value cannot drive pathological thrash, and a non-numeric value
+/// falls back to the default rather than erroring.
+fn ra_lru_capacity() -> u32 {
+    const DEFAULT: u32 = 64;
+    const FLOOR: u32 = 16;
+    match std::env::var("TF_RA_LRU_CAP") {
+        Ok(v) => v.parse::<u32>().map(|n| n.max(FLOOR)).unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    }
+}
+
 pub fn lean_init_options(opts: &InitOpts) -> Value {
     json!({
         // (1) checkOnSave — Option B+ softened (not disabled).
@@ -284,6 +300,20 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
         // need pre-warmed caches because our access pattern is
         // diagnostic-driven, not editor-driven.
         "cachePriming": { "enable": false },
+
+        // (3b) #112-B Tier-2 — bound RA's salsa query-memoization LRU.
+        // RA's default (128) trades RAM for recompute-avoidance tuned for
+        // a human in an editor. cargoless's access pattern is batchy
+        // (one analysis per agent-edit-batch, not per-keystroke), so a
+        // smaller cap reclaims a large slab of the ~2 GB RSS at the cost
+        // of a little recompute on the next batch — and recompute yields
+        // the IDENTICAL query result, so this is **correctness-neutral**:
+        // it cannot change a diagnostic, the F8-redo verdict, or the
+        // never-publish-red invariant (it only affects latency/CPU, which
+        // under the agent model is a non-issue between batches). Default
+        // halves RA's default; `TF_RA_LRU_CAP` lets bench-lead sweep the
+        // RSS/recompute curve (see D-RAM-TIERS §Tier-2).
+        "lru": { "capacity": ra_lru_capacity() },
 
         // (4) procMacro — the heaviest single configurable.
         // proc-macro-server is a separate process that re-runs proc
@@ -1265,6 +1295,52 @@ mod tests {
         // (RA reads them from one or the other depending on version).
         assert_eq!(v["cargo"]["features"], json!(["foo", "bar"]));
         assert_eq!(v["checkOnSave"]["features"], json!(["foo", "bar"]));
+    }
+
+    // ----------------------------------------------------------------
+    // #112-B Tier-2 — RA salsa LRU cap (RAM↔recompute, correctness-neutral)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn lean_init_options_emits_bounded_lru_capacity() {
+        // The new RAM lever must be present, numeric, and (with no env
+        // override) the conservative default that halves RA's built-in
+        // 128 — without disturbing the load-bearing checkOnSave/procMacro
+        // keys the #74 shape test pins.
+        let v = lean_init_options(&InitOpts::default());
+        assert_eq!(
+            v["lru"]["capacity"],
+            json!(64),
+            "Tier-2 default LRU cap (RA default is 128): {v}"
+        );
+        assert!(v["lru"]["capacity"].is_u64(), "must be a number");
+        // Coexists with the verdict-load-bearing key (regression guard).
+        assert_eq!(v["checkOnSave"]["enable"], json!(true));
+    }
+
+    #[test]
+    fn ra_lru_capacity_default_and_clamp_rule() {
+        // `ra_lru_capacity()` itself reads process env (unsafe to mutate
+        // across threads on edition 2024), so pin the pure parse/clamp
+        // RULE via a mirror — same discipline as structural::enabled's
+        // test. Default on unset/garbage; floor-clamped; honored when
+        // sane.
+        fn rule(v: Option<&str>) -> u32 {
+            const DEFAULT: u32 = 64;
+            const FLOOR: u32 = 16;
+            match v {
+                Some(s) => s.parse::<u32>().map(|n| n.max(FLOOR)).unwrap_or(DEFAULT),
+                None => DEFAULT,
+            }
+        }
+        assert_eq!(rule(None), 64, "unset ⇒ default");
+        assert_eq!(rule(Some("not-a-number")), 64, "garbage ⇒ default");
+        assert_eq!(rule(Some("256")), 256, "sane value honored");
+        assert_eq!(rule(Some("4")), 16, "below floor ⇒ clamped to 16");
+        assert_eq!(rule(Some("16")), 16, "floor exact");
+        // Default really is half of RA's built-in 128 (the documented
+        // RAM↔recompute trade — correctness-neutral, not a verdict knob).
+        assert_eq!(rule(None) * 2, 128);
     }
 
     #[test]
