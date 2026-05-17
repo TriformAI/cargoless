@@ -726,6 +726,9 @@ pub struct ModelSession {
     supervisor: Option<crate::analyzer::Supervisor>,
     watch: Option<crate::watcher::WatchHandle>,
     threads: Vec<JoinHandle<()>>,
+    /// #112 structural-trigger spike — bench-lead measurement hook
+    /// (D-OPENCLOSED §4.2). Additive; not part of any frozen seam.
+    structural_counters: Arc<crate::structural::StructuralCounters>,
 }
 
 impl ModelSession {
@@ -764,6 +767,17 @@ impl ModelSession {
     /// AC#6 transparent restart's 30-60s re-index window.
     pub fn subscribe_lifecycle(&self) -> Receiver<LifecycleEvent> {
         poisoned(&self.model).subscribe_lifecycle()
+    }
+
+    /// #112 structural-trigger spike — bench-lead measurement hook
+    /// (D-OPENCLOSED §4.2). `(settled_batches, closed_batches)`:
+    /// `1 − closed/settled` is the fraction of authoritative
+    /// cargo-checks the structural gate eliminated per agent-edit-batch.
+    /// `(0, 0)` while `TF_STRUCTURAL_TRIGGER` is unset (default-off ⇒ no
+    /// counting, prior path byte-identical). Additive — touches no
+    /// frozen seam.
+    pub fn structural_counters(&self) -> (u64, u64) {
+        self.structural_counters.snapshot()
     }
 
     /// Explicit graceful shutdown (also runs on drop).
@@ -870,11 +884,17 @@ pub fn watch<I: IdentityProvider + 'static>(
 
     let (watch_handle, batches) =
         crate::watcher::watch(&root, resolve_watch_debounce()).map_err(io::Error::other)?;
+    // #112 structural-trigger spike: bench-lead measurement counters,
+    // shared into the fs thread and exposed via ModelSession. Only move
+    // while `TF_STRUCTURAL_TRIGGER=1` (the gated branch); dormant (0,0)
+    // when default-off so an instrumented run is opt-in.
+    let structural_counters = Arc::new(crate::structural::StructuralCounters::new());
     let mut threads = Vec::new();
     {
         let model = Arc::clone(&model);
         let stop = Arc::clone(&stop);
         let current = Arc::clone(&current);
+        let structural = Arc::clone(&structural_counters);
         threads.push(
             thread::Builder::new()
                 .name("tf-model-fs".into())
@@ -884,20 +904,59 @@ pub fn watch<I: IdentityProvider + 'static>(
                         match batches.recv_timeout(Duration::from_millis(250)) {
                             Ok(batch) => {
                                 let client = poisoned(&current).as_ref().cloned();
-                                for path in batch {
-                                    if path.extension().is_none_or(|e| e != "rs") {
-                                        continue;
+                                if crate::structural::enabled() {
+                                    // #112 (D-OPENCLOSED): gate the cargo-check
+                                    // spend on the coalesced batch being
+                                    // structurally CLOSED. ALWAYS didChange
+                                    // (RA re-parses → RA-native severity:Error
+                                    // still flips per-file RED via the
+                                    // UNTOUCHED F8-redo path); only didSave
+                                    // (the flycheck/cargo-check trigger) when
+                                    // every .rs file in the batch is CLOSED.
+                                    // Closedness gates SPEND + publish-
+                                    // eligibility, NEVER the verdict colour.
+                                    let mut files: Vec<(String, String)> = Vec::new();
+                                    for path in batch {
+                                        if path.extension().is_none_or(|e| e != "rs") {
+                                            continue;
+                                        }
+                                        let p = path.to_string_lossy().into_owned();
+                                        match fs::read_to_string(&path) {
+                                            Ok(text) => files.push((p, text)),
+                                            Err(_) => poisoned(&model).forget_file(&p),
+                                        }
                                     }
-                                    let p = path.to_string_lossy().into_owned();
-                                    match fs::read_to_string(&path) {
-                                        Ok(text) => {
-                                            version += 1;
-                                            if let Some(c) = client.as_ref() {
-                                                let _ = c.did_change(&p, &text, version);
-                                                let _ = c.did_save(&p);
+                                    // A batch is worth a cargo-check iff NO
+                                    // file in it is OPEN (D-OPENCLOSED §2.4).
+                                    let all_closed =
+                                        files.iter().all(|(_, t)| crate::structural::is_closed(t));
+                                    structural.record(all_closed);
+                                    for (p, text) in &files {
+                                        version += 1;
+                                        if let Some(c) = client.as_ref() {
+                                            let _ = c.did_change(p, text, version);
+                                            if all_closed {
+                                                let _ = c.did_save(p);
                                             }
                                         }
-                                        Err(_) => poisoned(&model).forget_file(&p),
+                                    }
+                                } else {
+                                    // DEFAULT-OFF: prior path, byte-identical.
+                                    for path in batch {
+                                        if path.extension().is_none_or(|e| e != "rs") {
+                                            continue;
+                                        }
+                                        let p = path.to_string_lossy().into_owned();
+                                        match fs::read_to_string(&path) {
+                                            Ok(text) => {
+                                                version += 1;
+                                                if let Some(c) = client.as_ref() {
+                                                    let _ = c.did_change(&p, &text, version);
+                                                    let _ = c.did_save(&p);
+                                                }
+                                            }
+                                            Err(_) => poisoned(&model).forget_file(&p),
+                                        }
                                     }
                                 }
                             }
@@ -920,6 +979,7 @@ pub fn watch<I: IdentityProvider + 'static>(
         supervisor: Some(supervisor),
         watch: Some(watch_handle),
         threads,
+        structural_counters,
     };
     Ok((session, events))
 }
