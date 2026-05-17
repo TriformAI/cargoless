@@ -33,9 +33,14 @@ v0.1.
 - **`cargoless check`** — one-shot verdict. Exit code 0 on green, non-zero on
   red; diagnostics formatted file:line:col + severity + code + message.
 - **`cargoless watch`** — continuous headless verdict stream with per-line
-  relative timestamps. Sub-second save→verdict on the reference fixture;
-  field-measured at ~0.74s end-to-end on the dogfood Leptos project after
-  the debouncer fix (see [dogfood report](docs/dogfood/PHASE-2-REPORT.md)).
+  relative timestamps, in two tiers shown live: a **RA-incremental hint**
+  (median ≤1s — field-measured at ~0.74s on the dogfood Leptos project
+  after the debouncer fix) and the **authoritative cargo-check verdict**
+  (bounded by `cargo check` itself — seconds on small projects, ~20-30s on
+  a Leptos-sized tree; no sub-1s promise). The fast hint can flip RED
+  instantly; only the authoritative tier drives GREEN. Rationale:
+  [`docs/design/D-A2-RENEGOTIATION.md`](docs/design/D-A2-RENEGOTIATION.md);
+  evidence: [dogfood report](docs/dogfood/PHASE-2-REPORT.md).
 - **`cargoless build --watch --out <dir>`** — continuous build that publishes
   the latest green WASM artifact via an atomic `.cargoless/latest-green`
   pointer. Requires the upstream `trunk` binary to perform the actual WASM
@@ -50,7 +55,8 @@ v0.1.
 | # | Promise | Status |
 |---|---------|--------|
 | 1 | Zero-config headless startup within 30s — daemon up + config auto-detected + watch→verdict pipeline live, zero manual config | ✅ field-PASS (~0.08s to streaming on the dogfood project) |
-| 2 | Median save→verdict latency sub-1s on a committed reference project | ✅ field-PASS post-debouncer-fix (~0.74s end-to-end on Leptos) |
+| 2a | RA-incremental **hint** median ≤1s on a committed reference project (fast hint; does not by itself prove the tree compiles) | ✅ field-PASS post-debouncer-fix (~0.74s on Leptos) |
+| 2b | **Authoritative** verdict median ≤ bare `cargo check` +10% (cargo-check tier; no sub-1s promise — cargo's own runtime dominates) | ⏳ MEASURABLE-PASS pending the comparative bench landing the relative-cost number ([D-A2](docs/design/D-A2-RENEGOTIATION.md) §2/§8-Q1) |
 | 3 | Median green-save → latest-green artifact *published* latency, threshold from evidence (no sub-second artifact claim) | ⏳ measured by the AC#7 comparative bench; threshold published when bench reports |
 | 4 | Never publish red — `.cargoless/latest-green` only advances on green; a red tree or failed build never moves it | ⏳ verification-in-flight (publish-cycle empirical test landing; structural PASS already verified) |
 | 5 | CAS dedupe — identical source state is a cache hit, build skipped | ✅ structural PASS (integration tested) |
@@ -109,6 +115,20 @@ the browser/HTTP surface into v0 would have doubled the launch-hardening
 surface area for a feature that is strictly additive on top of the
 publisher contract. Better to ship v0 honest and small than v0 + v0.1
 half-done.
+
+### v0.1 perf follow-up — auto-narrow `--features` (single highest-leverage perf change)
+
+The **single highest-leverage performance follow-up** is **auto-narrow
+`--features`**: cargoless's steady-state footprint is rust-analyzer-dominated
+(~2 GB default on proc-macro-heavy projects such as Leptos, because RA runs
+proc-macro expansion by default). The `--features` knob already cuts that
+materially (≈75%, *pending* bench-lead's two-source confirmation); v0.1
+makes the narrowed configuration the **auto-detected default** rather than
+an opt-in flag, so the memory win lands without the user having to know the
+knob exists. This is *not* a v0 claim — v0 ships honest about RA-dominated
+memory; the auto-narrow change is the v0.1 work that moves the default. It
+is the largest single lever on the perf story and is named here so the
+roadmap reflects where the throughput follow-up effort goes first.
 
 ---
 

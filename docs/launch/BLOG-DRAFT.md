@@ -6,12 +6,15 @@
 > (project blog, dev.to, personal blog, GitHub release notes, etc.)
 > gets a frozen copy at publish time.
 >
-> **TBD markers:** `<!-- TBD-NUMBERS -->` marks spots where the final
-> copy depends on bench-lead's throughput report (CPU-seconds, RSS,
-> saves-per-CPU-minute on the Leptos fixture) and the perf-recon
-> agent's independent cross-check. Both ETA ~60-90min from
-> 2026-05-17 15:11; both slot into the placeholders via a small
-> follow-up commit when they land.
+> **PENDING markers:** `_PENDING_` (and the `<!-- PENDING bench-lead
+> Component-2 -->` comment) marks every spot where the final copy
+> depends on BOTH bench-lead's throughput report (CPU-seconds/edit,
+> RSS, saves-per-CPU-minute on the Leptos fixture) AND the independent
+> second-host cross-check. The verbatim "~half / ~2 GB / ~75%" prose
+> is bench-lead's explicit pre-confirmation estimate, kept verbatim
+> and labelled as such; numeric tables stay `_PENDING_` until the
+> two-source confirmation lands, then a small follow-up commit fills
+> them. No headline number is finalized in this draft.
 >
 > **Positioning:** locked to **Framing C — throughput, not speed.**
 > The earlier Framing A (speed) and Framing B (architectural-honesty)
@@ -149,46 +152,89 @@ a half-baked verdict layer. Better to ship one honest small thing.
 ## Honest performance comparison
 
 The metric that matters for cargoless's positioning is **CPU-seconds
-per save** — the headline throughput number. Latency is a secondary
+per edit** — the headline throughput number. Latency is a secondary
 concern; it's bounded by cargo-check no matter which tool you wrap
-around it. The numbers tell a throughput story.
+around it. The numbers tell a throughput story — and we tell the
+memory story honestly, even though it isn't a win.
 
-**Qualitative comparison** (numbers follow):
+The honest one-paragraph summary, in bench-lead's own words (unedited):
 
-| Tool | CPU per save | Peak RSS | Verdict honesty |
+> cargoless does ~half the per-edit CPU of `trunk serve` — it rebuilds
+> on confirmed-green edges, not blindly every keystroke. Memory is
+> rust-analyzer-dominated (~2 GB default on proc-macro projects); the
+> `--features` knob cuts ~75% and a v0.1 auto-narrow change moves the
+> default there.
+
+The CPU half of that is the pitch. The memory half is a thing we
+refuse to spin: cargoless keeps a warm rust-analyzer, and RA running
+proc-macro expansion is a ~2 GB process whether it's inside cargoless
+or inside your editor. cargoless does not make that smaller by
+default in v0. The `--features` knob recovers most of it today; the
+v0.1 auto-narrow change makes the narrowed config the default. Saying
+"low RSS" here would be the kind of selectively-true marketing this
+project exists to not do.
+
+> **All numbers in this section are PENDING bench-lead's Component-2
+> two-source confirmation.** The `~half` / `~2 GB` / `~75%` figures
+> are bench-lead's explicit pre-confirmation estimate; the tables stay
+> _PENDING_ until the independent second-host cross-check lands.
+
+**Qualitative comparison** (numbers PENDING two-source confirmation):
+
+| Tool | CPU per edit | Peak RSS | Verdict honesty |
 |---|---|---|---|
-| cargoless | LOW — CAS skips identical inputs; warm RA avoids cold-start per cycle | LOW — no HTTP/WS server overhead | publishes green only; pointer atomic |
+| cargoless | LOW — ~½ of `trunk serve`; CAS skips identical inputs, warm RA avoids cold-start per cycle | HIGH by default — RA-dominated (~2 GB on proc-macro projects); `--features` cuts ~75%, v0.1 auto-narrows the default | publishes green only; pointer atomic |
 | `trunk serve` | HIGH — rebuilds-everything per save | MEDIUM — HTTP + WS + browser-keepalive | serves on every build, red or green |
-| `bacon` | MEDIUM — spawns fresh cargo per cycle | LOW — terminal-only | terminal-only |
+| `bacon` †| MEDIUM — spawns fresh cargo per cycle | LOW — terminal-only | terminal-only |
+
+† Not like-for-like vs `bacon`: it is a terminal save→verdict checker,
+not a build+publish loop. Its row is the checker tier only; the
+artifact-publish dimension has no `bacon` counterpart.
 
 <!--
-TBD-NUMBERS — fill in from bench-lead's throughput report (CPU%/RSS/
-CPU-seconds on Leptos fixture, 3 tools) + perf-recon agent's
-independent cross-check. Both ETA ~60-90min from 2026-05-17 15:11.
-The numeric tables below get populated from those two reports.
+PENDING bench-lead Component-2 two-source confirmation. Cells stay
+_PENDING_ until BOTH bench-lead's throughput report (CPU-seconds/edit,
+peak RSS, saves-per-CPU-minute; Leptos fixture; 3 tools) AND the
+independent second-host cross-check land. A small follow-up commit
+then fills them. Do not substitute a single-source estimate for
+_PENDING_; the verbatim "~half / ~2 GB / ~75%" prose above is
+bench-lead's explicit pre-confirmation estimate, marked as such.
 -->
 
-**Measured numbers** (TBD — from `bench/run.sh` + independent
-cross-check):
+**Measured numbers** — _PENDING bench-lead Component-2 two-source
+confirmation_ (from `bench/run.sh` + an independent second host):
 
-| Tool | CPU-seconds per save (median) | Peak RSS (MB) | Saves per CPU-minute |
+| Tool | CPU-seconds per edit (median) | Peak RSS (MB) | Saves per CPU-minute |
 |---|---|---|---|
-| cargoless | _TBD_ | _TBD_ | _TBD_ |
-| `trunk serve` | _TBD_ | _TBD_ | _TBD_ |
-| `bacon` | _TBD_ | _TBD_ | _TBD_ |
+| cargoless | _PENDING_ | _PENDING_ | _PENDING_ |
+| `trunk serve` | _PENDING_ | _PENDING_ | _PENDING_ |
+| `bacon` †| _PENDING_ | _PENDING_ | _PENDING_ |
 
-For raw save→verdict latency (the inner-loop responsiveness number,
-secondary to throughput for cargoless's positioning):
+† `bacon` is not a like-for-like comparator — checker, not
+build+publish; the row is the checker tier only.
 
-| Tool | Save→verdict (median) | Save→artifact published |
-|---|---|---|
-| cargoless | _TBD_ | _TBD_ |
-| `trunk serve` | _TBD_ | _TBD_ |
-| `bacon` | _TBD_ | n/a (terminal-only) |
+Raw save→verdict is reported in **two tiers**, not one number (the
+honest-split per [`docs/design/D-A2-RENEGOTIATION.md`](https://github.com/TriformAI/cargoless/blob/main/docs/design/D-A2-RENEGOTIATION.md)):
+a **RA-incremental hint** (AC#2a — median ≤1s, ~0.74s field-measured;
+can flip RED instantly, does not by itself prove compilation) and the
+**authoritative cargo-check verdict** (AC#2b — bounded by `cargo
+check`; seconds on small projects, ~20-30s on a Leptos-sized tree;
+the only tier that drives GREEN). cargoless shows both, live, with
+timestamps — the latency gap is readable directly off any pair of
+lines, not hidden.
 
-On a real Leptos project, save→verdict for all three tools lands
-within the cargo-check-bound band — none of them are racing each
-other on raw wall-clock. **The interesting wins are on the
+| Tool | Hint (AC#2a) | Authoritative verdict (AC#2b) | Save→artifact published |
+|---|---|---|---|
+| cargoless | _PENDING_ (≤1s target) | _PENDING_ (cargo-check +≤10% target) | _PENDING_ |
+| `trunk serve` | n/a (no hint tier) | _PENDING_ | _PENDING_ |
+| `bacon` †| n/a (no hint tier) | _PENDING_ | n/a (terminal-only) |
+
+On a real Leptos project the **authoritative** verdict (AC#2b) lands
+within the cargo-check-bound band for all three tools — none of them
+are racing each other on raw wall-clock there, because cargo's own
+runtime dominates. cargoless's only latency edge is the AC#2a hint
+tier, which the other two don't have at all; it shows that hint live
+without pretending it's the verdict. **The interesting wins are on the
 throughput rows.** When the input set hasn't changed, cargoless does
 ~zero work; the other two redo the full build's worth of work
 because they don't know it's already been done. Over a day of
@@ -322,9 +368,18 @@ what we deliberately did **not** do:
 - **Linux + macOS only.** Windows is v1 parking-lot per the design
   doc; `cargo install` works there on a best-effort basis but no
   prebuilt artifact, no CI coverage.
+- **Memory is not a v0 win.** Steady-state RSS is rust-analyzer-
+  dominated (~2 GB default on proc-macro projects); cargoless does not
+  make that smaller by default in v0. The `--features` knob recovers
+  most of it today, and the v0.1 auto-narrow change makes the narrowed
+  config the default. We will not quote a flattering RSS number we
+  can't honestly default to. (Figures _PENDING_ bench-lead's
+  two-source confirmation.)
 - **The benchmark is INCONCLUSIVE on raw speed.** We measured. We
   reported. We did not silently miss the threshold and ship anyway.
-  See the methodology section above.
+  The save→verdict story is the honest dual-tier split (fast hint +
+  cargo-check-bound authoritative verdict), not a single sub-1s
+  headline. See the methodology section above.
 
 The launch-hardening process for this v0 was 12 field findings over
 3 weeks of dogfooding a real Leptos project on a clean Linux box; 11
@@ -398,14 +453,23 @@ the tool report when it breaks.
 - [ ] Headline value-prop matches the operator-locked **Framing C**
       ("cargoless doesn't burn your CPU" — throughput-not-speed) and
       the throughput-first comparison tables are intact.
-- [ ] All `<!-- TBD-NUMBERS -->` markers replaced with concrete copy
-      from bench-lead's throughput report + perf-recon cross-check.
-- [ ] Throughput numbers (CPU-seconds per save, peak RSS, saves per
+- [ ] All `_PENDING_` cells + the `<!-- PENDING bench-lead
+      Component-2 -->` comment replaced with concrete copy only after
+      BOTH bench-lead's throughput report AND the independent
+      second-host cross-check land (two-source rule).
+- [ ] Verbatim "~half / ~2 GB / ~75%" prose reconciled with the
+      confirmed numbers (kept verbatim until then; not silently
+      "improved").
+- [ ] Throughput numbers (CPU-seconds per edit, peak RSS, saves per
       CPU-minute) populated in the comparison tables + body
       paragraphs; methodology paragraph matches the actual bench
       shape used to produce them.
-- [ ] Latency table populated (cargo-check-bound on all three tools;
-      no sub-second artifact-publish claim).
+- [ ] Memory honesty intact: no "low RSS" by-default claim; the
+      RA-dominated ~2 GB + `--features` + v0.1 auto-narrow framing is
+      present and not softened.
+- [ ] Latency presented as the **dual-tier split** (AC#2a hint ≤1s /
+      AC#2b cargo-check-bound authoritative), not a single sub-1s
+      headline; no sub-second artifact-publish claim.
 - [x] D1 product name resolved = `cargoless` (operator, 2026-05-17);
       `tftrunk`/`tf-cli` drift renamed to `cargoless` in the #87
       surgical rename-commit; internal `tf-proto`/`tf-cas`/`tf-core`

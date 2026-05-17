@@ -14,9 +14,11 @@ via an atomic temp+fsync+rename; when the tree goes red, the pointer
 **does not move** — so anything consuming that pointer (a static
 server, a CI step, an agent) can rely on never seeing a broken build.
 
-The net effect is fewer CPU-seconds spent per save, lower peak RSS,
-and more dev cycles per battery — without giving up the verdict
-honesty that makes the codebase trust-worthy in the first place. It
+The net effect is fewer CPU-seconds spent per save — and therefore more
+dev cycles per battery — without giving up the verdict honesty that makes
+the codebase trust-worthy in the first place. (Memory is a different
+story, and we are honest about it below: steady-state RSS is
+rust-analyzer-dominated, not a by-default win.) It
 is the result of a vision cut: every type and decision in the project
 is justified by either sharpening the codebase's self-knowledge or
 shortening the latency from brokenness to signal. Anything that does
@@ -153,10 +155,34 @@ For the full v0 surface, see [`ROADMAP.md`](ROADMAP.md#v0-capabilities-available
 
 The differentiator isn't raw save→verdict latency — that's bounded by
 `cargo check`, which dominates the wall-clock no matter which tool
-wraps it. The differentiator is **throughput**: how much CPU and
-memory cargoless burns per save compared to the alternatives, and
-therefore how many dev cycles you get out of the same battery before
-the fans spin up.
+wraps it. The differentiator is **per-edit CPU throughput**: how much
+work cargoless avoids redoing per save, and therefore how many dev
+cycles you get out of the same battery before the fans spin up.
+
+The honest one-paragraph summary (bench-lead's wording, unedited):
+
+> cargoless does ~half the per-edit CPU of `trunk serve` — it rebuilds
+> on confirmed-green edges, not blindly every keystroke. Memory is
+> rust-analyzer-dominated (~2 GB default on proc-macro projects); the
+> `--features` knob cuts ~75% and a v0.1 auto-narrow change moves the
+> default there.
+
+Two things to read carefully out of that: the CPU win is real and
+roughly halves `trunk serve`'s per-edit cost; the memory picture is
+**not** a by-default win — steady-state RSS is dominated by
+rust-analyzer (which runs proc-macro expansion by default), so
+cargoless's footprint is comparable to an editor running RA, not
+lean. The `--features` knob already recovers most of that today; the
+v0.1 auto-narrow change (see [`ROADMAP.md`](ROADMAP.md)) makes the
+narrowed configuration the default. We say this plainly rather than
+quoting a flattering RSS number we can't honestly default to.
+
+> **Numbers below are PENDING bench-lead's Component-2 two-source
+> confirmation.** The `~half` / `~2 GB` / `~75%` figures above are
+> bench-lead's pre-confirmation estimate; the tables stay marked
+> _PENDING_ until the second-host cross-check lands, at which point a
+> small follow-up commit fills them. No headline number is finalized
+> here.
 
 The architectural asymmetry that produces the gap:
 
@@ -178,39 +204,61 @@ The architectural asymmetry that produces the gap:
   the v0.1 server adapter is an opt-in layer for users who want it.
 
 <!--
-TBD-NUMBERS — bench-lead's throughput report (CPU%/RSS/CPU-seconds on
-Leptos fixture, 3 tools) + perf-recon agent's independent cross-check
-(~60-90min ETA from 2026-05-17 15:11). Numbers slot into the tables
-below via a small follow-up commit when both reports land.
-
-Throughput report covers: CPU-seconds per save (median), peak RSS,
-saves-per-CPU-minute. Cross-check covers: methodology audit + repro
-on a second host. Both required before the headline is concrete.
+PENDING bench-lead Component-2 two-source confirmation. The numeric
+cells below stay _PENDING_ until BOTH (a) bench-lead's throughput
+report (CPU-seconds/edit, peak RSS, saves-per-CPU-minute on the Leptos
+fixture, 3 tools) AND (b) the independent second-host cross-check land.
+Then a small follow-up commit fills the tables. Do not substitute a
+single-source estimate for _PENDING_; the verbatim "~half / ~2 GB /
+~75%" prose above is bench-lead's explicitly pre-confirmation estimate
+and is marked as such inline.
 -->
 
 **Qualitative comparison** (numbers follow):
 
 | Tool | CPU per save | Peak RSS | Verdict honesty |
 |---|---|---|---|
-| cargoless | LOW — CAS skips identical inputs; warm RA avoids cold-start per cycle | LOW — no HTTP/WS server overhead | publishes green only; pointer atomic |
+| cargoless | LOW — ~½ of `trunk serve`; CAS skips identical inputs, warm RA avoids cold-start per cycle | HIGH by default — RA-dominated (~2 GB on proc-macro projects); `--features` knob cuts ~75%, v0.1 auto-narrows the default | publishes green only; pointer atomic |
 | `trunk serve` | HIGH — rebuilds-everything per save | MEDIUM — HTTP + WS + browser-keepalive | serves on every build, red or green |
-| `bacon` | MEDIUM — re-runs cargo per cycle | LOW — terminal-only | terminal-only |
+| `bacon` †| MEDIUM — re-runs cargo per cycle | LOW — terminal-only | terminal-only |
 
-**Measured numbers** (TBD — from `bench/run.sh` + independent cross-check):
+† Not like-for-like vs `bacon`: `bacon` is a terminal save→verdict
+checker, not a build+publish loop. The comparison row is for the
+checker tier only; the artifact-publish dimension has no `bacon`
+counterpart.
 
-<!-- TBD-NUMBERS: filled in when bench-lead's throughput report and the perf-recon cross-check both land. -->
+**Measured numbers** — _PENDING bench-lead Component-2 two-source
+confirmation_ (from `bench/run.sh` + an independent second-host
+cross-check; a follow-up commit fills these in):
 
-| Tool | CPU-seconds per save (median) | Peak RSS (MB) | Saves per CPU-minute |
+<!-- PENDING bench-lead Component-2: numeric cells fill in only when
+the throughput report AND the second-host cross-check both land. Until
+then every cell stays _PENDING_ — do not substitute a single-source
+estimate. -->
+
+| Tool | CPU-seconds per edit (median) | Peak RSS (MB) | Saves per CPU-minute |
 |---|---|---|---|
-| cargoless | _TBD_ | _TBD_ | _TBD_ |
-| `trunk serve` | _TBD_ | _TBD_ | _TBD_ |
-| `bacon` | _TBD_ | _TBD_ | _TBD_ |
+| cargoless | _PENDING_ | _PENDING_ | _PENDING_ |
+| `trunk serve` | _PENDING_ | _PENDING_ | _PENDING_ |
+| `bacon` †| _PENDING_ | _PENDING_ | _PENDING_ |
 
-For raw save→verdict latency (the inner-loop responsiveness number),
-cargoless lands at _TBD_ on the reference Leptos fixture — bounded
-by `cargo check`'s authoritative-tier compile step, which dominates
-the wall-clock regardless of which tool wraps it. No sub-second
-artifact-publish claim is made.
+† `bacon` is not a like-for-like comparator — it is a checker, not a
+build+publish loop; its row covers the checker tier only.
+
+For raw save→verdict latency cargoless reports **two tiers**, not one
+number (see [`docs/design/D-A2-RENEGOTIATION.md`](docs/design/D-A2-RENEGOTIATION.md)):
+
+- **AC#2a — RA-incremental hint:** median ≤1s (field-measured ~0.74s
+  on the dogfood Leptos project post-debouncer-fix). A fast hint that
+  can flip the verdict RED instantly; it does **not** by itself prove
+  the tree compiles.
+- **AC#2b — authoritative verdict:** bounded by `cargo check` itself
+  (seconds on small projects, ~20-30s on a Leptos-sized tree). Only
+  this tier drives GREEN. cargoless's *added* overhead targets ≤10% of
+  cargo's own time — _PENDING_ the relative-cost number from the
+  comparative bench.
+
+No sub-second artifact-publish claim is made.
 
 **Methodology** (for transparency once numbers land):
 

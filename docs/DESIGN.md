@@ -206,7 +206,10 @@ shapes above are designed so that is purely additive.
 | 4 never **publish** red | `BecameRed` edge + `BuildResult.artifact: None` on failure ⇒ publisher provably keeps the prior `.cargoless/latest-green` (headless; the v0.1 server is a downstream consumer of this guarantee) |
 | 5 CAS dedupe | `BuildIdentity` componentwise equality ⇒ `InputHash` equality; `BuildOutcome::Deduplicated` is the observable proof |
 | 6 survives RA kill | model emits `StateEvent`s; a restarted analyzer re-emits **level** `FileVerdict`s to re-sync subscribers — no edge replay needed |
-| 1 (headless) /2/ 3 (publish latency) /7 (two-mode) | unblocked, not closed here — depend on auto-detect (D7), the S1/two-mode bench, and the publisher; contract is the seam they build against |
+| 2a RA-incremental hint ≤1s | `LspEvent::Diagnostics` emit boundary in `tf_core::lsp` — RA-native severity:Error can flip RED instantly (F8-redo), but **cannot** drive GREEN (asymmetric-evidence rule) |
+| 2b authoritative verdict ≤ bare `cargo check` + 10% | `apply_event(FlycheckEnded)` boundary in `tf_core::model` — cargo-check (rustc) tier is the only signal that drives GREEN; cargoless's added overhead is the watch+debounce+emit loop, not cargo's runtime |
+| 1 (headless) / 3 (publish latency) / 7 (two-mode) | unblocked, not closed here — depend on auto-detect (D7), the S1/two-mode bench, and the publisher; contract is the seam they build against |
+| AC#2 split rationale | see [`docs/design/D-A2-RENEGOTIATION.md`](design/D-A2-RENEGOTIATION.md) §1–§2: single-line AC#2 conflated two phenomena the verdict architecture genuinely separates; zero code change, spec catching up to code |
 
 ## 6. Change protocol
 
