@@ -24,7 +24,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::statusfile::{self, Status, Verdict, HEARTBEAT};
+use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
 use crate::ui;
 
 const BRINGUP_BUDGET: Duration = Duration::from_secs(30);
