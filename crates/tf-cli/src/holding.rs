@@ -10,7 +10,7 @@
 //! and gives the user honest, auto-refreshing status. It is std-only
 //! (`TcpListener`, one thread) — no async runtime, no HTTP crate.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -166,10 +166,16 @@ fn accept_loop(listener: TcpListener, phase: Arc<Mutex<Phase>>, stop: Arc<Atomic
 
 fn serve_one(mut stream: TcpStream, phase: &Phase) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    // Drain (a bounded prefix of) the request; we serve the same page for any
-    // path, but a well-behaved server must consume the request line.
-    let mut buf = [0u8; 1024];
-    let _ = stream.read(&mut buf);
+    // Consume the request line (we serve the same page for any path, but a
+    // well-behaved server must read the request). `read_line` handles the
+    // byte count correctly — unlike a discarded `read`, which is both a
+    // partial-read bug and a `clippy::unused_io_amount` failure under
+    // `-D warnings`. A read timeout bounds a client that never sends a line.
+    {
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut request_line = String::new();
+        let _ = reader.read_line(&mut request_line);
+    }
 
     let body = render_page(phase);
     let response = format!(
@@ -185,6 +191,10 @@ fn serve_one(mut stream: TcpStream, phase: &Phase) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // `Read` for the loopback test's `read_to_string`; the module proper no
+    // longer needs it (the request line is consumed via `BufRead`).
+    use std::io::Read;
+
     use super::*;
 
     #[test]
