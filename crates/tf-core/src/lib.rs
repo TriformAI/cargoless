@@ -17,8 +17,8 @@ pub mod watcher;
 
 pub use tf_cas::{ContentStore, LocalDiskStore};
 pub use tf_proto::{
-    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, ContentHash, FileState,
-    InputHash, Profile, StateEvent, TargetTriple, TreeState,
+    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
+    Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,
 };
 
 /// Name-neutral build identifier. The shipping product name is decision D1;

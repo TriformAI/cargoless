@@ -292,6 +292,108 @@ pub struct BuildResult {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics — additive CLI-facing surface (FIELD FINDING #2 fix)
+//
+// The boolean `TreeState` answers "should the publisher advance?" (AC#4 —
+// load-bearing for v0 and STAYS BYTE-FROZEN); but a user staring at a red
+// tree needs to know *which* file, *which* line, *what* the rustc said. The
+// existing frozen seams (`StateEvent` / `TreeState` / `BuildTrigger` /
+// `BuildResult` / `ArtifactMeta`) deliberately carry no diagnostic payload —
+// adding one in place would break every wired consumer. So this is an
+// ADJACENT, additive surface: a parallel rich verdict the CLI may opt into
+// without touching the existing API anyone else binds to.
+//
+// Same discipline as the latest-green publisher: serde-free, no new deps,
+// the existing types are unchanged. Pairing the boolean tree with the
+// diagnostic list is what restores the README promise that "the codebase
+// always knows what works, *and tells you the moment it doesn't*".
+// ---------------------------------------------------------------------------
+
+/// Diagnostic severity, derived from the LSP `DiagnosticSeverity` integers
+/// (1=Error, 2=Warning, 3=Information, 4=Hint). A typed enum so the CLI
+/// renders `error`/`warning`/`info`/`hint` headers without re-deriving from
+/// raw numbers, and so a future consumer can pattern-match exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl Severity {
+    /// Lowercase tag used by `rustc`-style display (`error[E0277]: …`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+            Severity::Hint => "hint",
+        }
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One actionable diagnostic, surfaced by the LSP layer and aggregated by
+/// the daemon model. Carries the absolute file path, 1-based (file:line:col)
+/// position, severity, optional compiler/lint code, the human message, and
+/// the diagnostic `source` string verbatim (`"rustc"` for cargo-check
+/// authoritative, `"rust-analyzer"` for native advisory, anything else for
+/// future tiers) so the CLI can both show provenance and the model can keep
+/// classifying authoritative-vs-advisory off the same value.
+///
+/// Additive alongside the frozen `StateEvent`/`TreeState`/`check_once`
+/// surfaces — those keep their byte-frozen shapes; this is the parallel
+/// detail channel the CLI subscribes to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Diagnostic {
+    /// Absolute file path as reported by rust-analyzer (`file://` URI
+    /// stripped to its path). `PathBuf` (not `String`) so callers can render
+    /// it relative to the project root with `Path::strip_prefix` without
+    /// re-parsing.
+    pub file_path: std::path::PathBuf,
+    /// 1-based line number. The LSP wire is 0-based; the extraction
+    /// converts at the boundary so every consumer sees the same convention
+    /// (matches `cargo`/`rustc` display).
+    pub line: u32,
+    /// 1-based column number, same convention as `line`.
+    pub col: u32,
+    /// LSP severity, mapped to [`Severity`].
+    pub severity: Severity,
+    /// Diagnostic code, e.g. `"E0277"` (rustc) or `"unused_imports"` (lint).
+    /// `None` when the LSP omitted it (some advisory native diagnostics).
+    pub code: Option<String>,
+    /// Human-readable message text exactly as reported by the LSP. May be
+    /// multi-line — the CLI renderer is responsible for any indentation.
+    pub message: String,
+    /// `source` field verbatim — `"rustc"` for cargo-check authoritative
+    /// diagnostics, `"rust-analyzer"` for native advisory. `None` if the
+    /// LSP did not tag the diagnostic with a source.
+    pub source: Option<String>,
+}
+
+/// The rich one-shot check verdict: the existing boolean [`TreeState`] paired
+/// with the full diagnostic list a user needs to fix a red tree. Returned by
+/// the adjacent `tf_core::model::check_once_with_diagnostics`; existing
+/// callers of [`TreeState`]-returning APIs (`check_once`, frozen for cli-ux
+/// and the bench harness) are byte-unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckResult {
+    /// The same authoritative tree verdict `check_once` would return.
+    pub tree: TreeState,
+    /// Every diagnostic the model knew about at the moment the verdict was
+    /// finalised — every severity, both rustc-authoritative and RA-advisory.
+    /// The CLI renderer is free to filter (e.g. errors-only) by `severity`
+    /// and/or `source`.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+// ---------------------------------------------------------------------------
 // Latest-green publisher seam (the ONLY additive v0 surface — D-A1 / AC#4)
 // ---------------------------------------------------------------------------
 
@@ -572,5 +674,101 @@ mod tests {
         assert_eq!(UnixSeconds(42).to_string(), "42");
         assert!(UnixSeconds(1) < UnixSeconds(2));
         assert_eq!(UnixSeconds(7), UnixSeconds(7));
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostics — additive CLI-facing surface (FIELD FINDING #2 fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn severity_renders_lowercase_and_is_exhaustive() {
+        assert_eq!(Severity::Error.as_str(), "error");
+        assert_eq!(Severity::Warning.as_str(), "warning");
+        assert_eq!(Severity::Info.as_str(), "info");
+        assert_eq!(Severity::Hint.as_str(), "hint");
+        assert_eq!(Severity::Error.to_string(), "error");
+        // Distinct values — the four variants do not collide.
+        let s: std::collections::BTreeSet<_> = [
+            Severity::Error,
+            Severity::Warning,
+            Severity::Info,
+            Severity::Hint,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(s.len(), 4);
+    }
+
+    #[test]
+    fn diagnostic_carries_position_code_and_source() {
+        let d = Diagnostic {
+            file_path: std::path::PathBuf::from("/repo/src/lib.rs"),
+            line: 42,
+            col: 5,
+            severity: Severity::Error,
+            code: Some("E0277".to_string()),
+            message: "the trait bound `T: Foo` is not satisfied".to_string(),
+            source: Some("rustc".to_string()),
+        };
+        // Field accesses (the CLI's binding surface) compile and round-trip.
+        assert_eq!(d.line, 42);
+        assert_eq!(d.col, 5);
+        assert_eq!(d.code.as_deref(), Some("E0277"));
+        assert_eq!(d.source.as_deref(), Some("rustc"));
+        assert_eq!(d.severity, Severity::Error);
+        assert!(d.message.contains("trait bound"));
+        // Eq is value-equality (the AC: two identical diagnostics dedupe).
+        let d2 = d.clone();
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn check_result_pairs_tree_with_diagnostics() {
+        // Empty diagnostics + green = the canonical "happy path".
+        let green = CheckResult {
+            tree: TreeState::Green,
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(green.tree, TreeState::Green);
+        assert!(green.diagnostics.is_empty());
+
+        // Red verdict ⇒ at least one diagnostic the CLI will print. The
+        // FIELD FINDING #2 invariant: a red tree carries its evidence.
+        let red = CheckResult {
+            tree: TreeState::Red,
+            diagnostics: vec![Diagnostic {
+                file_path: std::path::PathBuf::from("/r/src/lib.rs"),
+                line: 1,
+                col: 1,
+                severity: Severity::Error,
+                code: Some("E0599".to_string()),
+                message: "no method named `frob` found".to_string(),
+                source: Some("rustc".to_string()),
+            }],
+        };
+        assert_eq!(red.tree, TreeState::Red);
+        assert_eq!(red.diagnostics.len(), 1);
+        assert_eq!(red.diagnostics[0].code.as_deref(), Some("E0599"));
+    }
+
+    #[test]
+    fn diagnostic_path_is_relativisable_against_a_root() {
+        // The CLI takes the absolute file_path and renders relative to the
+        // project root with std::path::Path::strip_prefix — verify the shape
+        // supports that (PathBuf, not String).
+        let d = Diagnostic {
+            file_path: std::path::PathBuf::from("/repo/src/lib.rs"),
+            line: 1,
+            col: 1,
+            severity: Severity::Warning,
+            code: None,
+            message: "x".to_string(),
+            source: None,
+        };
+        let rel = d
+            .file_path
+            .strip_prefix("/repo")
+            .expect("strips the root cleanly");
+        assert_eq!(rel, std::path::Path::new("src/lib.rs"));
     }
 }
