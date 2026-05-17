@@ -13,3 +13,9 @@ workspace = true
 [dependencies]
 tf-proto = { path = "../tf-proto" }
 tf-cas = { path = "../tf-cas" }
+# Owner-added (daemon-core, Epic 2). notify 6.x: stable cross-platform FS
+# backend (inotify/FSEvents/kqueue/ReadDirectoryChangesW), MSRV well under
+# 1.85. Debounce + ignore are implemented in-crate (pure, unit-tested) rather
+# than pulling notify-debouncer-* / the ignore crate, keeping the dep tree
+# minimal for the CI-only build model.
+notify = "6"
