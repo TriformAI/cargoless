@@ -43,7 +43,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tf_proto::{
-    BuildIdentity, ContentHash, FileState, Profile, StateEvent, TargetTriple, TreeState,
+    BuildIdentity, CheckResult, ContentHash, Diagnostic, FileState, Profile, StateEvent,
+    TargetTriple, TreeState,
 };
 
 use crate::lsp::LspEvent;
@@ -117,6 +118,14 @@ pub struct Model {
     subscribers: Vec<Sender<StateEvent>>,
     advisory_subscribers: Vec<Sender<Verdict>>,
     identity: Box<dyn IdentityProvider>,
+    /// FIELD FINDING #2 additive surface: the most recent diagnostic list
+    /// per file, indexed by path-from-URI. Replaced wholesale on every
+    /// `publishDiagnostics` (RA's semantics — a publish supersedes the prior
+    /// list for that file; an empty list clears it). The aggregated view is
+    /// what the CLI prints; this is NOT part of the authoritative verdict
+    /// rule (which still derives from `auth` + `flycheck_done`), just the
+    /// human-facing detail the boolean verdict was hiding.
+    diagnostics: BTreeMap<String, Vec<Diagnostic>>,
 }
 
 impl Model {
@@ -130,6 +139,7 @@ impl Model {
             subscribers: Vec::new(),
             advisory_subscribers: Vec::new(),
             identity: Box::new(identity),
+            diagnostics: BTreeMap::new(),
         }
     }
 
@@ -171,6 +181,27 @@ impl Model {
         self.auth.get(path).copied()
     }
 
+    /// FIELD FINDING #2: the diagnostics last reported for `path`, in
+    /// publish order. Empty iff RA has explicitly cleared this file (or
+    /// never reported on it). The aggregate stream is
+    /// [`Self::all_diagnostics`].
+    pub fn file_diagnostics(&self, path: &str) -> &[Diagnostic] {
+        self.diagnostics.get(path).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// FIELD FINDING #2: every known diagnostic, flattened across files in
+    /// deterministic path order. This is what the CLI prints — pairing
+    /// `tree_state` with `all_diagnostics` is the rich verdict the boolean
+    /// `TreeState` alone could not surface.
+    pub fn all_diagnostics(&self) -> Vec<Diagnostic> {
+        let total: usize = self.diagnostics.values().map(Vec::len).sum();
+        let mut out = Vec::with_capacity(total);
+        for v in self.diagnostics.values() {
+            out.extend(v.iter().cloned());
+        }
+        out
+    }
+
     /// Fold one [`LspEvent`] into the model.
     pub fn apply_event(&mut self, ev: &LspEvent) {
         match ev {
@@ -190,6 +221,16 @@ impl Model {
                 };
                 self.auth.insert(path.clone(), auth_state);
                 self.native.insert(path.clone(), native_state);
+                // FIELD FINDING #2: stash the rich diagnostic list for this
+                // file. RA's `publishDiagnostics` replaces the list (an empty
+                // list clears it) — mirror that exactly so the CLI's
+                // aggregate view never shows a stale error for a fixed file.
+                if pd.diagnostics.is_empty() {
+                    self.diagnostics.remove(&path);
+                } else {
+                    self.diagnostics
+                        .insert(path.clone(), pd.diagnostics.clone());
+                }
                 // FileVerdict is the authoritative per-file settle.
                 self.emit(StateEvent::FileVerdict {
                     path,
@@ -210,7 +251,10 @@ impl Model {
     pub fn forget_file(&mut self, path: &str) {
         let a = self.auth.remove(path).is_some();
         let n = self.native.remove(path).is_some();
-        if a || n {
+        // FIELD FINDING #2: keep the diagnostics map in sync — a deleted file
+        // must not haunt the CLI's aggregate view with stale errors.
+        let d = self.diagnostics.remove(path).is_some();
+        if a || n || d {
             self.reconcile();
             self.emit_advisory();
         }
@@ -406,6 +450,118 @@ pub fn check_once(root: &Path) -> io::Result<TreeState> {
     check_verdict(root).map(|v| v.tree)
 }
 
+/// FIELD FINDING #2: one-shot AUTHORITATIVE verdict for `root` PAIRED with
+/// the diagnostic list (file/line/col/severity/code/message/source) the CLI
+/// needs to print. Spins up rust-analyzer with flycheck on, opens every
+/// workspace `.rs`, waits for a completed `cargo check` pass, then returns
+/// the [`CheckResult`] (the [`TreeState`] every existing caller uses, plus
+/// the per-file diagnostics every red tree carries).
+///
+/// **Additive alongside** [`check_once`] / [`check_verdict`]: those keep
+/// their byte-frozen signatures (cli-ux's `watch`, bench-lead's harness, and
+/// the #21 advisory channel are all unchanged). This is the parallel rich
+/// API the CLI's `check` command binds to.
+///
+/// `Err` = setup/env failure (rust-analyzer missing, spawn/pipe error) — the
+/// CLI must surface this distinctly from "code is red". A run that never sees
+/// an authoritative flycheck pass yields `CheckResult { Red, diagnostics }`
+/// with whatever diagnostics RA emitted before the timeout (never claim
+/// unproven green — AC#4 stays inviolable here too).
+pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
+    let root = fs::canonicalize(root)?;
+    let mut cmd = crate::analyzer::rust_analyzer_command()?;
+    cmd.current_dir(&root);
+    let mut child = cmd.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    let root_str = root.to_string_lossy().into_owned();
+    let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
+
+    let ignore = crate::watcher::IgnoreRules::for_root(&root);
+    for f in collect_rs_files(&root, &ignore) {
+        if let Ok(text) = fs::read_to_string(&f) {
+            let _ = client.did_open(&f.to_string_lossy(), &text, 1);
+        }
+    }
+
+    let cap = std::env::var("TF_CHECK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(CHECK_HARD_CAP);
+    let deadline = Instant::now() + cap;
+    let mut auth: BTreeMap<String, FileState> = BTreeMap::new();
+    // Reuse the model's per-file-replace semantics: a later publish for the
+    // same file SUPERSEDES the earlier one (empty publish clears). This is
+    // how `apply_event` does it; mirroring keeps the CLI's one-shot view
+    // consistent with what `watch` shows live.
+    let mut diagnostics: BTreeMap<String, Vec<Diagnostic>> = BTreeMap::new();
+    let mut flycheck_seen = false;
+    let mut got_any = false;
+    while !flycheck_seen {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = CHECK_SETTLE.min(deadline - now);
+        match events.recv_timeout(wait) {
+            Ok(LspEvent::Diagnostics(pd)) => {
+                got_any = true;
+                if let Some(p) = crate::lsp::path_from_uri(&pd.uri) {
+                    let s = if pd.has_authoritative_error() {
+                        FileState::Red
+                    } else {
+                        FileState::Green
+                    };
+                    auth.insert(p.clone(), s);
+                    if pd.diagnostics.is_empty() {
+                        diagnostics.remove(&p);
+                    } else {
+                        diagnostics.insert(p, pd.diagnostics.clone());
+                    }
+                }
+            }
+            Ok(LspEvent::FlycheckEnded) => {
+                flycheck_seen = true;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if got_any {
+                    break; // settled without an authoritative pass
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break, // RA exited
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let tree = if flycheck_seen {
+        if auth.values().any(|s| *s == FileState::Red) {
+            TreeState::Red
+        } else {
+            TreeState::Green
+        }
+    } else {
+        // No authoritative pass observed → unproven, never green (AC#4).
+        TreeState::Red
+    };
+    let total: usize = diagnostics.values().map(Vec::len).sum();
+    let mut flat = Vec::with_capacity(total);
+    for v in diagnostics.values() {
+        flat.extend(v.iter().cloned());
+    }
+    Ok(CheckResult {
+        tree,
+        diagnostics: flat,
+    })
+}
+
 /// A running watch pipeline: rust-analyzer + LSP + watcher feeding the model.
 /// Drop = graceful shutdown (stop threads, stop watcher, kill RA).
 pub struct ModelSession {
@@ -436,6 +592,15 @@ impl ModelSession {
     /// Full reported verdict incl. provenance (additive #21).
     pub fn last_verdict(&self) -> Verdict {
         poisoned(&self.model).last_verdict()
+    }
+
+    /// FIELD FINDING #2: every diagnostic the model has accumulated, across
+    /// every reporting file. Returned in deterministic path order so the
+    /// CLI's `watch` mode can re-print a stable view on each transition
+    /// without flicker. Snapshot — the lock is released before the caller
+    /// formats output, so this is safe to call on every event.
+    pub fn current_diagnostics(&self) -> Vec<Diagnostic> {
+        poisoned(&self.model).all_diagnostics()
     }
 
     /// Explicit graceful shutdown (also runs on drop).
@@ -599,7 +764,52 @@ mod tests {
             authoritative_errors: auth_err,
             advisory_errors: adv_err,
             total: auth_err + adv_err,
+            // Counts-only helper: the per-file rich list isn't what these
+            // #21 tests assert on; the dedicated FIELD FINDING #2 tests
+            // below populate it via `diag_rich`.
+            diagnostics: Vec::new(),
         })
+    }
+
+    fn diag_rich(uri: &str, ds: Vec<Diagnostic>) -> LspEvent {
+        let mut auth = 0usize;
+        let mut adv = 0usize;
+        for d in &ds {
+            if d.severity == tf_proto::Severity::Error {
+                if d.source.as_deref() == Some("rustc") {
+                    auth += 1;
+                } else {
+                    adv += 1;
+                }
+            }
+        }
+        LspEvent::Diagnostics(crate::lsp::PublishDiagnostics {
+            uri: uri.into(),
+            authoritative_errors: auth,
+            advisory_errors: adv,
+            total: ds.len(),
+            diagnostics: ds,
+        })
+    }
+
+    fn mk_diag(
+        path: &str,
+        line: u32,
+        col: u32,
+        sev: tf_proto::Severity,
+        code: Option<&str>,
+        msg: &str,
+        source: Option<&str>,
+    ) -> Diagnostic {
+        Diagnostic {
+            file_path: std::path::PathBuf::from(path),
+            line,
+            col,
+            severity: sev,
+            code: code.map(str::to_owned),
+            message: msg.to_owned(),
+            source: source.map(str::to_owned),
+        }
     }
 
     fn drain<T>(rx: &Receiver<T>) -> Vec<T> {
@@ -764,6 +974,148 @@ mod tests {
         assert_eq!(id.profile, Profile::Dev);
         assert_eq!(id.target.as_str(), "wasm32-unknown-unknown");
         assert_eq!(id.source_tree, id.cargo_lock); // all the same sentinel
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #2 — diagnostic storage / aggregate view / forget sync
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diagnostics_accumulate_per_file_and_aggregate() {
+        let mut m = model();
+        // Two files, each with one rustc error + a position.
+        m.apply_event(&diag_rich(
+            "file:///p/src/a.rs",
+            vec![mk_diag(
+                "/p/src/a.rs",
+                10,
+                3,
+                tf_proto::Severity::Error,
+                Some("E0277"),
+                "the trait bound not satisfied",
+                Some("rustc"),
+            )],
+        ));
+        m.apply_event(&diag_rich(
+            "file:///p/src/b.rs",
+            vec![mk_diag(
+                "/p/src/b.rs",
+                1,
+                1,
+                tf_proto::Severity::Warning,
+                Some("unused_imports"),
+                "unused import",
+                Some("rust-analyzer"),
+            )],
+        ));
+        let all = m.all_diagnostics();
+        assert_eq!(all.len(), 2, "two diagnostics, one per file");
+        assert_eq!(m.file_diagnostics("/p/src/a.rs").len(), 1);
+        assert_eq!(m.file_diagnostics("/p/src/b.rs").len(), 1);
+        // Codes survived end-to-end (the FIELD FINDING #2 ask).
+        let codes: Vec<&str> = all.iter().filter_map(|d| d.code.as_deref()).collect();
+        assert!(codes.contains(&"E0277"));
+        assert!(codes.contains(&"unused_imports"));
+    }
+
+    #[test]
+    fn later_publish_replaces_prior_per_file() {
+        // RA's contract: publishDiagnostics REPLACES the prior list for that
+        // file. Test that the model mirrors that (no stale errors after a
+        // fix).
+        let mut m = model();
+        m.apply_event(&diag_rich(
+            "file:///p/src/a.rs",
+            vec![mk_diag(
+                "/p/src/a.rs",
+                1,
+                1,
+                tf_proto::Severity::Error,
+                Some("E0277"),
+                "first",
+                Some("rustc"),
+            )],
+        ));
+        assert_eq!(m.file_diagnostics("/p/src/a.rs").len(), 1);
+        // A second publish with a different diagnostic supersedes the first.
+        m.apply_event(&diag_rich(
+            "file:///p/src/a.rs",
+            vec![mk_diag(
+                "/p/src/a.rs",
+                2,
+                2,
+                tf_proto::Severity::Error,
+                Some("E0308"),
+                "second",
+                Some("rustc"),
+            )],
+        ));
+        let now = m.file_diagnostics("/p/src/a.rs");
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].code.as_deref(), Some("E0308"));
+        // An empty publish CLEARS the file's diagnostics — the user fixed it.
+        m.apply_event(&diag_rich("file:///p/src/a.rs", vec![]));
+        assert!(m.file_diagnostics("/p/src/a.rs").is_empty());
+    }
+
+    #[test]
+    fn forget_file_drops_diagnostics_too() {
+        let mut m = model();
+        m.apply_event(&diag_rich(
+            "file:///p/src/a.rs",
+            vec![mk_diag(
+                "/p/src/a.rs",
+                1,
+                1,
+                tf_proto::Severity::Error,
+                Some("E0277"),
+                "x",
+                Some("rustc"),
+            )],
+        ));
+        assert!(!m.all_diagnostics().is_empty());
+        m.forget_file("/p/src/a.rs");
+        assert!(
+            m.all_diagnostics().is_empty(),
+            "deleted file's diagnostics must be evicted from aggregate"
+        );
+    }
+
+    #[test]
+    fn aggregate_diagnostics_are_path_ordered() {
+        // BTreeMap iteration is sorted by key — verify the aggregate flatten
+        // preserves a deterministic file order so the CLI's `watch` mode
+        // doesn't flicker between renders.
+        let mut m = model();
+        m.apply_event(&diag_rich(
+            "file:///p/z.rs",
+            vec![mk_diag(
+                "/p/z.rs",
+                1,
+                1,
+                tf_proto::Severity::Error,
+                None,
+                "z",
+                Some("rustc"),
+            )],
+        ));
+        m.apply_event(&diag_rich(
+            "file:///p/a.rs",
+            vec![mk_diag(
+                "/p/a.rs",
+                1,
+                1,
+                tf_proto::Severity::Error,
+                None,
+                "a",
+                Some("rustc"),
+            )],
+        ));
+        let all = m.all_diagnostics();
+        assert_eq!(all.len(), 2);
+        // /p/a.rs sorts before /p/z.rs.
+        assert_eq!(all[0].file_path, std::path::PathBuf::from("/p/a.rs"));
+        assert_eq!(all[1].file_path, std::path::PathBuf::from("/p/z.rs"));
     }
 
     #[test]

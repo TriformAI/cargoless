@@ -34,12 +34,25 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
 use serde_json::{Value, json};
+use tf_proto::{Diagnostic, Severity};
 
 /// LSP `DiagnosticSeverity.Error`.
 const SEVERITY_ERROR: i64 = 1;
+/// LSP `DiagnosticSeverity.Warning`.
+const SEVERITY_WARNING: i64 = 2;
+/// LSP `DiagnosticSeverity.Information`.
+const SEVERITY_INFO: i64 = 3;
+/// LSP `DiagnosticSeverity.Hint`.
+const SEVERITY_HINT: i64 = 4;
 
 /// One `textDocument/publishDiagnostics` notification, reduced to what the
 /// model cares about, split by **provenance** (#21).
+///
+/// The count fields (`authoritative_errors`/`advisory_errors`/`total`) are
+/// the byte-frozen #21 surface the model's authoritative-vs-advisory logic
+/// binds to; the `diagnostics` list is the FIELD FINDING #2 additive surface
+/// the CLI uses to print actionable errors. Both are populated by the same
+/// extraction so they stay consistent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishDiagnostics {
     /// The document URI exactly as RA sent it (`file://...`).
@@ -52,6 +65,12 @@ pub struct PublishDiagnostics {
     pub advisory_errors: usize,
     /// Total diagnostics (errors + warnings + hints, any source).
     pub total: usize,
+    /// Full per-diagnostic detail (file/line/col/severity/code/message/source),
+    /// in publish order. Additive — the model's count fields above remain the
+    /// authority for green/red; this is what the CLI renders. May be empty on
+    /// a "cleared" publish (RA's way of saying the file now has zero
+    /// diagnostics).
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl PublishDiagnostics {
@@ -134,9 +153,71 @@ fn is_rustc_source(d: &Value) -> bool {
     d.get("source").and_then(Value::as_str) == Some("rustc")
 }
 
+/// Map an LSP `diagnostic.severity` integer to the typed [`Severity`].
+/// `None` ⇒ the severity was missing or out of range; the caller folds that
+/// into [`Severity::Info`] so a diagnostic is never silently dropped from
+/// the CLI surface (the #21 count fields still skip unknowns).
+fn severity_from_lsp(n: i64) -> Option<Severity> {
+    match n {
+        SEVERITY_ERROR => Some(Severity::Error),
+        SEVERITY_WARNING => Some(Severity::Warning),
+        SEVERITY_INFO => Some(Severity::Info),
+        SEVERITY_HINT => Some(Severity::Hint),
+        _ => None,
+    }
+}
+
+/// Extract one [`Diagnostic`] from a single LSP `Diagnostic` JSON object
+/// against a known `file_path`. Tolerant of malformed entries — anything
+/// missing/unsorted is filled with a sensible default so the CLI still
+/// surfaces *something* useful (the FIELD FINDING #2 contract: a red tree
+/// always tells you *what*).
+fn extract_one_diagnostic(d: &Value, file_path: &std::path::Path) -> Diagnostic {
+    let sev_int = d.get("severity").and_then(Value::as_i64).unwrap_or(0);
+    let severity = severity_from_lsp(sev_int).unwrap_or(Severity::Info);
+    // LSP positions are 0-based; rustc/cargo display is 1-based — convert at
+    // the boundary so every consumer sees the friendly convention.
+    let lsp_line = d
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let lsp_col = d
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("character"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let line = (lsp_line as u32).saturating_add(1);
+    let col = (lsp_col as u32).saturating_add(1);
+    // `code` may be a string ("E0277") or a number; render either as a string.
+    let code = d.get("code").and_then(|c| {
+        c.as_str()
+            .map(str::to_owned)
+            .or_else(|| c.as_i64().map(|n| n.to_string()))
+    });
+    let message = d
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("(no message)")
+        .to_string();
+    let source = d.get("source").and_then(Value::as_str).map(str::to_owned);
+    Diagnostic {
+        file_path: file_path.to_path_buf(),
+        line,
+        col,
+        severity,
+        code,
+        message,
+        source,
+    }
+}
+
 /// Pull a [`PublishDiagnostics`] out of a decoded JSON-RPC message, or `None`
 /// if it is not a `textDocument/publishDiagnostics` notification. Splits
-/// error counts by provenance (#21).
+/// error counts by provenance (#21) **and** extracts the full per-diagnostic
+/// detail (FIELD FINDING #2 additive surface).
 pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
     if v.get("method")?.as_str()? != "textDocument/publishDiagnostics" {
         return None;
@@ -146,21 +227,29 @@ pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
     let diags = params.get("diagnostics")?.as_array()?;
     let mut authoritative_errors = 0usize;
     let mut advisory_errors = 0usize;
+    // Pre-compute the per-publish file_path once. `path_from_uri` returns
+    // `None` for non-`file:` schemes (e.g. `untitled:`); fall back to the raw
+    // URI string so callers still get something stable.
+    let file_path = path_from_uri(&uri)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(&uri));
+    let mut rich = Vec::with_capacity(diags.len());
     for d in diags {
-        if d.get("severity").and_then(Value::as_i64) != Some(SEVERITY_ERROR) {
-            continue;
+        if d.get("severity").and_then(Value::as_i64) == Some(SEVERITY_ERROR) {
+            if is_rustc_source(d) {
+                authoritative_errors += 1;
+            } else {
+                advisory_errors += 1;
+            }
         }
-        if is_rustc_source(d) {
-            authoritative_errors += 1;
-        } else {
-            advisory_errors += 1;
-        }
+        rich.push(extract_one_diagnostic(d, &file_path));
     }
     Some(PublishDiagnostics {
         uri,
         authoritative_errors,
         advisory_errors,
         total: diags.len(),
+        diagnostics: rich,
     })
 }
 
@@ -437,6 +526,87 @@ mod tests {
         assert!(pd.has_authoritative_error());
         assert!(!pd.is_green());
         assert_eq!(pd.error_count(), 3);
+        // FIELD FINDING #2 additive surface: the rich list mirrors the count
+        // fields and carries everything the CLI needs to print.
+        assert_eq!(pd.diagnostics.len(), 4, "rich list mirrors total");
+        let codes: Vec<&str> = pd
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.code.as_deref())
+            .collect();
+        assert!(codes.contains(&"E0599"));
+        assert!(codes.contains(&"E0308"));
+        // Every diagnostic shares the publish file_path.
+        for d in &pd.diagnostics {
+            assert_eq!(d.file_path, std::path::PathBuf::from("/p/src/a.rs"));
+        }
+    }
+
+    #[test]
+    fn diagnostic_position_severity_and_code_extracted_one_based() {
+        // FIELD FINDING #2: the CLI must print file:line:col + severity +
+        // code + message; verify each piece round-trips and that LSP's
+        // 0-based positions are converted to 1-based at the boundary.
+        let v: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///r/src/lib.rs","diagnostics":[
+                  {"severity":1,"source":"rustc","code":"E0277",
+                   "message":"the trait bound `T: Foo` is not satisfied",
+                   "range":{"start":{"line":41,"character":4},
+                            "end":{"line":41,"character":11}}},
+                  {"severity":2,"source":"rust-analyzer","code":"unused_imports",
+                   "message":"unused import: `Bar`",
+                   "range":{"start":{"line":0,"character":0},
+                            "end":{"line":0,"character":11}}},
+                  {"severity":3,"message":"hint-ish","source":"rustc"},
+                  {"severity":4,"code":123,"message":"numeric code",
+                   "range":{"start":{"line":9,"character":7},"end":{"line":9,"character":9}}}
+                ]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&v).unwrap();
+        assert_eq!(pd.diagnostics.len(), 4);
+
+        let d0 = &pd.diagnostics[0];
+        assert_eq!(d0.severity, Severity::Error);
+        assert_eq!(d0.code.as_deref(), Some("E0277"));
+        assert_eq!(d0.line, 42, "0-based LSP line 41 → 1-based 42");
+        assert_eq!(d0.col, 5, "0-based LSP col 4 → 1-based 5");
+        assert!(d0.message.contains("trait bound"));
+        assert_eq!(d0.source.as_deref(), Some("rustc"));
+        assert_eq!(d0.file_path, std::path::PathBuf::from("/r/src/lib.rs"));
+
+        let d1 = &pd.diagnostics[1];
+        assert_eq!(d1.severity, Severity::Warning);
+        assert_eq!(d1.code.as_deref(), Some("unused_imports"));
+        assert_eq!(d1.line, 1, "0-based line 0 → 1-based 1");
+        assert_eq!(d1.col, 1);
+        assert_eq!(d1.source.as_deref(), Some("rust-analyzer"));
+
+        let d2 = &pd.diagnostics[2];
+        assert_eq!(d2.severity, Severity::Info, "severity:3 → Info");
+        assert_eq!(d2.line, 1, "missing range defaults to 1-based 1");
+        assert_eq!(d2.col, 1);
+        assert_eq!(d2.code, None);
+
+        let d3 = &pd.diagnostics[3];
+        assert_eq!(d3.severity, Severity::Hint, "severity:4 → Hint");
+        assert_eq!(d3.code.as_deref(), Some("123"), "numeric code → string");
+    }
+
+    #[test]
+    fn empty_publish_clears_the_rich_list_too() {
+        // RA sends an empty `diagnostics: []` to "clear" a file once it goes
+        // clean. The rich list must reflect that — Vec::is_empty is what the
+        // model uses to drop stale per-file diagnostics.
+        let v: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///r/src/lib.rs","diagnostics":[]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&v).unwrap();
+        assert!(pd.diagnostics.is_empty());
+        assert!(pd.is_green());
     }
 
     #[test]
