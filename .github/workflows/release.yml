@@ -89,8 +89,26 @@ jobs:
           # The release model assumes [workspace.package].version is the single
           # source of truth and crates inherit via version.workspace = true.
           # See D-RELEASE §4.1.
-          WS_VER=$(grep -A1 '^\[workspace.package\]' Cargo.toml \
-            | grep '^version' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          #
+          # Section-aware extraction (CWDL-71 Phase C finding 2026-05-17):
+          # the prior `grep -A1 '[workspace.package]'` assumed `version` was
+          # the line *immediately* after the section header. Phase B placed it
+          # below edition/rust-version/license + a comment block, so `-A1`
+          # silently yielded WS_VER='' → false hard-fail of every real tag.
+          # awk scans the whole [workspace.package] section (until the next
+          # [section] header) for the first `version =`, robust to field
+          # order and interleaved comments.
+          WS_VER=$(awk '
+            /^\[workspace\.package\]/ { insec = 1; next }
+            /^\[/                     { insec = 0 }
+            insec && /^version[[:space:]]*=/ {
+              v = $0
+              sub(/^version[[:space:]]*=[[:space:]]*"/, "", v)
+              sub(/".*/, "", v)
+              print v
+              exit
+            }
+          ' Cargo.toml)
           if [ "$WS_VER" != "$VERSION" ]; then
             echo "::error::workspace.package.version=$WS_VER but tag=v$VERSION"
             exit 1
