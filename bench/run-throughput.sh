@@ -80,6 +80,32 @@ echo "warming fixture cargo build cache (binary profile)..."
 echo "warming fixture cargo check cache (cargoless + bacon's tier)..."
 ( cd "$fixture" && cargo check ) >/dev/null 2>&1 \
   || echo "WARN: fixture cargo check did not fully succeed; bench will still try."
+
+# wasm-bindgen-cli for trunk. trunk auto-downloads a STATIC-PIE wasm-bindgen
+# to ~/.cache/trunk/, and THIS pod's loader cannot exec static-PIE binaries
+# ("Exec format error (os error 8)") — verified: pod is x86_64, binary is
+# x86-64, the problem is the static-pie link mode, not the arch. Installing
+# wasm-bindgen-cli via cargo puts a dynamically-linked binary on PATH;
+# trunk prefers a PATH wasm-bindgen over its cached download, so this
+# unblocks trunk's wasm pipeline. One-time (PVC-cached after first run).
+# Pinned to 0.2.121 to match the version trunk's manifest resolved.
+if command -v wasm-bindgen >/dev/null 2>&1; then
+  echo "wasm-bindgen on PATH: $(wasm-bindgen --version 2>&1 | head -1)"
+else
+  echo "installing wasm-bindgen-cli@0.2.121 (dynamically-linked; trunk's static-pie cache won't exec in this pod)..."
+  if ! cargo install wasm-bindgen-cli --version 0.2.121 >/dev/null 2>&1; then
+    echo "WARN: wasm-bindgen-cli install failed; trunk's wasm pipeline will likely still error (env constraint, documented in the report)."
+  else
+    echo "wasm-bindgen now on PATH: $(wasm-bindgen --version 2>&1 | head -1)"
+  fi
+fi
+# Also add the rustup wasm32 target if missing — trunk needs it to build
+# the cdylib for the bench fixture.
+if ! rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
+  echo "adding wasm32-unknown-unknown rustup target..."
+  rustup target add wasm32-unknown-unknown >/dev/null 2>&1 \
+    || echo "WARN: rustup target add wasm32-unknown-unknown failed."
+fi
 echo
 
 # Invoke the python driver. Args after `--` go straight through.

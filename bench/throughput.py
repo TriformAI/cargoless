@@ -102,10 +102,22 @@ def build_tools(cargoless_bin: str) -> list[Tool]:
         Tool(
             name="bacon",
             argv=["bacon", "--headless", "--job", "check"],
+            # bacon 3.22.0 does NOT print "Success!"/"Warnings."/"Errors
+            # found" banners — verified from the actual pod run. It passes
+            # cargo's own completion line through verbatim:
+            #   Finished `dev` profile [unoptimized + debuginfo] ... in 0.39s
+            # plus a status bar ` <pkg>  check   5 warnings `. The cargo
+            # `Finished ` line is the reliable check-complete signal
+            # regardless of warning count; `error[` / `could not compile`
+            # are cargo's reliable failure markers (no Finished line on a
+            # failed check). This is the same signal-vocab-mismatch
+            # bug-class as latency iterations 1 and 4 — fixed by matching
+            # what the tool ACTUALLY emits, not what its docs imply.
             ready_patterns=[
-                "Success!",
-                "Warnings.",  # added after 5th iteration: fixture has 5 warnings
-                "Errors found",
+                "Finished `dev`",
+                "Finished `release`",
+                "could not compile",
+                "error[",
             ],
             sum_tree=True,
         ),

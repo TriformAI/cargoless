@@ -110,7 +110,12 @@ tool_ready_re() {
   case "$1" in
     cargoless) echo 'GREEN — tree compiles|GREEN — building|published ' ;;
     trunk)     echo 'success|applying new distribution' ;;
-    bacon)     echo 'Success!|Warnings\.|Errors found' ;;
+    # bacon 3.22.0 passes cargo's own "Finished `dev`" / "Finished
+    # `release`" completion line through verbatim and prints `error[` /
+    # "could not compile" on failure — it does NOT emit literal
+    # "Success!"/"Warnings."/"Errors found" banners (verified from the
+    # actual pod run; the earlier pattern timed out forever).
+    bacon)     echo 'Finished .dev.|Finished .release.|could not compile|error\[' ;;
     *)         echo ""; return 1 ;;
   esac
 }
