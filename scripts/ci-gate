@@ -178,11 +178,14 @@ declare -A RESULT
 OVERALL=0
 
 # Mirrors .forgejo/workflows/ci.yml exactly: build, test, fmt, clippy.
+# `--locked` matches ci.yml post-#25 (committed Cargo.lock; CI fails loud on
+# lock drift instead of silently re-resolving). fmt resolves no deps so it
+# omits --locked, exactly like ci.yml.
 CHECKS=(
-  "build|build --workspace --all-targets"
-  "test|test --workspace"
+  "build|build --workspace --all-targets --locked"
+  "test|test --workspace --locked"
   "fmt|fmt --all -- --check"
-  "clippy|clippy --workspace --all-targets -- -D warnings"
+  "clippy|clippy --workspace --all-targets --locked -- -D warnings"
 )
 
 for entry in "${CHECKS[@]}"; do
@@ -210,9 +213,9 @@ if kexec bash -c "grep -qE '^[[:space:]]*integration[[:space:]]*=' $REMOTE_SRC/c
   echo
   echo "[ci-gate] tf-cli declares an 'integration' feature — gating the wired daemon too"
   INTEG=(
-    "integ-build|build -p tf-cli --features integration --all-targets"
-    "integ-test|test -p tf-cli --features integration"
-    "integ-clippy|clippy -p tf-cli --features integration --all-targets -- -D warnings"
+    "integ-build|build -p tf-cli --features integration --all-targets --locked"
+    "integ-test|test -p tf-cli --features integration --locked"
+    "integ-clippy|clippy -p tf-cli --features integration --all-targets --locked -- -D warnings"
   )
   for entry in "${INTEG[@]}"; do
     cname="${entry%%|*}"
