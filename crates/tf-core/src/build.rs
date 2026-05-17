@@ -80,18 +80,21 @@ impl Compiler for TrunkCompiler {
             .map_err(|e| format!("could not launch `trunk build`: {e}"))?;
 
         if !output.status.success() {
+            // FIELD FINDING #12: exit code is the gate (correct here);
+            // the failure-reason extraction needs to actually find error
+            // lines rather than blindly taking the last stderr line —
+            // the dogfood reproducer caught us surfacing cargo's
+            // "Finished `dev` profile … in 0.16s" success message as if
+            // it were a failure cause, because that line happened to be
+            // the very last non-empty stderr line after trunk's actual
+            // wasm-bindgen / dist-assembly error a few lines earlier.
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let reason = stderr
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(str::trim)
-                .map(str::to_owned)
-                .unwrap_or_else(|| match output.status.code() {
-                    Some(c) => format!("`trunk build` exited with status {c}"),
-                    None => "`trunk build` terminated by signal".to_owned(),
-                });
-            return Err(reason);
+            return Err(extract_trunk_failure_reason(
+                &stdout,
+                &stderr,
+                output.status.code(),
+            ));
         }
 
         let dist = project_root.join("dist");
@@ -100,6 +103,97 @@ impl Compiler for TrunkCompiler {
         }
         pack_dir(&dist).map_err(|e| format!("could not read trunk dist/: {e}"))
     }
+}
+
+/// FIELD FINDING #12: extract an actionable failure-reason from
+/// trunk-build's combined output streams, given that the subprocess
+/// already exited non-zero.
+///
+/// The naive "last non-empty stderr line" picker (pre-#12 behavior)
+/// surfaced cargo's `Finished \`dev\` profile [unoptimized + debuginfo]
+/// target(s) in 0.16s` — a SUCCESS message — as the failure reason,
+/// because that's the order trunk happens to emit when wasm-bindgen
+/// fails after cargo-check succeeds. Result: user sees "build failed —
+/// holding last green: Finished dev profile" and the publisher half of
+/// AC#4 looks non-functional even when it's actually trying.
+///
+/// Strategy (deterministic, pure):
+///   1. Scan BOTH stdout and stderr for lines whose first
+///      whitespace-delimited word is "error", "error[E…]", or "ERROR"
+///      (rustc, cargo, and trunk's canonical error prefixes). Keep up
+///      to the last 5 — recency-biased + bounded so multi-error builds
+///      stay readable.
+///   2. If none found, fall back to the last 3 non-empty stderr lines
+///      joined by ` | ` — better than the prior 1-line picker because
+///      cargo's "Finished" success message no longer appears in
+///      isolation; the user gets a small window of context.
+///   3. Empty output ⇒ name the exit code explicitly.
+///
+/// All paths include the exit code so a script/tester can correlate
+/// against trunk's own diagnostics.
+pub(crate) fn extract_trunk_failure_reason(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> String {
+    let exit_label = match exit_code {
+        Some(c) => format!("exit {c}"),
+        None => "signal".to_owned(),
+    };
+
+    // Step 1: scan both streams for error-prefix lines.
+    let error_lines: Vec<String> = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| is_error_prefix_line(l))
+        .map(str::to_owned)
+        .collect();
+
+    if !error_lines.is_empty() {
+        let take_n = error_lines.len().min(5);
+        let summary = error_lines[error_lines.len() - take_n..].join(" | ");
+        return format!("`trunk build` {exit_label} — {summary}");
+    }
+
+    // Step 2: no error-prefix lines — fall back to a small stderr tail.
+    let stderr_tail: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if stderr_tail.is_empty() {
+        return format!(
+            "`trunk build` {exit_label} with no diagnostic output \
+             (run `trunk build` directly to investigate)"
+        );
+    }
+    let take_n = stderr_tail.len().min(3);
+    let context = stderr_tail[stderr_tail.len() - take_n..].join(" | ");
+    format!(
+        "`trunk build` {exit_label} — no canonical `error:` line found; \
+         last {take_n} stderr line(s): {context}"
+    )
+}
+
+/// True iff the first whitespace-delimited token of `line` is a known
+/// error-prefix used by rustc / cargo / trunk:
+///   * `error:`           — cargo / rustc plain
+///   * `error[E0277]:`    — rustc with code
+///   * `ERROR` (any case) — trunk's `ERROR ❌ …` prefix
+/// Crucially, cargo's `Finished` / `Compiling` / `Building` SUCCESS
+/// markers do NOT match this — that's the #12 invariant.
+fn is_error_prefix_line(line: &str) -> bool {
+    let Some(first) = line.split_whitespace().next() else {
+        return false;
+    };
+    let first_lc = first.to_ascii_lowercase();
+    first_lc == "error:"
+        || first_lc.starts_with("error[")
+        || first_lc == "error"
+        // Trunk variants: `ERROR ❌ ...`, sometimes just `ERROR`.
+        || first == "ERROR"
 }
 
 /// Magic+version prefix of the v0 CAS artifact blob. Bumping it is a
@@ -482,6 +576,165 @@ mod tests {
             target: TargetTriple::new("wasm32-unknown-unknown"),
             profile: Profile::Dev,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #12 — extract_trunk_failure_reason behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_reason_finds_cargo_error_lines_in_stderr() {
+        // Canonical cargo error output: error[code] + final "could not
+        // compile" + "Finished" line ABSENT (because cargo failed). The
+        // extractor must surface the rustc errors, not the (absent) tail.
+        let stderr = "\
+            Compiling foo v0.1.0\n\
+            error[E0277]: the trait bound `T: Foo` is not satisfied\n\
+             --> src/lib.rs:10:5\n\
+            error: could not compile `foo` (lib) due to 1 previous error\n";
+        let got = extract_trunk_failure_reason("", stderr, Some(101));
+        assert!(got.contains("E0277"), "rustc code surfaced: {got}");
+        assert!(got.contains("could not compile"));
+        assert!(got.contains("exit 101"));
+        // The non-error "Compiling foo" line must not leak in.
+        assert!(
+            !got.contains("Compiling foo"),
+            "non-error line leaked: {got}"
+        );
+    }
+
+    #[test]
+    fn extract_reason_finds_trunk_error_lines() {
+        // Trunk-style: "ERROR ❌ <thing>" on stderr.
+        let stderr = "\
+            INFO  starting build\n\
+            ERROR ❌ wasm-bindgen-cli not found\n\
+            ERROR ❌ aborting due to previous error\n";
+        let got = extract_trunk_failure_reason("", stderr, Some(1));
+        assert!(got.contains("wasm-bindgen-cli not found"));
+        assert!(got.contains("exit 1"));
+        // INFO line excluded.
+        assert!(!got.contains("INFO"), "INFO line leaked: {got}");
+    }
+
+    #[test]
+    fn extract_reason_f12_dogfood_smoking_gun_does_not_surface_finished_line() {
+        // THE EXACT dogfood reproducer: trunk's wasm-bindgen step fails
+        // after cargo-check successfully completes. Cargo emits its
+        // "Finished `dev` profile" success line to stderr; trunk emits
+        // its actual ERROR slightly earlier, then exits non-zero. The
+        // bug was reason=`Finished ...` (cargo's success line treated as
+        // failure cause). Post-fix: the ERROR line is surfaced.
+        let stderr = "\
+            Compiling dogfood-realapp v0.1.0\n\
+            ERROR ❌ wasm-bindgen-cli missing — install via `cargo install wasm-bindgen-cli`\n\
+            Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s\n";
+        let got = extract_trunk_failure_reason("", stderr, Some(1));
+        // The CRITICAL assertion: cargo's success line must NOT be the
+        // surfaced reason (the bug that broke F12).
+        let surfaced_as_reason = got.ends_with("in 0.16s")
+            || (got.contains("Finished") && !got.contains("wasm-bindgen-cli"));
+        assert!(
+            !surfaced_as_reason,
+            "cargo success line was surfaced as failure reason: {got}"
+        );
+        // The ACTUAL error must reach the user.
+        assert!(
+            got.contains("wasm-bindgen-cli missing"),
+            "real error must be surfaced: {got}"
+        );
+    }
+
+    #[test]
+    fn extract_reason_scans_both_stdout_and_stderr() {
+        // Trunk sometimes prints errors to stdout (older versions) or
+        // cargo's own errors split between streams. The extractor must
+        // look at both — the F12 bug was stderr-tail-only.
+        let stdout = "error: linking failed via lld\n";
+        let stderr = "Compiling foo\nFinished `dev` profile in 1.2s\n";
+        let got = extract_trunk_failure_reason(stdout, stderr, Some(1));
+        assert!(
+            got.contains("linking failed"),
+            "stdout error surfaced: {got}"
+        );
+        assert!(!got.ends_with("in 1.2s"));
+    }
+
+    #[test]
+    fn extract_reason_fallback_when_no_error_lines() {
+        // No `error:` / `ERROR` lines anywhere — fall back to the last
+        // few stderr lines for context. Must NOT pick "Finished" in
+        // isolation: a 3-line tail keeps the user oriented.
+        let stderr = "step 1: prepare\nstep 2: compile\nFinished `dev` profile in 0.5s\n";
+        let got = extract_trunk_failure_reason("", stderr, Some(2));
+        assert!(got.contains("exit 2"));
+        assert!(got.contains("no canonical `error:` line found"));
+        // Last 3 lines all present in the context window.
+        assert!(got.contains("step 1: prepare"));
+        assert!(got.contains("step 2: compile"));
+        assert!(got.contains("Finished"));
+        // The pre-#12 bug was reason BEING `Finished ...` alone; here it's
+        // ONE of several lines in a "context" window — clearly labelled
+        // as such by the message prefix. Acceptable.
+    }
+
+    #[test]
+    fn extract_reason_handles_empty_output() {
+        // Trunk killed by signal with no diagnostic output. Don't pretend
+        // there's a reason — name the situation honestly.
+        let got = extract_trunk_failure_reason("", "", None);
+        assert!(got.contains("signal"), "signal flagged: {got}");
+        assert!(got.contains("no diagnostic output"));
+    }
+
+    #[test]
+    fn extract_reason_caps_at_five_error_lines_for_readability() {
+        // A build with 50 errors must not splat all 50 onto one line.
+        let stderr: String = (1..=20)
+            .map(|i| format!("error: failure number {i}\n"))
+            .collect();
+        let got = extract_trunk_failure_reason("", &stderr, Some(101));
+        // Take the LAST 5: numbers 16..=20.
+        for i in 16..=20 {
+            assert!(got.contains(&format!("failure number {i}")));
+        }
+        // 1..=15 are NOT in the surfaced message.
+        for i in 1..=15 {
+            assert!(
+                !got.contains(&format!("failure number {i}")),
+                "earlier error leaked: {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_error_prefix_line_negative_cases() {
+        // The success markers cargo prints — none must match the
+        // error-prefix predicate.
+        assert!(!is_error_prefix_line(
+            "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s"
+        ));
+        assert!(!is_error_prefix_line("Compiling dogfood-realapp v0.1.0"));
+        assert!(!is_error_prefix_line("Building target dist/..."));
+        assert!(!is_error_prefix_line("warning: unused import"));
+        // "errored" / "errors" must NOT match — only the canonical
+        // `error` / `error[X]` / `ERROR` prefixes.
+        assert!(!is_error_prefix_line(
+            "summary: 3 errors during compilation"
+        ));
+        // Bonus: an empty line / whitespace-only.
+        assert!(!is_error_prefix_line(""));
+        assert!(!is_error_prefix_line("   "));
+    }
+
+    #[test]
+    fn is_error_prefix_line_positive_cases() {
+        // The patterns we WANT to surface.
+        assert!(is_error_prefix_line("error: linking failed"));
+        assert!(is_error_prefix_line("error[E0277]: trait bound"));
+        assert!(is_error_prefix_line("error[unused_imports]: …"));
+        assert!(is_error_prefix_line("ERROR ❌ wasm-bindgen-cli not found"));
+        assert!(is_error_prefix_line("ERROR aborting"));
     }
 
     #[test]

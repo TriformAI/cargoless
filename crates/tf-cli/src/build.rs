@@ -219,8 +219,30 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                     }
                     // AC#4 fail-closed: never touch --out on a failed build;
                     // the prior pointer/output stays byte-unmoved.
+                    //
+                    // FIELD FINDING #12b: distinguish "holding last green"
+                    // (we HAVE a prior publish) from "nothing published yet"
+                    // (this is the first attempt and it failed — there is
+                    // NO last green to hold). The pre-#12 wording lied to
+                    // first-run users by claiming to hold a green that
+                    // never existed. We probe the canonical pointer file
+                    // via tf_core::build::read_latest_green — cheap, no
+                    // CAS round-trip, deterministic.
                     tf_core::BuildOutcome::Failed { reason } => {
-                        ui::error(format!("build failed — holding last green: {reason}"));
+                        let prior = tf_core::build::read_latest_green(&project_root)
+                            .ok()
+                            .flatten();
+                        match prior {
+                            Some(p) => ui::error(format!(
+                                "build failed — holding last green from \
+                                 published_at={} (input {}): {reason}",
+                                p.published_at, p.artifact.input_hash
+                            )),
+                            None => ui::error(format!(
+                                "build failed — nothing published yet \
+                                 (--out unchanged): {reason}"
+                            )),
+                        }
                     }
                 }
                 write_status(verdict_of(session.tree_state()));
