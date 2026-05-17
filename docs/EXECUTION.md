@@ -95,7 +95,8 @@ cross-module data flows only through `cargoless-proto` types.
 | AC | What proves it | Owner |
 |---|---|---|
 | 1 zero-config **headless** startup <30s (D-A1: daemon up + auto-detected + watch→verdict pipeline live; NO browser) | clean-env integration test | cli-ux + integration |
-| 2 median save→verdict <1s (primary) | committed CI bench harness (also S1) | ra-bench |
+| 2a RA-incremental hint median ≤1s (fast hint; does NOT prove compilation) | committed CI bench harness (also S1) | ra-bench |
+| 2b authoritative verdict median ≤ bare `cargo check` + 10% (cargo-check tier; no sub-1s promise) | two-mode bench harness, checker mode (relative-cost denominator) | ra-bench |
 | 3 median green-save → latest-green artifact **published** latency (no sub-second claim; D-A2 sets threshold) | two-mode bench harness, artifact mode | ra-bench + build-cas |
 | 4 never **publish** red — `.cargoless/latest-green` only advances on green | publisher integration test (headless, not a browser) | build-cas |
 | 5 CAS dedupe = build skipped | integration test | build-cas |
@@ -104,10 +105,10 @@ cross-module data flows only through `cargoless-proto` types.
 | 8 README/ROADMAP/CONTRIBUTING/LICENSE | present (this repo) + governance | docs |
 | 9 launch blog reviewed by ≥2 incl. outside | human-gated | lead |
 
-ACs 4/5/6 are the realistically-closable set; 2/3/7 depend on the two-mode
-bench harness; 1 depends on D-A1 (headless); 8 is largely done; 9 is
-human-gated. **Integrity rule:** an AC is Done only when its verifying test is
-green on `main` — branch-only work is In Progress, never Done.
+ACs 4/5/6 are the realistically-closable set; 2a/2b/3/7 depend on the
+two-mode bench harness; 1 depends on D-A1 (headless); 8 is largely done; 9
+is human-gated. **Integrity rule:** an AC is Done only when its verifying
+test is green on `main` — branch-only work is In Progress, never Done.
 
 ## Scope decisions already taken (do not relitigate)
 
@@ -115,10 +116,17 @@ green on `main` — branch-only work is In Progress, never Done.
   watch→verdict pipeline live, zero manual config* within 30s; first-green
   when the cold build finishes. No browser, no holding page (that moved to
   v0.1).
-- **D-A2**: AC#2's sub-1s wording is provisional until the S1 bench reports;
-  AC#3's publish-latency threshold is likewise set from S1/bench evidence —
-  **no sub-second artifact claim**. Renegotiate on evidence, never silently
-  miss it.
+- **D-A2**: AC#2 is split into **AC#2a** (RA-incremental hint, median ≤1s —
+  the fast hint; HOLDS per S1 + #49 debouncer 0.74s) and **AC#2b**
+  (authoritative cargo-check-tier verdict, median ≤ bare `cargo check` +10%
+  — relative-cost denominator, **no sub-1s promise**). The split is
+  documented authority `docs/design/D-A2-RENEGOTIATION.md` §2/§7; it is a
+  spec-honesty edit with **zero code change** (the verdict architecture
+  already produces both tiers; F8-redo's asymmetric-evidence rule is the
+  load-bearing wall: RA-native error → RED instantly, but only cargo-check
+  drives GREEN). AC#3's publish-latency threshold is likewise set from
+  S1/bench evidence — **no sub-second artifact claim**. Renegotiate on
+  evidence, never silently miss it.
 - **D-A3**: the benchmark substrate is pulled forward (the S1 harness), not
   deferred; it is two-mode (checker save→verdict + artifact save→publish,
   reported separately).
