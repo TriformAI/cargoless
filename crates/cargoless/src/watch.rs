@@ -1,9 +1,9 @@
 //! `watch` (and `check --watch`) — continuous **headless** verdict stream.
 //!
 //! Bound exact to daemon-core's frozen contract (on `main`):
-//! `tf_core::model::watch(&Path, IdentityProvider) -> io::Result<(
+//! `cargoless_core::model::watch(&Path, IdentityProvider) -> io::Result<(
 //! ModelSession, std::sync::mpsc::Receiver<StateEvent>)>`. We pass
-//! `tf_core::model::placeholder_identity` directly — a bare
+//! `cargoless_core::model::placeholder_identity` directly — a bare
 //! `fn() -> BuildIdentity` satisfying the blanket `IdentityProvider` impl;
 //! tf-cli never computes a `BuildIdentity` (build-cas owns the real seam).
 //!
@@ -29,10 +29,10 @@ use crate::ui;
 
 const BRINGUP_BUDGET: Duration = Duration::from_secs(30);
 
-fn verdict_of(s: tf_core::TreeState) -> Verdict {
+fn verdict_of(s: cargoless_core::TreeState) -> Verdict {
     match s {
-        tf_core::TreeState::Green => Verdict::Green,
-        tf_core::TreeState::Red => Verdict::Red,
+        cargoless_core::TreeState::Green => Verdict::Green,
+        cargoless_core::TreeState::Red => Verdict::Red,
     }
 }
 
@@ -64,7 +64,7 @@ fn stamp(t0: Instant) -> String {
 /// whether they re-ran `check` or kept the stream open. Stderr-only.
 /// Delegates to the shared `crate::check::render_diagnostics` so a fix to
 /// the format never has to be applied in two places.
-fn print_diagnostics(root: &Path, diags: &[tf_core::Diagnostic]) {
+fn print_diagnostics(root: &Path, diags: &[cargoless_core::Diagnostic]) {
     if diags.is_empty() {
         return;
     }
@@ -76,14 +76,14 @@ fn print_diagnostics(root: &Path, diags: &[tf_core::Diagnostic]) {
 pub fn run(cfg: &Config) -> ExitCode {
     let t0 = Instant::now();
     // §gap-3 / #89: read the single canonical identity from
-    // `tf_core::BUILD_ID` instead of building a second "cargoless
+    // `cargoless_core::BUILD_ID` instead of building a second "cargoless
     // {ver}" banner off CARGO_PKG_VERSION here. Before #89 this line
     // was the divergent site — `--version` said "tf-trunk {ver}" while
     // this said "cargoless {ver}", same binary two names. One source
     // now; the D1 rename is one literal in tf-core.
     ui::step(format!(
         "{} — watching {} ({})",
-        tf_core::BUILD_ID,
+        cargoless_core::BUILD_ID,
         cfg.root.display(),
         cfg.detection.describe()
     ));
@@ -113,17 +113,19 @@ pub fn run(cfg: &Config) -> ExitCode {
     // `watch()` blocks on rust-analyzer's initialize handshake (seconds);
     // the first green waits on a cold cargo check (minutes) — that is fine,
     // AC#1 is "pipeline live", not "first green".
-    let (session, events) =
-        match tf_core::model::watch(&cfg.root, tf_core::model::placeholder_identity) {
-            Ok(se) => se,
-            Err(e) => {
-                ui::error(format!(
-                    "could not start the verdict pipeline (rust-analyzer/setup): {e}\n  \
+    let (session, events) = match cargoless_core::model::watch(
+        &cfg.root,
+        cargoless_core::model::placeholder_identity,
+    ) {
+        Ok(se) => se,
+        Err(e) => {
+            ui::error(format!(
+                "could not start the verdict pipeline (rust-analyzer/setup): {e}\n  \
                      install rust-analyzer: `rustup component add rust-analyzer`."
-                ));
-                return ExitCode::from(2);
-            }
-        };
+            ));
+            return ExitCode::from(2);
+        }
+    };
 
     let bringup = t0.elapsed();
     if bringup <= BRINGUP_BUDGET {
@@ -212,17 +214,17 @@ pub fn run(cfg: &Config) -> ExitCode {
             Ok(ev) => {
                 let ts = stamp(t0);
                 match &ev {
-                    tf_core::StateEvent::BecameGreen { .. } => {
+                    cargoless_core::StateEvent::BecameGreen { .. } => {
                         ui::ok(format!("{ts}GREEN — tree compiles"));
                     }
-                    tf_core::StateEvent::BecameRed => {
+                    cargoless_core::StateEvent::BecameRed => {
                         ui::error(format!("{ts}RED — tree does not compile"));
                         // FIELD FINDING #2: on the red edge, print every
                         // diagnostic the model knows about so the user can
                         // act on it without re-running `check`.
                         print_diagnostics(&cfg.root, &session.current_diagnostics());
                     }
-                    tf_core::StateEvent::FileVerdict { path, state } => {
+                    cargoless_core::StateEvent::FileVerdict { path, state } => {
                         ui::step(format!("{ts}{path}: {state:?}"));
                         // On a per-file flip, surface just that file's
                         // diagnostics (the change-set the user is debugging).
@@ -260,10 +262,13 @@ pub fn run(cfg: &Config) -> ExitCode {
 /// timestamped, user-facing lines. Runs on EVERY watch-loop iteration so
 /// the worst-case latency from "RA restarted" to "user sees the message"
 /// is bounded by `HEARTBEAT` (250ms) — not 30-60s of silent reindex.
-fn drain_lifecycle(t0: Instant, lifecycle: &std::sync::mpsc::Receiver<tf_core::LifecycleEvent>) {
+fn drain_lifecycle(
+    t0: Instant,
+    lifecycle: &std::sync::mpsc::Receiver<cargoless_core::LifecycleEvent>,
+) {
     while let Ok(ev) = lifecycle.try_recv() {
         match ev {
-            tf_core::LifecycleEvent::AnalyzerRestarting => {
+            cargoless_core::LifecycleEvent::AnalyzerRestarting => {
                 // `ui::warn` (yellow) over `ui::step` (cyan) because this is
                 // a degraded-mode signal: AC#6 transparent restart, but the
                 // user is staring at a silent stream until reindex

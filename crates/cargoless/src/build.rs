@@ -8,7 +8,7 @@
 //! build leaves it byte-untouched). tf-cli then reads the pointer
 //! (`read_latest_green`), fetches the CAS blob by `input_hash`, and
 //! materializes it into the user's `--out <dir>`. We meet build-cas ONLY
-//! through `tf_proto::PublishedArtifact` + those `tf_core::build` fns.
+//! through `cargoless_proto::PublishedArtifact` + those `cargoless_core::build` fns.
 //!
 //! ## Feature gate
 //!
@@ -21,7 +21,7 @@
 //!
 //! ## Blob → dir materialization (RESOLVED — option (b))
 //!
-//! build-cas shipped `tf_core::build::materialize_latest_green` (frozen seam
+//! build-cas shipped `cargoless_core::build::materialize_latest_green` (frozen seam
 //! @ build-cas-publisher 5b4b7f9): one call does read_latest_green → CAS get
 //! → faithful `dist/` expansion into `out_dir`. The blob/container format
 //! stays entirely build-cas's; tf-cli never parses CAS internals. v0 uses
@@ -133,7 +133,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
     use std::sync::mpsc::RecvTimeoutError;
 
-    use tf_core::build::{BuildOrchestrator, TrunkCompiler};
+    use cargoless_core::build::{BuildOrchestrator, TrunkCompiler};
 
     use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
 
@@ -189,22 +189,24 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
     ));
 
     let orch = BuildOrchestrator::new(
-        tf_core::LocalDiskStore::new(cache_root.clone()),
+        cargoless_core::LocalDiskStore::new(cache_root.clone()),
         TrunkCompiler,
         project_root.clone(),
     );
 
-    let (session, events) =
-        match tf_core::model::watch(&project_root, tf_core::model::placeholder_identity) {
-            Ok(se) => se,
-            Err(e) => {
-                ui::error(format!(
-                    "could not start the verdict pipeline (rust-analyzer/setup): {e}\n  \
+    let (session, events) = match cargoless_core::model::watch(
+        &project_root,
+        cargoless_core::model::placeholder_identity,
+    ) {
+        Ok(se) => se,
+        Err(e) => {
+            ui::error(format!(
+                "could not start the verdict pipeline (rust-analyzer/setup): {e}\n  \
                      install rust-analyzer: `rustup component add rust-analyzer`."
-                ));
-                return ExitCode::from(2);
-            }
-        };
+            ));
+            return ExitCode::from(2);
+        }
+    };
 
     let root_for_status = project_root.clone();
     let started = statusfile::now_unix();
@@ -220,9 +222,9 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
             },
         );
     };
-    let verdict_of = |s: tf_core::TreeState| match s {
-        tf_core::TreeState::Green => Verdict::Green,
-        tf_core::TreeState::Red => Verdict::Red,
+    let verdict_of = |s: cargoless_core::TreeState| match s {
+        cargoless_core::TreeState::Green => Verdict::Green,
+        cargoless_core::TreeState::Red => Verdict::Red,
     };
 
     write_status(verdict_of(session.tree_state()));
@@ -250,14 +252,15 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
         }
 
         match events.recv_timeout(HEARTBEAT) {
-            Ok(tf_core::StateEvent::BecameGreen { identity }) => {
+            Ok(cargoless_core::StateEvent::BecameGreen { identity }) => {
                 ui::ok("GREEN — building");
-                let result = orch.run(&tf_core::BuildTrigger { identity });
+                let result = orch.run(&cargoless_core::BuildTrigger { identity });
                 match result.outcome {
                     // Compiled and Deduplicated are identical for --out: the
                     // pointer is (re)published either way (AC#5 dedupe just
                     // skipped the compile).
-                    tf_core::BuildOutcome::Compiled | tf_core::BuildOutcome::Deduplicated => {
+                    cargoless_core::BuildOutcome::Compiled
+                    | cargoless_core::BuildOutcome::Deduplicated => {
                         publish_to_out(&project_root, &cache_root, out);
                     }
                     // AC#4 fail-closed: never touch --out on a failed build;
@@ -269,10 +272,10 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                     // NO last green to hold). The pre-#12 wording lied to
                     // first-run users by claiming to hold a green that
                     // never existed. We probe the canonical pointer file
-                    // via tf_core::build::read_latest_green — cheap, no
+                    // via cargoless_core::build::read_latest_green — cheap, no
                     // CAS round-trip, deterministic.
-                    tf_core::BuildOutcome::Failed { reason } => {
-                        let prior = tf_core::build::read_latest_green(&project_root)
+                    cargoless_core::BuildOutcome::Failed { reason } => {
+                        let prior = cargoless_core::build::read_latest_green(&project_root)
                             .ok()
                             .flatten();
                         match prior {
@@ -290,11 +293,11 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 }
                 write_status(verdict_of(session.tree_state()));
             }
-            Ok(tf_core::StateEvent::BecameRed) => {
+            Ok(cargoless_core::StateEvent::BecameRed) => {
                 ui::warn("RED — holding last green (AC#4)");
                 write_status(Verdict::Red);
             }
-            Ok(tf_core::StateEvent::FileVerdict { path, state }) => {
+            Ok(cargoless_core::StateEvent::FileVerdict { path, state }) => {
                 ui::step(format!("{path}: {state:?}"));
                 write_status(verdict_of(session.tree_state()));
             }
@@ -320,9 +323,9 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 /// left it (AC#4: a non-green never advances the user's output).
 #[cfg(feature = "integration")]
 fn publish_to_out(project_root: &Path, cache_root: &Path, out: &Path) {
-    use tf_core::build::{Materialized, materialize_latest_green};
+    use cargoless_core::build::{Materialized, materialize_latest_green};
 
-    let store = tf_core::LocalDiskStore::new(cache_root.to_path_buf());
+    let store = cargoless_core::LocalDiskStore::new(cache_root.to_path_buf());
     match materialize_latest_green(&store, project_root, out) {
         Ok(Materialized::Materialized(pa)) => ui::ok(format!(
             "published {} → {} (at {}s)",

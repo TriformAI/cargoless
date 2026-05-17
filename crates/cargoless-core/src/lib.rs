@@ -18,12 +18,12 @@ pub mod procmacro;
 pub mod structural;
 pub mod watcher;
 
-pub use model::LifecycleEvent;
-pub use tf_cas::{ContentStore, LocalDiskStore};
-pub use tf_proto::{
+pub use cargoless_cas::{ContentStore, LocalDiskStore};
+pub use cargoless_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
     Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,
 };
+pub use model::LifecycleEvent;
 
 /// The single canonical identity string — `<product> <version>` — used
 /// by `--version`, `help`, AND every command banner.
@@ -35,7 +35,7 @@ pub use tf_proto::{
 /// constant), while `watch` built its own `cargoless <ver>` banner
 /// straight off `CARGO_PKG_VERSION` in `tf-cli`. Same binary, two
 /// names — dogfood-lead's §gap-3 finding. Every banner now reads THIS
-/// constant (`tf_core::BUILD_ID`), so the binary speaks one name.
+/// constant (`cargoless_core::BUILD_ID`), so the binary speaks one name.
 ///
 /// **Decision D1 (CWDL-12) rename = change the `"cargoless"` literal on
 /// the next line, and nothing else.** That single-site property is the
@@ -51,7 +51,7 @@ pub use tf_proto::{
 pub const BUILD_ID: &str = concat!("cargoless ", env!("CARGO_PKG_VERSION"));
 
 /// Returns [`BUILD_ID`]. Kept as a fn (not just the const) because
-/// callers historically bound to `tf_core::build_id()`; both paths now
+/// callers historically bound to `cargoless_core::build_id()`; both paths now
 /// resolve to the single canonical string.
 pub fn build_id() -> &'static str {
     BUILD_ID

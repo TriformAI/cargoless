@@ -5,8 +5,8 @@
 //! appear alongside RA-native "errors" that didn't drive it.
 //!
 //! Bound to daemon-core's adjacent rich-verdict seam (additive alongside the
-//! frozen `tf_core::model::check_once`):
-//! `tf_core::model::check_once_with_diagnostics(&Path) -> io::Result<CheckResult>`.
+//! frozen `cargoless_core::model::check_once`):
+//! `cargoless_core::model::check_once_with_diagnostics(&Path) -> io::Result<CheckResult>`.
 //! `CheckResult` pairs the existing boolean `TreeState` (the AC#4 publisher
 //! gate) with a `Vec<Diagnostic>` (the human-facing detail the boolean was
 //! hiding). The exit-code contract is byte-frozen — only the *body* of the
@@ -65,9 +65,9 @@ pub fn run(cfg: &Config) -> ExitCode {
         cfg.detection.describe()
     ));
 
-    match tf_core::model::check_once_with_diagnostics(&cfg.root) {
-        Ok(tf_core::CheckResult {
-            tree: tf_core::TreeState::Green,
+    match cargoless_core::model::check_once_with_diagnostics(&cfg.root) {
+        Ok(cargoless_core::CheckResult {
+            tree: cargoless_core::TreeState::Green,
             diagnostics,
         }) => {
             // FIELD FINDING #8-redo: partition by severity-then-provenance.
@@ -89,8 +89,8 @@ pub fn run(cfg: &Config) -> ExitCode {
             ));
             ExitCode::SUCCESS
         }
-        Ok(tf_core::CheckResult {
-            tree: tf_core::TreeState::Red,
+        Ok(cargoless_core::CheckResult {
+            tree: cargoless_core::TreeState::Red,
             diagnostics,
         }) => {
             // FIELD FINDING #2 stands: a red verdict MUST carry its
@@ -165,10 +165,10 @@ pub fn run(cfg: &Config) -> ExitCode {
 /// non-rustc bucket to "advisory" — including severity:Error from
 /// RA-native parse failures. That hid real errors and produced silent
 /// green on a broken tree. Severity-based gating is the honest fix.
-fn is_authoritative(d: &tf_core::Diagnostic) -> bool {
+fn is_authoritative(d: &cargoless_core::Diagnostic) -> bool {
     // Severity:Error from any source — always counted, always rendered,
     // always drives the verdict (matches model::apply_event's new rule).
-    if d.severity == tf_core::Severity::Error {
+    if d.severity == cargoless_core::Severity::Error {
         return true;
     }
     // Warnings/Info/Hints: only rustc-source is kept as authoritative
@@ -180,8 +180,11 @@ fn is_authoritative(d: &tf_core::Diagnostic) -> bool {
 /// Partition a diagnostic slice into (authoritative, advisory) in-publish
 /// order. Cheap clone — diagnostics are small and this runs once per check.
 fn partition_by_provenance(
-    diags: &[tf_core::Diagnostic],
-) -> (Vec<tf_core::Diagnostic>, Vec<tf_core::Diagnostic>) {
+    diags: &[cargoless_core::Diagnostic],
+) -> (
+    Vec<cargoless_core::Diagnostic>,
+    Vec<cargoless_core::Diagnostic>,
+) {
     let mut auth = Vec::new();
     let mut adv = Vec::new();
     for d in diags {
@@ -223,7 +226,7 @@ fn advisory_suppression_note(n: usize) -> String {
 /// (`rustc`) and advisory (`rust-analyzer`) provenance is visible at a
 /// glance. Stderr (matching the rest of `ui::*`) so a piped consumer
 /// captures the verdict separately from the noise budget.
-fn print_diagnostics(root: &Path, diags: &[tf_core::Diagnostic]) {
+fn print_diagnostics(root: &Path, diags: &[cargoless_core::Diagnostic]) {
     use std::io::Write as _;
     let mut err = std::io::stderr();
     let _ = render_diagnostics(&mut err, root, diags);
@@ -237,7 +240,7 @@ fn print_diagnostics(root: &Path, diags: &[tf_core::Diagnostic]) {
 pub(crate) fn render_diagnostics<W: std::io::Write>(
     w: &mut W,
     root: &Path,
-    diags: &[tf_core::Diagnostic],
+    diags: &[cargoless_core::Diagnostic],
 ) -> std::io::Result<()> {
     for d in diags {
         let path = d
@@ -270,13 +273,13 @@ pub(crate) fn render_diagnostics<W: std::io::Write>(
     Ok(())
 }
 
-fn severity_tally(diags: &[tf_core::Diagnostic]) -> (usize, usize) {
+fn severity_tally(diags: &[cargoless_core::Diagnostic]) -> (usize, usize) {
     let mut errs = 0usize;
     let mut warns = 0usize;
     for d in diags {
         match d.severity {
-            tf_core::Severity::Error => errs += 1,
-            tf_core::Severity::Warning => warns += 1,
+            cargoless_core::Severity::Error => errs += 1,
+            cargoless_core::Severity::Warning => warns += 1,
             _ => {}
         }
     }
@@ -292,12 +295,12 @@ mod tests {
         path: &str,
         line: u32,
         col: u32,
-        sev: tf_core::Severity,
+        sev: cargoless_core::Severity,
         code: Option<&str>,
         msg: &str,
         source: Option<&str>,
-    ) -> tf_core::Diagnostic {
-        tf_core::Diagnostic {
+    ) -> cargoless_core::Diagnostic {
+        cargoless_core::Diagnostic {
             file_path: PathBuf::from(path),
             line,
             col,
@@ -320,7 +323,7 @@ mod tests {
                 "/repo/src/lib.rs",
                 42,
                 5,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("E0277"),
                 "the trait bound `T: Foo` is not satisfied",
                 Some("rustc"),
@@ -329,7 +332,7 @@ mod tests {
                 "/repo/src/main.rs",
                 7,
                 1,
-                tf_core::Severity::Warning,
+                cargoless_core::Severity::Warning,
                 Some("unused_imports"),
                 "unused import: `std::io`",
                 Some("rust-analyzer"),
@@ -361,7 +364,7 @@ mod tests {
             "/tmp/elsewhere.rs",
             1,
             2,
-            tf_core::Severity::Error,
+            cargoless_core::Severity::Error,
             None,
             "oops",
             None,
@@ -382,7 +385,7 @@ mod tests {
             "/r/a.rs",
             1,
             1,
-            tf_core::Severity::Error,
+            cargoless_core::Severity::Error,
             Some("E0599"),
             "no method named `frob`\nhelp: did you mean `from`?",
             Some("rustc"),
@@ -422,7 +425,7 @@ mod tests {
                 "/r/a.rs",
                 1,
                 1,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("E0277"),
                 "rustc err",
                 Some("rustc"),
@@ -431,7 +434,7 @@ mod tests {
                 "/r/a.rs",
                 2,
                 1,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("syntax-error"),
                 "ra-native err",
                 Some("rust-analyzer"),
@@ -440,7 +443,7 @@ mod tests {
                 "/r/a.rs",
                 3,
                 1,
-                tf_core::Severity::Warning,
+                cargoless_core::Severity::Warning,
                 Some("unused"),
                 "ra-native warn",
                 Some("rust-analyzer"),
@@ -451,7 +454,7 @@ mod tests {
                 "/r/a.rs",
                 4,
                 1,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 None,
                 "untagged-err",
                 None,
@@ -460,7 +463,7 @@ mod tests {
                 "/r/a.rs",
                 5,
                 1,
-                tf_core::Severity::Info,
+                cargoless_core::Severity::Info,
                 None,
                 "ra-note",
                 None,
@@ -493,7 +496,7 @@ mod tests {
             "/r/a.rs",
             1,
             1,
-            tf_core::Severity::Error,
+            cargoless_core::Severity::Error,
             None,
             "x",
             Some("rustc"),
@@ -502,7 +505,7 @@ mod tests {
             "/r/a.rs",
             1,
             1,
-            tf_core::Severity::Error,
+            cargoless_core::Severity::Error,
             None,
             "x",
             Some("rust-analyzer"),
@@ -511,12 +514,20 @@ mod tests {
             "/r/a.rs",
             1,
             1,
-            tf_core::Severity::Error,
+            cargoless_core::Severity::Error,
             None,
             "x",
             Some("clippy"),
         );
-        let untagged_err = d("/r/a.rs", 1, 1, tf_core::Severity::Error, None, "x", None);
+        let untagged_err = d(
+            "/r/a.rs",
+            1,
+            1,
+            cargoless_core::Severity::Error,
+            None,
+            "x",
+            None,
+        );
         assert!(is_authoritative(&rustc_err));
         assert!(
             is_authoritative(&ra_err),
@@ -536,7 +547,7 @@ mod tests {
             "/r/a.rs",
             1,
             1,
-            tf_core::Severity::Warning,
+            cargoless_core::Severity::Warning,
             None,
             "x",
             Some("rustc"),
@@ -545,12 +556,20 @@ mod tests {
             "/r/a.rs",
             1,
             1,
-            tf_core::Severity::Warning,
+            cargoless_core::Severity::Warning,
             None,
             "x",
             Some("rust-analyzer"),
         );
-        let untagged_warn = d("/r/a.rs", 1, 1, tf_core::Severity::Warning, None, "x", None);
+        let untagged_warn = d(
+            "/r/a.rs",
+            1,
+            1,
+            cargoless_core::Severity::Warning,
+            None,
+            "x",
+            None,
+        );
         assert!(
             is_authoritative(&rustc_warn),
             "rustc warnings stay authoritative"
@@ -579,7 +598,7 @@ mod tests {
             "/repo/src/components/footer.rs",
             25,
             1,
-            tf_core::Severity::Error,
+            cargoless_core::Severity::Error,
             Some("syntax-error"),
             "Syntax Error: expected an item",
             Some("rust-analyzer"),
@@ -620,7 +639,7 @@ mod tests {
                 "/repo/src/lib.rs",
                 10,
                 5,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("E0277"),
                 "trait bound",
                 Some("rustc"),
@@ -629,7 +648,7 @@ mod tests {
                 "/repo/src/lib.rs",
                 20,
                 1,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("syntax-error"),
                 "ra syntax",
                 Some("rust-analyzer"),
@@ -663,7 +682,7 @@ mod tests {
                 "/r/a.rs",
                 1,
                 1,
-                tf_core::Severity::Warning,
+                cargoless_core::Severity::Warning,
                 Some("unused_imports"),
                 "ra lint",
                 Some("rust-analyzer"),
@@ -672,7 +691,7 @@ mod tests {
                 "/r/a.rs",
                 2,
                 1,
-                tf_core::Severity::Info,
+                cargoless_core::Severity::Info,
                 None,
                 "ra hint",
                 Some("rust-analyzer"),
@@ -681,7 +700,7 @@ mod tests {
                 "/r/a.rs",
                 3,
                 1,
-                tf_core::Severity::Hint,
+                cargoless_core::Severity::Hint,
                 None,
                 "ra hint2",
                 Some("rust-analyzer"),
@@ -714,7 +733,7 @@ mod tests {
                 "/r/a.rs",
                 1,
                 1,
-                tf_core::Severity::Warning,
+                cargoless_core::Severity::Warning,
                 Some("unused_variables"),
                 "rustc warning",
                 Some("rustc"),
@@ -723,7 +742,7 @@ mod tests {
                 "/r/a.rs",
                 2,
                 1,
-                tf_core::Severity::Warning,
+                cargoless_core::Severity::Warning,
                 Some("unused_imports"),
                 "ra warning",
                 Some("rust-analyzer"),
@@ -743,7 +762,7 @@ mod tests {
                 "/r/a.rs",
                 1,
                 1,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("E0277"),
                 "x",
                 Some("rustc"),
@@ -752,7 +771,7 @@ mod tests {
                 "/r/a.rs",
                 2,
                 1,
-                tf_core::Severity::Error,
+                cargoless_core::Severity::Error,
                 Some("E0308"),
                 "y",
                 Some("rustc"),
@@ -761,7 +780,7 @@ mod tests {
                 "/r/a.rs",
                 3,
                 1,
-                tf_core::Severity::Warning,
+                cargoless_core::Severity::Warning,
                 Some("unused"),
                 "z",
                 Some("rust-analyzer"),
@@ -770,12 +789,20 @@ mod tests {
                 "/r/a.rs",
                 4,
                 1,
-                tf_core::Severity::Info,
+                cargoless_core::Severity::Info,
                 None,
                 "i",
                 Some("rustc"),
             ),
-            d("/r/a.rs", 5, 1, tf_core::Severity::Hint, None, "h", None),
+            d(
+                "/r/a.rs",
+                5,
+                1,
+                cargoless_core::Severity::Hint,
+                None,
+                "h",
+                None,
+            ),
         ];
         let (e, w) = severity_tally(&ds);
         assert_eq!(e, 2);

@@ -47,12 +47,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tf_proto::{
+use cargoless_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, Profile,
     PublishedArtifact, TargetTriple, UnixSeconds,
 };
 
-use tf_cas::{ContentStore, absent_marker, content_hash, hash_source_tree, input_hash};
+use cargoless_cas::{ContentStore, absent_marker, content_hash, hash_source_tree, input_hash};
 
 /// Produces artifact bytes for a green [`BuildIdentity`], or a one-line failure
 /// reason. Implemented by [`TrunkCompiler`] in production and by a counting
@@ -361,7 +361,7 @@ pub fn materialize_latest_green<S: ContentStore>(
     }
 }
 
-fn hash_optional_file(path: &Path, kind: &str) -> io::Result<tf_proto::ContentHash> {
+fn hash_optional_file(path: &Path, kind: &str) -> io::Result<cargoless_proto::ContentHash> {
     match fs::read(path) {
         Ok(bytes) => Ok(content_hash(&bytes)),
         // Absent is a *distinct, deterministic* state — see `absent_marker`.
@@ -545,9 +545,9 @@ fn failed(reason: String) -> BuildResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cargoless_cas::LocalDiskStore;
     use std::cell::Cell;
     use std::path::PathBuf;
-    use tf_cas::LocalDiskStore;
 
     fn scratch(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -570,10 +570,10 @@ mod tests {
 
     fn ident() -> BuildIdentity {
         BuildIdentity {
-            source_tree: tf_cas::content_hash(b"s"),
-            cargo_lock: tf_cas::content_hash(b"l"),
-            rust_toolchain: tf_cas::content_hash(b"t"),
-            tf_config: tf_cas::content_hash(b"c"),
+            source_tree: cargoless_cas::content_hash(b"s"),
+            cargo_lock: cargoless_cas::content_hash(b"l"),
+            rust_toolchain: cargoless_cas::content_hash(b"t"),
+            tf_config: cargoless_cas::content_hash(b"c"),
             target: TargetTriple::new("wasm32-unknown-unknown"),
             profile: Profile::Dev,
         }
@@ -906,7 +906,7 @@ mod tests {
         // Now a failing build with a *different* identity (so it is not a
         // dedup hit) must NOT touch the pointer (AC#4).
         let mut other = ident();
-        other.source_tree = tf_cas::content_hash(b"different-source");
+        other.source_tree = cargoless_cas::content_hash(b"different-source");
         let bad = BuildOrchestrator::new(LocalDiskStore::new(dir.join("cas")), Boom, &dir);
         let r = bad.run(&BuildTrigger { identity: other });
         assert!(matches!(r.outcome, BuildOutcome::Failed { .. }));

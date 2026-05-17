@@ -407,7 +407,7 @@ pub fn admission(root: &Path, my_pid: u32) -> WatchAdmission {
 ///
 /// nix-free, matching house policy (local-extern for single syscalls —
 /// `kill`/`getppid`; `ps` for richer per-pid queries — `pgrep -s` in
-/// tf_core::analyzer). `ps -p <pid> -o comm=` is portable across the v0
+/// cargoless_core::analyzer). `ps -p <pid> -o comm=` is portable across the v0
 /// targets (Linux + macOS). Any failure ⇒ `false` ⇒ caller proceeds: a
 /// missed refusal (rare dual-watch) is strictly safer than false-refusing
 /// a legitimate lone watcher.
