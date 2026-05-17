@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The TF-Trunk binary. Subcommands: serve, check, status, clean."
+description = "The cargoless binary (v0 headless). Subcommands: check, watch, build, status, clean."
 
 [lints]
 workspace = true
