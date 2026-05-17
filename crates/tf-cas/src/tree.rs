@@ -29,6 +29,12 @@
 //!   real `TrunkCompiler` path. (The CAS cache directory must likewise live
 //!   *outside* the watched tree — decision D6/D10's global cache root — so it
 //!   is never walked here; that invariant is the orchestrator's to uphold.)
+//! * **`.cargoless/`** — excluded: this is where the build/CAS layer writes
+//!   the canonical latest-green pointer (`.cargoless/latest-green`). It lives
+//!   inside the project for discoverability, but it is *publisher output*, not
+//!   a compile input — and it changes on every green publish. Hashing it would
+//!   re-introduce the exact self-referential cache cycle `dist/` exclusion
+//!   exists to prevent, breaking AC#5 dedupe on the publish path.
 
 use std::fs;
 use std::io;
@@ -40,7 +46,7 @@ use crate::sha256::sha256_hex;
 
 /// Directory names pruned from the walk. Fixed and documented on purpose — see
 /// the module docs for why this is not a `.gitignore` engine in v0.
-pub const EXCLUDED_DIRS: &[&str] = &["target", ".git", "dist"];
+pub const EXCLUDED_DIRS: &[&str] = &["target", ".git", "dist", ".cargoless"];
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -203,11 +209,19 @@ mod tests {
         fs::create_dir_all(d.join("dist")).unwrap();
         fs::write(d.join("dist/index.html"), b"<html>built</html>").unwrap();
         fs::write(d.join("dist/app_bg.wasm"), b"\0asm BUILD OUTPUT").unwrap();
+        // `.cargoless/` holds the latest-green pointer — publisher output,
+        // changes every green build; hashing it would break AC#5 dedupe.
+        fs::create_dir_all(d.join(".cargoless")).unwrap();
+        fs::write(
+            d.join(".cargoless/latest-green"),
+            b"cargoless-latest-green/v1\ninput_hash=deadbeef\n",
+        )
+        .unwrap();
 
         assert_eq!(
             clean,
             hash_source_tree(&d).unwrap(),
-            "target/, .git/ and dist/ must not affect the source-tree hash"
+            "target/, .git/, dist/ and .cargoless/ must not affect the source-tree hash"
         );
 
         // But a real source addition must.

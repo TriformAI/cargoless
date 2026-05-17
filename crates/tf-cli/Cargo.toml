@@ -5,10 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The TF-Trunk binary. Subcommands: serve, check, status, clean."
+description = "The cargoless binary (v0 headless). Subcommands: check, watch, build, status, clean."
 
 [lints]
 workspace = true
+
+# `integration` gates the REAL `build --watch` publisher-drive wiring into
+# build-cas's `tf_core::build::{BuildOrchestrator,read_latest_green}` +
+# `tf_proto::PublishedArtifact` — not on this branch's main base yet. OFF by
+# default so the standalone `--locked` gate (build/test/clippy, NOT
+# --all-features) never compiles unresolved symbols and stays green. A
+# local-crate feature does not alter Cargo.lock, so --locked is unaffected.
+# #29 convergence enables this on the converged tree.
+[features]
+integration = []
 
 [[bin]]
 name = "tftrunk"

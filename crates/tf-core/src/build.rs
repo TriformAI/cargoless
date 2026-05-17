@@ -8,7 +8,19 @@
 //! proof of AC#5) or shells out to `trunk build`, stores the artifact, and
 //! returns [`BuildOutcome::Compiled`]. A build that fails despite a green
 //! verdict (a link/toolchain error the analyzer cannot see) becomes
-//! [`BuildOutcome::Failed`] and the server keeps serving last-green (AC#4).
+//! [`BuildOutcome::Failed`].
+//!
+//! ## v0 is a publisher, not a server
+//!
+//! v0 is a headless continuous checker + **latest-green publisher** (no HTTP,
+//! no WebSocket — that is v0.1). On every *servable* green build (`Compiled`
+//! or `Deduplicated`) this layer atomically advances a canonical pointer file
+//! `<project>/.cargoless/latest-green` (a [`PublishedArtifact`] rendered by
+//! the `tf-proto` codec) to the new CAS artifact. **AC#4 — never publish
+//! red:** a red tree never reaches here, and a failed build *or* a failed
+//! pointer swap leaves the previous pointer byte-untouched (fail closed). The
+//! CLI `status` / `build --watch --out` read the pointer via
+//! [`read_latest_green`] and fetch bytes with `ContentStore::get`.
 //!
 //! ## Why `trunk build` is wrapped, not reimplemented
 //!
@@ -30,11 +42,14 @@
 
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tf_proto::{
-    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, Profile, TargetTriple,
+    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, Profile,
+    PublishedArtifact, TargetTriple, UnixSeconds,
 };
 
 use tf_cas::{ContentStore, absent_marker, content_hash, hash_source_tree, input_hash};
@@ -87,9 +102,16 @@ impl Compiler for TrunkCompiler {
     }
 }
 
+/// Magic+version prefix of the v0 CAS artifact blob. Bumping it is a
+/// deliberate, repo-visible format change — [`unpack_artifact`] rejects any
+/// other header rather than mis-expanding an old blob into `--out`.
+const DIST_BLOB_HEADER: &[u8] = b"tf-core/dist/v1\n";
+
 /// Deterministically serialize a directory tree into one byte blob (sorted,
 /// length-prefixed) so an identical `dist/` always produces identical CAS
-/// bytes. Not a general archive format — just a stable, unambiguous dump.
+/// bytes. Not a general archive format — just a stable, unambiguous dump whose
+/// only reader is [`unpack_artifact`] (the blob layout is owned here; the CLI
+/// never parses CAS internals).
 fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
         let mut kids: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
@@ -118,7 +140,7 @@ fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut buf = Vec::new();
-    buf.extend_from_slice(b"tf-core/dist/v1\n");
+    buf.extend_from_slice(DIST_BLOB_HEADER);
     for (rel, bytes) in &files {
         buf.extend_from_slice(&(rel.len() as u64).to_be_bytes());
         buf.extend_from_slice(rel.as_bytes());
@@ -126,6 +148,122 @@ fn pack_dir(root: &Path) -> io::Result<Vec<u8>> {
         buf.extend_from_slice(bytes);
     }
     Ok(buf)
+}
+
+/// Expand a v0 CAS artifact blob (the [`pack_dir`] framing produced by
+/// [`TrunkCompiler`]) into `out_dir`, faithfully recreating the original
+/// `dist/` tree. This is the **inverse of the packer and the only sanctioned
+/// reader of the blob layout** — the CLI calls this so it never has to know
+/// the container format (the open flag cli-ux raised for `build --watch
+/// --out`).
+///
+/// Strict: a wrong/absent header, a truncated record, or a length that
+/// overruns the buffer ⇒ `Err` (a corrupt artifact is never half-expanded into
+/// a servable dir). Path-safe: each entry path is rebuilt from its
+/// forward-slash components with `.`/`..`/absolute/empty segments rejected, so
+/// a malformed blob can never escape `out_dir`. Existing files at the same
+/// relative paths are overwritten; unrelated pre-existing files are left as-is
+/// (v0-simple — the caller owns whether to clear `out_dir` first).
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidData`] for a malformed blob; the underlying
+/// [`io::Error`] for a filesystem failure under `out_dir`.
+pub fn unpack_artifact(blob: &[u8], out_dir: &Path) -> io::Result<()> {
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+
+    let mut cur = blob
+        .strip_prefix(DIST_BLOB_HEADER)
+        .ok_or_else(|| bad("not a cargoless dist blob (bad/absent header)"))?;
+
+    let take = |cur: &mut &[u8], n: usize| -> io::Result<Vec<u8>> {
+        if cur.len() < n {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "artifact blob truncated",
+            ));
+        }
+        let (head, tail) = cur.split_at(n);
+        *cur = tail;
+        Ok(head.to_vec())
+    };
+    let take_u64 = |cur: &mut &[u8]| -> io::Result<u64> {
+        Ok(u64::from_be_bytes(
+            take(cur, 8)?
+                .try_into()
+                .map_err(|_| bad("short length field"))?,
+        ))
+    };
+
+    while !cur.is_empty() {
+        let rel_len =
+            usize::try_from(take_u64(&mut cur)?).map_err(|_| bad("path length exceeds usize"))?;
+        let rel = String::from_utf8(take(&mut cur, rel_len)?)
+            .map_err(|_| bad("entry path is not UTF-8"))?;
+        let content_len = usize::try_from(take_u64(&mut cur)?)
+            .map_err(|_| bad("content length exceeds usize"))?;
+        let content = take(&mut cur, content_len)?;
+
+        // Rebuild the destination from sanitized components — never trust the
+        // blob to stay inside out_dir.
+        let mut dest = out_dir.to_path_buf();
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return Err(bad("unsafe component in artifact path"));
+            }
+            dest.push(seg);
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, &content)?;
+    }
+    Ok(())
+}
+
+/// Outcome of [`materialize_latest_green`] — distinct so the CLI can render
+/// honest `status` / `build --watch --out` states without guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Materialized {
+    /// No green build has been published yet (pointer absent).
+    NoGreen,
+    /// The pointer is present but the CAS no longer holds the bytes (cache
+    /// evicted / `clean`'d). Nothing was written to `out_dir`; the caller
+    /// should treat this as "no green — re-trigger a build".
+    Evicted(PublishedArtifact),
+    /// `out_dir` now contains the published `dist/` tree for this artifact.
+    Materialized(PublishedArtifact),
+}
+
+/// One-call read path for the CLI (`build --watch --out`, `status`): read the
+/// canonical pointer, fetch the blob from the caller-supplied `store`, and
+/// expand it into `out_dir`. Keeps the blob layout entirely inside this crate
+/// — `tf-cli` never reaches into CAS internals (the option-(b) seam cli-ux
+/// asked for).
+///
+/// Both `store` (the cli-ux-configured out-of-tree cache) and `project_root`
+/// (where `.cargoless/latest-green` lives) are caller-supplied — nothing is
+/// derived here.
+///
+/// # Errors
+/// A corrupt pointer or a malformed blob is [`io::ErrorKind::InvalidData`]; a
+/// CAS or filesystem failure is the underlying [`io::Error`]. A *missing*
+/// pointer or an *evicted* blob is **not** an error — it is
+/// [`Materialized::NoGreen`] / [`Materialized::Evicted`].
+pub fn materialize_latest_green<S: ContentStore>(
+    store: &S,
+    project_root: &Path,
+    out_dir: &Path,
+) -> io::Result<Materialized> {
+    let Some(pa) = read_latest_green(project_root)? else {
+        return Ok(Materialized::NoGreen);
+    };
+    match store.get(&pa.artifact.input_hash)? {
+        None => Ok(Materialized::Evicted(pa)),
+        Some(blob) => {
+            unpack_artifact(&blob, out_dir)?;
+            Ok(Materialized::Materialized(pa))
+        }
+    }
 }
 
 fn hash_optional_file(path: &Path, kind: &str) -> io::Result<tf_proto::ContentHash> {
@@ -182,28 +320,27 @@ impl<S: ContentStore, C: Compiler> BuildOrchestrator<S, C> {
         }
     }
 
-    /// Run one build request.
+    /// Run one build request, then publish the latest-green pointer.
     ///
     /// * input set already in the CAS ⇒ [`BuildOutcome::Deduplicated`], the
-    ///   compiler is **never invoked** (AC#5);
-    /// * otherwise compile, store, ⇒ [`BuildOutcome::Compiled`];
-    /// * compile failure *or* any CAS I/O error ⇒ [`BuildOutcome::Failed`]
-    ///   with `artifact: None` — the server then holds last-green (AC#4). A
-    ///   storage error is deliberately a `Failed`, never a panic: the daemon
-    ///   must not crash because a disk hiccuped.
+    ///   compiler is **never invoked** (AC#5) — but the pointer is *still*
+    ///   advanced: a dedup hit IS the current latest green;
+    /// * otherwise compile, store, verify ⇒ [`BuildOutcome::Compiled`];
+    /// * compile failure, any CAS I/O error, **or** an inability to advance
+    ///   the pointer ⇒ [`BuildOutcome::Failed`] with `artifact: None`. The
+    ///   prior pointer is left byte-untouched (**AC#4: never publish red**).
+    ///   Failures are `Failed`, never a panic: the daemon must not crash
+    ///   because a disk hiccuped.
     pub fn run(&self, trigger: &BuildTrigger) -> BuildResult {
         let key = input_hash(&trigger.identity);
+        let meta = ArtifactMeta {
+            input_hash: key.clone(),
+            identity: trigger.identity.clone(),
+        };
 
         match self.store.contains(&key) {
-            Ok(true) => {
-                return BuildResult {
-                    outcome: BuildOutcome::Deduplicated,
-                    artifact: Some(ArtifactMeta {
-                        input_hash: key,
-                        identity: trigger.identity.clone(),
-                    }),
-                };
-            }
+            // CAS hit: skip the compile (AC#5) but still advance the pointer.
+            Ok(true) => return self.publish_and_report(BuildOutcome::Deduplicated, meta),
             Ok(false) => {}
             Err(e) => return failed(format!("CAS lookup failed: {e}")),
         }
@@ -216,13 +353,89 @@ impl<S: ContentStore, C: Compiler> BuildOrchestrator<S, C> {
         if let Err(e) = self.store.put(&key, &bytes) {
             return failed(format!("CAS store failed: {e}"));
         }
+        // Verify the artifact is actually retrievable before we ever point at
+        // it — never advance latest-green to a key the CAS cannot serve.
+        match self.store.contains(&key) {
+            Ok(true) => {}
+            Ok(false) => {
+                return failed("CAS reported store success but artifact is absent".to_owned());
+            }
+            Err(e) => return failed(format!("CAS verify failed: {e}")),
+        }
 
-        BuildResult {
-            outcome: BuildOutcome::Compiled,
-            artifact: Some(ArtifactMeta {
-                input_hash: key,
-                identity: trigger.identity.clone(),
-            }),
+        self.publish_and_report(BuildOutcome::Compiled, meta)
+    }
+
+    /// Advance the latest-green pointer, then report. **AC#4 (Option A,
+    /// ratified):** if the artifact is safe in the CAS but the pointer cannot
+    /// be advanced, fail *closed* — return `Failed` so consumers keep the
+    /// prior last-green. The artifact stays cached, so the next trigger
+    /// dedups + republishes cheaply.
+    fn publish_and_report(&self, outcome: BuildOutcome, meta: ArtifactMeta) -> BuildResult {
+        match publish_latest_green(&self.project_root, &meta) {
+            Ok(()) => BuildResult {
+                outcome,
+                artifact: Some(meta),
+            },
+            Err(e) => failed(format!(
+                "artifact built but could not advance latest-green pointer: {e}"
+            )),
+        }
+    }
+}
+
+/// The canonical latest-green pointer path for a project root:
+/// `<project_root>/.cargoless/latest-green`. The CLI (`status`,
+/// `build --watch --out`) reads this; nothing else writes it.
+pub fn latest_green_path(project_root: &Path) -> PathBuf {
+    project_root.join(".cargoless").join("latest-green")
+}
+
+/// Read and parse the latest-green pointer, if a green build has been
+/// published. `Ok(None)` ⇒ no green yet (pointer absent). A present-but-corrupt
+/// pointer is an [`io::ErrorKind::InvalidData`] error, never a silent wrong
+/// artifact. Consumers then fetch bytes via `ContentStore::get(&meta.input_hash)`.
+pub fn read_latest_green(project_root: &Path) -> io::Result<Option<PublishedArtifact>> {
+    match fs::read_to_string(latest_green_path(project_root)) {
+        Ok(text) => PublishedArtifact::parse(&text)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Atomically advance the canonical pointer to `meta` (**AC#4**). The new
+/// record is written to a temp file in the **same directory** (so the
+/// `rename` is same-filesystem and therefore atomic), `fsync`'d, then renamed
+/// over the live pointer. The live pointer is never written in place: a crash
+/// or a full disk leaves the previous green pointer byte-intact, never torn.
+fn publish_latest_green(project_root: &Path, meta: &ArtifactMeta) -> io::Result<()> {
+    let published_at = UnixSeconds(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    let record = PublishedArtifact {
+        artifact: meta.clone(),
+        published_at,
+    };
+
+    let dir = project_root.join(".cargoless");
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!(".latest-green.{}.tmp", std::process::id()));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(record.render().as_bytes())?;
+        f.sync_all()?;
+    }
+    match fs::rename(&tmp, dir.join("latest-green")) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Don't leave a stale temp behind if the swap failed.
+            let _ = fs::remove_file(&tmp);
+            Err(e)
         }
     }
 }
@@ -367,5 +580,234 @@ mod tests {
         // Absent tf.toml (D6 open) must not break assembly.
         assert!(!proj.join("tf.toml").exists());
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn compiled_and_deduplicated_both_advance_the_pointer() {
+        let dir = scratch("publish");
+        let orch = BuildOrchestrator::new(
+            LocalDiskStore::new(dir.join("cas")),
+            CountingCompiler {
+                calls: Cell::new(0),
+                bytes: b"artifact".to_vec(),
+            },
+            &dir,
+        );
+        let trig = BuildTrigger { identity: ident() };
+
+        assert_eq!(orch.run(&trig).outcome, BuildOutcome::Compiled);
+        let p1 = read_latest_green(&dir)
+            .unwrap()
+            .expect("pointer advanced on first green build");
+        assert_eq!(p1.artifact.input_hash, input_hash(&ident()));
+        assert!(p1.published_at.0 > 0, "a real timestamp is recorded");
+
+        // Dedup hit still republishes (it IS the current latest green).
+        assert_eq!(orch.run(&trig).outcome, BuildOutcome::Deduplicated);
+        assert_eq!(orch.compiler.calls.get(), 1, "AC#5: compile still skipped");
+        let p2 = read_latest_green(&dir).unwrap().expect("pointer present");
+        assert_eq!(p2.artifact.input_hash, p1.artifact.input_hash);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_build_never_moves_the_pointer() {
+        struct Boom;
+        impl Compiler for Boom {
+            fn compile(&self, _r: &Path, _i: &BuildIdentity) -> Result<Vec<u8>, String> {
+                Err("trunk exploded".to_owned())
+            }
+        }
+        let dir = scratch("nopublish");
+        // First, a good build to establish a green pointer.
+        let good = BuildOrchestrator::new(
+            LocalDiskStore::new(dir.join("cas")),
+            CountingCompiler {
+                calls: Cell::new(0),
+                bytes: b"green-1".to_vec(),
+            },
+            &dir,
+        );
+        assert_eq!(
+            good.run(&BuildTrigger { identity: ident() }).outcome,
+            BuildOutcome::Compiled
+        );
+        let before = fs::read(latest_green_path(&dir)).expect("pointer exists");
+
+        // Now a failing build with a *different* identity (so it is not a
+        // dedup hit) must NOT touch the pointer (AC#4).
+        let mut other = ident();
+        other.source_tree = tf_cas::content_hash(b"different-source");
+        let bad = BuildOrchestrator::new(LocalDiskStore::new(dir.join("cas")), Boom, &dir);
+        let r = bad.run(&BuildTrigger { identity: other });
+        assert!(matches!(r.outcome, BuildOutcome::Failed { .. }));
+        assert!(r.artifact.is_none());
+
+        let after = fs::read(latest_green_path(&dir)).expect("pointer still exists");
+        assert_eq!(
+            before, after,
+            "AC#4: a failed build leaves the pointer byte-identical"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pointer_write_failure_is_failed_closed_option_a() {
+        // Option A (ratified): artifact lands in the CAS, but if the pointer
+        // cannot be advanced the result is Failed / artifact None — consumers
+        // keep last-green; the cached artifact makes the retry cheap.
+        let dir = scratch("ptrfail");
+        // Make `.cargoless` a *regular file* so create_dir_all(.cargoless)
+        // fails ⇒ the pointer can never be written.
+        fs::write(dir.join(".cargoless"), b"not a directory").unwrap();
+
+        let store = LocalDiskStore::new(dir.join("cas"));
+        let orch = BuildOrchestrator::new(
+            store,
+            CountingCompiler {
+                calls: Cell::new(0),
+                bytes: b"artifact".to_vec(),
+            },
+            &dir,
+        );
+        let r = orch.run(&BuildTrigger { identity: ident() });
+        match r.outcome {
+            BuildOutcome::Failed { reason } => {
+                assert!(
+                    reason.contains("could not advance latest-green pointer"),
+                    "reason names the publish failure: {reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            r.artifact.is_none(),
+            "fail closed: no servable artifact reported"
+        );
+        // But the artifact IS in the CAS (so the retry dedups + republishes).
+        assert!(
+            LocalDiskStore::new(dir.join("cas"))
+                .contains(&input_hash(&ident()))
+                .unwrap(),
+            "artifact is safely cached despite the publish failure"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `trunk` that emits a real packed-dist blob (CI has no trunk), so
+    /// the full publish → store → materialize path is exercised end-to-end.
+    struct DistCompiler {
+        blob: Vec<u8>,
+    }
+    impl Compiler for DistCompiler {
+        fn compile(&self, _r: &Path, _i: &BuildIdentity) -> Result<Vec<u8>, String> {
+            Ok(self.blob.clone())
+        }
+    }
+
+    fn make_dist(tag: &str) -> (PathBuf, Vec<u8>) {
+        let d = scratch(tag).join("dist");
+        fs::create_dir_all(d.join("assets")).unwrap();
+        fs::write(d.join("index.html"), b"<body>hi</body>").unwrap();
+        fs::write(d.join("app_bg.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        fs::write(d.join("assets/app.css"), b".x{}").unwrap();
+        let blob = pack_dir(&d).unwrap();
+        (d, blob)
+    }
+
+    #[test]
+    fn unpack_artifact_round_trips_pack_dir() {
+        let (src, blob) = make_dist("rt-src");
+        let out = scratch("rt-out");
+        unpack_artifact(&blob, &out).unwrap();
+        assert_eq!(
+            fs::read(out.join("index.html")).unwrap(),
+            b"<body>hi</body>"
+        );
+        assert_eq!(
+            fs::read(out.join("app_bg.wasm")).unwrap(),
+            b"\0asm\x01\0\0\0"
+        );
+        assert_eq!(fs::read(out.join("assets/app.css")).unwrap(), b".x{}");
+        let _ = fs::remove_dir_all(src.parent().unwrap());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn unpack_artifact_rejects_corruption_and_traversal() {
+        let out = scratch("bad-out");
+        assert_eq!(
+            unpack_artifact(b"not-a-blob", &out).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        // Header OK but truncated length field.
+        let mut t = DIST_BLOB_HEADER.to_vec();
+        t.extend_from_slice(&[0, 0, 0]);
+        assert!(unpack_artifact(&t, &out).is_err());
+        // Header OK, a path that tries to escape out_dir.
+        let mut e = DIST_BLOB_HEADER.to_vec();
+        let rel = b"../escape.txt";
+        e.extend_from_slice(&(rel.len() as u64).to_be_bytes());
+        e.extend_from_slice(rel);
+        e.extend_from_slice(&(3u64).to_be_bytes());
+        e.extend_from_slice(b"pwn");
+        assert_eq!(
+            unpack_artifact(&e, &out).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!out.parent().unwrap().join("escape.txt").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn materialize_latest_green_no_green_evicted_and_done() {
+        let project = scratch("mat-proj");
+        fs::create_dir_all(&project).unwrap();
+        let cache = scratch("mat-cache");
+        let out = scratch("mat-out");
+
+        // No pointer yet ⇒ NoGreen.
+        assert_eq!(
+            materialize_latest_green(&LocalDiskStore::new(&cache), &project, &out).unwrap(),
+            Materialized::NoGreen
+        );
+
+        // Publish a real dist blob through the orchestrator.
+        let (distdir, blob) = make_dist("mat-dist");
+        let orch =
+            BuildOrchestrator::new(LocalDiskStore::new(&cache), DistCompiler { blob }, &project);
+        assert_eq!(
+            orch.run(&BuildTrigger { identity: ident() }).outcome,
+            BuildOutcome::Compiled
+        );
+
+        // Pointer + blob present ⇒ Materialized, files faithfully expanded.
+        match materialize_latest_green(&LocalDiskStore::new(&cache), &project, &out).unwrap() {
+            Materialized::Materialized(pa) => {
+                assert_eq!(pa.artifact.input_hash, input_hash(&ident()));
+            }
+            other => panic!("expected Materialized, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(out.join("index.html")).unwrap(),
+            b"<body>hi</body>"
+        );
+        assert_eq!(fs::read(out.join("assets/app.css")).unwrap(), b".x{}");
+
+        // Wipe the cache (simulate `clean`) — pointer dangles ⇒ Evicted.
+        fs::remove_dir_all(&cache).unwrap();
+        match materialize_latest_green(&LocalDiskStore::new(&cache), &project, &out).unwrap() {
+            Materialized::Evicted(pa) => {
+                assert_eq!(pa.artifact.input_hash, input_hash(&ident()))
+            }
+            other => panic!("expected Evicted, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&project);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(distdir.parent().unwrap());
     }
 }
