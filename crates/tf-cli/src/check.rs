@@ -1,60 +1,62 @@
 //! `check` — one-shot verdict; exit code reflects green/red.
 //!
-//! The compile verdict comes from the daemon's rust-analyzer LSP client +
-//! green/red model. Those are daemon-core deliverables not yet on `main`
-//! (Plane CWDL tasks: LSP client, model + event bus). `tf-cli` must not edit
-//! `tf-core`, so `check` is wired against a single seam — [`verdict`] — that
-//! becomes a one-line call into `tf_core` the moment that public entrypoint
-//! exists (requested from the lead: `tf_core::check_once(&root) -> TreeState`).
+//! The compile verdict comes from daemon-core's model. The **real wiring** is
+//! the `integration` feature path below; the default path stays honest about
+//! being preflight-only so cli-ux's own CI gate compiles green while
+//! `tf_core::model` is not yet on the tf-core this crate builds against.
 //!
-//! Until then `check` does the half it fully owns and is honest about the
-//! half it does not: it runs config resolution + project preflight (which
-//! catches the most common "it doesn't work" — a mis-detected or
-//! mis-configured project) and reports the verdict pipeline as pending rather
-//! than fabricating a green. Faking a verdict would directly violate the
-//! product's one promise ("always knows what works").
+//! ## Two paths, one contract
+//!
+//! * default (feature off) — config resolution + project preflight only;
+//!   reports the verdict pipeline as pending. Never fabricates a green
+//!   (faking it would violate the product's one promise).
+//! * `--features integration` — calls
+//!   `tf_core::model::check_once(&Path) -> io::Result<TreeState>`
+//!   (daemon-core's authoritative contract, branch agent/daemon-core-sup).
+//!   This compiles only once daemon-core's `model` module is on the linked
+//!   tf-core; the lead's integration branch turns the feature on for the
+//!   authoritative gate (option (b)). `--all-targets` in cli-ux CI is NOT
+//!   `--all-features`, so this path is excluded there by construction.
+//!
+//! ## Exit-code contract (stable for scripts/CI), per daemon-core's mapping
+//!
+//! * `0` — green (every tracked file compiles)
+//! * `1` — red (tree does not compile; an *unproven* tree is conservatively
+//!   `Ok(TreeState::Red)` per AC#4 — handled by the same arm, not special-cased)
+//! * `2` — could not even run the verdict: rust-analyzer missing / spawn /
+//!   pipe error (`Err`), or configuration/detection error. This is a *setup*
+//!   failure, deliberately distinct from "red".
 
 use std::process::ExitCode;
 
 use crate::config::Config;
 use crate::ui;
 
-/// The one-shot tree verdict. `Unknown` is a first-class state, not an error:
-/// "I cannot currently tell you" is the honest answer while the daemon-core
-/// model API is pending, and it is wired to real `Green`/`Red` without
-/// touching any call site.
+/// The one-shot tree verdict (default path only). `Unknown` is a first-class
+/// state: "I cannot currently tell you" is the honest answer while the model
+/// API is not linked.
+#[cfg(not(feature = "integration"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Green,
     Red(String),
-    /// Verdict pipeline not yet wired (daemon-core model API pending).
+    /// Verdict pipeline not yet wired (daemon-core model API not linked).
     Unknown,
 }
 
-/// Compute the verdict for a resolved project.
-///
-/// SEAM: when `tf_core` exposes a one-shot verdict, this becomes
-/// `match tf_core::check_once(&cfg.root) { Green => .., Red => .. }`. Mapping
-/// `tf_proto::TreeState` here (not at the call site) keeps the swap to this
-/// one function.
+#[cfg(not(feature = "integration"))]
 fn verdict(_cfg: &Config) -> Verdict {
     Verdict::Unknown
 }
 
-/// Exit codes (stable contract for scripts/CI):
-/// * `0` — green (or, today, preflight OK + verdict pending)
-/// * `1` — red (tree does not compile)
-/// * `2` — configuration/detection error (could not even identify the project)
-pub fn run(cfg: &Config) -> ExitCode {
-    ui::step(format!(
-        "checking {} ({})",
-        cfg.root.display(),
-        cfg.detection.describe()
-    ));
-
+/// Default path: preflight only, verdict pending. Exit `0` (preflight passed)
+/// so this is not mistaken for a verified green by a script — the WAIT line
+/// makes the pending state explicit on the terminal.
+#[cfg(not(feature = "integration"))]
+fn run_verdict(cfg: &Config) -> ExitCode {
     match verdict(cfg) {
         Verdict::Green => {
-            ui::ok("green — every tracked file compiles".to_string());
+            ui::ok("green — every tracked file compiles");
             ExitCode::SUCCESS
         }
         Verdict::Red(why) => {
@@ -62,21 +64,56 @@ pub fn run(cfg: &Config) -> ExitCode {
             ExitCode::from(1)
         }
         Verdict::Unknown => {
-            // Preflight passed (config resolved, project identified). Be
-            // explicit that the compile verdict is not yet wired so a caller
-            // never mistakes this for a verified green.
-            ui::ok("project preflight passed".to_string());
+            ui::ok("project preflight passed");
             ui::wait(
                 "compile verdict pipeline pending daemon model API — \
-                 `check` will return 0=green / 1=red once tf-core exposes it."
-                    .to_string(),
+                 `check` returns 0=green / 1=red / 2=setup-error once the \
+                 model is linked (build with --features integration).",
             );
             ExitCode::SUCCESS
         }
     }
 }
 
-#[cfg(test)]
+/// Integration path: the real verdict. Maps daemon-core's
+/// `io::Result<TreeState>` exactly to the documented exit-code contract.
+/// `Err` is a setup failure (RA missing/spawn/pipe) — distinct from red.
+#[cfg(feature = "integration")]
+fn run_verdict(cfg: &Config) -> ExitCode {
+    match tf_core::model::check_once(&cfg.root) {
+        Ok(tf_core::TreeState::Green) => {
+            ui::ok("green — every tracked file compiles");
+            ExitCode::SUCCESS
+        }
+        Ok(tf_core::TreeState::Red) => {
+            ui::error("red — at least one tracked file does not compile");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            ui::error(format!(
+                "could not run the verdict: {e}\n  \
+                 cargoless needs rust-analyzer — install it: \
+                 `rustup component add rust-analyzer`."
+            ));
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub fn run(cfg: &Config) -> ExitCode {
+    ui::step(format!(
+        "checking {} ({})",
+        cfg.root.display(),
+        cfg.detection.describe()
+    ));
+    run_verdict(cfg)
+}
+
+// Tests cover the default (feature-off) behaviour — the path cli-ux's own CI
+// gate exercises. The integration path's verdict mapping is owned/verified on
+// the lead's integration branch (it needs a live rust-analyzer + the linked
+// model module, neither available in the zero-dep cli-ux test job).
+#[cfg(all(test, not(feature = "integration")))]
 mod tests {
     use super::*;
     use crate::config::Detection;
@@ -107,7 +144,7 @@ mod tests {
             Verdict::Red("E0599".into()),
             Verdict::Unknown,
         ] {
-            let _ = v; // mapping exhaustiveness is enforced in `run`'s match
+            let _ = v; // exhaustiveness enforced by `run_verdict`'s match
         }
         assert_eq!(verdict(&cfg()), Verdict::Unknown);
     }

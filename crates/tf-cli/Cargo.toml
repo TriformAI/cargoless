@@ -10,6 +10,15 @@ description = "The cargoless binary. Subcommands: serve, check, status, clean."
 [lints]
 workspace = true
 
+# `integration` gates the REAL wiring into daemon-core's `tf_core::model`
+# (and, when its signatures land, devserver's `tf_core::server`). It is OFF
+# by default so cli-ux's own CI gate — `cargo build/clippy --workspace
+# --all-targets` (NOT --all-features) — never compiles calls into modules not
+# yet on the linked tf-core, and stays green. The lead's integration branch
+# turns this on for the authoritative cross-crate gate (option (b)).
+[features]
+integration = []
+
 [[bin]]
 name = "tftrunk"
 path = "src/main.rs"
