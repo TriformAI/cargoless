@@ -74,13 +74,27 @@ load-bearing.
      block. The #117 trigger finding does **not** touch it.
      **Invariant: never let "trigger ≈0%" deflate or qualify Leg A —
      different mechanisms** (inv-7).
-   - **LEG B — tiered RAM ladder. STANDS.** dogfood Item-3-redo
-     (deployed-field): default RA-polish ≈**−20%** (a FINDING — the
-     default *under*-delivers vs the 30-50% hope) → proc-macro-off
-     ≈**−56%** (#126/#127 ✅ proven safe-for-proc-macro; v0.1 deploy)
-     → features-
-     narrowed ≈**−78%** + CPU collapse (v0.1 auto-narrow). Claim =
-     the ladder with per-rung gates, never one number (inv-8).
+   - **LEG B — tiered RAM ladder. STANDS, middle rung now STRONGER.**
+     default RA-polish ≈**−19%** (a FINDING — the default
+     *under*-delivers vs the 30-50% hope; **behaviour-neutral, no
+     opt-in**) → proc-macro-off ≈**−56%** (**safety field-CONFIRMED**
+     on a real 38-`view!`-site Leptos via dogfood #126: green stays
+     GREEN, real-error→RED rustc-sourced, **no false-GREEN** — the
+     no-wrong-verdict proof holds in the field, so this rung is
+     **safety-confirmed-shippable as default**, not "measured-but-
+     unsafe"; **AND the provisional latency tradeoff is INVERTED** —
+     ≈**5× FASTER to RED** (5.1s vs 25.8s) on macro-heavy code,
+     because the proc-macro server's `view!` expansion was on the
+     verdict critical-path and removing it *shortens* it: **a latency
+     bonus, not a tradeoff**) → features-narrowed ≈**−78%** + CPU
+     collapse (v0.1 auto-narrow). **n=1 caveat is LOAD-BEARING (§4
+     inv-8 appended constraint):** the latency-inversion is
+     n=1-per-mode on one real `view!`-heavy project, direction
+     unambiguous + mechanistically expected — the launch claim is
+     *"no latency penalty observed; faster on macro-heavy projects"*,
+     **never an unqualified "proc-macro-off is faster" / universal
+     speedup guarantee.** Claim = the ladder with per-rung gates,
+     never one number (inv-8).
    - **LEG C — Tier-4 idle-evict fleet-scale RAM. STANDS, INDEPENDENT
      of the trigger.** Acts on the idle *window*, not on
      trigger-firing. Quantified by bench #116 (PENDING). **Never
@@ -119,7 +133,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 | `## What cargoless v0 is (and isn't)` (L33) | **REFRAME** | Add a single lead sentence: primary consumer = an agent writing whole files atomically; the `check`/`watch`/`build` surface is the agent-edit-batch verdict loop. Existing v0/v0.1 bullets unchanged. | none |
 | `## Performance vs alternatives` (L154) | **ADD + REFRAME (lead only)** | **Leg A is the headline and it is the FROZEN C1 verbatim Framing-C block + dual-tier AC#2a/2b — do not touch, and do not let the Leg-D trigger paragraph qualify it.** Add *above* the qualitative table one paragraph for Leg D only: "cost unit is per agent-edit-batch; the structural-completeness trigger cargo-checks only confirmed-CLOSED batches — for whole-file agent writes (Claude `Write`) `.rs` OPEN is ≈0%, so the trigger is a **correctness property (only-meaningful-states-cached) + a conditional-benefit mechanism for fleets that *do* emit OPEN intermediate Rust**, NOT a v0 CPU lever for the Claude-`Write` population." **Never quote a fired-check-reduction % as expected savings; never couple this paragraph to the Leg-A 2× headline or Leg-C idle-evict** (§4 inv-7). RAM = §4-inv-8 tiered ladder (Leg B), not a single number. Fill `_PENDING_` cells only when gate-2 clears. | Leg A 2× = C1 frozen + #102; Leg B RAM ladder (dogfood Item-3-redo + bench #119, PENDING); Leg D = #117 LANDED `.rs`≈0% |
 | `## Workspace` (L286) | none | crate-name table is post-#97 (builder-infra). Out of scope. | — |
-| `## Status` (L315) | **REFRAME** | If gate-1 = v0-only: status line stays. If v0+v0.1: add the v0.1-RAM one-liner as the **ladder** (default ≈−20% today → proc-macro-off ≈−56% [#126/#127 ✅ proven, v0.1] → features ≈−78% [v0.1 auto-narrow]; Tier-4 idle-evict prototyped+measured per #122/#125), never a single number. | gate-1 |
+| `## Status` (L315) | **REFRAME** | If gate-1 = v0-only: status line stays. If v0+v0.1: add the v0.1-RAM one-liner as the **ladder** (default ≈−19% behaviour-neutral → proc-macro-off ≈−56% [safety field-confirmed real Leptos #126; faster-not-slower to RED, n=1-scoped — not a universal guarantee] → features ≈−78% [v0.1 auto-narrow]; Tier-4 idle-evict prototyped+measured per #122/#125), never a single number. | gate-1 |
 
 ### 2.2 `ROADMAP.md`
 
@@ -127,7 +141,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 |---|---|---|---|
 | `### v0 capabilities (available today on main)` (L31) | **REFRAME** | Add a bullet: agent-edit-batch as the cost unit; structural-trigger seam is **default-off spike in v0** (#113), not a v0 claim. | none |
 | `### The nine acceptance criteria` (L53) | none | AC#2a/2b split already staged (C1). Frozen. | — |
-| `### v0.1 perf follow-up — auto-narrow --features` (L119) | **ADD** | Extend this section into the **#118 v0.1-RAM-roadmap growth-path**, written as the four legs kept separate (§4 inv-7/8): **Leg B RAM ladder** = default RA-polish ≈**−20%** (deployed-field FINDING — the default under-delivers vs the 30-50% hope; state plainly) → proc-macro-off ≈**−56%** *(v0.1; #126/#127 ✅ proven safe-for-proc-macro)* → features-narrowed ≈**−78%** + CPU collapse *(v0.1 auto-narrow — the named single highest-leverage flag change)*. **Leg C v0.1 architectural** = Tier-4 idle-evict-RA (~2 GB reclaimed per idle gap), a lever on the idle *window* — **independent of the structural-trigger; do NOT write "enabled by"/"depends on" the trigger** (inv-7). **Tier-4 framing precision:** dev-fixer pulls it forward under #122/#125 as a **default-off prototype + no-wrong-verdict proof + measured RSS delta** — reads "**designed + prototyped + measured**", NOT "designed only"; do **not** overstate as v0-shipped (v0.1-DESIGN, default-off). The **Leg D structural-trigger** appears here only as the correctness + conditional-benefit mechanism (NOT a CPU-savings %, NOT coupled to Leg C). Sources: `docs/design/D-RAM-TIERS.md` verdict table + dogfood Item-3-redo (deployed-field) + bench #119 (harness per-tier) — **distinct sources, composed not conflated**. | D-RAM-TIERS ff'd to main; Leg-B rungs+gates PENDING (dogfood Item-3-redo + bench #119 + #126/#127 for −56% + v0.1-auto-narrow for −78%); Leg-C Tier-4 = #122/#125 prototype+proof+RSS-delta PENDING |
+| `### v0.1 perf follow-up — auto-narrow --features` (L119) | **ADD** | Extend this section into the **#118 v0.1-RAM-roadmap growth-path**, written as the four legs kept separate (§4 inv-7/8): **Leg B RAM ladder** = default RA-polish ≈**−19%** (deployed-field FINDING — under-delivers vs the 30-50% hope; behaviour-neutral, no opt-in; state plainly) → proc-macro-off ≈**−56%** *(safety field-CONFIRMED on real 38-`view!` Leptos #126 — no false-GREEN, safety-confirmed-shippable; **and** ≈5× faster-not-slower to RED 5.1s vs 25.8s, latency bonus not tradeoff; **n=1-scoped per §4 inv-8 — "no penalty observed; faster on macro-heavy", never a universal speedup guarantee**)* → features-narrowed ≈**−78%** + CPU collapse *(v0.1 auto-narrow — the named single highest-leverage flag change)*. **Leg C v0.1 architectural** = Tier-4 idle-evict-RA (~2 GB reclaimed per idle gap), a lever on the idle *window* — **independent of the structural-trigger; do NOT write "enabled by"/"depends on" the trigger** (inv-7). **Tier-4 framing precision:** dev-fixer pulls it forward under #122/#125 as a **default-off prototype + no-wrong-verdict proof + measured RSS delta** — reads "**designed + prototyped + measured**", NOT "designed only"; do **not** overstate as v0-shipped (v0.1-DESIGN, default-off). The **Leg D structural-trigger** appears here only as the correctness + conditional-benefit mechanism (NOT a CPU-savings %, NOT coupled to Leg C). Sources: `docs/design/D-RAM-TIERS.md` verdict table + dogfood Item-3-redo (deployed-field) + bench #119 (harness per-tier) — **distinct sources, composed not conflated**. | D-RAM-TIERS ff'd to main; Leg-B rungs+gates PENDING (dogfood Item-3-redo + bench #119 + #126/#127 for −56% + v0.1-auto-narrow for −78%); Leg-C Tier-4 = #122/#125 prototype+proof+RSS-delta PENDING |
 | `## v1 — parking lot` (L135) | none | unchanged | — |
 
 ### 2.3 `docs/launch/BLOG-DRAFT.md`
@@ -138,7 +152,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 | `## The problem nobody benchmarks` (L65) | **REFRAME** | Add the agent-input framing: the three-terminals-human picture still opens, but the turn is "and now the loop's primary user is an agent emitting whole-file writes in batches — per-keystroke optimization is the wrong axis entirely." Composes with existing throughput thesis. | none |
 | `## The cargoless architecture: do less, trust more` (L101) | **REFRAME + ADD** | Recenter on the **agent-edit-batch / structural-completeness** model (D-OPENCLOSED): CLOSED-batch-gated cargo-check, OPEN/NEUTRAL skip, F8-redo asymmetry preserved. Spine of the agent frame. Keep **Leg A** (the ≈2.05× green-edge-rebuild-vs-trunk-per-save CPU model) as its own distinct subsection — it is *not* the trigger. Position the **Leg D** structural-trigger as the **only-meaningful-states-cached correctness property + a conditional-benefit mechanism for fleets that emit OPEN intermediate Rust** — NOT a check-skip headline: #117 (survivorship-free, N=16, oracle-gated; bench-lead code-confirmed against `ab0d51b` model.rs that the pipeline filters to `.rs` before `is_closed`) found `.rs` OPEN ≈**0%** for whole-file agent writes; the 26.6% all-files figure is a Rust-lexer-on-non-Rust artifact and MUST NOT anchor (§4 inv-7). Tell the 0% straight — "for the way Claude actually writes (whole files), the trigger almost never *skips*; its job is to guarantee we never cache a half-written state" — honesty on-brand. **Do NOT couple Leg D to Leg A (the 2× headline) or Leg C (idle-evict).** Leg-C idle-evict fleet-RAM (#116) is described in the RAM paragraph as its *own independent* lever, not as the trigger's payoff. | D-OPENCLOSED on main; Leg D = LANDED #117 `.rs`≈0% conservative floor (cite w/ Rust-lexer caveat + the model.rs code-confirmation); Leg C #116 independent, PENDING |
 | `## Honest performance comparison` (L152) | **FROZEN** | The verbatim Framing-C block, dual-tier latency tables, memory-honesty bullet, bacon footnote, PENDING cells — **all frozen exactly as staged in C1.** Only fill `_PENDING_` when gate-2 clears. No prose rewrite. | gate-2 numbers |
-| `## Roadmap` (L325) | **ADD** | Mirror ROADMAP.md §2.2: the v0.1-RAM-roadmap growth-path **as the honest tiered ladder** (default ≈−20% deployed-field FINDING → proc-macro-off ≈−56% [#126/#127 ✅ proven, v0.1] → features ≈−78% [v0.1 auto-narrow] + Tier-4 idle-evict prototyped+measured). Never a single number (§4 inv-8). Keep v0/v0.1/v1 phasing exactly. | gate-1; D-RAM-TIERS; ladder rungs PENDING complete picture |
+| `## Roadmap` (L325) | **ADD** | Mirror ROADMAP.md §2.2: the v0.1-RAM-roadmap growth-path **as the honest tiered ladder** (default ≈−19% behaviour-neutral FINDING → proc-macro-off ≈−56% [safety field-confirmed real Leptos #126; faster-not-slower to RED, n=1-scoped not a universal guarantee] → features ≈−78% [v0.1 auto-narrow] + Tier-4 idle-evict prototyped+measured). Never a single number (§4 inv-8). Keep v0/v0.1/v1 phasing exactly. | gate-1; D-RAM-TIERS; ladder rungs PENDING complete picture (#116 last leg) |
 | `## What we are honest about` (L354) | **REFRAME** | Add one bullet: "Built for an agent loop; the human-facing `trunk serve` browser experience is explicitly v0.1, not v0 — we did not pretend the agent tool is a human live-reload replacement." Composes with the existing memory-honesty + INCONCLUSIVE-speed bullets (do not weaken those). Also fold dogfood-lead's **§gap-3 flagged→fixed→field-verified** data point as a "the two-tier method worked end-to-end" credibility line. | none (both inputs known) |
 | `## Appendix — reviewer checklist (AC#9)` (L447) | **see AC9-REVIEWER-PACKET.md** | The packet supplies the delta; do not hand-edit here twice. | — |
 
@@ -162,7 +176,7 @@ bundles may shift them; anchor on the **header text**, not the number).
 | `~2 GB` default RSS | README/BLOG memory framing | bench-lead #102/#119 §8.5 | two-source RSS (already solid; confirm wording) |
 | `~75%` `--features` cut | README/BLOG + ROADMAP | bench-lead #102 | two-source |
 | **LEG D** — structural-trigger = only-meaningful-states-cached **correctness property + conditional-benefit mechanism** (for fleets that emit OPEN intermediate Rust); **NOT a CPU-skip %, NOT coupled to Leg A or Leg C** | BLOG architecture / README perf (Leg-D paragraph) | D-OPENCLOSED + dogfood #117 (LANDED: `.rs` OPEN 0/97 ≈0%, conservative floor, Rust-lexer caveat; bench-lead code-confirmed vs `ab0d51b` model.rs) | none — LANDED; it is *bounded*, not pending a number. Never quote the 26.6% all-files artifact |
-| **LEG B — RAM tiered ladder** (composed, not conflated): default ≈−20% · proc-macro-off ≈−56% · features ≈−78% | ROADMAP §2.2 / README Status / BLOG Roadmap | default+rungs = dogfood Item-3-redo (deployed-field, LANDED FINDING); per-tier cross-source = bench-lead #119 (harness); D-RAM-TIERS verdict table | each rung's gate: −56% ⇒ #126/#127 ✅ proven safe-for-proc-macro (mechanism proven; published figure still PENDING the complete picture); −78% ⇒ v0.1 auto-narrow; final published figures PENDING complete picture (bench stage-2 v2 + #116 + #126) |
+| **LEG B — RAM tiered ladder** (composed, not conflated): default ≈−19% (behaviour-neutral) · proc-macro-off ≈−56% (safety-confirmed + latency-inverted, n=1-scoped) · features ≈−78% | ROADMAP §2.2 / README Status / BLOG Roadmap | default+rungs = dogfood Item-3-redo (deployed-field, LANDED); −56% safety+latency = dogfood #126 field-verify (real 38-`view!` Leptos, LANDED); per-tier cross-source = bench-lead #119 (harness); D-RAM-TIERS verdict table | −56% ⇒ #126/#127 ✅ proven safe-for-proc-macro **and** field-confirmed faster-not-slower to RED (n=1-scoped, §4 inv-8 — never an unqualified speedup); −78% ⇒ v0.1 auto-narrow; final published figures PENDING the complete picture — **#116 fleet-curve is the last leg** (bench stage-2 v2 + #116) |
 | **LEG C** — Tier-4 idle-evict (~2 GB/idle-gap), designed+prototyped+measured; **INDEPENDENT lever on the idle *window*, NOT trigger-coupled** | ROADMAP §2.2 / README Status | dev-fixer #122/#125 (default-off prototype + no-wrong-verdict proof + RSS delta); fleet-scale = bench #116 | #122/#125 RSS-delta + #116 fleet curve PENDING; **inv-7: never write "enabled by"/"depends on" the structural-trigger** |
 | v0-only vs v0+v0.1 framing | README Status / BLOG Roadmap / title | operator (CWDL/#101) | scope decision |
 
@@ -218,6 +232,19 @@ confirmed, leave the rest), a single-source estimate is **not**.
    sources **composed not conflated**. Quoting only −20% under-sells;
    quoting −56/−78 as the default over-sells. This *reinforces*
    inv-3 (the −20% default is the opposite of "lean by default").
+   - **Appended LOAD-BEARING constraint — the −56% rung's
+     latency-inversion is n=1-scoped and the scope MUST travel with
+     the number** (same enforcement class as the inv-7 `.rs`≈0%
+     Rust-lexer caveat). dogfood #126 field-verify (real
+     38-`view!`-site Leptos): proc-macro-off is safety-CONFIRMED (no
+     false-GREEN) **and** ≈5× faster-not-slower to RED (5.1s vs
+     25.8s; mechanistically expected — proc-macro `view!` expansion
+     was on the verdict critical-path). The launch claim is exactly
+     *"no latency penalty observed; faster on macro-heavy projects
+     (n=1, direction unambiguous + mechanistically expected)"* —
+     **NEVER an unqualified "proc-macro-off is faster" or a universal
+     speedup guarantee.** Any sentence stating the −56% latency
+     benefit without the n=1-macro-heavy scope is a violation.
 
 If executing this map would require violating 1-8, **stop and
 re-confirm with the lead** — the frame composes with the honest work;
@@ -243,7 +270,11 @@ story.
    the trigger (D) to the 2× CPU headline (A) or to Tier-4 idle-evict
    (C) ("enabled by"/"depends on"/"makes safe" the trigger = a
    violation); inv-8 — RAM appears only as the tiered ladder with
-   per-rung gates, never a lone default number**.
+   per-rung gates, never a lone default number, **and any sentence
+   asserting the −56% rung's latency benefit without the
+   n=1-macro-heavy scope (an unqualified "proc-macro-off is faster" /
+   universal speedup) is a violation — the scope must travel with the
+   number**.
 4. Run the EXECUTION.md self-gate checklist (docs-only ⇒ no rustfmt;
    confirm pure-`.md` change set).
 5. One commit, conventional message, `Co-Authored-By` trailer; report
