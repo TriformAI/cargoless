@@ -183,6 +183,50 @@ pub struct Model {
     /// the initial spawn). Bounded by retain-on-send like the verdict
     /// channels so a dropped subscriber does not stall the producer.
     lifecycle_subscribers: Vec<Sender<LifecycleEvent>>,
+    /// #126 Tier-3 bench/dogfood hook: count of `publishDiagnostics`
+    /// folds where RA-native `severity:Error` was *demoted* out of the
+    /// authoritative RED set (proc-macro-off downrank engaged). `0`
+    /// when `TF_RA_PROCMACRO_OFF` is unset (default-off ⇒ F8-redo
+    /// any-source rule, byte-identical). Lets bench-lead correlate the
+    /// RSS delta with the false-RED-suppression actually firing.
+    procmacro_downranked: u64,
+}
+
+/// #126 Tier-3 — the per-file authoritative-RED decision, factored
+/// pure (no env, no `self`) so both modes are unit-tested
+/// deterministically (the #88 discipline: isolate the env read, test
+/// the logic). Returns `(file_state, native_downranked)`.
+///
+/// When `downrank == false` (default-off) this is the F8-redo (#55)
+/// rule: ANY-source `severity:Error` ⇒ `Red` (RA-native parse errors
+/// are real "cannot compile" evidence that beat cargo-check to the
+/// punch). When `downrank == true` (`TF_RA_PROCMACRO_OFF=1`) RA
+/// proc-macro is forced off, so RA-native hallucinates "unresolved"
+/// for every macro-generated item — RED is driven from the
+/// `source:"rustc"` (cargo-check) tier ONLY (`has_authoritative_error`).
+/// cargo-check expands proc-macros itself, RA-independently, so it
+/// stays the complete authority; RA-native is demoted to advisory
+/// (still in `native`/diagnostics, just not verdict-driving).
+/// `native_downranked` is `true` iff there WERE any-source errors but
+/// NO authoritative one — i.e. this fold's RED was suppressed-as-false
+/// (the bench/dogfood signal that the −53 % RAM mode is firing safely).
+fn file_state_for(pd: &crate::lsp::PublishDiagnostics, downrank: bool) -> (FileState, bool) {
+    if downrank {
+        let st = if pd.has_authoritative_error() {
+            FileState::Red
+        } else {
+            FileState::Green
+        };
+        let suppressed = pd.has_any_severity_error() && !pd.has_authoritative_error();
+        (st, suppressed)
+    } else {
+        let st = if pd.has_any_severity_error() {
+            FileState::Red
+        } else {
+            FileState::Green
+        };
+        (st, false)
+    }
 }
 
 impl Model {
@@ -198,6 +242,7 @@ impl Model {
             identity: Box::new(identity),
             diagnostics: BTreeMap::new(),
             lifecycle_subscribers: Vec::new(),
+            procmacro_downranked: 0,
         }
     }
 
@@ -243,6 +288,14 @@ impl Model {
     /// first authoritative pass is never interrupted by an eviction.
     pub fn flycheck_done(&self) -> bool {
         self.flycheck_done
+    }
+
+    /// #126 Tier-3 bench/dogfood hook: how many `publishDiagnostics`
+    /// folds had RA-native `severity:Error` demoted out of the
+    /// authoritative RED set (proc-macro-off downrank suppressing a
+    /// would-be false-RED). `0` while `TF_RA_PROCMACRO_OFF` is unset.
+    pub fn procmacro_downranked(&self) -> u64 {
+        self.procmacro_downranked
     }
 
     /// The full reported verdict incl. provenance. Additive (#21).
@@ -304,11 +357,16 @@ impl Model {
                 // (the bug evidence is real), but only flycheck-completion
                 // + zero errors can drive GREEN (the absence of evidence
                 // must be backed by cargo's fuller analysis).
-                let file_state = if pd.has_any_severity_error() {
-                    FileState::Red
-                } else {
-                    FileState::Green
-                };
+                // #126 Tier-3: pure decision (env isolated). In
+                // proc-macro-off downrank mode RED is rustc-source only
+                // (cargo-check = complete RA-independent authority);
+                // otherwise the F8-redo any-source rule. RA-native is
+                // never lost — it still flows to `native`/advisory/
+                // diagnostics below, just not the authoritative verdict.
+                let (file_state, downranked) = file_state_for(pd, crate::procmacro::enabled());
+                if downranked {
+                    self.procmacro_downranked += 1;
+                }
                 let native_state = if pd.advisory_errors > 0 {
                     FileState::Red
                 } else {
@@ -800,6 +858,15 @@ impl ModelSession {
         self.idle_evict_counters.snapshot()
     }
 
+    /// #126 Tier-3 bench/dogfood hook: count of RA-native severity:Error
+    /// folds demoted out of the authoritative verdict by the
+    /// proc-macro-off downrank (the false-RED-suppression firing). `0`
+    /// while `TF_RA_PROCMACRO_OFF` is unset (default-off, byte-
+    /// identical). Additive — touches no frozen seam.
+    pub fn procmacro_downranked(&self) -> u64 {
+        poisoned(&self.model).procmacro_downranked()
+    }
+
     /// Explicit graceful shutdown (also runs on drop).
     pub fn shutdown(mut self) {
         self.do_shutdown();
@@ -1111,6 +1178,54 @@ mod tests {
             total: ds.len(),
             diagnostics: ds,
         })
+    }
+
+    // -----------------------------------------------------------------
+    // #126 Tier-3 — file_state_for: proc-macro-off RA-native-downrank.
+    // Pure decision, env isolated (the #88 discipline); exhaustive.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn file_state_for_downrank_vs_f8redo_default() {
+        fn pd(auth: usize, adv: usize) -> crate::lsp::PublishDiagnostics {
+            crate::lsp::PublishDiagnostics {
+                uri: "file:///x.rs".into(),
+                authoritative_errors: auth,
+                advisory_errors: adv,
+                total: auth + adv,
+                diagnostics: Vec::new(),
+            }
+        }
+
+        // DEFAULT (downrank=false) — F8-redo #55: ANY-source error ⇒ Red,
+        // never "downranked". Byte-identical to pre-#126.
+        assert_eq!(file_state_for(&pd(0, 0), false), (FileState::Green, false));
+        assert_eq!(file_state_for(&pd(1, 0), false), (FileState::Red, false));
+        assert_eq!(
+            file_state_for(&pd(0, 1), false),
+            (FileState::Red, false),
+            "F8-redo: RA-native-only error still drives RED by default"
+        );
+
+        // DOWNRANK (proc-macro-off): rustc-source ONLY drives RED.
+        assert_eq!(file_state_for(&pd(0, 0), true), (FileState::Green, false));
+        assert_eq!(
+            file_state_for(&pd(1, 0), true),
+            (FileState::Red, false),
+            "no false-GREEN: a real cargo-check error still drives RED"
+        );
+        assert_eq!(
+            file_state_for(&pd(0, 1), true),
+            (FileState::Green, true),
+            "the fix: RA-native-only (proc-macro hallucination) is \
+             demoted — would-be false-RED suppressed + counted"
+        );
+        assert_eq!(
+            file_state_for(&pd(1, 1), true),
+            (FileState::Red, false),
+            "authoritative present ⇒ RED, NOT a suppression (rustc \
+             evidence is real; nothing was downranked away)"
+        );
     }
 
     fn mk_diag(
