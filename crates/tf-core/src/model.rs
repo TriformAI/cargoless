@@ -319,10 +319,13 @@ impl Model {
                     self.diagnostics
                         .insert(path.clone(), pd.diagnostics.clone());
                 }
-                // FileVerdict is the authoritative per-file settle.
+                // FileVerdict is the authoritative per-file settle —
+                // emits the broadened-per-#8-redo `file_state` (any
+                // severity:Error from any source → Red), matching the
+                // tree-derivation rule above.
                 self.emit(StateEvent::FileVerdict {
                     path,
-                    state: auth_state,
+                    state: file_state,
                 });
                 self.reconcile();
                 self.emit_advisory();
