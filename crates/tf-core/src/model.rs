@@ -97,6 +97,21 @@ pub struct Verdict {
     pub provenance: VerdictProvenance,
 }
 
+/// FIELD FINDING #6-NEG-A (#51): supervisor-lifecycle events surfaced to
+/// the CLI so the watch stream is never silent during an AC#6 transparent
+/// restart. Separate channel from [`StateEvent`] (which is the byte-frozen
+/// tf-proto seam — must NOT grow) and [`Verdict`] (which is the #21
+/// authoritative-vs-advisory verdict, not lifecycle). Additive only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleEvent {
+    /// AC#6's supervisor just respawned the rust-analyzer child after a
+    /// crash/kill. The next-verdict latency is "however long re-indexing
+    /// takes" — typically tens of seconds on a real project. Emitted ONCE
+    /// per transparent restart; NOT emitted on the initial spawn (the
+    /// bring-up line covers that).
+    AnalyzerRestarting,
+}
+
 // ---------------------------------------------------------------------------
 // Identity seam (unchanged, frozen)
 // ---------------------------------------------------------------------------
@@ -144,6 +159,13 @@ pub struct Model {
     /// rule (which still derives from `auth` + `flycheck_done`), just the
     /// human-facing detail the boolean verdict was hiding.
     diagnostics: BTreeMap<String, Vec<Diagnostic>>,
+    /// FIELD FINDING #6-NEG-A (#51) additive surface: lifecycle event
+    /// subscribers. Currently the only event is
+    /// [`LifecycleEvent::AnalyzerRestarting`] emitted by the watch
+    /// pipeline's `on_spawn` hook on every transparent RA restart (NOT on
+    /// the initial spawn). Bounded by retain-on-send like the verdict
+    /// channels so a dropped subscriber does not stall the producer.
+    lifecycle_subscribers: Vec<Sender<LifecycleEvent>>,
 }
 
 impl Model {
@@ -158,6 +180,7 @@ impl Model {
             advisory_subscribers: Vec::new(),
             identity: Box::new(identity),
             diagnostics: BTreeMap::new(),
+            lifecycle_subscribers: Vec::new(),
         }
     }
 
@@ -174,6 +197,23 @@ impl Model {
         let (tx, rx) = channel();
         self.advisory_subscribers.push(tx);
         rx
+    }
+
+    /// Subscribe to the supervisor-lifecycle stream (FIELD FINDING #6-NEG-A
+    /// / #51). Currently fires [`LifecycleEvent::AnalyzerRestarting`] once
+    /// per transparent RA restart. Additive — distinct from `subscribe()`
+    /// (the frozen StateEvent seam) and `subscribe_advisory()` (the #21
+    /// verdict provenance channel).
+    pub fn subscribe_lifecycle(&mut self) -> Receiver<LifecycleEvent> {
+        let (tx, rx) = channel();
+        self.lifecycle_subscribers.push(tx);
+        rx
+    }
+
+    /// Fan-out a lifecycle event to every live subscriber; prune dropped
+    /// ones. Producer is the watch pipeline's on_spawn hook.
+    pub(crate) fn emit_lifecycle(&mut self, ev: LifecycleEvent) {
+        self.lifecycle_subscribers.retain(|s| s.send(ev).is_ok());
     }
 
     /// Current AUTHORITATIVE aggregate verdict (frozen signature).
@@ -657,6 +697,14 @@ impl ModelSession {
         poisoned(&self.model).all_diagnostics()
     }
 
+    /// FIELD FINDING #6-NEG-A (#51): subscribe to supervisor-lifecycle
+    /// events. The CLI watch loop drains this on every iteration and prints
+    /// a stream signal so the user is never staring at silence during an
+    /// AC#6 transparent restart's 30-60s re-index window.
+    pub fn subscribe_lifecycle(&self) -> Receiver<LifecycleEvent> {
+        poisoned(&self.model).subscribe_lifecycle()
+    }
+
     /// Explicit graceful shutdown (also runs on drop).
     pub fn shutdown(mut self) {
         self.do_shutdown();
@@ -707,7 +755,22 @@ pub fn watch<I: IdentityProvider + 'static>(
     let hook_root = root_str.clone();
     let hook_model = Arc::clone(&model);
     let hook_current = Arc::clone(&current);
+    // FIELD FINDING #6-NEG-A (#51): per-watch counter of on_spawn calls.
+    // n == 0 ⇒ the initial spawn (covered by the CLI's bring-up line — no
+    // restart signal needed). n >= 1 ⇒ a transparent AC#6 restart after
+    // RA crashed/was killed; emit `LifecycleEvent::AnalyzerRestarting`
+    // BEFORE the LSP handshake starts (so the CLI sees the signal while
+    // the model is still cold).
+    let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_spawn_count = Arc::clone(&spawn_count);
     let on_spawn = move |child: &mut std::process::Child| {
+        let n = hook_spawn_count.fetch_add(1, Ordering::SeqCst);
+        if n > 0 {
+            // Transparent restart — tell the CLI so the stream doesn't go
+            // silent for the 30-60s reindex window. Emit BEFORE the
+            // handshake so a slow-handshake restart is visible immediately.
+            poisoned(&hook_model).emit_lifecycle(LifecycleEvent::AnalyzerRestarting);
+        }
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return;
         };
@@ -864,6 +927,50 @@ mod tests {
             message: msg.to_owned(),
             source: source.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn lifecycle_subscribers_receive_analyzer_restarting() {
+        // FIELD FINDING #6-NEG-A (#51) — the model's lifecycle bus
+        // delivers AnalyzerRestarting to every live subscriber, and a
+        // dropped subscriber does not panic the producer.
+        let mut m = model();
+        let r1 = m.subscribe_lifecycle();
+        {
+            let r2 = m.subscribe_lifecycle();
+            m.emit_lifecycle(LifecycleEvent::AnalyzerRestarting);
+            assert_eq!(
+                drain(&r1),
+                vec![LifecycleEvent::AnalyzerRestarting],
+                "r1 receives"
+            );
+            assert_eq!(
+                drain(&r2),
+                vec![LifecycleEvent::AnalyzerRestarting],
+                "r2 receives"
+            );
+        }
+        // r2 dropped; emit must not panic and r1 must still receive.
+        m.emit_lifecycle(LifecycleEvent::AnalyzerRestarting);
+        assert_eq!(drain(&r1).len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_no_emit_before_first_restart_is_silent() {
+        // Sanity: just constructing a model does NOT emit
+        // AnalyzerRestarting (that would falsely tell the CLI "restarting"
+        // when the analyzer hasn't even started). The on_spawn hook is
+        // responsible for the first-spawn-vs-restart distinction.
+        let mut m = model();
+        let rx = m.subscribe_lifecycle();
+        assert!(drain(&rx).is_empty(), "no lifecycle events on quiet model");
+        // The verdict bus also stays quiet — lifecycle and verdict are
+        // strictly separate channels.
+        m.apply_event(&LspEvent::FlycheckEnded);
+        assert!(
+            drain(&rx).is_empty(),
+            "flycheck-end is a verdict event, not a lifecycle event"
+        );
     }
 
     fn drain<T>(rx: &Receiver<T>) -> Vec<T> {
