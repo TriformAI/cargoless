@@ -75,16 +75,42 @@ class Tool:
     sum_tree: bool = True
 
 
-def build_tools(cargoless_bin: str) -> list[Tool]:
+def build_tools(
+    cargoless_bin: str,
+    cargoless_argv: list[str] | None = None,
+    cargoless_label: str = "cargoless",
+) -> list[Tool]:
+    """`cargoless_argv` overrides the cargoless invocation entirely
+    (program + args), so the AC#7 throughput A/B can measure the
+    distinct axes the report must keep separate:
+
+      * watch-path RA-verdict tier (4-way RA-polish A/B):
+          [bin, "watch"]                          (post-polish default)
+          [bin, "watch", "--proc-macro", "disabled"]  (max RA savings)
+          [bin, "watch", "--features", "csr"]     (narrowed features)
+        (pre-polish baseline is a separate substrate — 5aea5cc — not a
+        flag, because RA-polish lean InitOpts is always-on post-#74.)
+
+      * build-path artifact tier (the §4 CAS-dedupe apples-comparison):
+          [bin, "build", "--watch", "--out", <dir>]  vs trunk watch
+
+    `cargoless_label` tags the result so the report can table the
+    variants side-by-side without conflation (the lead's hard
+    requirement: a reader who conflates the axes draws the wrong
+    conclusion)."""
+    cl_argv = cargoless_argv if cargoless_argv else [cargoless_bin, "watch"]
     return [
         Tool(
-            name="cargoless",
-            argv=[cargoless_bin, "watch"],
+            name=cargoless_label,
+            argv=cl_argv,
             # Strict ready signals — post-compile banner only (verified
             # via the 4th/5th comparative-latency iteration debugging).
+            # `published ` covers build-mode; the GREEN banners cover
+            # watch-mode. ANSI-stripped before match (see strip_ansi).
             ready_patterns=[
                 "GREEN — tree compiles",
                 "GREEN — building",
+                "published ",
             ],
             sum_tree=True,
         ),
@@ -588,6 +614,23 @@ def main() -> int:
         default="all",
     )
     parser.add_argument("--log-dir", default="/tmp/cargoless-throughput-logs")
+    # AC#7 A/B knobs — override the cargoless invocation + tag it so the
+    # report tables the variants without conflation.
+    parser.add_argument(
+        "--cargoless-mode",
+        choices=[
+            "watch",            # post-polish default RA-verdict tier
+            "watch-no-pm",      # --proc-macro disabled (max RA savings)
+            "watch-csr",        # --features csr (narrowed feature set)
+            "build",            # build --watch --out (artifact/CAS tier)
+        ],
+        default="watch",
+    )
+    parser.add_argument(
+        "--cargoless-out",
+        default="bench/fixture/.cargoless-tput-out",
+        help="--out dir for --cargoless-mode=build",
+    )
     args = parser.parse_args()
 
     fixture = Path(args.fixture).resolve()
@@ -598,9 +641,33 @@ def main() -> int:
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    tools = build_tools(args.cargoless_bin)
+    # Resolve the cargoless invocation + label from --cargoless-mode.
+    cb = args.cargoless_bin
+    cl_out = str(Path(args.cargoless_out).resolve())
+    mode_argv = {
+        "watch": ([cb, "watch"], "cargoless"),
+        "watch-no-pm": (
+            [cb, "watch", "--proc-macro", "disabled"],
+            "cargoless-watch-no-pm",
+        ),
+        "watch-csr": (
+            [cb, "watch", "--features", "csr"],
+            "cargoless-watch-csr",
+        ),
+        "build": (
+            [cb, "build", "--watch", "--out", cl_out],
+            "cargoless-build",
+        ),
+    }
+    cl_argv, cl_label = mode_argv[args.cargoless_mode]
+    if args.cargoless_mode == "build":
+        Path(cl_out).mkdir(parents=True, exist_ok=True)
+
+    tools = build_tools(cb, cargoless_argv=cl_argv, cargoless_label=cl_label)
     if args.tool != "all":
-        tools = [t for t in tools if t.name == args.tool]
+        # `--tool cargoless` selects whatever the mode-resolved label is.
+        want = cl_label if args.tool == "cargoless" else args.tool
+        tools = [t for t in tools if t.name == want]
 
     print("=== cargoless throughput bench (AC#7 reframed: CPU/RAM) ===")
     print(f"fixture:       {fixture}")
