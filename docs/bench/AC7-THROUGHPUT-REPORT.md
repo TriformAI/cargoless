@@ -775,6 +775,89 @@ floor.
 
 ---
 
+## 9. Structural-trigger fired-check-reduction (#112 stage-1) — DELIVERED
+
+The §8.6 agent-edit-batch frame's quantification, measured through
+**dev-fixer's real structural-trigger seam @ `11519e6`**
+(`TF_STRUCTURAL_TRIGGER=1`; `ModelSession::structural_counters() ->
+(settled, closed)` read at the genuine `model::watch()`
+notify→debounce→coalesce→`structural.record(all_closed)` site).
+Harness: `crates/tf-core/tests/structural_trigger_bench.rs`
+(public-API tf-core integration test, RA-spawning, builder-pod;
+substrate `agent/bench-lead@280576b`, reps via the disclosed trace).
+
+**Metric:** `fired_check_reduction = 1 − (closed_batches /
+settled_batches)` — the fraction of authoritative cargo-checks the
+structural trigger would *eliminate* per agent-edit-batch (each
+eliminated check ≈ one full AC#7 ~3–7 s CPU authoritative check **and**
+an idle window the stage-2 idle-evict-RA RAM lever can exploit).
+
+### 9.1 Result — a disclosed spectrum, NOT a single number
+
+`is_closed` is a pure syntactic balance scan, so the metric is
+deterministic given the trace ⇒ reported as a spectrum over three
+**fixed, fully-disclosed** agent-behaviour profiles (20 atomic
+whole-file Write batches each; OPEN = interrupted/truncated/mid-string
+draft; CLOSED = balanced; incl. split-multi-file in both states):
+
+| Profile (disclosed OPEN-design) | settled | closed | **fired-check-reduction** |
+|---|---:|---:|---:|
+| CONSERVATIVE (~10 % open — agents almost always Write whole balanced files) | 20 | 19 | **5.0 %** |
+| MODERATE (~30 % open — routine iterative drafting / interrupted tool calls) | 20 | 15 | **25.0 %** |
+| AGGRESSIVE-DRAFT (~50 % open — heavy skeleton-then-fill multi-file authoring) | 20 | 11 | **45.0 %** |
+
+Test **passed** (1/1); wall 73 s.
+
+### 9.2 Seam validation (this is the launch-relevant proof)
+
+`settled == 20` for **every** profile = the debounce pipeline
+coalesced exactly one settle per agent-edit-batch — **the
+notify→debounce→`structural.record` wiring is real and live, not
+dormant/theoretical**. The reduction is **monotone** across the
+disclosed OPEN-fractions (5 % → 25 % → 45 %) = the seam genuinely
+tracks per-batch syntactic closedness. The test asserts these seam
+properties (settled>0; monotone) — it does **not** assert a favourable
+number; the figures are reported, never gated.
+
+### 9.3 Honest reading (operator-actionable)
+
+The structural trigger eliminates a fraction of authoritative checks
+**≈ the agent-OPEN-batch fraction** — i.e. exactly the rate at which
+agents land syntactically-incomplete intermediate whole-file Writes
+(interrupted tool calls, skeleton-before-body, mid-string truncation).
+The realised reduction is slightly below the nominal OPEN-design
+(5 vs ~10, 25 vs ~30, 45 vs ~50 %) because the real `is_closed`
+predicate classified a few "open-intended" drafts as still
+syntactically balanced — **reported as the seam actually recorded it,
+not as designed** (same disclosure discipline as the rest of this
+report).
+
+**The launch number is not ours to pick — it is the dogfood-observed
+agent broken-intermediate rate mapped onto this validated bracket.**
+Decision input for v0-default-vs-v0.1 (#101): if the field rate is
+conservative (~10 %) the CPU saving is modest (~5 %) and the trigger
+is a v0.1 nicety; if moderate-to-aggressive (≥30 %) it is a material
+(~25–45 %) per-edit CPU cut **and** the enabler for idle-evict RAM
+reclamation (the operator's #1, stage-2). Combined with the §8.5
+two-source ~2× CPU-win vs trunk and the §8.6 conservative-floor
+framing, stage-1 says: cargoless's green-edge/structural model has a
+*tunable, real, seam-validated* additional CPU lever whose magnitude
+scales with exactly the workload cargoless is built for (agents).
+
+### 9.4 Stage-2 (per-tier RSS-delta) — queued
+
+Per the lead's two-stage split, stage-2 (per-tier RSS-delta vs the
+§8.5 two-source ~2.0–2.3 GB baseline, for dev-fixer's #114 RAM tiers:
+allocator/jemalloc, lru-cap + #74-knobs-default, proc-macro-off-default,
+idle-evict-RA) is double-gated on the lead's "tiers-ready @ &lt;sha&gt;"
+relay and runs as a SECOND pass on the same harness shape. Its
+combined {fired-check-reduction, per-tier RSS-delta} is what reshapes
+the held launch-scope (a material RSS drop shrinks/removes the §7
+honest-RSS-caveat rather than merely `--features`-mitigating it). Not
+blocking — stage-1 above is the gating CPU datum and is DELIVERED.
+
+---
+
 ## Appendix A: invocation reproducer
 
 ```bash
