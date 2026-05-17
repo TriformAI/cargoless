@@ -34,8 +34,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
+use cargoless_proto::{Diagnostic, Severity};
 use serde_json::{Value, json};
-use tf_proto::{Diagnostic, Severity};
 
 // ---------------------------------------------------------------------------
 // RA weight-shedding initializationOptions (#74)

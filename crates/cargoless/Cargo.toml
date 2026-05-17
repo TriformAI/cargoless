@@ -2,10 +2,11 @@
 # D1 RESOLVED 2026-05-17 (operator decision; Plane CWDL-12 / D-RELEASE §8 #1
 # + §8 #3 crate-name, both CLOSED): the shipping product name is `cargoless`
 # (incumbent working name — uniquely free across crates.io/GitHub/npm/pypi
-# per the D1-NAME-RECON evidence bundle). Only this published binary crate
-# is renamed; internal libs (tf-proto/tf-cas/tf-core) stay tf-* per
-# NAMING-DRIFT-INVENTORY Tier C. Crate directory stays crates/tf-cli/
-# (internal path; only [package] name + [[bin]] name are user-facing).
+# per the D1-NAME-RECON evidence bundle). #97 (operator override of
+# NAMING-DRIFT-INVENTORY Tier C): the internal libs are ALSO renamed to
+# the single brand token — cargoless-{proto,cas,core} — and this crate's
+# directory moved crates/tf-cli/ → crates/cargoless/ ([package]/[[bin]]
+# name was already `cargoless` from #87). One-token brand everywhere.
 # Phase-B `version.workspace = true` preserved unchanged below.
 name = "cargoless"
 version.workspace = true  # CWDL-71 Phase B: inherits from [workspace.package]
@@ -19,8 +20,8 @@ description = "The cargoless binary (v0 headless). Subcommands: check, watch, bu
 workspace = true
 
 # `integration` gates the REAL `build --watch` publisher-drive wiring into
-# build-cas's `tf_core::build::{BuildOrchestrator,read_latest_green}` +
-# `tf_proto::PublishedArtifact`. Now DEFAULT (post-#29 convergence + post-#42
+# build-cas's `cargoless_core::build::{BuildOrchestrator,read_latest_green}` +
+# `cargoless_proto::PublishedArtifact`. Now DEFAULT (post-#29 convergence + post-#42
 # main convergence): the integration symbols are resolved on current main, so
 # the prior "off by default until convergence" workaround is obsolete. Closes
 # F4 footgun where `cargo install <pubname>` (without `--features integration`)
@@ -54,7 +55,7 @@ name = "cargoless"
 path = "src/main.rs"
 
 [dependencies]
-tf-core = { path = "../tf-core", version = "0.0.0" }  # publish-ready
+cargoless-core = { path = "../cargoless-core", version = "0.0.0" }  # publish-ready
 
 # ──────────────────────────────────────────────────────────────────────────
 # cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)

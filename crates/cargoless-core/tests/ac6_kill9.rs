@@ -15,7 +15,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tf_core::analyzer::Supervisor;
+use cargoless_core::analyzer::Supervisor;
 
 fn sleeper() -> std::io::Result<std::process::Child> {
     Command::new("sleep")

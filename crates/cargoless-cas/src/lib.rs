@@ -32,7 +32,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use tf_proto::InputHash;
+use cargoless_proto::InputHash;
 
 /// A store that maps an [`InputHash`] to opaque artifact bytes.
 pub trait ContentStore {

@@ -379,7 +379,7 @@ pub struct Diagnostic {
 
 /// The rich one-shot check verdict: the existing boolean [`TreeState`] paired
 /// with the full diagnostic list a user needs to fix a red tree. Returned by
-/// the adjacent `tf_core::model::check_once_with_diagnostics`; existing
+/// the adjacent `cargoless_core::model::check_once_with_diagnostics`; existing
 /// callers of [`TreeState`]-returning APIs (`check_once`, frozen for cli-ux
 /// and the bench harness) are byte-unaffected.
 #[derive(Debug, Clone, PartialEq, Eq)]

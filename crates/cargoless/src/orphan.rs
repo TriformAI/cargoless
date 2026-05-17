@@ -31,7 +31,7 @@
 //! the prior behavior there, documented rather than silently wrong.
 //!
 //! libc-free: the `getppid` extern is declared locally, matching the
-//! house style of the `kill` extern in `tf_core::analyzer` (#44) —
+//! house style of the `kill` extern in `cargoless_core::analyzer` (#44) —
 //! the workspace dep tree stays minimal by deliberate policy.
 
 /// Parent-liveness probe. Construct once at watch/build startup with
@@ -87,7 +87,7 @@ fn current_ppid() -> i32 {
         // SAFETY: getppid(2) is documented async-signal-safe + has no
         // failure mode (always succeeds, returns the parent pid).
         // Local extern keeps `libc` out of the workspace dep tree —
-        // same pattern as the `kill` extern in tf_core::analyzer (#44).
+        // same pattern as the `kill` extern in cargoless_core::analyzer (#44).
         unsafe {
             unsafe extern "C" {
                 fn getppid() -> i32;

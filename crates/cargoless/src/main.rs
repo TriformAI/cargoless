@@ -48,14 +48,14 @@ struct Opts {
     out: Option<PathBuf>,
     /// FIELD FINDING #5 (#49): user-tunable file-watcher debounce quiet
     /// window in milliseconds. Plumbed into the live watch/build pipeline
-    /// by exporting `TF_DEBOUNCE_MS` before invoking `tf_core::model::watch`
+    /// by exporting `TF_DEBOUNCE_MS` before invoking `cargoless_core::model::watch`
     /// — keeps the `watch()` signature byte-frozen (the env-var idiom
     /// matches `TF_CHECK_TIMEOUT_SECS` from #21/#43).
     debounce_ms: Option<u64>,
     /// #74 RA weight-shedding: `auto` (default; Cargo.toml scan picks
     /// per-project), `enabled` (force on — proc-macro projects), or
     /// `disabled` (force off — non-proc-macro projects, max savings).
-    /// Plumbed via `TF_PROC_MACRO` env to `tf_core::lsp::InitOpts`.
+    /// Plumbed via `TF_PROC_MACRO` env to `cargoless_core::lsp::InitOpts`.
     proc_macro: Option<String>,
     /// #74 RA weight-shedding: cargo features to enable in RA's
     /// cargo-check invocation. Comma-separated. Default (when unset):
@@ -146,7 +146,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
 }
 
 fn usage() {
-    println!("{}", tf_core::build_id());
+    println!("{}", cargoless_core::build_id());
     println!();
     println!("USAGE: cargoless <COMMAND> [FLAGS]");
     println!();
@@ -212,7 +212,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Cmd::Version => {
-            println!("{}", tf_core::build_id());
+            println!("{}", cargoless_core::build_id());
             return ExitCode::SUCCESS;
         }
         _ => {}
@@ -235,7 +235,7 @@ fn main() -> ExitCode {
     };
 
     // FIELD FINDING #5 (#49): the `--debounce-ms` flag (when given) is
-    // plumbed to `tf_core::model::watch` via the `TF_DEBOUNCE_MS` env var,
+    // plumbed to `cargoless_core::model::watch` via the `TF_DEBOUNCE_MS` env var,
     // keeping the frozen `watch()` signature unchanged. Idiomatic match to
     // `TF_CHECK_TIMEOUT_SECS` (the #21/#43 path). Setting an env var from
     // a CLI is process-local; no risk of leaking outward.
@@ -247,7 +247,7 @@ fn main() -> ExitCode {
         }
     }
     // #74 RA weight-shedding knobs — same pattern as TF_DEBOUNCE_MS:
-    // CLI flag exports the env var, tf_core::lsp::InitOpts reads it in
+    // CLI flag exports the env var, cargoless_core::lsp::InitOpts reads it in
     // `from_env_and_project`. Keeps tf-core's API surface stable.
     if let Some(pm) = parsed.opts.proc_macro.as_deref() {
         unsafe {

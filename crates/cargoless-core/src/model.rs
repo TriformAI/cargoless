@@ -1,7 +1,7 @@
 //! File-level green/red model + event bus, with #21 verdict provenance.
 //!
 //! The daemon's single source of truth for "what works". It folds the
-//! per-file diagnostics from [`crate::lsp`] into the `tf_proto` contract:
+//! per-file diagnostics from [`crate::lsp`] into the `cargoless_proto` contract:
 //! level-triggered [`StateEvent::FileVerdict`] and edge-triggered
 //! [`StateEvent::BecameGreen`] / [`StateEvent::BecameRed`].
 //!
@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tf_proto::{
+use cargoless_proto::{
     BuildIdentity, CheckResult, ContentHash, Diagnostic, FileState, Profile, StateEvent,
     TargetTriple, TreeState,
 };
@@ -95,7 +95,7 @@ fn resolve_watch_debounce() -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// #21 additive provenance types (tf_core::model, serde-free — NOT tf-proto)
+// #21 additive provenance types (cargoless_core::model, serde-free — NOT tf-proto)
 // ---------------------------------------------------------------------------
 
 /// Where a verdict's authority comes from.
@@ -960,7 +960,7 @@ mod tests {
         let mut auth = 0usize;
         let mut adv = 0usize;
         for d in &ds {
-            if d.severity == tf_proto::Severity::Error {
+            if d.severity == cargoless_proto::Severity::Error {
                 if d.source.as_deref() == Some("rustc") {
                     auth += 1;
                 } else {
@@ -981,7 +981,7 @@ mod tests {
         path: &str,
         line: u32,
         col: u32,
-        sev: tf_proto::Severity,
+        sev: cargoless_proto::Severity,
         code: Option<&str>,
         msg: &str,
         source: Option<&str>,
@@ -1329,7 +1329,7 @@ mod tests {
                 "/p/src/a.rs",
                 10,
                 3,
-                tf_proto::Severity::Error,
+                cargoless_proto::Severity::Error,
                 Some("E0277"),
                 "the trait bound not satisfied",
                 Some("rustc"),
@@ -1341,7 +1341,7 @@ mod tests {
                 "/p/src/b.rs",
                 1,
                 1,
-                tf_proto::Severity::Warning,
+                cargoless_proto::Severity::Warning,
                 Some("unused_imports"),
                 "unused import",
                 Some("rust-analyzer"),
@@ -1369,7 +1369,7 @@ mod tests {
                 "/p/src/a.rs",
                 1,
                 1,
-                tf_proto::Severity::Error,
+                cargoless_proto::Severity::Error,
                 Some("E0277"),
                 "first",
                 Some("rustc"),
@@ -1383,7 +1383,7 @@ mod tests {
                 "/p/src/a.rs",
                 2,
                 2,
-                tf_proto::Severity::Error,
+                cargoless_proto::Severity::Error,
                 Some("E0308"),
                 "second",
                 Some("rustc"),
@@ -1406,7 +1406,7 @@ mod tests {
                 "/p/src/a.rs",
                 1,
                 1,
-                tf_proto::Severity::Error,
+                cargoless_proto::Severity::Error,
                 Some("E0277"),
                 "x",
                 Some("rustc"),
@@ -1432,7 +1432,7 @@ mod tests {
                 "/p/z.rs",
                 1,
                 1,
-                tf_proto::Severity::Error,
+                cargoless_proto::Severity::Error,
                 None,
                 "z",
                 Some("rustc"),
@@ -1444,7 +1444,7 @@ mod tests {
                 "/p/a.rs",
                 1,
                 1,
-                tf_proto::Severity::Error,
+                cargoless_proto::Severity::Error,
                 None,
                 "a",
                 Some("rustc"),

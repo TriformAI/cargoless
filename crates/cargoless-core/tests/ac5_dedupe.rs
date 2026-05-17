@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, io};
 
-use tf_core::LocalDiskStore;
-use tf_core::build::{BuildOrchestrator, Compiler, assemble_identity};
-use tf_core::{BuildOutcome, BuildTrigger, Profile, TargetTriple};
+use cargoless_core::LocalDiskStore;
+use cargoless_core::build::{BuildOrchestrator, Compiler, assemble_identity};
+use cargoless_core::{BuildOutcome, BuildTrigger, Profile, TargetTriple};
 
 /// A stand-in for `trunk build` that records how many times it actually ran.
 /// The whole point of AC#5 is that this counter does **not** advance on a
@@ -34,7 +34,7 @@ impl Compiler for CountingCompiler {
     fn compile(
         &self,
         _project_root: &Path,
-        _identity: &tf_core::BuildIdentity,
+        _identity: &cargoless_core::BuildIdentity,
     ) -> Result<Vec<u8>, String> {
         let n = self.runs.fetch_add(1, Ordering::SeqCst) + 1;
         // Deterministic "artifact" so a cache hit and a fresh compile are
