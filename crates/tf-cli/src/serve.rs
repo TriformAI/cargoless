@@ -1,38 +1,55 @@
 //! `serve` — the headline command and the **AC#1** proof.
 //!
-//! Decision **D-A1** redefines AC#1: on a clean machine, zero config, `serve`
-//! must bring the daemon up + auto-detect the project + serve a holding page
-//! within 30s (NOT a finished app — a cold Leptos build is minutes). This
-//! module does exactly that and nothing it cannot honestly back:
+//! Decision **D-A1**: zero config, `serve` brings the daemon up + auto-detects
+//! the project + serves a holding page within 30s (NOT a finished app — a
+//! cold Leptos build is minutes).
 //!
-//! 1. bind the holding page immediately (sub-second first paint),
-//! 2. write the status file (so `status` works),
-//! 3. start the rust-analyzer supervisor — best-effort; a missing RA degrades
-//!    to "no verdicts yet", it never blocks the holding page (AC#1),
-//! 4. start the filesystem watcher and report coalesced change batches.
+//! ## Two paths, one contract (the `integration` feature)
 //!
-//! The verdict → build → browser-reload tail of the loop is intentionally a
-//! marked seam: the green/red model, build trigger, and never-serve-red
-//! WebSocket server are daemon-core/devserver deliverables not yet on `main`.
-//! `tf-cli` does not edit `tf-core`; when those public entrypoints land this
-//! loop consumes a `StateEvent` stream and drives `holding.set_phase` /
-//! hand-off to the real server. The structure here is additive for that.
+//! * default (feature off) — the standalone bring-up cli-ux fully owns and
+//!   ships green today: own std holding server ([`crate::holding`]) +
+//!   RA supervisor + filesystem watcher. AC#1 satisfied by cli-ux directly.
+//! * `--features integration` — the **single-server** design the lead
+//!   decided: there is *no* holding→server handoff. `tf_core::server::
+//!   DevServer` owns the port and serves its *own* cold-start holding page
+//!   (with the reload shim) until first-green, then swaps to the artifact.
+//!   cli-ux runs NO second server. We construct the DevServer, `spawn` it
+//!   (binds synchronously — that is the AC#1 moment), and drive it from
+//!   daemon-core's model `StateEvent` stream.
+//!
+//! Wired against devserver's frozen surface (`agent/devserver` @ 6d4b5f8 /
+//! `agent/devserver-bundle` @ a8d063b): `DevServer::new(Arc<S: ContentStore>)`,
+//! `spawn(self, SocketAddr) -> io::Result<ServerHandle>`, `ServerHandle::
+//! {local_addr,notify_state,notify_build,has_green,tree_is_red,shutdown}`.
+//!
+//! The model drive (`tf_core::model::watch` → `handle.notify_state`) is the
+//! one piece still pending daemon-core's `IdentityProvider` signature
+//! clarification; until that lands the integration path stands the DevServer
+//! up (AC#1 holds — it serves its own holding page) and parks, rather than
+//! guessing a signature. That fill is localized to one block.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+#[cfg(not(feature = "integration"))]
 use tf_core::watcher;
 
 use crate::config::Config;
+#[cfg(not(feature = "integration"))]
 use crate::holding::{HoldingServer, Phase};
 use crate::status::{self, DaemonStatus};
 use crate::ui;
 
-/// AC#1 budget. We never approach this (bind + watcher start are
+/// AC#1 budget. We never approach this (bind + watcher/spawn are
 /// milliseconds), but asserting it in the bring-up makes a future regression
 /// that *does* (e.g. a blocking RA probe) loud instead of silent.
 const BRINGUP_BUDGET: Duration = Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------
+// Default path (feature off) — standalone bring-up, ships green.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "integration"))]
 pub fn run(cfg: &Config) -> ExitCode {
     let t0 = Instant::now();
     ui::step(format!(
@@ -84,8 +101,7 @@ pub fn run(cfg: &Config) -> ExitCode {
             ui::warn(
                 "rust-analyzer not found — holding page is up but verdicts \
                  are disabled. Install it: `rustup component add \
-                 rust-analyzer`."
-                    .to_string(),
+                 rust-analyzer`.",
             );
             None
         }
@@ -105,28 +121,12 @@ pub fn run(cfg: &Config) -> ExitCode {
     };
     ui::ok(format!("watching {}", cfg.root.display()));
 
-    let bringup = t0.elapsed();
-    if bringup <= BRINGUP_BUDGET {
-        ui::ok(format!(
-            "daemon up in {:.2}s (AC#1 budget {}s) — serving {url}",
-            bringup.as_secs_f64(),
-            BRINGUP_BUDGET.as_secs()
-        ));
-    } else {
-        // Should be impossible; loud if it ever happens.
-        ui::warn(format!(
-            "bring-up took {:.2}s, over the {}s AC#1 budget — investigate.",
-            bringup.as_secs_f64(),
-            BRINGUP_BUDGET.as_secs()
-        ));
-    }
+    report_bringup(t0, &url);
     server.set_phase(Phase::Building);
-    ui::wait("Ctrl-C to stop. Watching for changes…".to_string());
+    ui::wait("Ctrl-C to stop. Watching for changes…");
 
-    // The change loop. Today: report coalesced batches (the watcher already
-    // debounces + ignore-filters). SEAM: when tf-core exposes the verdict
-    // stream, each batch's resulting StateEvent drives `server.set_phase`
-    // (Red holds last-green per AC#4) and the build trigger.
+    // The change loop. SEAM: the integration path replaces this whole
+    // standalone bring-up with the DevServer + model stream.
     loop {
         match changes.recv() {
             Ok(batch) => {
@@ -137,13 +137,136 @@ pub fn run(cfg: &Config) -> ExitCode {
                 ));
             }
             Err(_) => {
-                // Watcher thread gone (shutdown / fatal). Don't leave a ghost
-                // status file behind for `status` to misreport.
                 status::clear_status(&cfg.root);
-                ui::warn("watcher stopped — exiting.".to_string());
+                ui::warn("watcher stopped — exiting.");
                 return ExitCode::from(1);
             }
         }
+    }
+}
+
+#[cfg(not(feature = "integration"))]
+fn report_bringup(t0: Instant, url: &str) {
+    let bringup = t0.elapsed();
+    if bringup <= BRINGUP_BUDGET {
+        ui::ok(format!(
+            "daemon up in {:.2}s (AC#1 budget {}s) — serving {url}",
+            bringup.as_secs_f64(),
+            BRINGUP_BUDGET.as_secs()
+        ));
+    } else {
+        ui::warn(format!(
+            "bring-up took {:.2}s, over the {}s AC#1 budget — investigate.",
+            bringup.as_secs_f64(),
+            BRINGUP_BUDGET.as_secs()
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integration path (feature on) — single-server: DevServer owns the port.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "integration")]
+pub fn run(cfg: &Config) -> ExitCode {
+    use std::net::ToSocketAddrs;
+    use std::sync::Arc;
+
+    let t0 = Instant::now();
+    ui::step(format!(
+        "cargoless {} — {}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.detection.describe()
+    ));
+
+    // Single-server (lead's decision): DevServer IS the holding page. The CAS
+    // store is the production `ArtifactProvider` path; `tf_core::LocalDiskStore`
+    // satisfies `DevServer::new`'s `S: ContentStore + Send + Sync + 'static`.
+    let store = Arc::new(tf_core::LocalDiskStore::new(cfg.cache_dir.clone()));
+    let dev = tf_core::server::DevServer::new(store);
+
+    let Some(addr) = (cfg.host.as_str(), cfg.port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
+        ui::error(format!(
+            "could not resolve bind address {}:{} — set `[serve] host`/`port` \
+             in tf.toml to a literal address.",
+            cfg.host, cfg.port
+        ));
+        return ExitCode::from(2);
+    };
+
+    // `spawn` binds the TcpListener synchronously: on Ok it is already
+    // listening (this is the AC#1 "up + holding page" moment — DevServer
+    // serves its own cold-start page with the reload shim).
+    let handle = match dev.spawn(addr) {
+        Ok(h) => h,
+        Err(e) => {
+            ui::error(format!(
+                "could not bind http://{}:{} ({e}). Port in use (another \
+                 cargoless / dev server)? Set `[serve] port` in tf.toml.",
+                cfg.host, cfg.port
+            ));
+            return ExitCode::from(1);
+        }
+    };
+    let bound = handle.local_addr();
+    ui::ok(format!("holding page live at http://{bound}"));
+
+    status::write_status(
+        &cfg.root,
+        &DaemonStatus {
+            pid: std::process::id(),
+            host: cfg.host.clone(),
+            port: bound.port(),
+            detection: cfg.detection.describe().to_string(),
+            latest_green: None,
+        },
+    );
+
+    let bringup = t0.elapsed();
+    if bringup <= BRINGUP_BUDGET {
+        ui::ok(format!(
+            "daemon up in {:.2}s (AC#1 budget {}s) — serving http://{bound}",
+            bringup.as_secs_f64(),
+            BRINGUP_BUDGET.as_secs()
+        ));
+    } else {
+        ui::warn(format!(
+            "bring-up took {:.2}s, over the {}s AC#1 budget — investigate.",
+            bringup.as_secs_f64(),
+            BRINGUP_BUDGET.as_secs()
+        ));
+    }
+
+    // MODEL DRIVE — the one block pending daemon-core's `IdentityProvider`
+    // signature (asked; not guessing). When confirmed, this becomes:
+    //
+    //   let (session, events) =
+    //       tf_core::model::watch(&cfg.root, <IdentityProvider per daemon-core>)?;
+    //   for ev in events {                       // std::sync::mpsc::Receiver
+    //       handle.notify_state(&ev);            // AC#4: Red only flips status
+    //       // first BecameGreen ⇒ DevServer auto-reloads to the artifact;
+    //       // status line + status-file latest_green updated from `ev`
+    //       //   / session.tree_state()
+    //   }
+    //
+    // DevServer already satisfies AC#1 (its own holding page is live above),
+    // so the honest interim is to keep it serving and park — not to fabricate
+    // an unconfirmed `watch` call. `handle` stays in scope (Drop = clean stop).
+    ui::step(format!(
+        "DevServer state: has_green={}, tree_is_red={} (cold start)",
+        handle.has_green(),
+        handle.tree_is_red()
+    ));
+    ui::wait(
+        "DevServer up and serving its holding page. Model-drive wiring is \
+         pending daemon-core's IdentityProvider signature — Ctrl-C to stop.",
+    );
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 
