@@ -75,12 +75,33 @@ fn print_diagnostics(root: &Path, diags: &[tf_core::Diagnostic]) {
 
 pub fn run(cfg: &Config) -> ExitCode {
     let t0 = Instant::now();
+    // §gap-3 / #89: read the single canonical identity from
+    // `tf_core::BUILD_ID` instead of building a second "cargoless
+    // {ver}" banner off CARGO_PKG_VERSION here. Before #89 this line
+    // was the divergent site — `--version` said "tf-trunk {ver}" while
+    // this said "cargoless {ver}", same binary two names. One source
+    // now; the D1 rename is one literal in tf-core.
     ui::step(format!(
-        "cargoless {} — watching {} ({})",
-        env!("CARGO_PKG_VERSION"),
+        "{} — watching {} ({})",
+        tf_core::BUILD_ID,
         cfg.root.display(),
         cfg.detection.describe()
     ));
+
+    // FIELD FINDING #13a (#93): refuse a SECOND watcher on the same
+    // root. Two `cargoless watch` on one tree both heartbeat the
+    // `.cargoless/cli-status` file; pid flaps and `status` reports
+    // whichever wrote last. Checked HERE — before the costly
+    // rust-analyzer bring-up — so a refused start is instant. Only
+    // refuses against a *live* process that is *another instance of
+    // this binary*: stale files, dead pids, and pids recycled to some
+    // other program all proceed (never false-refuse a lone watcher).
+    if let statusfile::WatchAdmission::Refuse(c) =
+        statusfile::admission(&cfg.root, std::process::id())
+    {
+        ui::error(c.message());
+        return ExitCode::from(2);
+    }
 
     // `watch()` blocks on rust-analyzer's initialize handshake (seconds);
     // the first green waits on a cold cargo check (minutes) — that is fine,
@@ -133,6 +154,13 @@ pub fn run(cfg: &Config) -> ExitCode {
     // alongside the existing verdict events; mpsc Receivers aren't `Sync`,
     // so we keep them both in this single thread.
     let lifecycle = session.subscribe_lifecycle();
+    // FIELD FINDING #13b (#88): snapshot the parent pid BEFORE the loop.
+    // `tftrunk watch &` then closing the shell would otherwise leave
+    // this daemon orphaned, holding rust-analyzer + cargo + ~2GB RSS,
+    // until the user `pkill`s it by hand. Polled cheaply each loop
+    // iteration; on parent-death we run the same graceful shutdown the
+    // Disconnected path uses.
+    let parent = crate::orphan::ParentWatch::capture();
     ui::wait("Ctrl-C to stop. Streaming verdicts…");
 
     // Single-thread drain (Receiver is not Sync). recv_timeout = heartbeat:
@@ -149,6 +177,25 @@ pub fn run(cfg: &Config) -> ExitCode {
     // surfaced to the user inside one HEARTBEAT, even if the verdict
     // stream stays silent during the post-restart reindex window.
     loop {
+        // FIELD FINDING #13b (#88): parent-death check FIRST — if the
+        // shell that launched us is gone, do NOT keep running as a
+        // ~2GB orphan. Same graceful shutdown as the Disconnected
+        // path (session.shutdown() reaps RA via the AC#6 Supervisor +
+        // #44/#61 ReapOnDrop; statusfile::clear removes the ghost so a
+        // later `status` doesn't show F10-style live-for-a-dead-tree).
+        // Exit 0: this is a deliberate clean shutdown, not an error
+        // (and there's no parent left to read an exit code anyway).
+        if parent.orphaned() {
+            statusfile::clear(&root);
+            ui::warn(format!(
+                "{}parent process exited — shutting down so no orphaned \
+                 daemon is left holding rust-analyzer (FIELD FINDING #13b).",
+                stamp(t0)
+            ));
+            session.shutdown();
+            return ExitCode::SUCCESS;
+        }
+
         // Lifecycle drain — cheap, non-blocking, no allocations on the
         // empty path. Belongs OUTSIDE the verdict-event match because a
         // restart can fire while the verdict stream is mid-reindex-silence.

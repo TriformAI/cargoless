@@ -28,6 +28,7 @@
 //! against a scripted fake server too.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -35,6 +36,291 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::{Value, json};
 use tf_proto::{Diagnostic, Severity};
+
+// ---------------------------------------------------------------------------
+// RA weight-shedding initializationOptions (#74)
+//
+// rust-analyzer is configurable via LSP `initializationOptions`. By default
+// it does FAR more work than cargoless ever consumes: inlay hints, hover
+// actions, code lenses, cache priming, completion snippets, full-features
+// cargo check, all-targets cargo check, parallel-per-workspace-member
+// flycheck, etc. We use the publishDiagnostics stream and the
+// `$/progress` cargo-check end signal — full stop. Everything else is
+// resource waste on a tool whose pitch is throughput.
+//
+// `InitOpts` is the small shape the CLI threads through (proc-macro
+// enable/disable per-project, cargo features list). `lean_init_options()`
+// is the pure JSON builder unit-tested against the resulting nested key
+// shape; `detect_proc_macro()` is the pure Cargo.toml-scan implementing
+// the "auto" knob (default).
+//
+// Option B+ refinement (#74 lead clarification post-#48 design catch):
+// `checkOnSave` STAYS ENABLED. The F8-redo verdict architecture
+// (model::Model::authoritative_tree, ff1feaf) gates GREEN on flycheck
+// completion; disabling checkOnSave would break the verdict path. What
+// we DO soften is checkOnSave's subsettings: allTargets=false (lib+bin
+// only, skip tests/benches/examples); invocationStrategy=once +
+// invocationLocation=workspace (one cargo subprocess per workspace, not
+// per-member). Combined with the other 4 settings + honorable mentions
+// the expected RA resource reduction is 30-50%.
+// ---------------------------------------------------------------------------
+
+/// CLI/env-resolved options threaded into [`LspClient::initialize`].
+/// Constructed via [`InitOpts::from_env_and_project`] (mirrors the
+/// `TF_DEBOUNCE_MS` pattern from #49); tests construct directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitOpts {
+    /// Per-project resolved proc-macro server enable. Drives
+    /// `procMacro.enable` in the lean init options.
+    pub proc_macro_enabled: bool,
+    /// Cargo features to enable for RA's cargo-check invocation. Drives
+    /// `cargo.features` in the lean init options. Empty = RA picks default.
+    pub features: Vec<String>,
+}
+
+impl Default for InitOpts {
+    /// Safe defaults: proc-macros ON (most projects need them — the only
+    /// non-proc-macro-using projects are rare; defaulting OFF would
+    /// silently mis-analyze macro-heavy code), `features = []` (empty
+    /// list ⇒ RA invokes cargo WITHOUT `--features`, letting cargo
+    /// use its own default-feature behavior).
+    ///
+    /// **Why empty, not `["default"]`:** passing `--features default`
+    /// to cargo errors out on crates that don't define a `[features]`
+    /// table (the fixture in the F2 integration test is exactly this
+    /// shape — caught by self-gate). Empty list = "no override" =
+    /// safe across every cargo project. The CLI's `--features csr`
+    /// flag becomes a real opt-in override on top.
+    fn default() -> Self {
+        Self {
+            proc_macro_enabled: true,
+            features: Vec::new(),
+        }
+    }
+}
+
+impl InitOpts {
+    /// Read `TF_PROC_MACRO` (auto | enabled | disabled) + `TF_FEATURES`
+    /// (comma-separated) env vars, resolving "auto" via a Cargo.toml
+    /// scan at `project_root`. The CLI's `--proc-macro` /
+    /// `--features` flags set these env vars before invoking the daemon
+    /// path (same pattern as `TF_DEBOUNCE_MS` / `--debounce-ms` from
+    /// #49 — keeps `LspClient::initialize`'s signature stable across
+    /// callers that don't care about env).
+    pub fn from_env_and_project(project_root: &Path) -> Self {
+        let proc_macro_enabled = match std::env::var("TF_PROC_MACRO")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("enabled") | Some("on") | Some("true") | Some("1") => true,
+            Some("disabled") | Some("off") | Some("false") | Some("0") => false,
+            // "auto" or unset → Cargo.toml scan. False if the scan errors
+            // (defensive: avoid mis-enabling RA's heavy proc-macro server
+            // on a tree we can't read).
+            _ => detect_proc_macro(project_root).unwrap_or(false),
+        };
+        let features: Vec<String> = std::env::var("TF_FEATURES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            // Unset / parse-failure ⇒ empty list (let cargo use its
+            // own defaults). See InitOpts::default() rationale on why
+            // we do NOT default to `["default"]`.
+            .unwrap_or_default();
+        Self {
+            proc_macro_enabled,
+            features,
+        }
+    }
+}
+
+/// FIELD FINDING #74: "auto" proc-macro detector — scan `<root>/Cargo.toml`
+/// for any of the well-known proc-macro-bearing crate names (direct deps,
+/// dev-deps, build-deps, or workspace members) PLUS `[lib] proc-macro =
+/// true` (this crate itself emits proc macros).
+///
+/// Pure / shell-out-free: just `fs::read_to_string` + substring/heuristic
+/// matching. Returns `Ok(true)` if any signal hits, `Ok(false)` otherwise,
+/// `Err` only if Cargo.toml is absent or unreadable (caller defaults to
+/// false in that case — see [`InitOpts::from_env_and_project`]).
+pub fn detect_proc_macro(project_root: &Path) -> io::Result<bool> {
+    let cargo_toml = project_root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&cargo_toml)?;
+    Ok(cargo_toml_signals_proc_macro(&text))
+}
+
+/// Inner pure function — operates on Cargo.toml text. Pulled out so
+/// unit tests don't need a filesystem.
+pub(crate) fn cargo_toml_signals_proc_macro(text: &str) -> bool {
+    // Signal 1: [lib] proc-macro = true (this crate defines proc macros).
+    let mut in_lib_section = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_lib_section = name.trim() == "lib";
+            continue;
+        }
+        if in_lib_section && line.starts_with("proc-macro") && line.contains("true") {
+            return true;
+        }
+    }
+    // Signal 2: depends on a well-known proc-macro-bearing crate. The list
+    // is the lead's spec + the syn/quote/proc-macro2 trio that signals
+    // heavy proc-macro use even when the obvious culprits aren't direct
+    // deps. Per-line substring match on the dep-name token at the start
+    // of a key=…/key.* line (no full TOML parser needed — the false-
+    // positive cost on a name collision is acceptable, the false-negative
+    // cost on a real proc-macro project is "wrong RA state, harder to
+    // debug").
+    const KNOWN_PROC_MACRO_DEPS: &[&str] = &[
+        "leptos",
+        "serde_derive",
+        "tokio-macros",
+        "async-trait",
+        "derive_more",
+        "thiserror",
+        "syn",
+        "quote",
+        "proc-macro2",
+    ];
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = name.trim().to_string();
+            continue;
+        }
+        // Only check inside [*dependencies*] sections. A bare name match
+        // OUTSIDE a deps section would false-positive on `name = "syn"`
+        // in [package].
+        if !section.contains("dependencies") {
+            continue;
+        }
+        let key = line.split(['=', '.']).next().unwrap_or("").trim();
+        if KNOWN_PROC_MACRO_DEPS.contains(&key) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the full lean `initializationOptions` JSON for RA. Pure: takes
+/// the resolved [`InitOpts`], emits the JSON value the LSP `initialize`
+/// `params.initializationOptions` field carries.
+///
+/// Settings (post-Option B+ refinement on #1; see module-doc comment):
+///   1. checkOnSave: enabled (load-bearing for #21/F8-redo verdict),
+///      subsettings softened (allTargets/invocationStrategy/Location/
+///      features) for ~15-30% checkOnSave-cost reduction without
+///      breaking the verdict path.
+///   2. inlayHints.*: ALL DISABLED (cargoless never displays them).
+///   3. cachePriming.enable: false (skip eager startup analysis).
+///   4. procMacro.enable: from InitOpts.proc_macro_enabled (auto-detected
+///      from Cargo.toml or explicit per `tftrunk.proc-macro` knob).
+///   5. cargo.allFeatures: false + features: from InitOpts + workspace.
+///      symbol narrowed (only_types, workspace scope).
+///   + Honorable mentions: hover.actions, lens.enable, completion.
+///      snippets.custom, assist.expressionFillDefault, references.
+///      excludeImports — all idle-cost reductions on signals cargoless
+///      doesn't consume.
+pub fn lean_init_options(opts: &InitOpts) -> Value {
+    json!({
+        // (1) checkOnSave — Option B+ softened (not disabled).
+        // F8-redo's GREEN gate requires `LspEvent::FlycheckEnded`, which
+        // requires RA's cargo-check to actually run. Disabling
+        // checkOnSave breaks the verdict path; we soften its subsettings
+        // for ~15-30% cost cut on the load-bearing flycheck instead.
+        "checkOnSave": {
+            "enable": true,
+            "command": "check",
+            "allTargets": false,
+            "invocationStrategy": "once",
+            "invocationLocation": "workspace",
+            "noDefaultFeatures": false,
+            "features": opts.features.clone(),
+        },
+        // Modern RA's same setting under a different key. RA tolerates
+        // unknown keys, so emitting both is safe across versions.
+        "check": {
+            "command": "check",
+            "allTargets": false,
+            "invocationStrategy": "once",
+            "invocationLocation": "workspace",
+        },
+
+        // (2) inlayHints — ALL OFF. cargoless's stream + check output
+        // formats are file:line:col text; we never render inlay-style
+        // augmentations. Every one of these is pure idle cost.
+        "inlayHints": {
+            "parameterHints":          { "enable": false },
+            "typeHints":               { "enable": false },
+            "chainingHints":           { "enable": false },
+            "closureReturnTypeHints":  { "enable": "never" },
+            "bindingModeHints":        { "enable": false },
+            "closingBraceHints":       { "enable": false },
+            "discriminantHints":       { "enable": "never" },
+            "implicitDrops":           { "enable": false },
+            "lifetimeElisionHints":    { "enable": "never" },
+            "rangeExclusiveHints":     { "enable": false },
+            "reborrowHints":           { "enable": "never" },
+        },
+
+        // (3) cachePriming — RA's startup-time eager analysis. Skipping
+        // it makes initial-handshake faster + lowers idle CPU; we don't
+        // need pre-warmed caches because our access pattern is
+        // diagnostic-driven, not editor-driven.
+        "cachePriming": { "enable": false },
+
+        // (4) procMacro — the heaviest single configurable.
+        // proc-macro-server is a separate process that re-runs proc
+        // macros on every analysis. On non-proc-macro projects it is
+        // pure waste; on proc-macro projects it is mandatory for
+        // correctness. The InitOpts.proc_macro_enabled bool is resolved
+        // upstream (env var explicit OR Cargo.toml auto-detect).
+        "procMacro": { "enable": opts.proc_macro_enabled },
+
+        // (5) cargo.* + workspace.symbol.* — narrow what RA indexes.
+        // allFeatures=false matches cargo's actual default behavior
+        // (RA's "all features" was always a divergence); the features
+        // list flows from InitOpts (CLI `--features` flag); symbol
+        // search narrowed to workspace + types-only avoids indexing
+        // 3rd-party crate APIs we never query.
+        "cargo": {
+            "allFeatures": false,
+            "features": opts.features.clone(),
+            "noDefaultFeatures": false,
+        },
+        "workspace": {
+            "symbol": {
+                "search": {
+                    "scope": "workspace",
+                    "kind": "only_types",
+                }
+            }
+        },
+
+        // Honorable mentions — small but cumulative idle-cost wins.
+        "hover":      { "actions": { "enable": false } },
+        "lens":       { "enable": false },
+        "completion": { "snippets": { "custom": {} } },
+        "assist":     { "expressionFillDefault": "" },
+        "references": { "excludeImports": true },
+    })
+}
 
 /// LSP `DiagnosticSeverity.Error`.
 const SEVERITY_ERROR: i64 = 1;
@@ -380,10 +666,19 @@ impl LspClient {
     /// Handshake against an RA speaking LSP over (`w` = its stdin, `r` = its
     /// stdout). `root_path` is the absolute workspace root. flycheck
     /// (`cargo check` on save) is enabled — it is the authoritative tier.
+    ///
+    /// FIELD FINDING #74: now takes an `InitOpts` carrying the
+    /// proc-macro-enable + features list. The lean
+    /// `initializationOptions` JSON is built by [`lean_init_options`]
+    /// and includes the full Option-B+ refinement (softened checkOnSave,
+    /// inlayHints disabled, cachePriming off, procMacro per-opts,
+    /// cargo features narrowed, plus honorable mentions). See module-
+    /// doc on the 30-50% RA-resource-reduction rationale.
     pub fn initialize<W, R>(
         mut w: W,
         r: R,
         root_path: &str,
+        opts: &InitOpts,
     ) -> io::Result<(Self, Receiver<LspEvent>)>
     where
         W: Write + Send + 'static,
@@ -397,14 +692,10 @@ impl LspClient {
             "params": {
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                // #21: flycheck IS the authoritative (cargo-check) tier.
-                // Both the modern (`check.command`) and legacy
-                // (`checkOnSave`) keys, since RA tolerates unknown keys and
-                // versions differ across toolchains.
-                "initializationOptions": {
-                    "checkOnSave": true,
-                    "check": { "command": "check" }
-                },
+                // #21 + F8-redo + #74: lean init options. checkOnSave
+                // stays ON (load-bearing for the GREEN gate); everything
+                // else is tuned down.
+                "initializationOptions": lean_init_options(opts),
                 "capabilities": {
                     "window": { "workDoneProgress": true },
                     "textDocument": {
@@ -872,6 +1163,261 @@ mod tests {
         assert!(path_from_uri("http://x").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // #74 RA weight-shedding — InitOpts + lean_init_options + proc-macro
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lean_init_options_shape_has_load_bearing_keys_in_right_places() {
+        // The full JSON tree the lean init builder produces. Assert that
+        // the EXPECTED nested keys are present at the right paths — a
+        // future refactor that drops e.g. "checkOnSave.enable" or
+        // "procMacro.enable" would silently regress the verdict path
+        // (#21/F8-redo) or the polish savings (#74).
+        let v = lean_init_options(&InitOpts::default());
+
+        // checkOnSave is enabled (the F8-redo invariant — disabling would
+        // break the GREEN gate). Option B+ softened subsettings present.
+        assert_eq!(v["checkOnSave"]["enable"], json!(true));
+        assert_eq!(v["checkOnSave"]["command"], json!("check"));
+        assert_eq!(v["checkOnSave"]["allTargets"], json!(false));
+        assert_eq!(v["checkOnSave"]["invocationStrategy"], json!("once"));
+        assert_eq!(v["checkOnSave"]["invocationLocation"], json!("workspace"));
+
+        // Modern "check" key emitted alongside legacy "checkOnSave"
+        // (RA version-skew tolerance).
+        assert_eq!(v["check"]["command"], json!("check"));
+        assert_eq!(v["check"]["allTargets"], json!(false));
+
+        // inlayHints all OFF (cargoless never renders them).
+        for k in [
+            "parameterHints",
+            "typeHints",
+            "chainingHints",
+            "bindingModeHints",
+            "closingBraceHints",
+            "implicitDrops",
+            "rangeExclusiveHints",
+        ] {
+            assert_eq!(
+                v["inlayHints"][k]["enable"],
+                json!(false),
+                "inlayHints.{k}.enable must be false (rendered nowhere): {v}"
+            );
+        }
+        for k in [
+            "closureReturnTypeHints",
+            "discriminantHints",
+            "lifetimeElisionHints",
+            "reborrowHints",
+        ] {
+            // RA accepts "never" string (not bool) for these.
+            assert_eq!(v["inlayHints"][k]["enable"], json!("never"));
+        }
+
+        // cachePriming OFF.
+        assert_eq!(v["cachePriming"]["enable"], json!(false));
+
+        // procMacro tracks InitOpts.proc_macro_enabled (default=true).
+        assert_eq!(v["procMacro"]["enable"], json!(true));
+
+        // cargo: allFeatures OFF, features list from InitOpts (default
+        // = empty so cargo uses its own defaults), defaults kept
+        // (noDefaultFeatures: false).
+        assert_eq!(v["cargo"]["allFeatures"], json!(false));
+        assert_eq!(v["cargo"]["features"], json!([]));
+        assert_eq!(v["cargo"]["noDefaultFeatures"], json!(false));
+
+        // workspace.symbol narrowed.
+        assert_eq!(
+            v["workspace"]["symbol"]["search"]["scope"],
+            json!("workspace")
+        );
+        assert_eq!(
+            v["workspace"]["symbol"]["search"]["kind"],
+            json!("only_types")
+        );
+
+        // Honorable mentions.
+        assert_eq!(v["hover"]["actions"]["enable"], json!(false));
+        assert_eq!(v["lens"]["enable"], json!(false));
+        assert_eq!(v["completion"]["snippets"]["custom"], json!({}));
+        assert_eq!(v["assist"]["expressionFillDefault"], json!(""));
+        assert_eq!(v["references"]["excludeImports"], json!(true));
+    }
+
+    #[test]
+    fn lean_init_options_threads_proc_macro_disabled() {
+        let v = lean_init_options(&InitOpts {
+            proc_macro_enabled: false,
+            features: vec!["default".into()],
+        });
+        assert_eq!(v["procMacro"]["enable"], json!(false));
+    }
+
+    #[test]
+    fn lean_init_options_threads_custom_features() {
+        let v = lean_init_options(&InitOpts {
+            proc_macro_enabled: true,
+            features: vec!["foo".into(), "bar".into()],
+        });
+        // Features appear in BOTH cargo.features AND checkOnSave.features
+        // (RA reads them from one or the other depending on version).
+        assert_eq!(v["cargo"]["features"], json!(["foo", "bar"]));
+        assert_eq!(v["checkOnSave"]["features"], json!(["foo", "bar"]));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_detects_leptos() {
+        let cargo = r#"
+            [package]
+            name = "app"
+            [dependencies]
+            leptos = { version = "0.6", features = ["csr"] }
+            serde = "1"
+        "#;
+        assert!(cargo_toml_signals_proc_macro(cargo));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_detects_serde_derive() {
+        let cargo = r#"
+            [dependencies]
+            serde = "1"
+            serde_derive = "1"
+        "#;
+        assert!(cargo_toml_signals_proc_macro(cargo));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_detects_lib_section() {
+        let cargo = r#"
+            [package]
+            name = "my_macros"
+            [lib]
+            proc-macro = true
+        "#;
+        assert!(cargo_toml_signals_proc_macro(cargo));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_detects_syn_quote_trio() {
+        // syn/quote/proc-macro2 as direct deps strongly signals heavy
+        // proc-macro use even without the obvious culprits.
+        let cargo = r#"
+            [dependencies]
+            syn = "2"
+            quote = "1"
+        "#;
+        assert!(cargo_toml_signals_proc_macro(cargo));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_negative_simple_project() {
+        // A plain CLI with serde + clap + anyhow: no proc-macro-server
+        // need. serde with derive feature IS proc-macro-heavy but the
+        // dep entry says `serde` not `serde_derive`; we accept that
+        // false-negative (the false-positive cost of treating serde
+        // alone as proc-macro signal would over-detect).
+        let cargo = r#"
+            [package]
+            name = "cli"
+            [dependencies]
+            serde = "1"
+            clap = "4"
+            anyhow = "1"
+        "#;
+        assert!(!cargo_toml_signals_proc_macro(cargo));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_detects_in_dev_deps() {
+        let cargo = r#"
+            [dev-dependencies]
+            tokio-macros = "2"
+        "#;
+        assert!(cargo_toml_signals_proc_macro(cargo));
+    }
+
+    #[test]
+    fn cargo_toml_signals_proc_macro_ignores_dep_name_outside_deps_section() {
+        // "syn" as the PACKAGE name (not a dep) must not false-positive.
+        let cargo = r#"
+            [package]
+            name = "syn"
+            [dependencies]
+            serde = "1"
+        "#;
+        assert!(
+            !cargo_toml_signals_proc_macro(cargo),
+            "package name 'syn' must not trigger"
+        );
+    }
+
+    #[test]
+    fn init_opts_from_env_handles_explicit_disabled() {
+        let prev = std::env::var("TF_PROC_MACRO").ok();
+        // SAFETY: single-threaded test, no concurrent env readers.
+        unsafe { std::env::set_var("TF_PROC_MACRO", "disabled") };
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert!(!opts.proc_macro_enabled);
+        // Restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TF_PROC_MACRO", v),
+                None => std::env::remove_var("TF_PROC_MACRO"),
+            }
+        }
+    }
+
+    #[test]
+    fn init_opts_from_env_handles_explicit_enabled() {
+        let prev = std::env::var("TF_PROC_MACRO").ok();
+        unsafe { std::env::set_var("TF_PROC_MACRO", "enabled") };
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert!(opts.proc_macro_enabled);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TF_PROC_MACRO", v),
+                None => std::env::remove_var("TF_PROC_MACRO"),
+            }
+        }
+    }
+
+    #[test]
+    fn init_opts_features_from_env_csv() {
+        let prev = std::env::var("TF_FEATURES").ok();
+        unsafe { std::env::set_var("TF_FEATURES", "csr, hydrate ,") };
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert_eq!(
+            opts.features,
+            vec!["csr".to_string(), "hydrate".to_string()]
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TF_FEATURES", v),
+                None => std::env::remove_var("TF_FEATURES"),
+            }
+        }
+    }
+
+    #[test]
+    fn init_opts_default_safe_for_macro_heavy_projects() {
+        // The safe default is proc_macro_enabled=true: most projects
+        // need it; defaulting OFF would silently mis-analyze leptos/
+        // serde-derive code. Defaulting ON is a small idle cost vs a
+        // potentially-wrong verdict.
+        //
+        // features default = empty (let cargo use its own defaults).
+        // Passing `--features default` to cargo errors on crates that
+        // don't define a [features] table — caught by F2 integration
+        // test's fixture and our first-self-gate red. Empty is the
+        // safe-across-every-cargo-project choice.
+        let opts = InitOpts::default();
+        assert!(opts.proc_macro_enabled);
+        assert_eq!(opts.features, Vec::<String>::new());
+    }
+
     #[test]
     fn handshake_then_events_over_fakes() {
         // Scripted "RA": initialize response + a rustc diag + flycheck end.
@@ -885,7 +1431,8 @@ mod tests {
         let reader = Cursor::new(server);
         let writer: Vec<u8> = Vec::new();
 
-        let (client, rx) = LspClient::initialize(writer, reader, "/r").expect("handshake");
+        let opts = InitOpts::default();
+        let (client, rx) = LspClient::initialize(writer, reader, "/r", &opts).expect("handshake");
         client.next_request_id();
 
         let e1 = rx
