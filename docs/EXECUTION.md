@@ -41,37 +41,61 @@ push (it is the one allowed local toolchain command).
 | `tf-cli` | cli-ux | 5 |
 | `bench/` | ra-bench | S1 spike + AC#2 harness |
 
-`tf-core` is shared by three roles — they own **disjoint modules** inside it
-(`watcher`/`analyzer`/`model` = daemon-core; `build` = build-cas; `server` =
-devserver) and communicate only through `tf-proto` types.
+`tf-core` is shared by disjoint modules — `watcher`/`analyzer`/`model` =
+daemon-core; `build` + the latest-green publisher = build-cas. The `server`
+module is **v0.1** (live HTTP/WS dev-server), not v0; it is preserved on
+`agent/devserver*` branches and consumes the v0 published output. All
+cross-module data flows only through `tf-proto` types.
 
-## Acceptance criteria → verifying work
+## Phasing (v0 / v0.1 / v1) — Plane CWDL-1 is the single source of truth
+
+- **v0** = headless continuous checker + latest-green publisher. No browser,
+  no HTTP. This is the launch gate.
+- **v0.1** = optional live server/browser-reload adapter over the v0 published
+  `.cargoless/latest-green` (HTTP, WebSocket, Trunk-compatible reload D3,
+  browser shim, holding page, browser "never serve red", `serve`). Deferred,
+  not deleted.
+- **v1** = parking lot (below).
+
+## Acceptance criteria → verifying work (mirrors Plane CWDL-1)
 
 | AC | What proves it | Owner |
 |---|---|---|
-| 1 zero-config serve <30s (D-A1 redefined: daemon up + holding page) | clean-env integration test | cli-ux + integration |
-| 2 median save→verdict <1s | committed CI bench harness (also S1) | ra-bench |
-| 3 green-save→browser <5s | bench harness | ra-bench + devserver |
-| 4 never serve red | integration test | devserver |
-| 5 CAS dedupe = build skipped | integration test (skeleton already has the dedupe primitive) | build-cas |
+| 1 zero-config **headless** startup <30s (D-A1: daemon up + auto-detected + watch→verdict pipeline live; NO browser) | clean-env integration test | cli-ux + integration |
+| 2 median save→verdict <1s (primary) | committed CI bench harness (also S1) | ra-bench |
+| 3 median green-save → latest-green artifact **published** latency (no sub-second claim; D-A2 sets threshold) | two-mode bench harness, artifact mode | ra-bench + build-cas |
+| 4 never **publish** red — `.cargoless/latest-green` only advances on green | publisher integration test (headless, not a browser) | build-cas |
+| 5 CAS dedupe = build skipped | integration test | build-cas |
 | 6 survives kill -9 of rust-analyzer | integration test | daemon-core |
-| 7 benchmarks beat trunk/bacon on ≥2 dims | comparative bench, README | ra-bench |
-| 8 README/ROADMAP/CONTRIBUTING/LICENSE | present (this repo) + governance | proto-contracts (docs) |
-| 9 launch blog reviewed by ≥2 incl. outside | human-gated — will NOT close this session | lead |
+| 7 benchmarks beat trunk/bacon on ≥2 dims, **two-mode** (checker vs artifact, never blended) | comparative bench, README | ra-bench |
+| 8 README/ROADMAP/CONTRIBUTING/LICENSE | present (this repo) + governance | docs |
+| 9 launch blog reviewed by ≥2 incl. outside | human-gated | lead |
 
-ACs 4/5/6 are the realistically-closable-this-session set; 2/3/7 depend on the
-bench harness; 1 depends on D-A1; 8 is largely done; 9 is human-gated.
+ACs 4/5/6 are the realistically-closable set; 2/3/7 depend on the two-mode
+bench harness; 1 depends on D-A1 (headless); 8 is largely done; 9 is
+human-gated. **Integrity rule:** an AC is Done only when its verifying test is
+green on `main` — branch-only work is In Progress, never Done.
 
 ## Scope decisions already taken (do not relitigate)
 
-- **D-A1**: AC#1 "works in <30s" is impossible for a cold Leptos build → it
-  means *daemon up + config auto-detected + holding page, zero manual config*;
-  first-green when the cold build finishes.
+- **D-A1**: AC#1 is **headless** — *daemon up + config auto-detected +
+  watch→verdict pipeline live, zero manual config* within 30s; first-green
+  when the cold build finishes. No browser, no holding page (that moved to
+  v0.1).
 - **D-A2**: AC#2's sub-1s wording is provisional until the S1 bench reports;
-  renegotiate on evidence, do not silently miss it.
-- **D-A3**: the benchmark substrate is pulled forward (it is the S1 harness),
-  not deferred to a late epic.
-- v1 parking lot (NOT v0): salsa/RA-as-library, remote CAS, team/auth,
+  AC#3's publish-latency threshold is likewise set from S1/bench evidence —
+  **no sub-second artifact claim**. Renegotiate on evidence, never silently
+  miss it.
+- **D-A3**: the benchmark substrate is pulled forward (the S1 harness), not
+  deferred; it is two-mode (checker save→verdict + artifact save→publish,
+  reported separately).
+- **Contract status**: the `tf-proto` seams (StateEvent / BuildTrigger /
+  BuildResult / ArtifactMeta) are frozen on `main` and unchanged; the
+  latest-green publisher is the **only additive v0 contract surface**.
+  `server::Bundle` is **not** in v0.
+- v0.1 (NOT v0): HTTP/WS dev-server, reload protocol, browser shim, holding
+  page, browser never-serve-red, `serve`.
+- v1 parking lot (NOT v0 or v0.1): salsa/RA-as-library, remote CAS, team/auth,
   multi-agent, editor plugin, symbol-level granularity, replacing trunk build,
   hot-swap, CI integration, Windows.
 
