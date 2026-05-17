@@ -352,6 +352,17 @@ def run_tool(
     log_path = log_dir / f"{tool.name}.log"
     log_path.write_text("")  # truncate
     print(f"  [{tool.name}] spawn argv={tool.argv}", flush=True)
+    # Build env: inherit parent, plus per-tool overrides.
+    # IMPORTANT: do NOT set NO_COLOR=1 — trunk's clap exposes NO_COLOR as a
+    # bool CLI arg via env (--no-color=$NO_COLOR), and "1" is rejected
+    # ("invalid value '1' for '--no-color' [possible values: true, false]")
+    # causing trunk to exit at startup with NO_READY in <1s. We just don't
+    # touch color env at all; spawning into a pipe (non-TTY) already
+    # suppresses ANSI for all three tools in practice. Our substring
+    # matching on "Success!"/"success"/"GREEN" tolerates the rare ANSI
+    # bracket sequences anyway (the codes wrap words, don't split them).
+    child_env = dict(os.environ)
+    child_env["RUST_LOG_STYLE"] = "never"
     with open(log_path, "ab") as log_f:
         # New session so we can reap the whole tree cleanly.
         proc = subprocess.Popen(
@@ -360,13 +371,7 @@ def run_tool(
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
-            env={
-                **os.environ,
-                "NO_COLOR": "1",
-                "CLICOLOR": "0",
-                "CLICOLOR_FORCE": "0",
-                "RUST_LOG_STYLE": "never",
-            },
+            env=child_env,
             start_new_session=True,
         )
 
