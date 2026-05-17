@@ -28,8 +28,26 @@ Forgejo CI (`.forgejo/workflows/ci.yml`) on `triform/cargoless`. Workflow:
    merges CI-green branches. Agents do **not** push to `main`, do not
    pull/merge/rebase (the lead integrates).
 
-`rustfmt <files>` may be run locally to make formatting deterministic before a
-push (it is the one allowed local toolchain command).
+`rustfmt` may be run locally to make formatting deterministic before a push
+(it is the one allowed local toolchain command). **Always pass
+`--edition 2024`** — this is an Edition-2024 workspace and the CI `fmt`
+gate runs `cargo fmt` (which infers `style_edition = 2024`). Bare
+`rustfmt <file>` silently defaults to **edition 2015**, whose import-sort
+rules differ — it will *regress* already-correct code and turn the `fmt`
+gate RED while build/test/clippy stay green (a confusing, builder-round-
+wasting failure that has bitten ≥2 agents: dev-fixer #93,
+docs-launch-lead pre-#87).
+
+**Self-gate checklist — before every push, in addition to
+`scripts/ci-gate`:**
+
+```
+rustfmt --edition 2024 --check crates/**/*.rs   # MUST be clean (exit 0, no diff)
+```
+
+This is a free, instant local pre-gate for the exact trap above — run it
+and the `fmt` builder round is never wasted on an edition mismatch. To
+*fix* (not just check): `rustfmt --edition 2024 <files>`.
 
 ## Crate ownership (disjoint)
 
