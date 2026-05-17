@@ -12,12 +12,31 @@ workspace = true
 
 # `integration` gates the REAL `build --watch` publisher-drive wiring into
 # build-cas's `tf_core::build::{BuildOrchestrator,read_latest_green}` +
-# `tf_proto::PublishedArtifact` — not on this branch's main base yet. OFF by
-# default so the standalone `--locked` gate (build/test/clippy, NOT
-# --all-features) never compiles unresolved symbols and stays green. A
-# local-crate feature does not alter Cargo.lock, so --locked is unaffected.
-# #29 convergence enables this on the converged tree.
+# `tf_proto::PublishedArtifact`. Now DEFAULT (post-#29 convergence + post-#42
+# main convergence): the integration symbols are resolved on current main, so
+# the prior "off by default until convergence" workaround is obsolete. Closes
+# F4 footgun where `cargo install <pubname>` (without `--features integration`)
+# produced a binary whose `build` returned EX_UNAVAILABLE (honest stub, but
+# bad UX for the canonical install path).
+#
+# Users who want the standalone holding-page semantics can still opt out via
+# `--no-default-features`. A local-crate feature default does NOT alter
+# Cargo.lock, so `--locked` semantics are unchanged. ci-gate's standard tier
+# (cargo build --workspace --all-targets --locked) now exercises the
+# integration path too — that's actually better coverage.
+#
+# Install consequence — the documented install command for outside users is:
+#   cargo install --git https://github.com/TriformAI/cargoless.git tf-cli \
+#                 --branch main --locked
+# (no `--features integration` needed anymore). The explicit `tf-cli` package
+# arg is REQUIRED because `cargo install --git` walks the entire repo for
+# Cargo.toml files and refuses to pick when multiple installable binary crates
+# exist — the bench/{harness,fixture} sub-workspaces produce `ra-latency`,
+# `cargoless-bench`, and `cargoless-bench-fixture` binaries that cargo treats
+# as install candidates. README install command (in agent/builder-infra's
+# pending integration) reflects this.
 [features]
+default = ["integration"]
 integration = []
 
 [[bin]]
@@ -26,3 +45,58 @@ path = "src/main.rs"
 
 [dependencies]
 tf-core = { path = "../tf-core" }
+
+# ──────────────────────────────────────────────────────────────────────────
+# cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)
+#
+# Cargo treats [package.metadata.*] as opaque (it does NOT validate the
+# contents), so this stub adds zero compile/test/fmt/clippy gate risk.
+# Only `cargo-binstall` reads these keys, at install time on a user's
+# machine, to fetch a prebuilt tarball instead of compiling from source.
+#
+# Status: PLACEHOLDER binary name (`tftrunk`). Locked when D1/CWDL-12 picks
+# the public product name. DO NOT cut a real release tag while D1 is open
+# (see D-RELEASE §8 #1).
+#
+# Template variables binstall resolves:
+#   {repo}            — package.repository (workspace-inherited from root
+#                       Cargo.toml → https://github.com/TriformAI/cargoless)
+#   {name}            — package.name (the published crate name)
+#   {version}         — package.version (without leading "v")
+#   {target}          — target triple, e.g. x86_64-unknown-linux-gnu
+#   {archive-suffix}  — derived from pkg-fmt, e.g. ".tgz"
+#
+# First release ships THREE prebuilts (D-RELEASE §3):
+#   - x86_64-unknown-linux-gnu  (GH Actions ubuntu-latest)
+#   - aarch64-apple-darwin       (GH Actions macos-14, Apple Silicon)
+#   - x86_64-apple-darwin        (GH Actions macos-13, Intel)
+# All three follow the same tarball layout, so ONE pkg-url template + ONE
+# bin-dir entry covers all targets — no per-target overrides needed for
+# 0.1.0. (Overrides example below is for hypothetical future Windows etc.)
+# ──────────────────────────────────────────────────────────────────────────
+[package.metadata.binstall]
+# GitHub release-asset URL shape: /{owner}/{repo}/releases/download/v{version}/{file}
+# (Forgejo follows the same convention, so the template is portable.)
+# TODO(D-RELEASE §8 #6): verify on one throwaway test tag (e.g., v0.0.1-rc.1)
+# before first real fire.
+pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target}{archive-suffix}"
+pkg-fmt = "tgz"
+
+# Inside the tarball, layout is:
+#   {name}-v{version}-{target}/
+#     tftrunk         ← the binary (renamed at D1)
+#     README.md
+#     LICENSE
+# TODO(D1/CWDL-12): if D1 renames the binary from `tftrunk`, update both
+# this `bin-dir` AND .github/workflows/release.yml.draft's `strip` + tarball
+# package step. These two places MUST stay in sync.
+bin-dir = "{name}-v{version}-{target}/tftrunk"
+
+# Per-target overrides not needed for 0.1.0 — all three triples
+# (x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin)
+# share the same tarball layout. If a future target needs a different
+# layout (e.g., Windows .zip post-v1), add:
+#   [package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]
+#   pkg-fmt = "zip"
+#   bin-dir = "{name}-v{version}-{target}/tftrunk.exe"
+# Windows is v1 parking-lot per CLAUDE.md — not in 0.1.0 scope.

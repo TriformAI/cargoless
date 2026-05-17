@@ -45,6 +45,12 @@ struct Opts {
     root: Option<PathBuf>,
     watch: bool,
     out: Option<PathBuf>,
+    /// FIELD FINDING #5 (#49): user-tunable file-watcher debounce quiet
+    /// window in milliseconds. Plumbed into the live watch/build pipeline
+    /// by exporting `TF_DEBOUNCE_MS` before invoking `tf_core::model::watch`
+    /// — keeps the `watch()` signature byte-frozen (the env-var idiom
+    /// matches `TF_CHECK_TIMEOUT_SECS` from #21/#43).
+    debounce_ms: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -95,6 +101,13 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                     it.next().ok_or(ParseError::MissingValue("--out"))?,
                 ));
             }
+            "--debounce-ms" => {
+                let v = it.next().ok_or(ParseError::MissingValue("--debounce-ms"))?;
+                opts.debounce_ms = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| ParseError::MissingValue("--debounce-ms (numeric ms)"))?,
+                );
+            }
             "-h" | "--help" => {
                 return Ok(Parsed {
                     cmd: Cmd::Help,
@@ -124,6 +137,15 @@ fn usage() {
     println!("  --root <DIR>          Project root (default: current directory)");
     println!("  --watch               Run continuously instead of one-shot");
     println!("  --out <DIR>           Artifact output directory (build only)");
+    println!(
+        "  --debounce-ms <N>     Save-burst quiet window before re-checking \
+         (default 150ms;"
+    );
+    println!(
+        "                        tune up if mid-edit reds flicker, down for \
+         faster verdicts;"
+    );
+    println!("                        also settable via TF_DEBOUNCE_MS env)");
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
     println!();
@@ -173,6 +195,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // FIELD FINDING #5 (#49): the `--debounce-ms` flag (when given) is
+    // plumbed to `tf_core::model::watch` via the `TF_DEBOUNCE_MS` env var,
+    // keeping the frozen `watch()` signature unchanged. Idiomatic match to
+    // `TF_CHECK_TIMEOUT_SECS` (the #21/#43 path). Setting an env var from
+    // a CLI is process-local; no risk of leaking outward.
+    if let Some(ms) = parsed.opts.debounce_ms {
+        // SAFETY: single-threaded init phase, no other threads observe env
+        // yet. set_var is unsafe on 2024 edition due to multi-thread reads.
+        unsafe {
+            std::env::set_var("TF_DEBOUNCE_MS", ms.to_string());
+        }
+    }
 
     match parsed.cmd {
         Cmd::Check if parsed.opts.watch => watch::run(&cfg),
@@ -244,5 +279,61 @@ mod tests {
             parse(&v(&["check", "--root"])),
             Err(ParseError::MissingValue("--root"))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #5 (#49) — --debounce-ms parses, validates, defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn debounce_ms_parses_into_opts() {
+        let p = parse(&v(&["watch", "--debounce-ms", "300"])).unwrap();
+        assert_eq!(p.cmd, Cmd::Watch);
+        assert_eq!(p.opts.debounce_ms, Some(300));
+    }
+
+    #[test]
+    fn debounce_ms_works_alongside_other_flags() {
+        // Order independence + composability with --root / --watch.
+        let p = parse(&v(&[
+            "build",
+            "--watch",
+            "--debounce-ms",
+            "750",
+            "--root",
+            "/p",
+            "--out",
+            "dist",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::Build);
+        assert!(p.opts.watch);
+        assert_eq!(p.opts.debounce_ms, Some(750));
+        assert_eq!(p.opts.root.as_deref(), Some(std::path::Path::new("/p")));
+        assert_eq!(p.opts.out.as_deref(), Some(std::path::Path::new("dist")));
+    }
+
+    #[test]
+    fn debounce_ms_missing_value_is_actionable() {
+        assert_eq!(
+            parse(&v(&["watch", "--debounce-ms"])),
+            Err(ParseError::MissingValue("--debounce-ms"))
+        );
+    }
+
+    #[test]
+    fn debounce_ms_non_numeric_is_actionable() {
+        // The error variant carries enough context for the user to know
+        // what failed (numeric ms expected, not free-form text).
+        let r = parse(&v(&["watch", "--debounce-ms", "nope"]));
+        assert!(matches!(r, Err(ParseError::MissingValue(s)) if s.contains("--debounce-ms")));
+    }
+
+    #[test]
+    fn debounce_ms_default_is_none() {
+        // Default-Opts: no --debounce-ms ⇒ None (the env var / model default
+        // applies; the CLI does not impose a value over the existing 150ms).
+        let p = parse(&v(&["watch"])).unwrap();
+        assert_eq!(p.opts.debounce_ms, None);
     }
 }

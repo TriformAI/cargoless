@@ -56,8 +56,26 @@ const CHECK_HARD_CAP: Duration = Duration::from_secs(180);
 /// Quiet window: once events have arrived and none have for this long without
 /// an authoritative pass, the one-shot check gives up (→ Red/Advisory).
 const CHECK_SETTLE: Duration = Duration::from_secs(2);
-/// Debounce for the streaming [`watch`] pipeline.
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Default debounce for the streaming [`watch`] pipeline. The save-burst
+/// quiet window before a [`crate::watcher`] batch is emitted to the model.
+/// Tuned to keep mid-edit reds quiet without making the post-save verdict
+/// feel laggy; user-overridable via `TF_DEBOUNCE_MS` (set by the
+/// `--debounce-ms` CLI flag — FIELD FINDING #5 / #49).
+const DEFAULT_WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Resolve the live debounce duration: `TF_DEBOUNCE_MS` env override iff
+/// parseable as a positive `u64` milliseconds, else [`DEFAULT_WATCH_DEBOUNCE`].
+/// Zero is rejected (would cause the watcher to spin); too-large values are
+/// honored — dogfood tuning may legitimately want a long quiet window for
+/// flicker-free large-refactor runs. Pure (only reads env, no side effects).
+fn resolve_watch_debounce() -> Duration {
+    std::env::var("TF_DEBOUNCE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_WATCH_DEBOUNCE)
+}
 
 // ---------------------------------------------------------------------------
 // #21 additive provenance types (tf_core::model, serde-free — NOT tf-proto)
@@ -77,6 +95,21 @@ pub enum VerdictProvenance {
 pub struct Verdict {
     pub tree: TreeState,
     pub provenance: VerdictProvenance,
+}
+
+/// FIELD FINDING #6-NEG-A (#51): supervisor-lifecycle events surfaced to
+/// the CLI so the watch stream is never silent during an AC#6 transparent
+/// restart. Separate channel from [`StateEvent`] (which is the byte-frozen
+/// tf-proto seam — must NOT grow) and [`Verdict`] (which is the #21
+/// authoritative-vs-advisory verdict, not lifecycle). Additive only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleEvent {
+    /// AC#6's supervisor just respawned the rust-analyzer child after a
+    /// crash/kill. The next-verdict latency is "however long re-indexing
+    /// takes" — typically tens of seconds on a real project. Emitted ONCE
+    /// per transparent restart; NOT emitted on the initial spawn (the
+    /// bring-up line covers that).
+    AnalyzerRestarting,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +159,13 @@ pub struct Model {
     /// rule (which still derives from `auth` + `flycheck_done`), just the
     /// human-facing detail the boolean verdict was hiding.
     diagnostics: BTreeMap<String, Vec<Diagnostic>>,
+    /// FIELD FINDING #6-NEG-A (#51) additive surface: lifecycle event
+    /// subscribers. Currently the only event is
+    /// [`LifecycleEvent::AnalyzerRestarting`] emitted by the watch
+    /// pipeline's `on_spawn` hook on every transparent RA restart (NOT on
+    /// the initial spawn). Bounded by retain-on-send like the verdict
+    /// channels so a dropped subscriber does not stall the producer.
+    lifecycle_subscribers: Vec<Sender<LifecycleEvent>>,
 }
 
 impl Model {
@@ -140,6 +180,7 @@ impl Model {
             advisory_subscribers: Vec::new(),
             identity: Box::new(identity),
             diagnostics: BTreeMap::new(),
+            lifecycle_subscribers: Vec::new(),
         }
     }
 
@@ -156,6 +197,23 @@ impl Model {
         let (tx, rx) = channel();
         self.advisory_subscribers.push(tx);
         rx
+    }
+
+    /// Subscribe to the supervisor-lifecycle stream (FIELD FINDING #6-NEG-A
+    /// / #51). Currently fires [`LifecycleEvent::AnalyzerRestarting`] once
+    /// per transparent RA restart. Additive — distinct from `subscribe()`
+    /// (the frozen StateEvent seam) and `subscribe_advisory()` (the #21
+    /// verdict provenance channel).
+    pub fn subscribe_lifecycle(&mut self) -> Receiver<LifecycleEvent> {
+        let (tx, rx) = channel();
+        self.lifecycle_subscribers.push(tx);
+        rx
+    }
+
+    /// Fan-out a lifecycle event to every live subscriber; prune dropped
+    /// ones. Producer is the watch pipeline's on_spawn hook.
+    pub(crate) fn emit_lifecycle(&mut self, ev: LifecycleEvent) {
+        self.lifecycle_subscribers.retain(|s| s.send(ev).is_ok());
     }
 
     /// Current AUTHORITATIVE aggregate verdict (frozen signature).
@@ -243,6 +301,18 @@ impl Model {
                 self.flycheck_done = true;
                 self.reconcile();
                 self.emit_advisory();
+            }
+            LspEvent::IndexingEnded => {
+                // FIELD FINDING #3a: the watch-mode model's authoritative
+                // GREEN is already correctly gated on `flycheck_done` (the
+                // #21 rule), and a real RA only fires a flycheck pass AFTER
+                // indexing completes — so the model itself does not need to
+                // gate on indexing here. The signal exists in this enum to
+                // un-stick the one-shot `check_*` loops (which were
+                // settle-early-breaking before the first flycheck on cold
+                // RA); the watch loop sees it pass through and ignores it.
+                // A future "still warming up" UI signal could light up off
+                // this — out of #43 scope.
             }
         }
     }
@@ -365,15 +435,14 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
     let root = fs::canonicalize(root)?;
     let mut cmd = crate::analyzer::rust_analyzer_command()?;
     cmd.current_dir(&root);
-    let mut child = cmd.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    // FIELD FINDING #3b: wrap the child in a `ReapOnDrop` BEFORE any
+    // `?` early-return path so a failing LSP handshake (handshake EOF,
+    // pipe error, etc.) no longer leaks the child + its proc-macro-srv
+    // grandchildren on Unix.
+    let mut guard = crate::analyzer::ReapOnDrop::new(cmd.spawn()?);
+    let (stdin, stdout) = guard
+        .take_stdio()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdio unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
     let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
 
@@ -393,6 +462,13 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
     let mut auth: BTreeMap<String, FileState> = BTreeMap::new();
     let mut flycheck_seen = false;
     let mut got_any = false;
+    // FIELD FINDING #3a: RA fires advisory `publishDiagnostics` during
+    // indexing (got_any=true), then goes quiet for 5-10s while the rest of
+    // indexing/proc-macro-bringup completes; the old code's "if got_any
+    // and Timeout, break early" path fired during THAT quiet and reported
+    // the unproven red. Gate the early-break on `indexing_done` so cold
+    // RA gets the project-ready signal it deserves before we give up.
+    let mut indexing_done = false;
     while !flycheck_seen {
         let now = Instant::now();
         if now >= deadline {
@@ -414,16 +490,26 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
             Ok(LspEvent::FlycheckEnded) => {
                 flycheck_seen = true;
             }
+            Ok(LspEvent::IndexingEnded) => {
+                indexing_done = true;
+            }
             Err(RecvTimeoutError::Timeout) => {
-                if got_any {
-                    break; // settled without an authoritative pass
+                // Only allow settle-early once RA has actually finished
+                // indexing — otherwise the quiet IS the indexing window
+                // and breaking here false-reds a green tree (#43).
+                if got_any && indexing_done {
+                    break;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break, // RA exited
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    // `guard` drops here — `ReapOnDrop` SIGKILLs RA's whole process group
+    // on Unix (RA + every proc-macro-srv grandchild) and waits to reap;
+    // on non-Unix it falls back to killing just the immediate child.
+    // The explicit `drop(guard)` makes the scope-end deterministic and
+    // documents the reap point.
+    drop(guard);
 
     if flycheck_seen {
         let tree = if auth.values().any(|s| *s == FileState::Red) {
@@ -471,15 +557,14 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
     let root = fs::canonicalize(root)?;
     let mut cmd = crate::analyzer::rust_analyzer_command()?;
     cmd.current_dir(&root);
-    let mut child = cmd.spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+    // FIELD FINDING #3b: same guard as `check_verdict` — Drop-based reap
+    // covers every early-return path (handshake EOF, pipe error, etc.)
+    // and on Unix takes out the whole RA process group so
+    // `rust-analyzer-proc-macro-srv` grandchildren do not accumulate.
+    let mut guard = crate::analyzer::ReapOnDrop::new(cmd.spawn()?);
+    let (stdin, stdout) = guard
+        .take_stdio()
+        .ok_or_else(|| io::Error::other("rust-analyzer stdio unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
     let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
 
@@ -504,6 +589,12 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
     let mut diagnostics: BTreeMap<String, Vec<Diagnostic>> = BTreeMap::new();
     let mut flycheck_seen = false;
     let mut got_any = false;
+    // FIELD FINDING #3a: identical gate to `check_verdict`. The false-red
+    // on a cold green tree happens because RA fires advisory diags during
+    // indexing, then goes silent — the old settle-early-on-got_any path
+    // mistook the silence for completion. `indexing_done` blocks the
+    // early-break until RA has actually announced project-ready.
+    let mut indexing_done = false;
     while !flycheck_seen {
         let now = Instant::now();
         if now >= deadline {
@@ -530,16 +621,19 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
             Ok(LspEvent::FlycheckEnded) => {
                 flycheck_seen = true;
             }
+            Ok(LspEvent::IndexingEnded) => {
+                indexing_done = true;
+            }
             Err(RecvTimeoutError::Timeout) => {
-                if got_any {
-                    break; // settled without an authoritative pass
+                if got_any && indexing_done {
+                    break; // settled, project ready, no authoritative pass
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break, // RA exited
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    // Same deterministic reap-point as `check_verdict` (see comment there).
+    drop(guard);
 
     let tree = if flycheck_seen {
         if auth.values().any(|s| *s == FileState::Red) {
@@ -603,6 +697,14 @@ impl ModelSession {
         poisoned(&self.model).all_diagnostics()
     }
 
+    /// FIELD FINDING #6-NEG-A (#51): subscribe to supervisor-lifecycle
+    /// events. The CLI watch loop drains this on every iteration and prints
+    /// a stream signal so the user is never staring at silence during an
+    /// AC#6 transparent restart's 30-60s re-index window.
+    pub fn subscribe_lifecycle(&self) -> Receiver<LifecycleEvent> {
+        poisoned(&self.model).subscribe_lifecycle()
+    }
+
     /// Explicit graceful shutdown (also runs on drop).
     pub fn shutdown(mut self) {
         self.do_shutdown();
@@ -653,7 +755,22 @@ pub fn watch<I: IdentityProvider + 'static>(
     let hook_root = root_str.clone();
     let hook_model = Arc::clone(&model);
     let hook_current = Arc::clone(&current);
+    // FIELD FINDING #6-NEG-A (#51): per-watch counter of on_spawn calls.
+    // n == 0 ⇒ the initial spawn (covered by the CLI's bring-up line — no
+    // restart signal needed). n >= 1 ⇒ a transparent AC#6 restart after
+    // RA crashed/was killed; emit `LifecycleEvent::AnalyzerRestarting`
+    // BEFORE the LSP handshake starts (so the CLI sees the signal while
+    // the model is still cold).
+    let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_spawn_count = Arc::clone(&spawn_count);
     let on_spawn = move |child: &mut std::process::Child| {
+        let n = hook_spawn_count.fetch_add(1, Ordering::SeqCst);
+        if n > 0 {
+            // Transparent restart — tell the CLI so the stream doesn't go
+            // silent for the 30-60s reindex window. Emit BEFORE the
+            // handshake so a slow-handshake restart is visible immediately.
+            poisoned(&hook_model).emit_lifecycle(LifecycleEvent::AnalyzerRestarting);
+        }
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return;
         };
@@ -684,7 +801,7 @@ pub fn watch<I: IdentityProvider + 'static>(
     let supervisor = crate::analyzer::Supervisor::start_with_hook(spawn, on_spawn)?;
 
     let (watch_handle, batches) =
-        crate::watcher::watch(&root, WATCH_DEBOUNCE).map_err(io::Error::other)?;
+        crate::watcher::watch(&root, resolve_watch_debounce()).map_err(io::Error::other)?;
     let mut threads = Vec::new();
     {
         let model = Arc::clone(&model);
@@ -810,6 +927,50 @@ mod tests {
             message: msg.to_owned(),
             source: source.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn lifecycle_subscribers_receive_analyzer_restarting() {
+        // FIELD FINDING #6-NEG-A (#51) — the model's lifecycle bus
+        // delivers AnalyzerRestarting to every live subscriber, and a
+        // dropped subscriber does not panic the producer.
+        let mut m = model();
+        let r1 = m.subscribe_lifecycle();
+        {
+            let r2 = m.subscribe_lifecycle();
+            m.emit_lifecycle(LifecycleEvent::AnalyzerRestarting);
+            assert_eq!(
+                drain(&r1),
+                vec![LifecycleEvent::AnalyzerRestarting],
+                "r1 receives"
+            );
+            assert_eq!(
+                drain(&r2),
+                vec![LifecycleEvent::AnalyzerRestarting],
+                "r2 receives"
+            );
+        }
+        // r2 dropped; emit must not panic and r1 must still receive.
+        m.emit_lifecycle(LifecycleEvent::AnalyzerRestarting);
+        assert_eq!(drain(&r1).len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_no_emit_before_first_restart_is_silent() {
+        // Sanity: just constructing a model does NOT emit
+        // AnalyzerRestarting (that would falsely tell the CLI "restarting"
+        // when the analyzer hasn't even started). The on_spawn hook is
+        // responsible for the first-spawn-vs-restart distinction.
+        let mut m = model();
+        let rx = m.subscribe_lifecycle();
+        assert!(drain(&rx).is_empty(), "no lifecycle events on quiet model");
+        // The verdict bus also stays quiet — lifecycle and verdict are
+        // strictly separate channels.
+        m.apply_event(&LspEvent::FlycheckEnded);
+        assert!(
+            drain(&rx).is_empty(),
+            "flycheck-end is a verdict event, not a lifecycle event"
+        );
     }
 
     fn drain<T>(rx: &Receiver<T>) -> Vec<T> {
@@ -966,6 +1127,80 @@ mod tests {
         m.apply_event(&diag("untitled:Untitled-1", 5, 5));
         assert_eq!(m.file_state("untitled:Untitled-1"), None);
         assert_eq!(m.tree_state(), TreeState::Red);
+    }
+
+    // -----------------------------------------------------------------------
+    // FIELD FINDING #5 (#49) — TF_DEBOUNCE_MS env override semantics
+    //
+    // Per-test env mutation is unavoidable here (the function reads the
+    // process env on purpose) — `set_var` is `unsafe` on Edition 2024 due
+    // to the multi-threaded-read hazard; serializing tests + the
+    // remove_var-on-exit guard below keeps them deterministic.
+    // -----------------------------------------------------------------------
+
+    /// RAII guard: set `TF_DEBOUNCE_MS` for the test's scope, restore the
+    /// pre-test value (or unset) on drop.
+    struct EnvGuard {
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("TF_DEBOUNCE_MS").ok();
+            // SAFETY: tests gated on `#[cfg(test)]`; this module's tests do
+            // not spawn threads that read the env.
+            unsafe { std::env::set_var("TF_DEBOUNCE_MS", value) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("TF_DEBOUNCE_MS", v),
+                    None => std::env::remove_var("TF_DEBOUNCE_MS"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watch_debounce_defaults_when_env_unset() {
+        // Belt-and-braces: clear first, then probe the default.
+        let _g = EnvGuard::set("");
+        unsafe { std::env::remove_var("TF_DEBOUNCE_MS") };
+        let d = resolve_watch_debounce();
+        assert_eq!(d, Duration::from_millis(150), "default = 150ms");
+        // Restore via guard's Drop (sets to "", which the parser rejects →
+        // also falls back to default — that's fine for the next test).
+    }
+
+    #[test]
+    fn watch_debounce_honors_valid_env_override() {
+        let _g = EnvGuard::set("300");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn watch_debounce_rejects_zero_and_garbage() {
+        // Zero ⇒ spinloop hazard, rejected → default.
+        let _g0 = EnvGuard::set("0");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(150));
+        drop(_g0);
+        // Non-numeric ⇒ rejected → default. (No fail-loud; the CLI parser
+        // rejects bad input upstream; here we fail-safe on accidental env
+        // pollution.)
+        let _g1 = EnvGuard::set("nope");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(150));
+    }
+
+    #[test]
+    fn watch_debounce_accepts_large_values_for_flicker_free_refactor() {
+        // Sweet spot per F5 is 300-1000ms but dogfood may want longer for
+        // a noisy multi-file refactor; no artificial upper bound.
+        let _g = EnvGuard::set("2500");
+        assert_eq!(resolve_watch_debounce(), Duration::from_millis(2500));
     }
 
     #[test]
