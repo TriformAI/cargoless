@@ -117,8 +117,33 @@ echo "building harness..."
 if ! ( cd "$harness" && cargo build --release ) >/dev/null 2>&1; then
   blocker "harness failed to build." harness-build-failed
 fi
-bin="$harness/target/release/ra-latency"
-[ -x "$bin" ] || blocker "harness binary missing at $bin" harness-binary-missing
+# Resolve the binary HONORING $CARGO_TARGET_DIR. The dedicated cargoless
+# builder deliberately sets CARGO_TARGET_DIR to a PVC path OUTSIDE the
+# streamed source tree (warm cache survives the per-run wipe), so the
+# per-crate "$harness/target/release" path does NOT exist there — the
+# old hardcoded check produced a false BLOCKER=harness-binary-missing
+# even though the harness built fine. Env-first, then per-crate, then
+# ask cargo, then find.
+bin=""
+for cand in \
+  "${CARGO_TARGET_DIR:-}/release/ra-latency" \
+  "$harness/target/release/ra-latency" \
+  "$here/target/release/ra-latency"; do
+  if [ -n "$cand" ] && [ -x "$cand" ]; then bin="$cand"; break; fi
+done
+if [ -z "$bin" ]; then
+  td="$( cd "$harness" && cargo metadata --no-deps --format-version 1 2>/dev/null \
+         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("target_directory",""))' 2>/dev/null || true)"
+  if [ -n "$td" ] && [ -x "$td/release/ra-latency" ]; then bin="$td/release/ra-latency"; fi
+fi
+if [ -z "$bin" ]; then
+  bin="$(find "${CARGO_TARGET_DIR:-$harness/target}" "$harness/target" \
+           -name ra-latency -type f -perm -u+x 2>/dev/null | head -1 || true)"
+fi
+if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+  blocker "harness binary missing (CARGO_TARGET_DIR='${CARGO_TARGET_DIR:-unset}', also looked in $harness/target)" harness-binary-missing
+fi
+echo "harness binary: $bin"
 echo
 
 # ---------------------------------------------------------------------
