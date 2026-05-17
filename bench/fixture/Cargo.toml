@@ -9,7 +9,14 @@
 # Standalone workspace on purpose: it has a real external dependency (leptos)
 # and MUST NOT be pulled into the root cargoless workspace, whose build/test/
 # clippy jobs are zero-dependency by contract.
+#
+# resolver = "3" makes cargo MSRV-aware: it picks dependency versions
+# compatible with rust-version (1.85) instead of floating transitive deps
+# (icu_*, idna_adapter, wasip*, wit-bindgen) up to versions that require
+# rustc 1.86/1.87 and break the pinned 1.85 toolchain. Verified on the
+# dedicated builder. A committed Cargo.lock alongside this pins it fully.
 [workspace]
+resolver = "3"
 
 [package]
 name = "cargoless-bench-fixture"

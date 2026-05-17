@@ -1,6 +1,11 @@
 //! A todo list with add / toggle / remove / filter. Realistic signal-of-Vec
-//! state, keyed `For`, and several `view!` blocks — a fair amount of macro
-//! expansion for rust-analyzer to chew through.
+//! state and several `view!` blocks — a fair amount of macro expansion for
+//! rust-analyzer to chew through.
+//!
+//! Lists are rendered by pre-collecting `Vec<_>` of views in plain Rust and
+//! interpolating them (`{filter_buttons}` / `{todo_rows}`) rather than
+//! `<For>`: the conservative leptos-0.6.15 rsx subset that parses reliably
+//! (turbofish / iterator chains are kept OUT of the macro).
 
 use leptos::*;
 
@@ -64,6 +69,50 @@ pub fn TodoList() -> impl IntoView {
 
     let remaining = move || items.get().iter().filter(|i| !i.done).count();
 
+    let filter_buttons = move || {
+        [Filter::All, Filter::Active, Filter::Done]
+            .into_iter()
+            .map(|f| {
+                view! {
+                    <button
+                        class="todo-filter"
+                        class:active=move || filter.get() == f
+                        on:click=move |_| set_filter.set(f)
+                    >
+                        {format!("{f:?}")}
+                    </button>
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let todo_rows = move || {
+        visible
+            .get()
+            .into_iter()
+            .map(|item| {
+                let id = item.id;
+                let is_done = item.done;
+                let title = item.title.clone();
+                let prio = item.priority.tag();
+                view! {
+                    <li class="todo-row" class:done=move || is_done>
+                        <input
+                            type="checkbox"
+                            prop:checked=is_done
+                            on:change=move |_| toggle(id)
+                        />
+                        <span class="todo-title">{title}</span>
+                        <span class="todo-prio">{prio}</span>
+                        <button class="todo-del" on:click=move |_| remove(id)>
+                            "x"
+                        </button>
+                    </li>
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
     view! {
         <section class="todo">
             <h3>"Todo"</h3>
@@ -83,55 +132,9 @@ pub fn TodoList() -> impl IntoView {
                 <button type="submit">"add"</button>
             </form>
 
-            <div class="todo-filters">
-                <For
-                    each=move || [Filter::All, Filter::Active, Filter::Done]
-                    key=|f| format!("{f:?}")
-                    let:f
-                >
-                    <button
-                        class="todo-filter"
-                        class:active=move || filter.get() == f
-                        on:click=move |_| set_filter.set(f)
-                    >
-                        {format!("{f:?}")}
-                    </button>
-                </For>
-            </div>
+            <div class="todo-filters">{filter_buttons}</div>
 
-            <ul class="todo-list">
-                <For
-                    each=move || visible.get()
-                    key=|i| i.id
-                    let:item
-                >
-                    {
-                        // Destructure once into owned/Copy locals so no
-                        // single `item` is moved into several closures.
-                        let id = item.id;
-                        let is_done = item.done;
-                        let title = item.title.clone();
-                        let prio = item.priority.tag();
-                        view! {
-                            <li class="todo-row" class:done=move || is_done>
-                                <input
-                                    type="checkbox"
-                                    prop:checked=is_done
-                                    on:change=move |_| toggle(id)
-                                />
-                                <span class="todo-title">{title}</span>
-                                <span class="todo-prio">{prio}</span>
-                                <button
-                                    class="todo-del"
-                                    on:click=move |_| remove(id)
-                                >
-                                    "x"
-                                </button>
-                            </li>
-                        }
-                    }
-                </For>
-            </ul>
+            <ul class="todo-list">{todo_rows}</ul>
 
             <p class="todo-count">
                 {move || format!("{} remaining", remaining())}

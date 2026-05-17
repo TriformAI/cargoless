@@ -1,14 +1,15 @@
 //! Profile validation. Plain functions + types so the form component has a
 //! real trait/type surface behind its `view!`.
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProfileDraft {
     pub name: String,
     pub email: String,
     pub age: String,
 }
 
-#[derive(Clone, Debug, Default)]
+// `PartialEq` is required by `leptos::create_memo` (Memo<T>: T: PartialEq).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ValidationReport {
     pub errors: Vec<String>,
 }
