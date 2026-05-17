@@ -1,29 +1,34 @@
-# D-OPENCLOSED — Structural-Completeness Trigger (investigation + design)
+# D-OPENCLOSED — Structural-Completeness Trigger (agent-input model)
 
-**Status:** DESIGN ONLY. No behavior change on `main`. This is an
-investigate-and-propose note; the operator decides implement-or-not on
-the findings. Author: dev-fixer. Scratch branch
-`agent/dev-fixer-openclosed-design` off `main @ 04c7de5`.
+**Status:** DESIGN ONLY. No behavior change on `main`. Investigate-and-
+propose; the operator decides implement-or-not. Author: dev-fixer.
+Scratch branch `agent/dev-fixer-openclosed-design` off `main @ 04c7de5`.
+
+**Reframe (operator, central — not a footnote):** cargoless's primary
+input is **AI agents writing whole pieces** — atomic `Write`/`Edit` of
+complete files — **not humans streaming keystrokes**. cargoless is an
+**agent-loop tool**: it tells *the agent* the moment its code stops
+compiling. Every design choice below is centered on that. The honest
+cost unit is **per agent-edit-batch**, never per-keystroke.
 
 ## VERDICT
 
-> **FEASIBLE-WITH-PROXY.** rust-analyzer does **not** expose a clean,
-> stable-LSP "syntax-tree / parse-complete" state object over the LSP
-> surface cargoless already speaks. **But** RA's parser runs continuously
-> and *already* emits its syntax errors into the
-> `textDocument/publishDiagnostics` stream cargoless already consumes
-> (`source: "rust-analyzer"`, `severity: Error`) — so an RA-derived OPEN
-> signal is available **with zero new transport**. Because RA-native
-> diagnostics conflate *syntax* with *semantic* errors and RA's
-> syntax-error code/message is an RA-internal detail (fragility), the
-> **recommended primary signal is a dependency-free local
-> delimiter/string/brace-balance lexer** over the changed buffer (the
-> operator's own proxy #1), with the RA-native syntax-error signal as an
-> optional corroborating secondary. The state machine is a *trigger
-> heuristic only* — the authoritative cargo-check tier still decides
-> green/red, so cache correctness (AC#4) is structurally unaffected
-> regardless of proxy accuracy. Net: implementable, low-blast-radius,
-> additive; recommend proceeding to a spike on the local-lexer proxy.
+> **FEASIBLE-WITH-PROXY — and materially *stronger* under the agent-input
+> model than under human keystrokes.** RA exposes no clean stable-LSP
+> parse-state object, but its parser's syntax errors already arrive on
+> the `publishDiagnostics` stream cargoless consumes
+> (`source:"rust-analyzer"`, `severity:Error`) — zero new transport.
+> Recommended primary signal: a dependency-free local
+> delimiter/string/comment-balance lexer over each file in the
+> fs-watcher's coalesced `ChangeBatch`. Under agent input the
+> structural gate is **almost free and almost always trivially CLOSED**
+> (agent edits are intended-complete by construction), so the proxy's
+> accuracy budget is generous; its real job is the two cases that *do*
+> occur in agent loops — (a) a genuinely broken intermediate edit, and
+> (b) a multi-file batch observed mid-batch — and in both, closedness
+> only gates the *cargo-check spend*, never the verdict, so there is
+> **no wrong-cache path** regardless of proxy accuracy. Recommend a
+> bounded spike behind a default-off knob.
 
 ---
 
@@ -31,230 +36,239 @@ the findings. Author: dev-fixer. Scratch branch
 
 ### 1.1 What cargoless already observes (exact sites)
 
-cargoless does not parse Rust itself; it drives rust-analyzer over LSP
-and folds events:
+cargoless drives rust-analyzer over LSP and folds events; it also runs
+its **own** `notify` fs-watcher that coalesces change events:
 
-- `crates/tf-core/src/lsp.rs:343` `PublishDiagnostics` — one
-  `textDocument/publishDiagnostics` reduced. It already splits by
-  source: `authoritative_errors` (`source == "rustc"` — cargo-check /
-  flycheck) vs `advisory_errors` (`source == "rust-analyzer"` —
-  RA-native). `lsp.rs:388 has_any_severity_error()`,
-  `lsp.rs:369 is_green()`.
-- `crates/tf-core/src/model.rs:281 Model::apply_event` folds
-  `LspEvent::{Diagnostics, FlycheckEnded, IndexingEnded}`. GREEN is
-  gated strictly on `flycheck_done` + zero authoritative errors
-  (`model.rs:366` reconcile rule; header `model.rs:11-33`).
-- The streaming entry point is `tf_core::model::watch` (consumed by
-  `crates/tf-cli/src/watch.rs`); the FS save-burst coalescer is
-  `crates/tf-core/src/watcher.rs:206 Debouncer` +
-  `model.rs:81-94 resolve_watch_debounce` / `DEFAULT_WATCH_DEBOUNCE`
-  (150 ms) / `TF_DEBOUNCE_MS` (#49 knob).
-- Publish gate: `StateEvent::BecameGreen { identity }` →
+- **fs-watcher coalesce (the agent-write seam):**
+  `crates/tf-core/src/watcher.rs:206 Debouncer` — `record(path, now)`
+  (`:222`) accumulates a `BTreeSet<PathBuf>`; `poll(now)` (`:229`)
+  drains a coalesced **`ChangeBatch`** once the tree has been quiet for
+  `quiet`. An agent's atomic `Write` of a file surfaces as exactly one
+  (or, for a multi-file edit, a few) notify events → one `ChangeBatch`.
+- **debounce duration:** `crates/tf-core/src/model.rs:81-94
+  resolve_watch_debounce` / `DEFAULT_WATCH_DEBOUNCE` (150 ms) /
+  `TF_DEBOUNCE_MS` (#49 knob).
+- **diagnostics fold:** `crates/tf-core/src/lsp.rs:343
+  PublishDiagnostics` splits errors by source —
+  `authoritative_errors` (`source=="rustc"`, cargo-check/flycheck) vs
+  `advisory_errors` (`source=="rust-analyzer"`, RA-native). Folded at
+  `crates/tf-core/src/model.rs:283 Model::apply_event`. GREEN gated on
+  `flycheck_done` + zero authoritative errors (`model.rs:366`
+  reconcile; header `model.rs:11-33`).
+- **publish gate:** `StateEvent::BecameGreen{identity}` →
   `crates/tf-cli/src/build.rs` → build-cas atomically advances
   `.cargoless/latest-green` (AC#4 fail-closed).
 
 ### 1.2 Does RA expose parse/syntax state directly?
 
-**No clean dedicated API over our LSP surface.** rust-analyzer has a
-rich internal syntax tree (rowan) and an *unstable* extension
-`rust-analyzer/syntaxTree`, but that returns a debug-rendered tree for a
-document on request — it is a debugging endpoint, not a
-parse-error/closedness state, and is explicitly unstable. Stable LSP has
-no "is this buffer structurally complete" request.
+**No clean dedicated API over our LSP surface.** RA has a rich internal
+syntax tree and an *unstable* `rust-analyzer/syntaxTree` debug
+extension (renders a tree for a doc on request — not a closedness
+state, explicitly unstable). Stable LSP has no "is this buffer
+structurally complete" request.
 
-**However — RA's syntax errors are already in the stream we consume.**
-RA's parser is error-resilient and runs independent of cargo; it reports
-parse failures (unbalanced delimiters, incomplete items/expressions) as
-diagnostics with `source: "rust-analyzer"` and `severity: Error`. The
-codebase *already depends on this fact*: `model.rs:287-300` (F8-redo)
-documents that "RA-native parse errors don't make it to cargo-check …
-yet are unambiguous evidence the file cannot compile" and folds them
-into per-file RED. So an **RA-derived OPEN signal needs zero new
-transport** — it is a classification of diagnostics already arriving at
-`model.rs:283`.
-
-The gap: `advisory_errors` lumps RA *syntax* errors together with RA
-*semantic* errors (unresolved import, type mismatch). OPEN must mean
-*parse-incomplete*, not "RA found a semantic problem" (a buffer can be
-structurally CLOSED yet semantically wrong — that is exactly the case
-the authoritative tier exists to catch). Distinguishing them requires
-reading `Diagnostic.code` / `message` (captured at
-`lsp.rs:~484 extract_one_diagnostic` into `tf_proto::Diagnostic{ code:
-Option<String>, message }`). RA tags syntax errors with a recognizable
-code/message family ("Syntax Error: …"), but that string/code shape is
-an **RA-internal detail with no stability guarantee** — see Risk R4.
+**But RA's syntax errors are already in the stream we consume.** RA's
+parser is error-resilient and runs independent of cargo; it reports
+parse failures (unbalanced delimiters, incomplete items/exprs) as
+diagnostics with `source:"rust-analyzer"`, `severity:Error`. The
+codebase already depends on this: `model.rs:287-300` (F8-redo)
+documents that RA-native parse errors never reach cargo-check yet are
+unambiguous "cannot compile" evidence. So an RA-derived OPEN signal
+needs **zero new transport** — it is a classification of diagnostics
+already arriving at `model.rs:283`. Gap: `advisory_errors` lumps RA
+*syntax* with RA *semantic* errors; isolating syntax requires reading
+`Diagnostic.code`/`message` (captured at `lsp.rs:~484
+extract_one_diagnostic`), whose shape is an **RA-internal detail with
+no stability guarantee** (Risk R3).
 
 ### 1.3 Cheapest faithful proxy (recommended primary)
 
-A **local, dependency-free lexer** computing delimiter/string/char/raw-
-string/block-comment balance over the changed buffer. It does NOT need
-to be a Rust parser — OPEN/CLOSED is a *worth-checking heuristic*, not
-the verdict. Faithful enough: the dominant "mid-edit, not meaningful"
-states (unbalanced `{}`/`()`/`[]`, unterminated string/char, open block
-comment, trailing `.`/`::`/`,` operator with no RHS) are exactly what a
-~150-line scanner catches with zero false *negatives* on the cases that
-matter (it can be conservative — see §2.4). This matches the codebase's
-explicit hand-rolled-minimal ethos: `watcher.rs` hand-rolls
-gitignore+debounce, `statusfile.rs` hand-rolls its format, the CLI
-hand-rolls arg parsing — all "no dep until it earns its place". The
-read site is naturally **`model.rs` at the `LspEvent::Diagnostics`
-fold / the `watch` loop's debounce tick**, where the changed buffer
-text is already in hand (RA `didChange`/our watcher batch).
+A **local, dependency-free balance lexer** run over each file in the
+`ChangeBatch` (`watcher.rs:229 poll`): track `{}`/`()`/`[]` nesting,
+string/char/byte/raw-string termination, block-comment nesting. NOT a
+Rust grammar — closedness is a *worth-checking heuristic*, not the
+verdict. This matches the codebase's explicit hand-rolled-minimal ethos
+(watcher hand-rolls gitignore+debounce; statusfile its format; CLI its
+argparse — "no dep until it earns its place"). Read-site:
+**`model.rs` watch-loop, at the `Debouncer::poll` → `ChangeBatch`
+consumer** — the batch's file contents are already in hand there.
 
-> Recommendation: **local-lexer balance proxy as the authoritative
-> closedness signal**; RA-native-syntax-error as an *optional*
-> corroborating secondary (if present it strengthens OPEN; its absence
-> never forces CLOSED — the lexer is sufficient). This removes the
-> RA-internal-format dependency from the critical path (R4).
+> Under agent input the lexer is almost always trivially CLOSED (agents
+> emit complete files). Its accuracy budget is therefore generous and
+> conservative-OPEN bias (R5) is nearly costless. RA-native-syntax-error
+> is an *optional* corroborating secondary — never on the critical path
+> (keeps R3 fragility out).
 
 ---
 
-## 2. State-machine specification
+## 2. State machine — centered on agent-whole-file-write
 
-### 2.1 States
+### 2.1 The agent-input observation that drives everything
 
-| State | Meaning | Trigger behavior |
+A human keystroke stream spends **most** of its wall-clock in OPEN
+(mid-token, mid-expression). An **agent** does not type — it emits a
+*finished artifact* in one `Write`. So:
+
+- **OPEN is a RARE, SHORT TRANSIENT**, occurring only when (a) the agent
+  produced genuinely broken code (real syntax error in generated
+  output), or (b) we observe a *multi-file* edit mid-batch (file A
+  landed, file B in flight). It is **not** the steady state.
+- **CLOSED is the by-construction default** the instant the fs-watcher's
+  coalesced `ChangeBatch` settles on a well-formed agent edit.
+- Therefore the **natural trigger is "fs-watcher emitted a coalesced
+  batch AND that batch parses CLEAN"** — which, for a well-formed agent
+  edit, is true the moment the batch is observed. No keystroke
+  debouncing is being modelled.
+
+### 2.2 States
+
+| State | Meaning (agent-input) | Behavior |
 |---|---|---|
-| **OPEN** | Buffer not structurally meaningful (unbalanced / parse-error) | Suppress the authoritative (cargo-check) tier; **never** advance `.cargoless/latest-green`; do not treat any verdict as cacheable |
-| **CLOSED** | Buffer parses structurally clean | *Eligible* for the authoritative tier; only a CLOSED tree may advance latest-green |
-| **NEUTRAL** | A CLOSED→OPEN transition just occurred | Reset: discard the pending closed-quiescence timer; equivalent to OPEN for triggering, distinct only for instrumentation |
+| **CLOSED** | The coalesced `ChangeBatch` parses structurally clean (the common case for an agent edit) | Eligible for the authoritative cargo-check tier; only a CLOSED tree may advance `.cargoless/latest-green` |
+| **OPEN** | A file in the batch is parse-broken (rare: bad generated code, or batch observed mid-multi-file-write) | Suppress the authoritative tier; never advance latest-green; not cacheable |
+| **NEUTRAL** | A CLOSED→OPEN transition (a follow-up write re-broke a previously-clean batch) | Reset pending closed-quiescence; collapses to OPEN for triggering, distinct only for instrumentation |
 
-### 2.2 Transitions
+### 2.3 The #49 debouncer is demoted to a multi-file-batch safety-net
+
+Today the debouncer is the *primary* trigger mechanism (time-quiescence
+fires the check). Under the agent model it becomes a **safety-net for
+one specific case**: an agent writes file A, then file B ~200 ms later
+(two `Write` tool calls for one logical change). Without coalescing
+we'd check twice — once on A alone (crate incomplete → spurious RED),
+once on A+B. The existing `Debouncer` (`watcher.rs:206`) **already**
+solves this: `record` accumulates, `poll` yields the *union* batch once
+quiet for `quiet`. We keep its mechanism **unchanged**; we only add
+closedness as a **conjunctive precondition on the fire**:
 
 ```
-        structural-clean            structural-broken
-OPEN ───────────────────────▶ CLOSED ───────────────────────▶ NEUTRAL
-  ▲                              │                                │
-  │           (re-edit broke it) │                                │
-  └──────────────────────────────┘◀───────────────────────────────┘
-                       NEUTRAL collapses to OPEN immediately
-                       (it is OPEN + "we were just CLOSED" tag)
+// model.rs watch-loop, at the Debouncer::poll consumer:
+if let Some(batch) = debouncer.poll(now) {
+    if batch_all_closed(&batch) { run_authoritative(batch) }
+    else { /* OPEN: skip; re-evaluated when the batch next settles */ }
+}
 ```
 
-The *real trigger* is the **edge into "CLOSED ∧ quiescent"**:
-`CLOSED` holds **and** the #49 debouncer's quiet window has elapsed with
-no further change. Not pure time (today's model), not pure keystroke
-edge — the conjunction.
+So: debounce window still coalesces the multi-`Write` agent batch
+(its real remaining job); closedness gates whether that coalesced
+batch is worth a cargo-check. "Only meaningful entries
+checked/cached" becomes **nearly free** — an agent edit is
+intended-complete by construction, so the common path is
+batch→CLOSED→check, exactly once per logical agent edit.
 
-### 2.3 Granularity — per-file gate, workspace verdict (unchanged)
+### 2.4 Granularity: per-batch gate, workspace-authoritative verdict
 
-- **Closedness is computed per changed file** (the lexer runs on the
-  buffer that changed). A workspace is "closed enough to check" when
-  **no changed-since-last-check file is OPEN**. This is deliberately a
-  *heuristic for worth-checking*, NOT a per-file verdict.
-- The **verdict stays workspace-level and authoritative**: the existing
-  `flycheck_done + zero severity:Error` rule (`model.rs:366`) is
-  untouched. Closedness only decides *whether to spend a cargo-check*,
-  never *what colour the tree is*. A per-file-closed-but-crate-
-  incomplete situation (R3) therefore cannot mis-colour the tree — worst
-  case is a *skipped* check, caught on the next CLOSED∧quiescent edge.
+- Closedness is computed **per file in the `ChangeBatch`**; the batch is
+  "worth checking" iff **no file in it is OPEN**.
+- The **verdict stays workspace-level and authoritative** —
+  `flycheck_done + zero severity:Error` (`model.rs:366`) is **untouched**.
+  Closedness decides only *whether to spend a cargo-check on this
+  batch*, never *the colour*. This is the single load-bearing
+  invariant: see §3.
 
-### 2.4 Composition with the three existing invariants
+### 2.5 Composition with the two frozen invariants
 
-1. **#49 debouncer** (`watcher.rs:206`, `model.rs:81-94`): unchanged
-   mechanism; closedness becomes an **additional precondition** on the
-   debounce *fire*. Pseudologic at the watch-loop tick:
-   `if debouncer.poll(now).is_some() && workspace_closed() { run_authoritative() } else { skip }`.
-   The debouncer keeps its 150 ms/`TF_DEBOUNCE_MS` window; we add the
-   closedness conjunction. Conservative-OPEN bias: if the lexer is
-   uncertain, treat as OPEN (skip) — a skipped check is self-healing
-   (the next quiescent edge re-evaluates); a wrongly-fired check is
-   merely the *current* cost we are trying to reduce, never a
-   correctness bug.
-2. **F8-redo verdict gating** (`model.rs:287-300`): **untouched.** RED
-   still flips on any `severity:Error` from any source the instant it
-   arrives (asymmetric-evidence rule). Closedness does NOT gate RED —
-   only the *authoritative-tier spend* and *GREEN/publish eligibility*.
-   Rationale: RED is "we have positive evidence of breakage"; that
-   evidence is valid even mid-edit and must not be suppressed.
-3. **never-publish-red / AC#4** (`build.rs` → build-cas): **strengthened,
-   not weakened.** Today: latest-green advances on
-   `BecameGreen{identity}` (flycheck-backed green). Proposed: an
-   additional necessary precondition — the tree was **CLOSED** at the
-   flycheck pass that produced the green. A green derived from a
-   transiently-closed-then-reopened buffer is *still* a real cargo-check
-   green (cargo only succeeds on compilable input), so this is purely
-   *more* conservative: it can only ever *withhold* a publish, never
-   cause a wrong one. The fail-closed direction is preserved.
+1. **F8-redo asymmetric RED gating** (`model.rs:287-300`): **untouched.**
+   Any `severity:Error` from any source still flips per-file RED the
+   instant it arrives. Closedness never suppresses RED — RED is
+   positive breakage evidence and is valid even for an OPEN batch
+   (indeed an OPEN batch is *trivially* RED-worthy). Closedness gates
+   only the authoritative *spend* and GREEN/publish eligibility.
+2. **never-publish-red / AC#4** (`build.rs` → build-cas):
+   **strengthened, fail-closed preserved.** Add a necessary
+   precondition: latest-green advances only if the tree was **CLOSED**
+   at the flycheck pass that produced the green. A green off a
+   transiently-OPEN-then-CLOSED batch is *still* a real cargo-check
+   green (cargo only succeeds on compilable input) — so this can only
+   ever *withhold* a publish, never cause a wrong one.
 
 ---
 
-## 3. Risk list
+## 3. Risk list (agent-input framing)
 
 | # | Risk | Disposition |
 |---|---|---|
-| **R1** | "Parses clean ≠ compiles" — a CLOSED buffer can still be semantically broken | **Non-issue by construction.** CLOSED only makes the buffer *eligible* for the authoritative tier; cargo-check still runs and still decides. CLOSED is a worth-checking gate, never a green claim. The asymmetry is the same one F8-redo already encodes: structural-clean is *necessary, not sufficient* for green. |
-| **R2** | Transient CLOSED mid-thought (you finish a brace, pause, keep typing) fires a wasted check | **Handled by CLOSED ∧ quiescent.** The debounce quiet window (150 ms+, user-tunable via #49) must elapse *while still CLOSED*. A keep-typing burst re-opens (or resets via NEUTRAL) before the window matures, so no fire. This is strictly better than today (today a quiescent *broken* buffer still fires). |
-| **R3** | Per-file CLOSED but crate incomplete (file A balanced, but it references an item you haven't written in file B) | **No wrong-cache path.** Worst case: the authoritative tier runs and cargo-check returns RED (real evidence) → handled by the untouched F8-redo path; OR a check is *skipped* because another changed file is OPEN → self-heals on the next CLOSED∧quiescent edge. Neither path can advance latest-green on non-green (AC#4 untouched). Proven by §2.3/§2.4.4: closedness never feeds the verdict, only the spend decision. |
-| **R4** | RA-internal-dependency fragility (RA syntax-error code/message format changes across RA versions) | **Removed from critical path by the §1.3 recommendation.** Primary signal = local lexer (no RA dependency). RA-native-syntax-error is optional corroboration only; if RA's format drifts, the lexer still fully drives OPEN/CLOSED — graceful degradation, no gate breakage. (Contrast: making RA the *primary* signal would inherit AC#6-class fragility.) |
-| **R5** *(added)* | Lexer false-CLOSED on exotic-but-valid token soup (nested raw strings `r#"…"#`, byte strings, lifetimes-vs-char `'a` vs `'a'`, `<>` turbofish vs comparison) | Lexer must be **delimiter/string/comment-balance only**, NOT a Rust grammar. `<>` are *not* counted (they are not delimiters in the lexical grammar); raw-string hashes and char-vs-lifetime are the only genuinely tricky lexemes and are well-specified (~30 extra lines). Conservative-OPEN on any scanner uncertainty (R2 bias) makes false-CLOSED self-healing, not corrupting. Spike must include the raw-string/char/lifetime test corpus. |
+| **R1** | Parse-clean ≠ compiles (a CLOSED agent file can still be semantically wrong) | **Non-issue by construction.** CLOSED only makes the batch *eligible*; cargo-check still runs and still decides green/red. CLOSED is structural-necessary, never green-sufficient — the same asymmetry F8-redo already encodes. |
+| **R2** *(primary risk under agent input)* | Multi-file agent batch: file A written CLOSED, but the crate is incomplete until file B lands (A references an item B defines) | **No wrong-cache path — proven.** Two sub-cases: **(i)** the `Debouncer` coalesces A+B into one `ChangeBatch` (the common case — the safety-net of §2.3), so the check sees the complete batch; **(ii)** if A and B arrive far enough apart to be separate batches, A's batch is CLOSED → cargo-check runs → returns **RED** (real "unresolved reference" evidence) → handled by the *untouched* F8-redo path; the next batch (B) re-checks and settles green. In neither sub-case does closedness feed the verdict (§2.4) — worst case is an *extra* RED or a *skipped* check, never a green/publish on non-green. AC#4 is untouched. |
+| **R3** | RA-internal-dependency fragility (RA syntax-error code/message format drifts across RA versions) | **Off the critical path.** Primary signal = local lexer (no RA dep); RA-native-syntax-error is optional corroboration only. RA format drift ⇒ lexer still fully drives OPEN/CLOSED — graceful degradation, no gate breakage (contrast: RA-primary would inherit AC#6-class fragility). |
+| **R4** | Transient broken intermediate (agent writes a syntactically-invalid draft, then immediately fixes it) | **This is the *intended* win, not a risk.** Under the current model both the broken draft *and* the fix get cargo-checked on their respective quiescence edges. Under closedness the broken draft is skipped (RA-native RED already tells the agent it's broken, cheaply) and only the fixed CLOSED batch is cargo-checked. Strictly fewer, strictly more-meaningful. |
+| **R5** | Lexer false-CLOSED on exotic-but-valid lexemes (nested raw strings `r#"…"#`, byte strings, lifetime `'a` vs char `'a'`) | Balance-lexer only, NOT a grammar (`<>` are not delimiters lexically, so no turbofish/comparison ambiguity). Raw-string hashes + char-vs-lifetime are the only tricky lexemes (~30 lines, well-specified). Conservative-OPEN on scanner uncertainty ⇒ self-healing (skipped batch re-evaluated). Spike must carry a raw-string/char/lifetime corpus. |
 
 ---
 
-## 4. Expected effect (qualitative) + measurement hook
+## 4. Expected effect under AGENT input + measurement seam
 
-### 4.1 Why this is strictly-fewer / strictly-more-meaningful checks
+### 4.1 Why this is strictly-fewer / strictly-more-meaningful
 
-Today the authoritative tier fires on **time-quiescence alone** (debounce
-window after the last save). That includes every pause over a
-*structurally broken* buffer: every time you stop typing mid-expression
-to think, look something up, or get interrupted, a full cargo-check is
-scheduled against input that *cannot possibly* be green and whose RED is
-already known cheaply from RA-native evidence. Those checks are pure
-waste — they consume the most expensive resource in the system
-(cargo-check / rust-analyzer flycheck, the AC#2/#3 cost center) to
-re-derive a verdict the parser already knew.
+The cost unit is **per agent-edit-batch**. Two distinct wins, both
+specific to agent input:
 
-Under CLOSED∧quiescent, the authoritative tier fires **only** on pauses
-over a *structurally complete* buffer — i.e. the moments a green is
-actually *possible*. The set of fired checks becomes a strict subset of
-today's (every CLOSED∧quiescent instant is also a quiescent instant; the
-converse fails for every mid-edit pause). So: **strictly ≤ checks, and
-every suppressed check was provably incapable of producing a new green**
-(it would have been RED-by-parse or unchanged). The user-visible verdict
-latency for *real* greens is unchanged (the triggering quiescent edge
-still fires); only the wasted broken-buffer checks are removed.
+1. **Broken intermediate elimination (R4).** Agent loops routinely emit
+   syntactically-invalid intermediate states — partial refactors,
+   a `Write` that will be corrected by the next tool call, generated
+   code with a brace bug. Today every such state that reaches a
+   debounce-quiescence edge triggers a full cargo-check to re-derive a
+   RED the RA parser already knew for free. Under closedness those are
+   skipped. The fired set becomes a **strict subset**: every
+   CLOSED∧settled instant is also a settled instant; the converse fails
+   for every broken intermediate. The agent still gets the RED verdict
+   immediately (RA-native, F8-redo path) — only the *redundant
+   cargo-check* is removed.
+2. **Multi-file-batch collapse.** An agent rewriting N files for one
+   logical change triggers **one** authoritative check (when the
+   coalesced batch is CLOSED+settled) instead of up to **N** (one as
+   each file lands, several of them against a transiently-incomplete
+   crate). This is the larger win under agent input and is exactly the
+   §2.3 safety-net behavior.
 
-Secondary effect: fewer RA flycheck invocations ⇒ lower sustained
-CPU/RSS during active editing (the Framing-C throughput concern, #71) —
-but that is a *consequence to be measured*, not claimed here.
+Real-green latency for a *correct* agent edit is **unchanged** — the
+batch is CLOSED the moment it settles, so the triggering edge fires as
+today. Only provably-incapable-of-a-new-green checks are removed.
+Secondary (consequence, not claimed here): fewer cargo-check
+invocations ⇒ lower sustained CPU/RSS during an agent run — the
+Framing-C/#71 throughput concern.
 
-### 4.2 bench-lead quantification hook (do not measure here)
+### 4.2 bench-lead quantification hook (do NOT measure here)
 
-The seam where this is quantified is the existing two-mode bench
-harness (`bench/harness`, S1/AC#2). The concrete hook: instrument the
-authoritative-tier trigger site (the `model.rs` watch-loop
-debounce-fire branch identified in §1.1/§2.4.1) to emit a counter on
-**(a)** every quiescent edge (would-fire-today) and **(b)** every
-CLOSED∧quiescent edge (would-fire-proposed), over a scripted realistic
-edit trace (e.g. the `bench/fixture` Leptos `view!` corpus — RA's
-documented weak spot, already the AC#2 substrate). The metric is
-**`1 − (b/a)` = fraction of authoritative checks eliminated**, plus the
-delta in cargo-check CPU-seconds over the trace. **bench-lead owns
-running this**; this note only names the counter site and the metric.
+Seam: instrument the `model.rs` watch-loop **`Debouncer::poll →
+ChangeBatch` consumer** (§2.3) to emit a counter on **(a)** every
+settled batch (would-fire today) and **(b)** every settled *CLOSED*
+batch (would-fire proposed), over a **synthetic agent-edit trace** —
+sequences of atomic multi-file `Write` batches including deliberate
+broken-intermediate and split multi-file cases (the realistic
+agent-loop shape; the `bench/fixture` Leptos `view!` corpus is the
+substrate, driven as agent-style whole-file rewrites rather than
+keystrokes). Metric: **`1 − (b/a)` = fraction of authoritative
+cargo-checks eliminated per agent-edit-batch**, plus cargo-check
+CPU-seconds delta over the trace. **bench-lead owns running this**;
+this note only names the counter site, the unit (agent-edit-batch),
+and the metric.
 
 ---
 
 ## 5. Recommendation & operator decision points
 
 **Recommend: PROCEED to a bounded spike** on the local-lexer proxy
-(§1.3) behind a default-off flag (env idiom matching `TF_DEBOUNCE_MS`,
-e.g. `TF_STRUCTURAL_TRIGGER=1`), additive alongside the frozen
-`StateEvent` seam — zero risk to the byte-frozen contract or AC#4, fully
-reversible, measurable via §4.2 before any default flip.
+(§1.3) behind a default-off env knob (idiom matching `TF_DEBOUNCE_MS`,
+e.g. `TF_STRUCTURAL_TRIGGER=1`), additive alongside the byte-frozen
+`StateEvent` seam — zero risk to the frozen contract or AC#4, fully
+reversible, measurable via §4.2 before any default flip. The
+agent-input reframe *strengthens* the case: the gate is almost-free,
+almost-always-CLOSED, and its wins (broken-intermediate skip,
+multi-file collapse) are exactly the wasteful patterns agent loops
+generate.
 
-Operator decisions this note surfaces:
-1. **Proxy choice:** local-lexer-primary (recommended, robust) vs
-   RA-native-syntax-error-primary (zero new code but R4-fragile) vs
-   both-required (most conservative, fewest fires).
-2. **Default disposition:** ship default-off (knob) and let §4.2 evidence
+Operator decisions surfaced:
+1. **Proxy choice:** local-lexer-primary (recommended) vs
+   RA-native-syntax-error-primary (zero new code, R3-fragile) vs
+   both-required (most conservative).
+2. **Default disposition:** ship default-off knob and let §4.2 evidence
    justify a later default-on, or keep permanently opt-in.
-3. **Scope of CLOSED for publish (§2.4.3):** adopt the *strengthened*
-   never-publish-unless-was-CLOSED precondition (recommended — strictly
-   safer, costs nothing) or leave AC#4 exactly as-is and apply
-   closedness only to the *trigger* (smaller change).
-4. Whether the eventual implementation is dev-fixer's lane (model/lsp
-   trigger seam) with bench-lead owning the §4.2 measurement — proposed
-   ownership split, lead to confirm.
+3. **Publish precondition (§2.5.2):** adopt the strengthened
+   never-publish-unless-was-CLOSED (recommended — strictly safer, free)
+   vs apply closedness to the *trigger* only (smaller change, AC#4
+   byte-unchanged).
+4. **Ownership split (proposed, lead to confirm):** dev-fixer owns the
+   `model.rs`/`watcher.rs` trigger-seam implementation; bench-lead owns
+   the §4.2 agent-edit-batch quantification.
 
-No code changes proposed in this note; nothing on `main` is touched.
+No code changes proposed; nothing on `main` is touched.
