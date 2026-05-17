@@ -24,7 +24,8 @@ harness="$here/harness"
 hr() { printf '%s\n' "------------------------------------------------------------"; }
 
 # Honest blocker: print why the spike could not produce a verdict, then
-# exit 0 (see DESIGN above).
+# emit the machine-parseable verdict as the FINAL stdout line, then
+# exit 0 (see DESIGN above). $1 = human message, $2 = kebab token.
 blocker() {
   hr
   echo "BLOCKER: $1"
@@ -33,6 +34,9 @@ blocker() {
   echo "This is the S1 gate (Plane CWDL-22); resolve before Sprint 2."
   echo "(run.sh exits 0 by design — evidence, not a CI gate.)"
   hr
+  # MUST be the last line: the lead lifts this into a Forgejo commit
+  # status (the only S1 channel readable via API on this build).
+  echo "S1_VERDICT: BLOCKER=${2:-spike-could-not-run} AC2=UNKNOWN D-A2=BLOCKED"
   exit 0
 }
 
@@ -59,7 +63,7 @@ if [ "${rs_files:-0}" -lt "$MIN_FILES" ] || [ "${rs_loc:-0}" -lt "$MIN_LOC" ]; t
   echo "number measured against it would flatter rust-analyzer and make"
   echo "the AC#2 / D-A2 verdict dishonest. Refusing to report a median."
   echo "Restore bench/fixture to a realistically-sized Leptos project."
-  blocker "fixture below honest-size floor (${rs_files}f/${rs_loc}L < ${MIN_FILES}f/${MIN_LOC}L)"
+  blocker "fixture below honest-size floor (${rs_files}f/${rs_loc}L < ${MIN_FILES}f/${MIN_LOC}L)" fixture-below-honest-size-floor
 fi
 echo
 
@@ -83,7 +87,7 @@ if [ -z "$RA_BIN" ] && command -v rust-analyzer >/dev/null 2>&1; then
 fi
 if [ -z "$RA_BIN" ] || ! "$RA_BIN" --version >/dev/null 2>&1; then
   blocker "rust-analyzer not available. It is required for the S1 spike \
-and must be installable in CI (rustup component add rust-analyzer)."
+and must be installable in CI (rustup component add rust-analyzer)." rust-analyzer-unavailable
 fi
 echo "rust-analyzer: $RA_BIN ($("$RA_BIN" --version 2>/dev/null | head -1))"
 echo
@@ -98,7 +102,7 @@ echo "fetching fixture dependencies (leptos)..."
 if ! ( cd "$fixture" && cargo fetch ) >/dev/null 2>&1; then
   blocker "cargo fetch failed in the fixture — most likely no crates.io \
 egress in this CI runner. RA fidelity on Leptos cannot be measured \
-without the real leptos proc-macro crate."
+without the real leptos proc-macro crate." no-crates-io-egress
 fi
 echo "building fixture (warm cargo metadata + proc-macro artifacts)..."
 ( cd "$fixture" && cargo build ) >/dev/null 2>&1 \
@@ -111,14 +115,23 @@ echo
 # ---------------------------------------------------------------------
 echo "building harness..."
 if ! ( cd "$harness" && cargo build --release ) >/dev/null 2>&1; then
-  blocker "harness failed to build."
+  blocker "harness failed to build." harness-build-failed
 fi
 bin="$harness/target/release/ra-latency"
-[ -x "$bin" ] || blocker "harness binary missing at $bin"
+[ -x "$bin" ] || blocker "harness binary missing at $bin" harness-binary-missing
 echo
 
 # ---------------------------------------------------------------------
-# Run it. The harness prints the full report + verdict and exits 0.
+# Run it. The harness prints the full human report, then its FINAL
+# stdout line is the machine-parseable `S1_VERDICT:` summary — the only
+# S1 channel the lead can read back via the Forgejo API (logs 404 / web
+# UI 303s to login on this build). Safety net: if the harness died
+# before emitting it, synthesize a BLOCKER verdict as the last line so
+# `^S1_VERDICT:` is ALWAYS grep-able. exit 0 always (evidence, not gate).
 # ---------------------------------------------------------------------
-RA_BIN="$RA_BIN" FIXTURE_DIR="$fixture" "$bin"
+out_log="$(mktemp)"
+RA_BIN="$RA_BIN" FIXTURE_DIR="$fixture" "$bin" | tee "$out_log"
+if ! grep -q '^S1_VERDICT:' "$out_log"; then
+  echo "S1_VERDICT: BLOCKER=harness-no-verdict AC2=UNKNOWN D-A2=BLOCKED"
+fi
 exit 0

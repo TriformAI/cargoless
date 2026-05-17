@@ -62,10 +62,13 @@ fn main() {
     let fixture = match cfg.fixture.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            blocker(&format!(
-                "fixture dir {:?} not found ({e}). Cannot measure.",
-                cfg.fixture
-            ));
+            blocker(
+                "fixture-dir-missing",
+                &format!(
+                    "fixture dir {:?} not found ({e}). Cannot measure.",
+                    cfg.fixture
+                ),
+            );
             return;
         }
     };
@@ -85,10 +88,13 @@ fn main() {
     let mut ra = match spawn_ra(&cfg.ra_bin, &fixture) {
         Ok(c) => c,
         Err(e) => {
-            blocker(&format!(
-                "could not spawn rust-analyzer ({e}). \
-                 RA is required and must be available in CI."
-            ));
+            blocker(
+                "rust-analyzer-spawn-failed",
+                &format!(
+                    "could not spawn rust-analyzer ({e}). \
+                     RA is required and must be available in CI."
+                ),
+            );
             return;
         }
     };
@@ -738,6 +744,41 @@ fn report(cfg: &Cfg, t: &ScenarioResult, m: &ScenarioResult) {
     }
     println!();
     println!("(harness exit 0 by design — evidence, not a CI gate)");
+
+    // MUST be the final stdout line: run.sh / the lead lift this single
+    // line into a Forgejo commit status (the only S1 channel readable
+    // via API on this build). <=200 chars, prefix `S1_VERDICT:`.
+    println!("{}", s1_verdict_line(cfg, t, m));
+}
+
+/// The one machine-parseable line. Self-contained, grep-able as
+/// `^S1_VERDICT:`, <=200 chars.
+fn s1_verdict_line(cfg: &Cfg, t: &ScenarioResult, m: &ScenarioResult) -> String {
+    let b = cfg.ac2_budget_ms;
+    let tv = verdict(t, b);
+    let mv = verdict(m, b);
+
+    let trait_part = match t.median() {
+        Some(ms) => format!("trait_err={ms}ms:{}", if tv.1 { "PASS" } else { "FAIL" }),
+        None => "trait_err=NA:FAIL".to_string(),
+    };
+    let view_part = if !m.fidelity() {
+        "view_macro=MISS".to_string()
+    } else {
+        match m.median() {
+            Some(ms) => format!("view_macro={ms}ms"),
+            None => "view_macro=MISS".to_string(),
+        }
+    };
+    let pass = tv.1 && mv.1;
+    let ac2 = if pass { "PASS" } else { "FAIL" };
+    let da2 = if pass { "GO" } else { "NO-GO" };
+    let reword = if pass {
+        "AC#2 stands: median save->verdict <1s on the reference project"
+    } else {
+        "<1s median for RA-native errors; view!/macro errors use slower-but-correct flycheck"
+    };
+    format!("S1_VERDICT: {trait_part} {view_part} AC2={ac2} D-A2={da2} reword=\"{reword}\"")
 }
 
 /// -> (status string, meets_budget, adjective)
@@ -774,7 +815,7 @@ fn verdict(r: &ScenarioResult, budget: u64) -> (String, bool, &'static str) {
     }
 }
 
-fn blocker(msg: &str) {
+fn blocker(token: &str, msg: &str) {
     println!("=== cargoless S1 / AC#2 latency harness ===");
     println!();
     println!("BLOCKER: {msg}");
@@ -784,4 +825,6 @@ fn blocker(msg: &str) {
     println!("Sprint 2 (it is the S1 gate, Plane CWDL-22).");
     println!();
     println!("(harness exit 0 by design — evidence, not a CI gate)");
+    // Final stdout line — see s1_verdict_line.
+    println!("S1_VERDICT: BLOCKER={token} AC2=UNKNOWN D-A2=BLOCKED");
 }
