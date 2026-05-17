@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+.DS_Store
+# Local CAS / daemon scratch dirs (real paths come from config).
+.tf-trunk-cache/
+*.log

@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    name: build + test + fmt + clippy
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  bench:
+    name: rust-analyzer latency harness (S1 / AC#2)
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    # Placeholder until the bench/spike agent lands the harness. AC#2 requires
+    # this to be a reproducible benchmark committed to the repo and run by CI.
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Harness status
+        run: |
+          if [ -x bench/run.sh ]; then
+            bench/run.sh
+          else
+            echo "S1/AC#2 latency harness not yet implemented (bench/run.sh missing)."
+            echo "Tracked in Plane CWDL: S1 spike (CWDL-22) + AC#2 (CWDL-3)."
+          fi

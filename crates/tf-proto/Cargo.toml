@@ -1,0 +1,13 @@
+[package]
+name = "tf-proto"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared contract types for the TF-Trunk daemon, build pipeline, and future remote backends."
+
+[lints]
+workspace = true
+
+[dependencies]

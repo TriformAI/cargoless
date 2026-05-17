@@ -1,0 +1,18 @@
+[package]
+name = "tf-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The TF-Trunk binary. Subcommands: serve, check, status, clean."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tftrunk"
+path = "src/main.rs"
+
+[dependencies]
+tf-core = { path = "../tf-core" }

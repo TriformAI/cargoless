@@ -1,0 +1,7 @@
+# Pinned so it is a deterministic input to the artifact hash (plan: input
+# hashing includes rust-toolchain.toml content). Dogfoods our own determinism
+# requirement.
+[toolchain]
+channel = "1.85.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

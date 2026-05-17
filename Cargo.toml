@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/tf-proto",
+    "crates/tf-cas",
+    "crates/tf-core",
+    "crates/tf-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://forgejo.triform.dev/triform/tf-trunk"
+# NOTE: the published product name is open decision D1 (Plane CWDL-12).
+# "tf-trunk" is a name-neutral working identifier, NOT the shipping name.
+# `tf` collides with Terraform and must not be the published binary name.
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.dev]
+# Inner-loop builds must stay debug / no wasm-opt (plan AC#3 constraint).
+opt-level = 0
+debug = true

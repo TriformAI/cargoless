@@ -1,0 +1,15 @@
+[package]
+name = "tf-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The TF-Trunk daemon: filesystem watcher, rust-analyzer wrapper, green/red model, build orchestration, dev server."
+
+[lints]
+workspace = true
+
+[dependencies]
+tf-proto = { path = "../tf-proto" }
+tf-cas = { path = "../tf-cas" }
