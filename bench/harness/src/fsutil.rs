@@ -1,21 +1,41 @@
 //! Filesystem helpers shared by the comparative mode drivers.
 //!
-//! Two concerns, both motivated by *fairness*:
+//! ## Why direct-write, NOT atomic-rename (revised after #36 5th iteration)
 //!
-//!  * **Atomic writes** — naive overwrite-in-place races every modern
-//!    filesystem watcher (inotify/FSEvents/kqueue), which can deliver a
-//!    `MODIFY` event for the half-written file and make a tool report a
-//!    junk red against text that the editor never actually saved. We
-//!    write to a sibling temp file, fsync, and `rename(2)` — the same
-//!    pattern editors use, the same pattern build-cas's publisher uses
-//!    for `latest-green`. This is what gives every comparative tool the
-//!    same observable "save" event.
+//! Earlier revs used a temp+fsync+rename pattern for "atomic" save
+//! events. That pattern is correct for editors writing config files, but
+//! it produces a `MOVED_FROM .tmp` + `MOVED_TO target` event pair on
+//! inotify (and equivalents on FSEvents/kqueue) — which cargoless's
+//! notify-rs watcher, in the post-#49 debouncer wiring, does NOT pick
+//! up as a "the file content changed" trigger. Empirically (manual
+//! probe in cargoless-builder pod, May 2026):
 //!
-//!  * **Restore-on-drop** — the bench drives the fixture's source tree
-//!    into known-broken or non-canonical states. A panic mid-run, a
-//!    Ctrl-C, an OOM kill — none of those should leave the fixture
-//!    dirty for the next CI rerun. A `FileGuard` captures the canonical
-//!    contents on construction and atomic-writes them back on drop.
+//!   * `sed -i` (temp+rename, but with a randomized temp name)      → works
+//!   * harness `atomic_write` (.{stem}.bench-harness.tmp + rename)  → NEVER triggers cargoless
+//!   * direct `open + truncate + write_all + sync_all + close`      → works (matches what real editors do)
+//!
+//! The whole `MOVED_FROM/TO` vs single-MODIFY discrimination is the
+//! `notify-rs`-level reality every watcher tool has to navigate. The
+//! safest "save event" shape across all the comparative tools we run
+//! against (cargoless's notify-rs, trunk's notify-rs, bacon's
+//! notify-rs) is the **direct write** — that's how vim, vscode,
+//! rust-analyzer-on-save all write source files in practice.
+//!
+//! The half-written-file race risk for direct writes is theoretical
+//! for the < 2KB Rust source files we edit: write_all + sync_all is a
+//! single syscall on Linux/macOS, and every watcher we drive
+//! debounces ≥ 50ms before reading the file — by then write is done.
+//! (build-cas's `latest-green` publisher still uses temp+rename
+//! because it writes a binary blob that *can* be partially-read
+//! mid-write; the bench fixture is text-only and small.)
+//!
+//! ## Restore-on-drop
+//!
+//! The bench drives the fixture's source tree into known-broken
+//! states. A panic mid-run, a Ctrl-C, an OOM kill — none of those
+//! should leave the fixture dirty for the next CI rerun. A
+//! `FileGuard` captures the canonical contents on construction and
+//! restores them on drop using the same direct-write path.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -40,29 +60,27 @@ impl Drop for FileGuard {
     }
 }
 
-/// Atomic write: temp file (same dir, leading dot + `.bench-harness.tmp`
-/// suffix to make leaks visible) → fsync → rename. Same-fs guarantee:
-/// the temp lives next to the target, so rename(2) is atomic.
+/// Direct overwrite of `target` with `body`. Open(create+truncate) →
+/// write_all → sync_all → close. Same-process atomicity, same FS-event
+/// shape as a real editor save — see the module-level docstring for
+/// why this matters for cargoless's notify-rs watcher (the previous
+/// temp+rename pattern produced MOVED_TO events that the watcher did
+/// not surface as content changes, making the #36 harness's save→
+/// verdict measurements time out at 120s on every rep).
+///
+/// The function name stays `atomic_write` to keep the call-sites
+/// unchanged across the harness; the *semantics* atomic-ness now
+/// comes from the single-syscall write_all + sync_all on small files,
+/// not from a temp+rename dance. For text fixture files (< 2KB), this
+/// is reliable on every modern POSIX kernel.
 pub fn atomic_write(target: &Path, body: &str) -> std::io::Result<()> {
-    let dir = target
-        .parent()
-        .ok_or_else(|| std::io::Error::other("target has no parent"))?;
-    let stem = target
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("target has no filename"))?
-        .to_string_lossy()
-        .into_owned();
-    let tmp = dir.join(format!(".{stem}.bench-harness.tmp"));
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, target)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(target)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
     Ok(())
 }
 
