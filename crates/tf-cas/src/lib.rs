@@ -1,8 +1,32 @@
-//! Content-addressed storage.
+//! Content-addressed storage + the build-input hashing that keys it.
 //!
 //! The [`ContentStore`] trait is the v1 remote-backend seam — it MUST exist in
 //! v0 even though only [`LocalDiskStore`] implements it, or v1 becomes a
 //! rewrite (decision D10). v0 ships local-disk only; S3/RustFS are v1.
+//!
+//! This crate also owns the half of the `tf-proto` contract that `tf-proto`
+//! deliberately does *not* specify: the hash algorithm ([`sha256`]) and the
+//! `BuildIdentity → InputHash` reduction ([`input_hash`]) that the whole AC#5
+//! dedupe / AC#4 provenance guarantee rests on. The daemon assembles a
+//! `BuildIdentity`; this crate turns it into the CAS key and stores the bytes.
+//!
+//! | Concern | Where |
+//! |---|---|
+//! | stable hash primitive | [`sha256`] |
+//! | `BuildIdentity → InputHash`, per-file content hashing | [`identity`] |
+//! | deterministic whole-source-tree hash | [`tree`] |
+//! | `tf clean` wipe semantics + safety guard | [`clean`] |
+//! | artifact byte storage (trait + local disk) | [`ContentStore`] |
+
+pub mod clean;
+pub mod identity;
+pub mod sha256;
+pub mod tree;
+
+pub use clean::{UnsafeCacheRoot, clean_cache, guard_cache_root};
+pub use identity::{absent_marker, content_hash, input_hash};
+pub use sha256::sha256_hex;
+pub use tree::hash_source_tree;
 
 use std::fs;
 use std::io;
