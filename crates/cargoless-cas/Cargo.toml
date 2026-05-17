@@ -1,5 +1,5 @@
 [package]
-name = "tf-cas"
+name = "cargoless-cas"
 version.workspace = true  # CWDL-71 Phase B: inherits from [workspace.package]
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,4 @@ description = "Content-addressed artifact store: trait + local-disk implementati
 workspace = true
 
 [dependencies]
-tf-proto = { path = "../tf-proto", version = "0.0.0" }  # publish-ready: explicit version required by `cargo publish` even with path
+cargoless-proto = { path = "../cargoless-proto", version = "0.0.0" }  # publish-ready: explicit version required by `cargo publish` even with path

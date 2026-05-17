@@ -34,7 +34,7 @@
 #   (no in-pod git, no registry auth, deterministic — tracked files only).
 #
 #   The gate runs the four .forgejo checks under DEFAULT features, then —
-#   iff crates/tf-cli/Cargo.toml declares an `integration` feature in the
+#   iff crates/cargoless/Cargo.toml declares an `integration` feature in the
 #   streamed tree — ALSO runs build/test/clippy for `-p cargoless --features
 #   integration` (the wired daemon, excluded from the default build). On a
 #   tree with no such feature those three are reported SKIPPED, not failed.
@@ -225,16 +225,16 @@ done
 # `--features integration`; the default workspace build deliberately excludes
 # it (standalone holding-page semantics). The 4 checks above are
 # default-feature only, so on the converged set they would NOT exercise the
-# wired cargoless binary at all. (The crate lives at crates/tf-cli/ — the
+# wired cargoless binary at all. (The crate lives at crates/cargoless/ — the
 # directory path is unchanged by the D1 rename; only `[package] name`
 # became `cargoless`.) Detect the
 # feature in the STREAMED tree and, when present, gate it explicitly. This
 # is a no-op on plain main (no `integration` feature → checks reported
 # SKIPPED, not failed) and a hard gate on the convergence branch.
 INTEG_CHECKS=(integ-build integ-test integ-clippy)
-if kexec bash -c "grep -qE '^[[:space:]]*integration[[:space:]]*=' $REMOTE_SRC/crates/tf-cli/Cargo.toml 2>/dev/null"; then
+if kexec bash -c "grep -qE '^[[:space:]]*integration[[:space:]]*=' $REMOTE_SRC/crates/cargoless/Cargo.toml 2>/dev/null"; then
   echo
-  echo "[ci-gate] cargoless (crates/tf-cli/) declares an 'integration' feature — gating the wired daemon too"
+  echo "[ci-gate] cargoless (crates/cargoless/) declares an 'integration' feature — gating the wired daemon too"
   INTEG=(
     "integ-build|build -p cargoless --features integration --all-targets --locked"
     "integ-test|test -p cargoless --features integration --locked"
@@ -253,7 +253,7 @@ if kexec bash -c "grep -qE '^[[:space:]]*integration[[:space:]]*=' $REMOTE_SRC/c
   done
 else
   echo
-  echo "[ci-gate] no 'integration' feature in cargoless (crates/tf-cli/) — wired-daemon checks SKIPPED (expected on plain main)"
+  echo "[ci-gate] no 'integration' feature in cargoless (crates/cargoless/) — wired-daemon checks SKIPPED (expected on plain main)"
 fi
 
 echo

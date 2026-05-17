@@ -22,7 +22,7 @@
 //! reduction an explicit, observable cache-space move rather than a silent
 //! one.
 
-use tf_proto::{BuildIdentity, ContentHash, InputHash};
+use cargoless_proto::{BuildIdentity, ContentHash, InputHash};
 
 use crate::sha256::sha256_hex;
 
@@ -105,7 +105,7 @@ pub fn absent_marker(kind: &str) -> ContentHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tf_proto::{Profile, TargetTriple};
+    use cargoless_proto::{Profile, TargetTriple};
 
     fn base() -> BuildIdentity {
         BuildIdentity {

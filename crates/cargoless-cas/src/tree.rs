@@ -40,7 +40,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use tf_proto::ContentHash;
+use cargoless_proto::ContentHash;
 
 use crate::sha256::sha256_hex;
 

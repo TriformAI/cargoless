@@ -41,8 +41,8 @@ const K: [u32; 64] = [
 /// SHA-256 digest of `data` as a lowercase 64-char hex string.
 ///
 /// This is the single hashing primitive the CAS is built on: it produces both
-/// the per-component [`tf_proto::ContentHash`](tf_proto::ContentHash) values
-/// and the derived [`tf_proto::InputHash`](tf_proto::InputHash) CAS key.
+/// the per-component [`cargoless_proto::ContentHash`](cargoless_proto::ContentHash) values
+/// and the derived [`cargoless_proto::InputHash`](cargoless_proto::InputHash) CAS key.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let digest = sha256(data);

@@ -1,5 +1,5 @@
 [package]
-name = "tf-proto"
+name = "cargoless-proto"
 version.workspace = true  # CWDL-71 Phase B: inherits from [workspace.package]
 edition.workspace = true
 rust-version.workspace = true
