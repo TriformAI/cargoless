@@ -689,20 +689,29 @@ mod tests {
 
     #[test]
     fn extract_reason_caps_at_five_error_lines_for_readability() {
-        // A build with 50 errors must not splat all 50 onto one line.
+        // A build with 20 errors must not splat all 20 onto one line —
+        // the cap is the last 5 (recency-biased + bounded for readability).
+        //
+        // Note: the per-line marker uses a UNIQUE delimited token
+        // (`#{i}#`) rather than a bare integer, so substring matching
+        // doesn't false-positive (e.g. "failure 1" would otherwise be a
+        // substring of "failure 16" — exactly the test bug the first
+        // self-gate revealed).
         let stderr: String = (1..=20)
-            .map(|i| format!("error: failure number {i}\n"))
+            .map(|i| format!("error: failure #{i}# marker\n"))
             .collect();
         let got = extract_trunk_failure_reason("", &stderr, Some(101));
-        // Take the LAST 5: numbers 16..=20.
+        // The LAST 5 (numbers 16..=20) MUST appear in the surfaced message.
         for i in 16..=20 {
-            assert!(got.contains(&format!("failure number {i}")));
+            let marker = format!("#{i}#");
+            assert!(got.contains(&marker), "expected marker {marker} in: {got}");
         }
-        // 1..=15 are NOT in the surfaced message.
+        // The earlier 15 (1..=15) MUST NOT appear — they got capped out.
         for i in 1..=15 {
+            let marker = format!("#{i}#");
             assert!(
-                !got.contains(&format!("failure number {i}")),
-                "earlier error leaked: {got}"
+                !got.contains(&marker),
+                "earlier marker {marker} leaked into: {got}"
             );
         }
     }
