@@ -10,6 +10,7 @@
 //! green-on-empty (decision D10).
 
 pub mod analyzer;
+pub mod server;
 pub mod watcher;
 
 pub use tf_cas::{ContentStore, LocalDiskStore};
