@@ -10,7 +10,10 @@
 //! green-on-empty (decision D10).
 
 pub use tf_cas::{ContentStore, LocalDiskStore};
-pub use tf_proto::{ArtifactMeta, FileState, InputHash, StateEvent};
+pub use tf_proto::{
+    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, ContentHash, FileState,
+    InputHash, Profile, StateEvent, TargetTriple, TreeState,
+};
 
 /// Name-neutral build identifier. The shipping product name is decision D1;
 /// nothing in the codebase hardcodes a public name until then.
@@ -37,13 +40,19 @@ mod tests {
     fn proto_and_cas_are_reexported() {
         let _h = InputHash::new("x");
         let _s = LocalDiskStore::new(std::env::temp_dir());
-        let _e = StateEvent::BecameGreen;
+        let _e = StateEvent::BecameRed;
         let _f = FileState::Green;
+        let identity = BuildIdentity {
+            source_tree: ContentHash::new("a"),
+            cargo_lock: ContentHash::new("b"),
+            rust_toolchain: ContentHash::new("c"),
+            tf_config: ContentHash::new("d"),
+            target: TargetTriple::new("wasm32-unknown-unknown"),
+            profile: Profile::Dev,
+        };
         let _m = ArtifactMeta {
             input_hash: InputHash::new("x"),
-            toolchain_id: "1.85.0".into(),
-            target_triple: "wasm32-unknown-unknown".into(),
-            profile: "dev".into(),
+            identity,
         };
     }
 }

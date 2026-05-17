@@ -365,10 +365,12 @@ mod tests {
     fn outcome_servability_drives_artifact_presence() {
         assert!(BuildOutcome::Deduplicated.is_servable());
         assert!(BuildOutcome::Compiled.is_servable());
-        assert!(!BuildOutcome::Failed {
-            reason: "linker exploded".into()
-        }
-        .is_servable());
+        assert!(
+            !BuildOutcome::Failed {
+                reason: "linker exploded".into()
+            }
+            .is_servable()
+        );
 
         let ok = BuildResult {
             outcome: BuildOutcome::Compiled,
