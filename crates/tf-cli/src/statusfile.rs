@@ -307,60 +307,97 @@ impl Conflict {
 /// Startup admission verdict for `watch` / `build --watch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchAdmission {
-    /// No live sibling — safe to become the watcher for this root.
+    /// No prior `.cargoless/cli-status` at all — safe clean start.
     Proceed,
-    /// A live sibling watcher already owns this root.
+    /// #128: a prior `cli-status` EXISTED but its owner is **not a
+    /// demonstrably-live cargoless watcher** (SIGKILL'd-then-stale,
+    /// zombie, dead pid, or a pid reused by an unrelated process). The
+    /// orphaned file is taken over and the caller logs an actionable
+    /// recovery note — **never a bare refuse** (the agent-fleet bug:
+    /// fleets hard-kill daemons routinely). `stale_pid` is the dead /
+    /// not-our-live-daemon pid the old file named.
+    Recover { stale_pid: u32 },
+    /// A genuinely-live sibling cargoless watcher (heartbeat-fresh AND
+    /// pid-alive AND same-binary) already owns this root.
     Refuse(Conflict),
 }
 
-/// Pure decision (no I/O) so every branch is unit-tested deterministically.
-/// `pid_alive` mirrors [`pid_is_alive`]'s tri-state: `None` (non-Unix)
-/// cannot safely refuse and therefore proceeds — the #56 legacy posture.
+/// Pure decision (no I/O) so every branch is unit-tested
+/// deterministically.
+///
+/// #128: this now applies the **same F10 composite `run_status` uses** —
+/// the prior watcher counts as a genuinely-live sibling (⇒ `Refuse`)
+/// ONLY if its `cli-status` heartbeat is still fresh **AND** its pid is
+/// alive **AND** it is the same binary. A live cargoless watcher
+/// rewrites `updated` every [`HEARTBEAT`]; a SIGKILL'd one's heartbeat
+/// freezes and ages past [`STALE_AFTER`]. So any of {stale heartbeat,
+/// dead pid, pid reused by an unrelated process} ⇒ the prior daemon is
+/// gone ⇒ `Recover` (take over the orphaned file + log it), **never a
+/// bare refuse**. `pid_alive == None` (non-Unix, unprobable) keeps the
+/// #56 legacy `Proceed` posture unchanged.
 fn admission_decision(
     existing: Option<&Status>,
     my_pid: u32,
     now: u64,
+    file_fresh: bool,
     pid_alive: Option<bool>,
     same_binary: bool,
 ) -> WatchAdmission {
     let Some(st) = existing else {
-        return WatchAdmission::Proceed; // no prior watcher
+        return WatchAdmission::Proceed; // no prior watcher at all
     };
     if st.pid == 0 || st.pid == my_pid {
-        // Malformed (pid 0) or our own re-read — never a conflict.
+        // Malformed (pid 0) or our own re-read — not a conflict, and
+        // not an orphan to "recover" from either.
         return WatchAdmission::Proceed;
     }
-    if pid_alive != Some(true) {
-        // Dead pid (the #56 F10 stale-file case) OR non-Unix (None):
-        // the prior daemon is gone / unprobable — take over the root.
+    if pid_alive.is_none() {
+        // Non-Unix: we cannot probe liveness, so we can neither refuse
+        // nor claim the file is stale. Preserve the #56 legacy posture
+        // exactly (Proceed, no recovery note).
         return WatchAdmission::Proceed;
     }
-    if !same_binary {
-        // pid alive but recycled to some OTHER program — not a
-        // cargoless watcher; do NOT false-refuse.
-        return WatchAdmission::Proceed;
+    // Unix from here. The prior watcher is a genuinely-live sibling iff
+    // ALL THREE hold (the run_status F10 composite + same-binary):
+    // heartbeat fresh, pid alive, same binary. Anything else means the
+    // recorded daemon is NOT actually watching this root anymore.
+    let demonstrably_live = file_fresh && pid_alive == Some(true) && same_binary;
+    if demonstrably_live {
+        WatchAdmission::Refuse(Conflict {
+            pid: st.pid,
+            root: st.root.clone(),
+            verdict: Verdict::parse(&st.verdict_str),
+            age_secs: now.saturating_sub(st.updated),
+        })
+    } else {
+        // SIGKILL'd-then-stale, zombie, dead pid, or pid reused by an
+        // unrelated process: the file is orphaned. Take it over with an
+        // actionable recovery note — the agent-fleet bug fix (#128).
+        WatchAdmission::Recover { stale_pid: st.pid }
     }
-    WatchAdmission::Refuse(Conflict {
-        pid: st.pid,
-        root: st.root.clone(),
-        verdict: Verdict::parse(&st.verdict_str),
-        age_secs: now.saturating_sub(st.updated),
-    })
 }
 
 /// Resolve the I/O probes and apply [`admission_decision`]. Call ONCE at
 /// `watch` / `build --watch` startup, BEFORE the costly rust-analyzer
-/// bring-up, so a refused start is instant.
+/// bring-up, so a refused start (or stale-file recovery) is instant.
+///
+/// #128: `file_fresh` is computed from the heartbeat exactly as
+/// [`run_status`] does, so `watch` and `status` now AGREE on "is the
+/// prior daemon really there". The binary-identity probe runs only when
+/// the heartbeat is fresh AND the pid is alive — a stale or dead entry
+/// is recovered without spawning `ps` at all.
 pub fn admission(root: &Path, my_pid: u32) -> WatchAdmission {
     let Ok(text) = std::fs::read_to_string(path(root)) else {
-        return WatchAdmission::Proceed; // no status file ⇒ no sibling
+        return WatchAdmission::Proceed; // no status file ⇒ clean start
     };
     let st = Status::parse(&text);
+    let now = now_unix();
+    let file_fresh = st.is_fresh(now);
     let alive = pid_is_alive(st.pid);
-    // Only run the (process-spawning) binary-identity probe when the pid
-    // is actually alive — short-circuits the common stale-file path.
-    let same = alive == Some(true) && pid_is_this_binary(st.pid);
-    admission_decision(Some(&st), my_pid, now_unix(), alive, same)
+    // Probe binary identity only for a fresh + live entry — a stale or
+    // dead pid is recovered without the (process-spawning) `ps` probe.
+    let same = file_fresh && alive == Some(true) && pid_is_this_binary(st.pid);
+    admission_decision(Some(&st), my_pid, now, file_fresh, alive, same)
 }
 
 /// True iff `pid` is running the *same executable as us*. Identity is by
@@ -572,61 +609,99 @@ mod tests {
         }
     }
 
+    // admission_decision(existing, my_pid, now, file_fresh, pid_alive,
+    // same_binary). #128: Refuse ONLY a demonstrably-live sibling
+    // (file_fresh ∧ pid_alive==Some(true) ∧ same_binary); every other
+    // prior-status case Recovers (take over + actionable note), never
+    // bare-Proceeds-silently and never bare-Refuses.
+
     #[test]
     fn admission_proceeds_when_no_status_file() {
+        // No prior file at all ⇒ clean start (not a "recovery").
         assert_eq!(
-            admission_decision(None, 100, 0, Some(true), true),
+            admission_decision(None, 100, 0, true, Some(true), true),
             WatchAdmission::Proceed
         );
     }
 
     #[test]
     fn admission_proceeds_on_pid_zero_or_self() {
-        // pid 0 is malformed; pid == us is our own re-read — neither is a
-        // sibling, regardless of the (irrelevant) liveness/binary probes.
+        // pid 0 malformed / pid == us: neither a sibling nor an orphan.
         let z = st_with(0, 10, "green");
         assert_eq!(
-            admission_decision(Some(&z), 4242, 100, Some(true), true),
+            admission_decision(Some(&z), 4242, 100, true, Some(true), true),
             WatchAdmission::Proceed
         );
         let me = st_with(4242, 10, "green");
         assert_eq!(
-            admission_decision(Some(&me), 4242, 100, Some(true), true),
+            admission_decision(Some(&me), 4242, 100, true, Some(true), true),
             WatchAdmission::Proceed
         );
     }
 
     #[test]
-    fn admission_proceeds_on_dead_or_unprobable_pid() {
-        let s = st_with(777, 10, "green");
-        // Dead pid (the #56 F10 stale-file case): take over the root.
-        assert_eq!(
-            admission_decision(Some(&s), 4242, 100, Some(false), false),
-            WatchAdmission::Proceed
-        );
-        // Non-Unix (None): cannot safely refuse — legacy proceed posture.
-        assert_eq!(
-            admission_decision(Some(&s), 4242, 100, None, false),
-            WatchAdmission::Proceed
-        );
-    }
-
-    #[test]
-    fn admission_proceeds_when_pid_recycled_to_other_program() {
-        // pid alive but it's NOT another cargoless — must not false-refuse.
+    fn admission_non_unix_keeps_legacy_proceed() {
+        // pid_alive == None (non-Unix): unprobable — preserve the #56
+        // legacy posture EXACTLY (Proceed, no recovery claim).
         let s = st_with(777, 10, "green");
         assert_eq!(
-            admission_decision(Some(&s), 4242, 100, Some(true), false),
+            admission_decision(Some(&s), 4242, 100, true, None, false),
             WatchAdmission::Proceed
         );
     }
 
     #[test]
-    fn admission_refuses_only_live_same_binary_sibling() {
+    fn admission_recovers_on_dead_pid() {
+        // #128: dead pid + a prior cli-status present ⇒ orphaned file;
+        // take it over with an actionable recovery note (was a bare
+        // Proceed pre-#128).
+        let s = st_with(777, 10, "green");
+        assert_eq!(
+            admission_decision(Some(&s), 4242, 100, true, Some(false), false),
+            WatchAdmission::Recover { stale_pid: 777 }
+        );
+    }
+
+    #[test]
+    fn admission_recovers_when_pid_reused_by_other_program() {
+        // pid alive but NOT a cargoless (reused by some unrelated
+        // process): the prior daemon is gone — recover, never refuse.
+        let s = st_with(777, 10, "green");
+        assert_eq!(
+            admission_decision(Some(&s), 4242, 100, true, Some(true), false),
+            WatchAdmission::Recover { stale_pid: 777 }
+        );
+    }
+
+    #[test]
+    fn admission_recovers_on_stale_heartbeat_even_if_pid_alive_same_binary() {
+        // THE #128 CORE FIX. A SIGKILL'd-then-zombie (or pid reused by
+        // a *sibling* cargoless on a fleet box) looks pid-alive +
+        // same-binary, but our cli-status heartbeat is STALE — a
+        // genuinely-live watcher would have refreshed it every
+        // HEARTBEAT. Pre-#128 this bare-refused; now it recovers,
+        // matching what `run_status` (F10) already reports.
         let s = st_with(777, 40, "red");
-        let d = admission_decision(Some(&s), 4242, 100, Some(true), true);
         assert_eq!(
-            d,
+            admission_decision(
+                Some(&s),
+                4242,
+                100,
+                /*file_fresh=*/ false,
+                Some(true),
+                /*same_binary=*/ true,
+            ),
+            WatchAdmission::Recover { stale_pid: 777 }
+        );
+    }
+
+    #[test]
+    fn admission_refuses_only_fresh_live_same_binary_sibling() {
+        // The ONLY Refuse: heartbeat-fresh ∧ pid-alive ∧ same-binary —
+        // a genuinely-live concurrent watcher (the real #93 dual-watch).
+        let s = st_with(777, 40, "red");
+        assert_eq!(
+            admission_decision(Some(&s), 4242, 100, true, Some(true), true),
             WatchAdmission::Refuse(Conflict {
                 pid: 777,
                 root: "/proj".into(),
@@ -691,29 +766,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn admission_end_to_end_refuses_live_self_then_proceeds_on_dead_pid() {
+    fn admission_e2e_refuses_fresh_live_self_then_recovers_dead_pid() {
         use std::process::{Command, Stdio};
 
         let mut root = std::env::temp_dir();
-        root.push(format!("tf-cli-f13a-{}-{}", std::process::id(), now_unix()));
+        root.push(format!("tf-cli-128-{}-{}", std::process::id(), now_unix()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        // (a) status file names a LIVE same-binary process (ourselves);
-        // call admission with a DIFFERENT my_pid so WE are the sibling.
-        // Skip if `ps` is unavailable (the probe can't run — see above).
+        // (a) status names a LIVE same-binary process (ourselves) with a
+        // JUST-written (fresh) heartbeat ⇒ a genuinely-live sibling ⇒
+        // Refuse. Call with a DIFFERENT my_pid so WE are the "sibling".
+        // Skip if `ps` is unavailable (the probe can't run).
         if process_comm(std::process::id()).is_some() {
             write(&root, &st_with(std::process::id(), now_unix(), "green"));
             match admission(&root, std::process::id().wrapping_add(1)) {
                 WatchAdmission::Refuse(c) => assert_eq!(c.pid, std::process::id()),
-                WatchAdmission::Proceed => {
-                    panic!("a live same-binary sibling must be refused")
+                other => {
+                    panic!("a fresh + live + same-binary sibling must be REFUSED, got {other:?}")
                 }
             }
         }
 
-        // (b) status file names a guaranteed-DEAD pid → proceed (the #56
-        // F10 stale-file case, through the real pid_is_alive path).
+        // (b) #128: status names a guaranteed-DEAD pid ⇒ the orphaned
+        // file is RECOVERED (not a bare Proceed, never a Refuse) —
+        // through the real pid_is_alive + freshness path. This is the
+        // agent-fleet SIGKILL'd-daemon case.
         let mut dead = Command::new("true")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -725,8 +803,30 @@ mod tests {
         write(&root, &st_with(dead_pid, now_unix(), "green"));
         assert_eq!(
             admission(&root, std::process::id()),
-            WatchAdmission::Proceed
+            WatchAdmission::Recover {
+                stale_pid: dead_pid
+            },
+            "a SIGKILL'd/dead prior daemon must auto-recover, never refuse"
         );
+
+        // (c) #128 LITERAL BUG: status names a pid that is alive AND
+        // the same binary (ourselves) BUT the heartbeat is STALE (the
+        // SIGKILL'd-then-zombie / pid-reused-by-sibling-cargoless
+        // fleet case). Pre-#128 this bare-refused; it MUST recover —
+        // and agree with what `run_status`/F10 reports for the same
+        // file. Skip if `ps` unavailable (probe can't run).
+        if process_comm(std::process::id()).is_some() {
+            let stale_updated = now_unix().saturating_sub(STALE_AFTER.as_secs() + 5);
+            write(&root, &st_with(std::process::id(), stale_updated, "green"));
+            assert_eq!(
+                admission(&root, std::process::id().wrapping_add(1)),
+                WatchAdmission::Recover {
+                    stale_pid: std::process::id()
+                },
+                "alive+same-binary but STALE heartbeat ⇒ recover, never \
+                 bare-refuse (the #128 agent-fleet bug)"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
