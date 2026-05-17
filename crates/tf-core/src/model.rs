@@ -477,7 +477,14 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
         .take_stdio()
         .ok_or_else(|| io::Error::other("rust-analyzer stdio unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
-    let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
+    // FIELD FINDING #74: lean InitOpts derived from env vars
+    // (TF_PROC_MACRO / TF_FEATURES — set by the CLI's --proc-macro /
+    // --features flags) + Cargo.toml auto-detection at the project root.
+    // The lean initializationOptions cut RA's idle/check cost ~30-50%
+    // without breaking the F8-redo verdict gate (checkOnSave stays
+    // enabled per Option B+).
+    let init_opts = crate::lsp::InitOpts::from_env_and_project(&root);
+    let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str, &init_opts)?;
 
     let ignore = crate::watcher::IgnoreRules::for_root(&root);
     for f in collect_rs_files(&root, &ignore) {
@@ -607,7 +614,14 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
         .take_stdio()
         .ok_or_else(|| io::Error::other("rust-analyzer stdio unavailable"))?;
     let root_str = root.to_string_lossy().into_owned();
-    let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str)?;
+    // FIELD FINDING #74: lean InitOpts derived from env vars
+    // (TF_PROC_MACRO / TF_FEATURES — set by the CLI's --proc-macro /
+    // --features flags) + Cargo.toml auto-detection at the project root.
+    // The lean initializationOptions cut RA's idle/check cost ~30-50%
+    // without breaking the F8-redo verdict gate (checkOnSave stays
+    // enabled per Option B+).
+    let init_opts = crate::lsp::InitOpts::from_env_and_project(&root);
+    let (client, events) = crate::lsp::LspClient::initialize(stdin, stdout, &root_str, &init_opts)?;
 
     let ignore = crate::watcher::IgnoreRules::for_root(&root);
     for f in collect_rs_files(&root, &ignore) {
@@ -821,7 +835,14 @@ pub fn watch<I: IdentityProvider + 'static>(
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return;
         };
-        let Ok((client, events)) = crate::lsp::LspClient::initialize(stdin, stdout, &hook_root)
+        // FIELD FINDING #74: same lean InitOpts as the one-shot check
+        // paths above — read env vars (TF_PROC_MACRO / TF_FEATURES) +
+        // auto-detect proc-macro from project Cargo.toml. On a
+        // transparent AC#6 restart the env reads re-execute, so a CLI
+        // change between restarts is respected by the new RA instance.
+        let init_opts = crate::lsp::InitOpts::from_env_and_project(Path::new(&hook_root));
+        let Ok((client, events)) =
+            crate::lsp::LspClient::initialize(stdin, stdout, &hook_root, &init_opts)
         else {
             return; // RA broke during handshake; supervisor retries
         };

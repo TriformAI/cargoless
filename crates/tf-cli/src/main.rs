@@ -51,6 +51,15 @@ struct Opts {
     /// — keeps the `watch()` signature byte-frozen (the env-var idiom
     /// matches `TF_CHECK_TIMEOUT_SECS` from #21/#43).
     debounce_ms: Option<u64>,
+    /// #74 RA weight-shedding: `auto` (default; Cargo.toml scan picks
+    /// per-project), `enabled` (force on — proc-macro projects), or
+    /// `disabled` (force off — non-proc-macro projects, max savings).
+    /// Plumbed via `TF_PROC_MACRO` env to `tf_core::lsp::InitOpts`.
+    proc_macro: Option<String>,
+    /// #74 RA weight-shedding: cargo features to enable in RA's
+    /// cargo-check invocation. Comma-separated. Default (when unset):
+    /// `default`. Plumbed via `TF_FEATURES` env.
+    features: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,6 +117,21 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .map_err(|_| ParseError::MissingValue("--debounce-ms (numeric ms)"))?,
                 );
             }
+            "--proc-macro" => {
+                let v = it.next().ok_or(ParseError::MissingValue("--proc-macro"))?;
+                match v.as_str() {
+                    "auto" | "enabled" | "disabled" => opts.proc_macro = Some(v.clone()),
+                    _ => {
+                        return Err(ParseError::MissingValue(
+                            "--proc-macro (auto|enabled|disabled)",
+                        ));
+                    }
+                }
+            }
+            "--features" => {
+                let v = it.next().ok_or(ParseError::MissingValue("--features"))?;
+                opts.features = Some(v.clone());
+            }
             "-h" | "--help" => {
                 return Ok(Parsed {
                     cmd: Cmd::Help,
@@ -146,6 +170,19 @@ fn usage() {
          faster verdicts;"
     );
     println!("                        also settable via TF_DEBOUNCE_MS env)");
+    println!(
+        "  --proc-macro <MODE>   rust-analyzer proc-macro server: \
+         auto|enabled|disabled"
+    );
+    println!(
+        "                        (default auto = Cargo.toml-scan picks; \
+         also TF_PROC_MACRO env)"
+    );
+    println!(
+        "  --features <FEATS>    cargo features for RA's check (comma-separated; \
+         default 'default';"
+    );
+    println!("                        also TF_FEATURES env)");
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
     println!();
@@ -206,6 +243,19 @@ fn main() -> ExitCode {
         // yet. set_var is unsafe on 2024 edition due to multi-thread reads.
         unsafe {
             std::env::set_var("TF_DEBOUNCE_MS", ms.to_string());
+        }
+    }
+    // #74 RA weight-shedding knobs — same pattern as TF_DEBOUNCE_MS:
+    // CLI flag exports the env var, tf_core::lsp::InitOpts reads it in
+    // `from_env_and_project`. Keeps tf-core's API surface stable.
+    if let Some(pm) = parsed.opts.proc_macro.as_deref() {
+        unsafe {
+            std::env::set_var("TF_PROC_MACRO", pm);
+        }
+    }
+    if let Some(fs) = parsed.opts.features.as_deref() {
+        unsafe {
+            std::env::set_var("TF_FEATURES", fs);
         }
     }
 
@@ -335,5 +385,76 @@ mod tests {
         // applies; the CLI does not impose a value over the existing 150ms).
         let p = parse(&v(&["watch"])).unwrap();
         assert_eq!(p.opts.debounce_ms, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // #74 RA weight-shedding knobs — --proc-macro + --features
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn proc_macro_flag_accepts_three_modes() {
+        for mode in ["auto", "enabled", "disabled"] {
+            let p = parse(&v(&["watch", "--proc-macro", mode])).unwrap();
+            assert_eq!(p.opts.proc_macro.as_deref(), Some(mode));
+        }
+    }
+
+    #[test]
+    fn proc_macro_flag_rejects_invalid_value() {
+        let r = parse(&v(&["watch", "--proc-macro", "maybe"]));
+        assert!(
+            matches!(r, Err(ParseError::MissingValue(s)) if s.contains("--proc-macro")),
+            "invalid proc-macro mode must be actionable: {r:?}"
+        );
+    }
+
+    #[test]
+    fn proc_macro_flag_missing_value_is_actionable() {
+        assert_eq!(
+            parse(&v(&["watch", "--proc-macro"])),
+            Err(ParseError::MissingValue("--proc-macro"))
+        );
+    }
+
+    #[test]
+    fn features_flag_parses_comma_separated_string() {
+        let p = parse(&v(&["watch", "--features", "csr,hydrate"])).unwrap();
+        assert_eq!(p.opts.features.as_deref(), Some("csr,hydrate"));
+    }
+
+    #[test]
+    fn features_flag_missing_value_is_actionable() {
+        assert_eq!(
+            parse(&v(&["watch", "--features"])),
+            Err(ParseError::MissingValue("--features"))
+        );
+    }
+
+    #[test]
+    fn proc_macro_and_features_flags_compose_with_other_flags() {
+        let p = parse(&v(&[
+            "watch",
+            "--proc-macro",
+            "disabled",
+            "--features",
+            "csr",
+            "--debounce-ms",
+            "300",
+            "--root",
+            "/p",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::Watch);
+        assert_eq!(p.opts.proc_macro.as_deref(), Some("disabled"));
+        assert_eq!(p.opts.features.as_deref(), Some("csr"));
+        assert_eq!(p.opts.debounce_ms, Some(300));
+        assert_eq!(p.opts.root.as_deref(), Some(std::path::Path::new("/p")));
+    }
+
+    #[test]
+    fn proc_macro_and_features_default_to_none_unset() {
+        let p = parse(&v(&["watch"])).unwrap();
+        assert_eq!(p.opts.proc_macro, None);
+        assert_eq!(p.opts.features, None);
     }
 }
