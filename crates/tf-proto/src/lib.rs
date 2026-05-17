@@ -39,6 +39,8 @@
 #![forbid(unsafe_code)]
 
 use core::fmt;
+use std::collections::BTreeMap;
+use std::io;
 
 // ---------------------------------------------------------------------------
 // Content identity
@@ -291,6 +293,137 @@ pub struct BuildResult {
     pub artifact: Option<ArtifactMeta>,
 }
 
+// ---------------------------------------------------------------------------
+// Multi-file artifact framing
+// ---------------------------------------------------------------------------
+
+/// A built artifact as the set of files the browser fetches: request path
+/// (no leading `/`, e.g. `index.html`, `app_bg.wasm`) → raw bytes.
+///
+/// This type is the **producer/consumer seam between the build/CAS layer and
+/// the dev server**, which is why it lives in the contract crate rather than
+/// in either owner. A WASM dev build is several files (an HTML shell, a JS
+/// loader, the `_bg.wasm` blob, assets), but the CAS stores one opaque blob
+/// per [`InputHash`]. The build orchestrator [`Bundle::pack`]s the `dist`
+/// tree into that blob; the dev server fetches the blob and
+/// [`Bundle::unpack`]s it. The framing is fixed here so the two disjoint
+/// owners cannot silently diverge (the same reason the rest of this crate
+/// exists).
+///
+/// Consistent with §4: this is dependency-free and serde-free — the framing
+/// is a hand-rolled, self-describing length prefix, not a frozen wire format,
+/// and it crosses no process boundary in v0 (both sides link `tf-proto`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bundle {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl Bundle {
+    /// Build a bundle from `(path, bytes)` entries. Leading `/` is stripped so
+    /// lookups match request paths.
+    pub fn from_entries<I, P, B>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (P, B)>,
+        P: Into<String>,
+        B: Into<Vec<u8>>,
+    {
+        let mut files = BTreeMap::new();
+        for (p, b) in entries {
+            let p = p.into();
+            let key = p.trim_start_matches('/').to_string();
+            files.insert(key, b.into());
+        }
+        Self { files }
+    }
+
+    /// Bytes for `path` (leading `/` ignored), if present.
+    pub fn get(&self, path: &str) -> Option<&[u8]> {
+        self.files
+            .get(path.trim_start_matches('/'))
+            .map(Vec::as_slice)
+    }
+
+    /// The document served for `/`. Prefers `index.html`; falls back to the
+    /// single entry if the bundle has exactly one file.
+    pub fn document(&self) -> Option<&[u8]> {
+        if let Some(b) = self.files.get("index.html") {
+            return Some(b);
+        }
+        if self.files.len() == 1 {
+            return self.files.values().next().map(Vec::as_slice);
+        }
+        None
+    }
+
+    /// Number of files in the bundle.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether the bundle has no files.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Serialize to one opaque blob for the CAS. Framing: a 4-byte
+    /// big-endian entry count, then per entry: 2-byte BE path length, path
+    /// (UTF-8), 8-byte BE content length, content. Stable and
+    /// self-describing; the build/CAS layer writes this, the server reads it.
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.files.len() as u32).to_be_bytes());
+        for (path, content) in &self.files {
+            let pb = path.as_bytes();
+            out.extend_from_slice(&(pb.len() as u16).to_be_bytes());
+            out.extend_from_slice(pb);
+            out.extend_from_slice(&(content.len() as u64).to_be_bytes());
+            out.extend_from_slice(content);
+        }
+        out
+    }
+
+    /// Inverse of [`Bundle::pack`]. Rejects truncated/over-long input rather
+    /// than serving a half-decoded artifact (a corrupt bundle is treated like
+    /// "no green yet", never served as a broken page).
+    pub fn unpack(bytes: &[u8]) -> io::Result<Self> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        let mut cur = bytes;
+        let take = |cur: &mut &[u8], n: usize| -> io::Result<Vec<u8>> {
+            if cur.len() < n {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bundle truncated",
+                ));
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head.to_vec())
+        };
+        let count = u32::from_be_bytes(
+            take(&mut cur, 4)?
+                .try_into()
+                .map_err(|_| bad("bad count"))?,
+        );
+        let mut files = BTreeMap::new();
+        for _ in 0..count {
+            let plen =
+                u16::from_be_bytes(take(&mut cur, 2)?.try_into().map_err(|_| bad("bad plen"))?)
+                    as usize;
+            let path =
+                String::from_utf8(take(&mut cur, plen)?).map_err(|_| bad("path not utf-8"))?;
+            let clen =
+                u64::from_be_bytes(take(&mut cur, 8)?.try_into().map_err(|_| bad("bad clen"))?)
+                    as usize;
+            let content = take(&mut cur, clen)?;
+            files.insert(path, content);
+        }
+        if !cur.is_empty() {
+            return Err(bad("trailing bytes in bundle"));
+        }
+        Ok(Self { files })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +528,48 @@ mod tests {
         assert_eq!(Profile::Dev.as_str(), "dev");
         assert_eq!(Profile::Release.to_string(), "release");
         assert_ne!(TreeState::Green, TreeState::Red);
+    }
+
+    #[test]
+    fn bundle_pack_roundtrips() {
+        let b = Bundle::from_entries([
+            ("index.html", b"<html></html>".to_vec()),
+            ("app_bg.wasm", vec![0, 159, 146, 150]),
+        ]);
+        let packed = b.pack();
+        assert_eq!(
+            Bundle::unpack(&packed).unwrap(),
+            b,
+            "pack/unpack is the build→server seam; it must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn bundle_unpack_rejects_garbage() {
+        // A claimed 9-entry count with no entries, and non-bundle bytes:
+        // both must error, never half-decode into a servable bundle.
+        assert!(Bundle::unpack(&[0, 0, 0, 9]).is_err());
+        assert!(Bundle::unpack(b"not a bundle at all").is_err());
+    }
+
+    #[test]
+    fn bundle_lookup_and_document() {
+        let b = Bundle::from_entries([
+            ("/index.html", b"<body>x</body>".to_vec()),
+            ("a.js", b"1".to_vec()),
+        ]);
+        assert_eq!(b.len(), 2);
+        assert!(!b.is_empty());
+        assert_eq!(b.get("index.html"), Some(&b"<body>x</body>"[..]));
+        assert_eq!(b.get("/a.js"), Some(&b"1"[..]));
+        assert_eq!(b.document(), Some(&b"<body>x</body>"[..]));
+
+        let single = Bundle::from_entries([("only.html", b"solo".to_vec())]);
+        assert_eq!(
+            single.document(),
+            Some(&b"solo"[..]),
+            "single-file bundle serves that file as the document"
+        );
+        assert_eq!(Bundle::default().document(), None);
     }
 }
