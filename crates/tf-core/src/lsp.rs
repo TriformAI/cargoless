@@ -1,21 +1,27 @@
-//! Minimal LSP client over rust-analyzer's stdio (Epic 2 / CWDL #4).
+//! Minimal LSP client over rust-analyzer's stdio (Epic 2 / CWDL #4, #21).
 //!
 //! Scope is exactly what the green/red model needs and no more:
-//! `initialize`/`initialized`, `textDocument/didOpen|didChange|didSave`, and
-//! consuming `textDocument/publishDiagnostics`. This is **not** a general LSP
-//! library — RA-specific, v0-shaped, single workspace.
+//! `initialize`/`initialized`, `textDocument/didOpen|didChange|didSave`,
+//! consuming `textDocument/publishDiagnostics`, and observing flycheck
+//! progress. This is **not** a general LSP library — RA-specific, v0-shaped,
+//! single workspace.
 //!
-//! ## Layering
+//! ## #21 verdict-provenance (load-bearing for v0)
 //!
-//! This module is pure transport + protocol: it turns RA's diagnostics into a
-//! transport-level [`PublishDiagnostics`] (`uri`, error/total counts). The
-//! mapping to `tf_proto::FileState` and the green/red edge logic live in
-//! `model` — `lsp` deliberately does not depend on `tf-proto`, so the protocol
-//! seam and the verdict seam can change independently.
+//! rust-analyzer's *native* analysis is BLIND to the type/trait/method/macro
+//! error class (e.g. E0599) — only `cargo check` (RA's *flycheck*) produces
+//! it. So a diagnostic's authority depends on WHO produced it: RA tags
+//! flycheck/cargo-check diagnostics with `source: "rustc"`, native ones with
+//! `source: "rust-analyzer"`. [`PublishDiagnostics`] therefore splits error
+//! counts into **authoritative** (rustc/cargo-check) vs **advisory**
+//! (native). The authoritative *tree* verdict is only trustworthy at a
+//! flycheck-pass boundary, so we also surface [`LspEvent::FlycheckEnded`]
+//! from `$/progress`. The model gates GREEN on the authoritative tier; the
+//! mapping/edge logic lives in `model`, not here.
 //!
 //! ## Testability
 //!
-//! Framing (`Content-Length` codec) and diagnostics extraction are pure
+//! Framing, diagnostics classification, and flycheck-end detection are pure
 //! functions unit-tested over in-memory buffers — the CI `test` job (no
 //! rust-analyzer in the image) exercises every parsing branch. The live
 //! [`LspClient`] is generic over `Read`/`Write`, so the handshake is testable
@@ -33,22 +39,46 @@ use serde_json::{Value, json};
 const SEVERITY_ERROR: i64 = 1;
 
 /// One `textDocument/publishDiagnostics` notification, reduced to what the
-/// model cares about: which document, and whether it has compile errors.
+/// model cares about, split by **provenance** (#21).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishDiagnostics {
     /// The document URI exactly as RA sent it (`file://...`).
     pub uri: String,
-    /// Number of `severity == Error` diagnostics.
-    pub error_count: usize,
-    /// Total diagnostics (errors + warnings + hints).
+    /// `severity == Error` diagnostics with `source == "rustc"` — produced by
+    /// cargo-check/flycheck. These are AUTHORITATIVE for the verdict.
+    pub authoritative_errors: usize,
+    /// `severity == Error` diagnostics from any non-rustc source (chiefly
+    /// `"rust-analyzer"` native). ADVISORY only — never asserts green.
+    pub advisory_errors: usize,
+    /// Total diagnostics (errors + warnings + hints, any source).
     pub total: usize,
 }
 
 impl PublishDiagnostics {
-    /// File is green iff RA reported zero error-severity diagnostics for it.
-    pub fn is_green(&self) -> bool {
-        self.error_count == 0
+    /// Total error-severity diagnostics regardless of source.
+    pub fn error_count(&self) -> usize {
+        self.authoritative_errors + self.advisory_errors
     }
+
+    /// No error of any source. (Not authority on its own — see module docs.)
+    pub fn is_green(&self) -> bool {
+        self.error_count() == 0
+    }
+
+    /// This file has a cargo-check (rustc) error — authoritative red.
+    pub fn has_authoritative_error(&self) -> bool {
+        self.authoritative_errors > 0
+    }
+}
+
+/// What the reader thread streams to the model: either a diagnostics
+/// notification or the boundary of a completed flycheck (`cargo check`) pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspEvent {
+    Diagnostics(PublishDiagnostics),
+    /// RA reported a flycheck/`cargo check` `$/progress` `end`. The set of
+    /// `source:"rustc"` diagnostics as of now is an AUTHORITATIVE snapshot.
+    FlycheckEnded,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +102,6 @@ pub fn read_message<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
         let mut line = String::new();
         let n = r.read_line(&mut line)?;
         if n == 0 {
-            // EOF. Clean iff it happened before any header of a new message.
             if saw_any_header {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -98,8 +127,16 @@ pub fn read_message<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
+/// True iff a diagnostic is `severity == Error` and produced by cargo-check
+/// (`source == "rustc"`). Everything else (native `"rust-analyzer"`, etc.) is
+/// advisory.
+fn is_rustc_source(d: &Value) -> bool {
+    d.get("source").and_then(Value::as_str) == Some("rustc")
+}
+
 /// Pull a [`PublishDiagnostics`] out of a decoded JSON-RPC message, or `None`
-/// if it is not a `textDocument/publishDiagnostics` notification.
+/// if it is not a `textDocument/publishDiagnostics` notification. Splits
+/// error counts by provenance (#21).
 pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
     if v.get("method")?.as_str()? != "textDocument/publishDiagnostics" {
         return None;
@@ -107,20 +144,62 @@ pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
     let params = v.get("params")?;
     let uri = params.get("uri")?.as_str()?.to_string();
     let diags = params.get("diagnostics")?.as_array()?;
-    let error_count = diags
-        .iter()
-        .filter(|d| d.get("severity").and_then(Value::as_i64) == Some(SEVERITY_ERROR))
-        .count();
+    let mut authoritative_errors = 0usize;
+    let mut advisory_errors = 0usize;
+    for d in diags {
+        if d.get("severity").and_then(Value::as_i64) != Some(SEVERITY_ERROR) {
+            continue;
+        }
+        if is_rustc_source(d) {
+            authoritative_errors += 1;
+        } else {
+            advisory_errors += 1;
+        }
+    }
     Some(PublishDiagnostics {
         uri,
-        error_count,
+        authoritative_errors,
+        advisory_errors,
         total: diags.len(),
     })
 }
 
+/// True iff `v` is a `$/progress` notification ending a flycheck /
+/// `cargo check` pass. RA's flycheck progress carries `"check"` in its token
+/// or title; matching generously on that (case-insensitive) is safe because
+/// a missed end only degrades to the model's settle/timeout path — it can
+/// never manufacture a false green (the model needs a *seen* end to upgrade
+/// to authoritative).
+pub fn extract_flycheck_end(v: &Value) -> bool {
+    if v.get("method").and_then(Value::as_str) != Some("$/progress") {
+        return false;
+    }
+    let params = match v.get("params") {
+        Some(p) => p,
+        None => return false,
+    };
+    let value = match params.get("value") {
+        Some(x) => x,
+        None => return false,
+    };
+    if value.get("kind").and_then(Value::as_str) != Some("end") {
+        return false;
+    }
+    let token = params
+        .get("token")
+        .map(|t| t.to_string())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    token.contains("check") || title.contains("check") || title.contains("flycheck")
+}
+
 /// `/abs/path` → `file:///abs/path`. v0: assumes an already-absolute,
-/// space-free path (cargoless watches a project root); percent-encoding is a
-/// documented v1 refinement, not a contract change.
+/// space-free path; percent-encoding is a documented v1 refinement.
 pub fn uri_from_path(abs_path: &str) -> String {
     if abs_path.starts_with('/') {
         format!("file://{abs_path}")
@@ -129,8 +208,7 @@ pub fn uri_from_path(abs_path: &str) -> String {
     }
 }
 
-/// Inverse of [`uri_from_path`] for the `file:` scheme; returns the URI
-/// unchanged-stripped path or `None` for a non-`file:` URI.
+/// Inverse of [`uri_from_path`] for the `file:` scheme; `None` for non-`file:`.
 pub fn path_from_uri(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
     Some(rest.to_string())
@@ -141,8 +219,8 @@ pub fn path_from_uri(uri: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// LSP client bound to one rust-analyzer process's stdio. Construction runs
-/// the `initialize`/`initialized` handshake synchronously, then a reader
-/// thread streams [`PublishDiagnostics`] on the returned channel.
+/// the `initialize`/`initialized` handshake synchronously (enabling flycheck
+/// via `checkOnSave`), then a reader thread streams [`LspEvent`]s.
 pub struct LspClient {
     writer: Mutex<Box<dyn Write + Send>>,
     next_id: AtomicI64,
@@ -150,12 +228,13 @@ pub struct LspClient {
 
 impl LspClient {
     /// Handshake against an RA speaking LSP over (`w` = its stdin, `r` = its
-    /// stdout). `root_path` is the absolute workspace root.
+    /// stdout). `root_path` is the absolute workspace root. flycheck
+    /// (`cargo check` on save) is enabled — it is the authoritative tier.
     pub fn initialize<W, R>(
         mut w: W,
         r: R,
         root_path: &str,
-    ) -> io::Result<(Self, Receiver<PublishDiagnostics>)>
+    ) -> io::Result<(Self, Receiver<LspEvent>)>
     where
         W: Write + Send + 'static,
         R: Read + Send + 'static,
@@ -168,7 +247,16 @@ impl LspClient {
             "params": {
                 "processId": std::process::id(),
                 "rootUri": root_uri,
+                // #21: flycheck IS the authoritative (cargo-check) tier.
+                // Both the modern (`check.command`) and legacy
+                // (`checkOnSave`) keys, since RA tolerates unknown keys and
+                // versions differ across toolchains.
+                "initializationOptions": {
+                    "checkOnSave": true,
+                    "check": { "command": "check" }
+                },
                 "capabilities": {
+                    "window": { "workDoneProgress": true },
                     "textDocument": {
                         "publishDiagnostics": { "relatedInformation": false }
                     }
@@ -179,8 +267,6 @@ impl LspClient {
         w.flush()?;
 
         let mut br = BufReader::new(r);
-        // Drain until the initialize *response* (id == 1). RA may interleave
-        // window/logMessage notifications before it; skip those.
         loop {
             match read_message(&mut br)? {
                 None => {
@@ -208,9 +294,7 @@ impl LspClient {
         w.write_all(&encode_message(initialized.to_string().as_bytes()))?;
         w.flush()?;
 
-        let (tx, rx): (Sender<PublishDiagnostics>, Receiver<PublishDiagnostics>) = channel();
-        // Detached: the reader ends on RA-stdout EOF (which the analyzer
-        // Supervisor causes on restart), so there is no handle to join.
+        let (tx, rx): (Sender<LspEvent>, Receiver<LspEvent>) = channel();
         let _reader: JoinHandle<()> = thread::Builder::new()
             .name("tf-lsp-reader".into())
             .spawn(move || reader_loop(br, tx))
@@ -251,8 +335,7 @@ impl LspClient {
         )
     }
 
-    /// `textDocument/didChange` (full-document sync — v0 keeps it simple and
-    /// correct rather than incremental).
+    /// `textDocument/didChange` (full-document sync — v0 keeps it simple).
     pub fn did_change(&self, abs_path: &str, text: &str, version: i64) -> io::Result<()> {
         self.notify(
             "textDocument/didChange",
@@ -263,7 +346,8 @@ impl LspClient {
         )
     }
 
-    /// `textDocument/didSave`.
+    /// `textDocument/didSave` — triggers RA flycheck (`cargo check`), the
+    /// authoritative tier.
     pub fn did_save(&self, abs_path: &str) -> io::Result<()> {
         self.notify(
             "textDocument/didSave",
@@ -277,7 +361,7 @@ impl LspClient {
     }
 }
 
-fn reader_loop<R: BufRead>(mut br: R, tx: Sender<PublishDiagnostics>) {
+fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>) {
     loop {
         match read_message(&mut br) {
             Ok(None) => break, // RA exited cleanly
@@ -286,10 +370,14 @@ fn reader_loop<R: BufRead>(mut br: R, tx: Sender<PublishDiagnostics>) {
                 let Ok(v) = serde_json::from_slice::<Value>(&body) else {
                     continue;
                 };
-                let Some(pd) = extract_publish_diagnostics(&v) else {
+                let ev = if let Some(pd) = extract_publish_diagnostics(&v) {
+                    LspEvent::Diagnostics(pd)
+                } else if extract_flycheck_end(&v) {
+                    LspEvent::FlycheckEnded
+                } else {
                     continue;
                 };
-                if tx.send(pd).is_err() {
+                if tx.send(ev).is_err() {
                     break; // model gone
                 }
             }
@@ -309,7 +397,6 @@ mod tests {
         let mut cur = Cursor::new(framed);
         let got = read_message(&mut cur).unwrap().unwrap();
         assert_eq!(got, body);
-        // next read is clean EOF
         assert!(read_message(&mut cur).unwrap().is_none());
     }
 
@@ -330,43 +417,94 @@ mod tests {
     }
 
     #[test]
-    fn extract_diagnostics_counts_errors_only() {
+    fn provenance_split_rustc_vs_native() {
+        // E0599 (method-not-found) is rustc/cargo-check ONLY — the exact
+        // class RA-native is blind to (#21). Native borrow error is advisory.
         let v: Value = serde_json::from_str(
-            r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics",
+            r#"{"method":"textDocument/publishDiagnostics",
                 "params":{"uri":"file:///p/src/a.rs","diagnostics":[
-                  {"severity":1,"message":"E0382"},
-                  {"severity":2,"message":"unused"},
-                  {"severity":1,"message":"E0277"}]}}"#,
+                  {"severity":1,"source":"rustc","code":"E0599","message":"no method"},
+                  {"severity":1,"source":"rust-analyzer","message":"native"},
+                  {"severity":2,"source":"rustc","message":"warn"},
+                  {"severity":1,"source":"rustc","code":"E0308","message":"mismatch"}]}}"#,
         )
         .unwrap();
         let pd = extract_publish_diagnostics(&v).unwrap();
         assert_eq!(pd.uri, "file:///p/src/a.rs");
-        assert_eq!(pd.error_count, 2);
-        assert_eq!(pd.total, 3);
+        assert_eq!(pd.authoritative_errors, 2, "two rustc errors");
+        assert_eq!(pd.advisory_errors, 1, "one native error");
+        assert_eq!(pd.total, 4);
+        assert!(pd.has_authoritative_error());
         assert!(!pd.is_green());
+        assert_eq!(pd.error_count(), 3);
     }
 
     #[test]
-    fn extract_diagnostics_empty_is_green() {
+    fn empty_diagnostics_is_green_no_authoritative() {
         let v: Value = serde_json::from_str(
             r#"{"method":"textDocument/publishDiagnostics",
                 "params":{"uri":"file:///p/src/a.rs","diagnostics":[]}}"#,
         )
         .unwrap();
         let pd = extract_publish_diagnostics(&v).unwrap();
-        assert_eq!(pd.error_count, 0);
         assert!(pd.is_green());
+        assert!(!pd.has_authoritative_error());
+        assert_eq!(pd.authoritative_errors, 0);
+        assert_eq!(pd.advisory_errors, 0);
     }
 
     #[test]
-    fn non_diagnostics_message_is_ignored() {
-        let v: Value =
-            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#)
-                .unwrap();
-        assert!(extract_publish_diagnostics(&v).is_none());
-        let n: Value =
-            serde_json::from_str(r#"{"method":"window/logMessage","params":{}}"#).unwrap();
-        assert!(extract_publish_diagnostics(&n).is_none());
+    fn native_only_error_is_not_authoritative() {
+        let v: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics",
+                "params":{"uri":"file:///x.rs","diagnostics":[
+                  {"severity":1,"source":"rust-analyzer","message":"syntax"}]}}"#,
+        )
+        .unwrap();
+        let pd = extract_publish_diagnostics(&v).unwrap();
+        assert!(!pd.has_authoritative_error());
+        assert_eq!(pd.advisory_errors, 1);
+        assert!(!pd.is_green());
+    }
+
+    #[test]
+    fn flycheck_end_detection() {
+        let end: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/cargoCheck",
+                "value":{"kind":"end"}}}"#,
+        )
+        .unwrap();
+        assert!(extract_flycheck_end(&end));
+
+        let end_by_title: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"x",
+                "value":{"kind":"end","title":"cargo check"}}}"#,
+        )
+        .unwrap();
+        assert!(extract_flycheck_end(&end_by_title));
+
+        // begin/report of the same is NOT an end
+        let begin: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/cargoCheck",
+                "value":{"kind":"begin","title":"cargo check"}}}"#,
+        )
+        .unwrap();
+        assert!(!extract_flycheck_end(&begin));
+
+        // unrelated progress (indexing) end is not a flycheck end
+        let indexing: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/Indexing",
+                "value":{"kind":"end","title":"Indexing"}}}"#,
+        )
+        .unwrap();
+        assert!(!extract_flycheck_end(&indexing));
+
+        // a publishDiagnostics is not a flycheck end
+        let pd: Value = serde_json::from_str(
+            r#"{"method":"textDocument/publishDiagnostics","params":{"uri":"file:///a","diagnostics":[]}}"#,
+        )
+        .unwrap();
+        assert!(!extract_flycheck_end(&pd));
     }
 
     #[test]
@@ -380,22 +518,34 @@ mod tests {
     }
 
     #[test]
-    fn handshake_then_diagnostics_over_fakes() {
-        // Scripted "RA": initialize response (id 1) + one publishDiagnostics.
+    fn handshake_then_events_over_fakes() {
+        // Scripted "RA": initialize response + a rustc diag + flycheck end.
         let mut server = encode_message(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
         server.extend(encode_message(
-            br#"{"method":"textDocument/publishDiagnostics","params":{"uri":"file:///r/src/lib.rs","diagnostics":[{"severity":1}]}}"#,
+            br#"{"method":"textDocument/publishDiagnostics","params":{"uri":"file:///r/src/lib.rs","diagnostics":[{"severity":1,"source":"rustc","code":"E0599"}]}}"#,
+        ));
+        server.extend(encode_message(
+            br#"{"method":"$/progress","params":{"token":"rustAnalyzer/cargoCheck","value":{"kind":"end"}}}"#,
         ));
         let reader = Cursor::new(server);
         let writer: Vec<u8> = Vec::new();
 
         let (client, rx) = LspClient::initialize(writer, reader, "/r").expect("handshake");
-        client.next_request_id(); // 2 -> 3, just exercising the counter
+        client.next_request_id();
 
-        let pd = rx
+        let e1 = rx
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("diagnostics delivered");
-        assert_eq!(pd.uri, "file:///r/src/lib.rs");
-        assert_eq!(pd.error_count, 1);
+            .expect("first event");
+        match e1 {
+            LspEvent::Diagnostics(pd) => {
+                assert_eq!(pd.uri, "file:///r/src/lib.rs");
+                assert_eq!(pd.authoritative_errors, 1);
+            }
+            other => panic!("expected Diagnostics, got {other:?}"),
+        }
+        let e2 = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second event");
+        assert_eq!(e2, LspEvent::FlycheckEnded);
     }
 }
