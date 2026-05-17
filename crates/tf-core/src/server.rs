@@ -444,9 +444,22 @@ fn inject_reload_shim(html: &[u8]) -> Vec<u8> {
 /// Cold-start placeholder served before the first green build (decision
 /// D-A1 / AC#1): a 200 page, not an error, that reloads itself into the app
 /// as soon as the first green artifact is available.
+///
+/// Two independent swap mechanisms, by design:
+/// * the [`reload_shim`] WebSocket — instant swap the moment `notify_build`
+///   broadcasts on first green (the low-latency path);
+/// * a `<meta http-equiv="refresh">` — a level-triggered safety net **on the
+///   holding page only** (never on the served app, so the running app never
+///   inherits a refresh loop). This covers the AC#5 dedupe path, where the
+///   first build can be a sub-second `Deduplicated` hit that lands *before*
+///   the holding page's WS has connected and would otherwise miss the
+///   edge-triggered reload broadcast. With it, the holding page re-asks
+///   `GET /` every 2s and `route()` serves the real app as soon as one
+///   exists — bounded worst-case swap latency instead of a silent hang.
 fn holding_page() -> Vec<u8> {
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>building…</title>\
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta http-equiv=\"refresh\" content=\"2\"><title>building…</title>\
 <style>body{{font:14px ui-monospace,monospace;display:grid;place-items:center;height:100vh;margin:0;background:#0b0b0b;color:#cfcfcf}}</style></head>\
 <body><div>building — the page will load itself when the first green build is ready.</div>{}</body></html>",
         reload_shim()
