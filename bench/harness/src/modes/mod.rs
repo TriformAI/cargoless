@@ -69,8 +69,21 @@ impl Cfg {
     pub fn default_for_ci() -> Self {
         Self {
             reps: 5,
-            edit_timeout: std::time::Duration::from_secs(60),
-            warm_timeout: std::time::Duration::from_secs(300), // cold Leptos build
+            // edit_timeout was 60s in #35. The 4th comparative run found
+            // it insufficient: cargoless's actual save→verdict on cold-
+            // Leptos is ~26s steady-state (post-#49 debouncer is 150ms,
+            // but the authoritative cargo-check tier per #55 dominates),
+            // and the FIRST edit after warm tends to add cold-fingerprint
+            // overhead pushing past 60s. 120s = generous floor that
+            // accommodates first-edit cold spike while still surfacing
+            // a genuinely-broken signal path as a timeout (not "tool is
+            // slow forever").
+            edit_timeout: std::time::Duration::from_secs(120),
+            // 5min was tight for cold-Leptos bacon (cargo check of ~200
+            // crates). 10min gives headroom; run-comparative.sh's
+            // explicit `cargo check` pre-warm should make this almost
+            // always-fast in practice.
+            warm_timeout: std::time::Duration::from_secs(600),
             settle: std::time::Duration::from_millis(250),
         }
     }

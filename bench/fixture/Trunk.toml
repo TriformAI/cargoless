@@ -15,12 +15,20 @@ dist = "trunk-dist"
 release = false
 
 [watch]
-# Default ignore list plus the harness's own scratch dirs so an artifact
-# update inside .cargoless-bench-out doesn't loop back into trunk's
-# watcher (its --dist also lives under fixture root in this benchmark).
-ignore = [
-    "trunk-dist",
-    ".cargoless-bench-out",
-    ".cargoless",
-    "target",
-]
+# Trunk REQUIRES every entry in `ignore` to canonicalize at startup
+# (paths must exist). Listing non-existent paths makes trunk die at
+# spawn with `ERROR error taking the canonical path to the watch ignore
+# path: ...` — which is exactly what killed trunk's 4th-attempt run
+# (`target/` hadn't been created yet).
+#
+# Trunk handles `target/` and `dist` by default; we only list the
+# bench-harness-specific scratch dirs and only if they already exist
+# at the moment trunk starts. The run-comparative.sh driver creates
+# `trunk-dist` (the --dist target) by virtue of asking for it; the two
+# .cargoless* dirs only exist after cargoless artifact-mode has run.
+#
+# Simpler + correct: drop ignore entirely. The defaults already cover
+# target/ and dist; the cross-tool loop concern (cargoless writing
+# .cargoless-bench-out under fixture root re-triggering trunk) is
+# bounded by trunk's own debounce + the fact that trunk's own --dist
+# != .cargoless-bench-out (different paths, no actual feedback loop).

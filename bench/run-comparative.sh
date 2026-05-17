@@ -155,9 +155,18 @@ if ! ( cd "$fixture" && cargo fetch ) >/dev/null 2>&1; then
   blocker "cargo fetch failed in the fixture — most likely no crates.io \
 egress in this runner. The comparative bench depends on a warmed dep graph."
 fi
-echo "warming fixture build cache..."
+# Warm BOTH `cargo build` (binary profile — covers any tool that uses it)
+# AND `cargo check` (check profile — what cargoless's authoritative tier,
+# bacon, and trunk's typecheck-pass all run). cargo's per-profile
+# fingerprint cache means these are DISJOINT — warming one does not warm
+# the other. The 4th comparative run hit bacon NO_READY at 300s because
+# cargo check was cold; this fix removes that surface.
+echo "warming fixture build cache (cargo build — release of any binary target)..."
 ( cd "$fixture" && cargo build ) >/dev/null 2>&1 \
   || echo "WARN: fixture cargo build did not fully succeed; bench will still try."
+echo "warming fixture check cache (cargo check — cargoless + bacon's tier)..."
+( cd "$fixture" && cargo check ) >/dev/null 2>&1 \
+  || echo "WARN: fixture cargo check did not fully succeed; bench will still try."
 echo
 
 # ---------------------------------------------------------------------
