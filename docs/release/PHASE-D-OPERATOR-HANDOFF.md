@@ -101,11 +101,37 @@ pre-stage the token once:
    Actions → "New repository secret". Name **exactly**
    `FORGEJO_READONLY_TOKEN`. Value = the token from step 1.
 
+**VERIFIED working mint mechanism (CWDL-71 Phase C, 2026-05-17, Forgejo
+`14.0.2+gitea-1.22.0`).** The naive recipe (`gh auth token --hostname
+forgejo.triform.dev` → `POST /api/v1/users/<u>/tokens`) does NOT work
+here: `gh auth token` returns empty for the Forgejo host, and the
+git-credential-store token can READ the API but `POST .../tokens`
+returns `403 token does not have at least one of required scope(s):
+[write:user]`. The authoritative, least-privilege path that worked is
+the in-pod Forgejo admin CLI (operator has cluster `kubectl`):
+```
+kubectl exec -n forgejo <forgejo-pod> -- \
+  forgejo admin user generate-access-token \
+  -u triform-admin -t cargoless-ci-readonly \
+  --scopes read:repository --raw
+# `--raw` = bare-token stdout → capture into a var, never echo/log;
+# pipe directly:  printf %s "$TOK" | gh secret set FORGEJO_READONLY_TOKEN \
+#   --repo TriformAI/cargoless
+```
+Least-privilege confirmed post-mint via an authed `GET .../tokens`
+(scopes must be exactly `["read:repository"]`). Zero token-value
+leakage: `--raw`→var→stdin-pipe; only name/scopes/id ever printed;
+`unset` after. This step was operator-AUTHORIZED + builder-infra-executed
+in Phase C (#100). For the real launch the operator either re-mints the
+same way or confirms the existing `cargoless-ci-readonly` (id=45) token
++ the GitHub secret are still present (`gh secret list`).
+
 No code change needed (`release.yml` already consumes
 `secrets.FORGEJO_READONLY_TOKEN`). Never committed; GH masks it in logs.
 **Option 2** (also publish the verdict as a GitHub commit status /
-release asset so GH Actions never crosses to Forgejo) is a **0.2.0+**
-hardening — parked, deliberately not launch-blocking.
+release asset so GH Actions never crosses to Forgejo — D-CI-RESILIENCE
+F-C) is a **0.2.0+** hardening — parked, deliberately not
+launch-blocking.
 
 ### 2.2 crates.io publish — the LATER operator-credential stage (§8 #5)
 
@@ -143,21 +169,46 @@ State as of skeleton-draft 2026-05-17 (✅ done / ⏳ pending / TBD = fill at fi
 
 ```
 [✅] D1 product name resolved — `cargoless` (CWDL-12, 2026-05-17)
-[⏳] D1-rename landed on main (#87 — docs-launch-lead surgical rename;
-     builder-infra ci-gate-reviews binstall/CI hunk)
+[✅] D1-rename landed on main — #87 @ `61d8324` (cherry-picked + re-gated);
+     binstall/CI hunk ci-gate-reviewed; D1 source-tier complete
+     (#99 statusfile follow-up @ `348c85c`; `git grep tftrunk crates/`=0)
 [✅] §8 #2 Mac builder — resolved (GH Actions macos-{13,14})
 [✅] §8 #4 CHANGELOG format + scaffold — Keep a Changelog v1.1.0
-[✅] §8 #6 GitHub asset-URL shape — verified (static analysis + PKG/BIN fix)
+[✅] §8 #6 GitHub asset-URL shape — verified (static analysis + PKG/BIN fix
+     + Phase-C live: sha256 byte-verified, layout==binstall bin-dir)
 [✅] §8 #8 canonical install URL — github.com/TriformAI/cargoless, seeded,
      anonymous install verified end-to-end
-[✅] §8 #9 Forgejo→GitHub push-mirror — live, sync_on_commit
+[✅] §8 #9 Forgejo→GitHub push-mirror — live, sync_on_commit (Phase-C:
+     tag+branch replication validated ~3–15s across 5 fires)
 [✅] CWDL-71 Phase A — release.yml activated on GitHub Actions
 [✅] CWDL-71 Phase B — version hoisted to [workspace.package]
-[⏳] CWDL-71 Phase C — v0.0.0 rehearsal: GH Actions 3-runner matrix
-     verified end-to-end (TBD: rehearsal outcome — fill after Phase C)
+[✅] CWDL-71 Phase C — v0.0.0 rehearsal GREEN (2026-05-18). Topology
+     REVISED: 2 REQUIRED legs (ubuntu x86_64-linux + macos-14
+     aarch64-darwin) + DECOUPLED best-effort Intel (x86_64-darwin /
+     macos-13, `continue-on-error`, nothing `needs:` it). Validated:
+     tag-validate BOTH assertions ✓, 2 required builds ✓,
+     attach-release-assets ✓ (Release-object created + assets),
+     sha256 byte-verified, layout==binstall bin-dir, notes==CHANGELOG.
+     Rehearsal peeled 4 launch-blockers — see §5.
 [⏳] §8 #5 crates.io token — operator-configured (operator-time, §2.2 — the LATER credential stage)
-[⏳] FORGEJO_READONLY_TOKEN secret — operator-configured (operator-time, §2.1 — the NEARER gate; CWDL-71 Phase C #100)
+[✅] FORGEJO_READONLY_TOKEN secret — minted+set+verified in Phase C #100
+     (`cargoless-ci-readonly` id=45, scope `read:repository`); operator
+     re-confirms presence at launch via `gh secret list` (§2.1)
 [ ] §8 #7 GPG signing — v1+ parking-lot (intentionally NOT a 0.1.0 gate)
+[OPERATOR PRE-FLIGHT — D-CI-RESILIENCE F-C/F-D, do immediately before §0]
+     ( ) authed probe returns `s1-ac2-verdict` for the launch SHA
+         (`curl -H "Authorization: token <FORGEJO_READONLY_TOKEN>"
+         .../commits/<sha>/statuses` → context present) AND
+         forgejo.triform.dev reachable — else tag-validate hard-fails
+     ( ) after `git push origin v0.1.0`: within 60s the tag is on
+         github.com/TriformAI/cargoless AND a `release.yml` run started
+         — else mirror health (Forgejo→Settings→Mirroring) + the
+         break-glass `git push github v0.1.0` fallback
+KNOWN LIMITATION (documented, NOT a gate): x86_64-apple-darwin (Intel
+     Mac) prebuilt is best-effort — free-tier macos-13 runner
+     availability is systemic-flaky (Phase-C: queued/never-assigned
+     3×). When absent, `cargo binstall` auto-falls-back to a source
+     build for Intel Mac. Recorded per D-CI-RESILIENCE F-A.
 [TBD] AC#7 comparative verdict — bench-lead (#36); throughput numbers in README
 [TBD] D-A2 / AC#2 renegotiation — operator decision (#48); honest
       save→verdict claim wording in README/blog
@@ -207,18 +258,45 @@ GitHub-release artifacts have been smoke-tested.
 
 ## 5. Finalize-time TODO (fill these after Phase C + before first real launch)
 
-- [ ] Phase C rehearsal outcome: did the GH Actions 3-runner matrix
-      produce all 3 installable tarballs? macOS-runner build path
-      exercised? `cargo binstall cargoless` fetch verified? (builder-infra
-      fills after Phase C runs)
-- [ ] Final throughput numbers for README/blog (bench-lead, AC#7 #36)
-- [ ] D-A2 honest save→verdict claim wording (operator decision #48)
-- [ ] crate-publish name confirmation (all-internal-renamed vs
-      top-level-only — depends on #87 final scope)
-- [ ] Actual launch date (operator decides; this doc is name-and-mechanism
-      ready, date is a business call)
+- [✅] **Phase C rehearsal outcome (builder-infra, 2026-05-18):** GREEN.
+      Topology was REVISED mid-rehearsal (the all-3-required matrix was a
+      real fragility): now **2 REQUIRED** legs (ubuntu x86_64-linux +
+      macos-14 aarch64-darwin) both ✅ produced installable tarballs +
+      `.sha256` (byte-verified) with layout == binstall bin-dir
+      `cargoless-vX-<target>/cargoless`; Release object created with
+      notes == CHANGELOG section; anonymous asset fetch (= the
+      `cargo binstall` fetch path) ✅. **Intel x86_64-darwin is
+      best-effort/DECOUPLED** — macos-13 free-tier runner is
+      systemic-flaky (queued/never-assigned 3×); absent ⇒ binstall
+      source-fallback (documented known-limitation, §3). The rehearsal
+      **peeled 4 launch-blockers, each invisible to static review**:
+      F-1 `grep -A1` workspace-version extraction (`9f0c9cf`);
+      F-2 anonymous Forgejo s1-ac2 read under REQUIRE_SIGNIN_VIEW
+      (`c033aa3` + operator token #100);
+      F-A all-legs `needs:` runner-wedge (`3baf659` decouple);
+      F-3 `gh release upload` with no auto-created Release object
+      (`1ef8dab`, + CHANGELOG-notes). 5th fire clean end-to-end. Full
+      topology audit → `docs/design/D-CI-RESILIENCE.md` (#123).
+- [✅] Final throughput numbers for README/blog — AC#7 #36 complete;
+      numbers available for docs-launch-lead/operator to wire (not a
+      builder-infra artifact; pointer only).
+- [ ] D-A2 honest save→verdict claim wording (operator decision #48 —
+      human/operator-gated; will NOT close in an agent session)
+- [ ] crate-publish name confirmation — **depends on #97** (internal
+      tf-{proto,cas,core}→cargoless-* rename). If #97 lands: §2.2 publish
+      list becomes `cargoless-proto/cas/core` + `cargoless`. If #97 is
+      deferred: internals stay `tf-*` (publish under `tf-*` if free, else
+      `publish = false`). Confirm at the #97 decision point; §2.2 NOTE
+      already enumerates both branches.
+- [ ] Actual launch date (operator decides; this doc is
+      name-and-mechanism ready, date is a business call)
 - [ ] AC#9 launch blog ≥2-reviewer sign-off (human-gated; will NOT close
       in an agent session)
+- [ ] **(D-CI-RESILIENCE F-E, HARDEN-NOW recommended pre-real-v0.1.0):**
+      make the Forgejo `bench` verdict-POST assert HTTP 2xx (fail the
+      step on non-2xx) so a silently-broken s1-ac2 producer reds `main`
+      at commit time instead of surprising the operator at tag time —
+      lead-routed item, cheap, not yet landed.
 
 When all §5 boxes are filled and §3 is fully ✅, the operator runs §0.
 That is launch.
