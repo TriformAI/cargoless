@@ -37,7 +37,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tf_proto::{BuildIdentity, FileState, StateEvent, TreeState};
+use tf_proto::{
+    BuildIdentity, ContentHash, FileState, Profile, StateEvent, TargetTriple, TreeState,
+};
 
 /// Hard ceiling for [`check_once`] (override: `TF_CHECK_TIMEOUT_SECS`). A
 /// cold rust-analyzer flycheck (`cargo check`) can take minutes; this only
@@ -216,6 +218,25 @@ fn collect_rs_files(root: &Path, ignore: &crate::watcher::IgnoreRules) -> Vec<Pa
 /// rust-analyzer or spawn failure is *not* "the code is red" — it is an error
 /// the CLI must surface distinctly. A successful run with no provable-green
 /// files yields [`TreeState::Red`] (never claim unproven green — AC#4).
+/// The display-only [`BuildIdentity`] for callers that consume the verdict
+/// stream but never trigger a build (e.g. `tf serve`/`status` showing
+/// green/red). It is **not** a real build key — every hash is a fixed
+/// sentinel — so it can never alias a genuine artifact. The real identity is
+/// the build-cas owner's to compute; this exists purely so cli-ux/devserver
+/// can satisfy [`watch`]'s `identity` param without hand-filling `tf-proto`
+/// internals or fabricating a plausible-looking key.
+pub fn placeholder_identity() -> BuildIdentity {
+    let sentinel = ContentHash::new("placeholder-display-only-not-a-build-key");
+    BuildIdentity {
+        source_tree: sentinel.clone(),
+        cargo_lock: sentinel.clone(),
+        rust_toolchain: sentinel.clone(),
+        tf_config: sentinel,
+        target: TargetTriple::new("wasm32-unknown-unknown"),
+        profile: Profile::Dev,
+    }
+}
+
 pub fn check_once(root: &Path) -> io::Result<TreeState> {
     let root = fs::canonicalize(root)?;
     let mut cmd = crate::analyzer::rust_analyzer_command()?;
