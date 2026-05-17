@@ -108,19 +108,30 @@ impl InitOpts {
     /// #49 — keeps `LspClient::initialize`'s signature stable across
     /// callers that don't care about env).
     pub fn from_env_and_project(project_root: &Path) -> Self {
-        let proc_macro_enabled = match std::env::var("TF_PROC_MACRO")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("enabled") | Some("on") | Some("true") | Some("1") => true,
-            Some("disabled") | Some("off") | Some("false") | Some("0") => false,
-            // "auto" or unset → Cargo.toml scan. False if the scan errors
-            // (defensive: avoid mis-enabling RA's heavy proc-macro server
-            // on a tree we can't read).
-            _ => detect_proc_macro(project_root).unwrap_or(false),
+        // #126 Tier-3: `TF_RA_PROCMACRO_OFF=1` forces RA proc-macro OFF
+        // (the −53 % RSS lever) regardless of TF_PROC_MACRO / auto-
+        // detect. SAFE only because #126 simultaneously down-ranks
+        // RA-native diagnostics out of the verdict in the model (see
+        // crate::procmacro / D-PROCMACRO-DOWNRANK) — the two are a pair.
+        // Default-off: unset ⇒ the #74 resolution below is byte-
+        // identical to pre-#126.
+        let proc_macro_enabled = if crate::procmacro::enabled() {
+            false
+        } else {
+            match std::env::var("TF_PROC_MACRO")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("enabled") | Some("on") | Some("true") | Some("1") => true,
+                Some("disabled") | Some("off") | Some("false") | Some("0") => false,
+                // "auto" or unset → Cargo.toml scan. False if the scan
+                // errors (defensive: avoid mis-enabling RA's heavy
+                // proc-macro server on a tree we can't read).
+                _ => detect_proc_macro(project_root).unwrap_or(false),
+            }
         };
         let features: Vec<String> = std::env::var("TF_FEATURES")
             .ok()
