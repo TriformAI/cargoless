@@ -11,6 +11,7 @@
 
 pub mod analyzer;
 pub mod lsp;
+pub mod model;
 pub mod watcher;
 
 pub use tf_cas::{ContentStore, LocalDiskStore};
