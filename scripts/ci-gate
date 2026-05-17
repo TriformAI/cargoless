@@ -116,6 +116,26 @@ stream_tree() {
   git -C "$REPO_ROOT" archive --format=tar "$SHA" \
     | kexec_i tar -x -C "$REMOTE_SRC" \
     || die "source transfer failed"
+  # Defeat the git-archive-mtime + PVC-cache stale-green trap:
+  # `git archive` writes extracted files with mtime = commit timestamp.
+  # The PVC-resident CARGO_TARGET_DIR persists across runs, and its cached
+  # build artifacts have mtime = LAST-RUN-time (usually NEWER than any
+  # commit). cargo's mtime-based fingerprint then sees
+  # `target/.../deps/foo.rlib > src/foo.rs` and SKIPS the rebuild — the
+  # cached binary (without the new code's tests/changes) runs and the gate
+  # reports green for OLD code. This silent-stale-green nearly shipped
+  # F8-redo's dangling identifier (d16b695) AND F12's substring-matching
+  # bug — both caught only by dev-fixer pushing a second commit which had
+  # a newer timestamp and force-busted the cache.
+  #
+  # Fix: bump every extracted file's mtime to NOW. cargo then sees source
+  # NEWER than cached artifact and rebuilds correctly. Costs ~1s; cheaper
+  # than `cargo clean -p <crate>` (which would force a 30-60s rebuild even
+  # when sources legitimately match the cache). See dev-fixer's diagnostic
+  # in agent/dev-fixer-5 / lead's routing message Item 3 (2026-05-17).
+  echo "[ci-gate] bumping mtimes (defeats git-archive-mtime / PVC-cache stale-green trap)..."
+  kexec bash -c "find $REMOTE_SRC -type f -exec touch {} +" \
+    || die "mtime bump failed"
 }
 
 # ───────────────────────── --bench: S1/AC#2 verdict ─────────────────────────
