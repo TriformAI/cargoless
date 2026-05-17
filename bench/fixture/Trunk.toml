@@ -1,13 +1,17 @@
 # Trunk config for the bench fixture.
 #
-# Both the trunk comparator and `tftrunk build --watch --out` (which
+# Both the trunk comparator and `cargoless build --watch --out` (which
 # delegates to trunk per FIELD FINDING #54) use this when building the
-# wasm bundle. Kept deliberately MINIMAL — pinning `dist = "trunk-dist"`
-# only because the comparative harness watches `trunk-dist/index.html`'s
-# mtime as the artifact-publish witness; everything else is trunk default.
+# wasm bundle. Kept deliberately MINIMAL — NO `dist` override: trunk
+# uses its default `dist/`, which is ALSO what cargoless's build
+# orchestrator hardcodes (`project_root.join("dist")`), so both tools
+# agree on the artifact location. (An earlier `dist = "trunk-dist"`
+# override — added for a comparative-latency mtime witness — broke
+# cargoless's build-path: it looked for `dist/`, trunk wrote
+# `trunk-dist/`. Resolved: single default `dist/` everywhere.)
 #
 # `release = false` because the bench measures inner-loop edit-save
-# latency, not release optimization time — matches the v0 plan AC#3
+# cost, not release optimization time — matches the v0 plan AC#3
 # wording "no wasm-opt on the inner loop".
 
 [build]
@@ -22,21 +26,11 @@
 # `dist/index.html` to match (bench/harness/src/tools.rs).
 release = false
 
-[watch]
-# Trunk REQUIRES every entry in `ignore` to canonicalize at startup
-# (paths must exist). Listing non-existent paths makes trunk die at
-# spawn with `ERROR error taking the canonical path to the watch ignore
-# path: ...` — which is exactly what killed trunk's 4th-attempt run
-# (`target/` hadn't been created yet).
-#
-# Trunk handles `target/` and `dist` by default; we only list the
-# bench-harness-specific scratch dirs and only if they already exist
-# at the moment trunk starts. The run-comparative.sh driver creates
-# `trunk-dist` (the --dist target) by virtue of asking for it; the two
-# .cargoless* dirs only exist after cargoless artifact-mode has run.
-#
-# Simpler + correct: drop ignore entirely. The defaults already cover
-# target/ and dist; the cross-tool loop concern (cargoless writing
-# .cargoless-bench-out under fixture root re-triggering trunk) is
-# bounded by trunk's own debounce + the fact that trunk's own --dist
-# != .cargoless-bench-out (different paths, no actual feedback loop).
+# [watch] intentionally has NO `ignore` list. Trunk REQUIRES every
+# `ignore` entry to canonicalize (exist) at startup; listing a
+# not-yet-created path (`target/`, scratch dirs) makes trunk die at
+# spawn with "ERROR error taking the canonical path to the watch
+# ignore path". Trunk's defaults already ignore `target/` and `dist/`;
+# the harness scratch dirs (`.cargoless*`, `.cargoless-*-out`) don't
+# create a feedback loop (trunk's default `dist/` ≠ those paths), so
+# an explicit ignore list buys nothing and only risks the spawn-death.
