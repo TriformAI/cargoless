@@ -337,12 +337,11 @@ fn apply_ra_allocator_env(cmd: &mut Command) {
     }
     // Opt-in jemalloc preload (only if a libjemalloc is discoverable and
     // the operator has not already set LD_PRELOAD — we never clobber it).
-    if matches!(std::env::var("TF_RA_JEMALLOC").as_deref(), Ok("1"))
-        && std::env::var_os("LD_PRELOAD").is_none()
-    {
-        if let Some(so) = find_jemalloc() {
-            cmd.env("LD_PRELOAD", so);
-        }
+    let want_jemalloc = matches!(std::env::var("TF_RA_JEMALLOC").as_deref(), Ok("1"))
+        && std::env::var_os("LD_PRELOAD").is_none();
+    let preload = if want_jemalloc { find_jemalloc() } else { None };
+    if let Some(so) = preload {
+        cmd.env("LD_PRELOAD", so);
     }
 }
 
@@ -351,10 +350,10 @@ fn apply_ra_allocator_env(cmd: &mut Command) {
 /// common multiarch/dev paths. Returns `None` (⇒ no preload, glibc
 /// arena cap still applies) if none exist — never an error.
 fn find_jemalloc() -> Option<std::ffi::OsString> {
-    if let Some(p) = std::env::var_os("TF_RA_JEMALLOC_SO") {
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
+    if let Some(p) =
+        std::env::var_os("TF_RA_JEMALLOC_SO").filter(|p| std::path::Path::new(p).exists())
+    {
+        return Some(p);
     }
     const CANDIDATES: &[&str] = &[
         "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
