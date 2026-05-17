@@ -81,12 +81,20 @@ pub struct InitOpts {
 impl Default for InitOpts {
     /// Safe defaults: proc-macros ON (most projects need them — the only
     /// non-proc-macro-using projects are rare; defaulting OFF would
-    /// silently mis-analyze macro-heavy code), features = `["default"]`
-    /// (matches what `cargo check` does without `--no-default-features`).
+    /// silently mis-analyze macro-heavy code), `features = []` (empty
+    /// list ⇒ RA invokes cargo WITHOUT `--features`, letting cargo
+    /// use its own default-feature behavior).
+    ///
+    /// **Why empty, not `["default"]`:** passing `--features default`
+    /// to cargo errors out on crates that don't define a `[features]`
+    /// table (the fixture in the F2 integration test is exactly this
+    /// shape — caught by self-gate). Empty list = "no override" =
+    /// safe across every cargo project. The CLI's `--features csr`
+    /// flag becomes a real opt-in override on top.
     fn default() -> Self {
         Self {
             proc_macro_enabled: true,
-            features: vec!["default".to_string()],
+            features: Vec::new(),
         }
     }
 }
@@ -123,7 +131,10 @@ impl InitOpts {
                     .map(str::to_owned)
                     .collect()
             })
-            .unwrap_or_else(|| vec!["default".to_string()]);
+            // Unset / parse-failure ⇒ empty list (let cargo use its
+            // own defaults). See InitOpts::default() rationale on why
+            // we do NOT default to `["default"]`.
+            .unwrap_or_default();
         Self {
             proc_macro_enabled,
             features,
@@ -1210,10 +1221,11 @@ mod tests {
         // procMacro tracks InitOpts.proc_macro_enabled (default=true).
         assert_eq!(v["procMacro"]["enable"], json!(true));
 
-        // cargo: allFeatures OFF, features list from InitOpts, defaults
-        // kept (noDefaultFeatures: false).
+        // cargo: allFeatures OFF, features list from InitOpts (default
+        // = empty so cargo uses its own defaults), defaults kept
+        // (noDefaultFeatures: false).
         assert_eq!(v["cargo"]["allFeatures"], json!(false));
-        assert_eq!(v["cargo"]["features"], json!(["default"]));
+        assert_eq!(v["cargo"]["features"], json!([]));
         assert_eq!(v["cargo"]["noDefaultFeatures"], json!(false));
 
         // workspace.symbol narrowed.
@@ -1395,9 +1407,15 @@ mod tests {
         // need it; defaulting OFF would silently mis-analyze leptos/
         // serde-derive code. Defaulting ON is a small idle cost vs a
         // potentially-wrong verdict.
+        //
+        // features default = empty (let cargo use its own defaults).
+        // Passing `--features default` to cargo errors on crates that
+        // don't define a [features] table — caught by F2 integration
+        // test's fixture and our first-self-gate red. Empty is the
+        // safe-across-every-cargo-project choice.
         let opts = InitOpts::default();
         assert!(opts.proc_macro_enabled);
-        assert_eq!(opts.features, vec!["default".to_string()]);
+        assert_eq!(opts.features, Vec::<String>::new());
     }
 
     #[test]
