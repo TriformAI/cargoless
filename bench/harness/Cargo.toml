@@ -1,10 +1,27 @@
-# cargoless S1 / AC#2 latency harness.
+# cargoless bench harness.
 #
-# Standalone workspace, ZERO external dependencies on purpose: the harness
-# itself must not add a build/network/lock surface that would muddy the very
-# latency it measures, and std-only keeps it reproducible in the constrained
-# CI image. It speaks LSP (JSON-RPC over stdio) to a real `rust-analyzer`
-# process by hand.
+# Two binaries:
+#   * `ra-latency`     — single-tool RA save→publishDiagnostics latency
+#                        (S1/AC#2, CWDL-22/CWDL-3; the existing harness,
+#                        unchanged — preserves the `S1_VERDICT:` verdict
+#                        line the ci-gate `--bench` mode publishes).
+#   * `cargoless-bench` — two-mode COMPARATIVE harness:
+#                        - `checker`  = save→verdict      (AC#2 dim)
+#                        - `artifact` = save→publish      (AC#3 dim,
+#                                                          reported
+#                                                          SEPARATELY)
+#                        run against {cargoless, trunk, bacon} on the
+#                        same bench/fixture, so AC#7's "better on ≥2
+#                        dimensions vs trunk/bacon" is measured, not
+#                        asserted. Emits `AC2_VERDICT:` / `AC3_VERDICT:` /
+#                        `AC7_VERDICT:` single-line markers (≤255 chars
+#                        each) for the ci-gate to lift into Forgejo
+#                        commit statuses.
+#
+# Shared library is std-only too: no extra dep is added because adding
+# one to a dep-free harness would pollute the very latency profile the
+# harness measures, and `--locked` CI would then have to grow Cargo.lock
+# entries the rest of the repo does not need.
 [workspace]
 
 [package]
@@ -15,9 +32,17 @@ rust-version = "1.85"
 license = "Apache-2.0"
 publish = false
 
+[lib]
+name = "cargoless_bench_harness"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ra-latency"
 path = "src/main.rs"
+
+[[bin]]
+name = "cargoless-bench"
+path = "src/bench_main.rs"
 
 [dependencies]
 

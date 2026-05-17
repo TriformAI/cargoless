@@ -3,3 +3,12 @@
 fixture/target/
 harness/target/
 **/Cargo.lock.orig
+
+# Comparative-bench artifact `--out` (cargoless `build --watch --out`
+# materializes the latest-green dist here; trunk's --dist sibling lives
+# under `fixture/trunk-dist/` by registry default).
+fixture/.cargoless-bench-out/
+fixture/trunk-dist/
+# cargoless publisher pointer + CAS — written under the fixture root by
+# `tftrunk build --watch` in artifact-mode benches; never source.
+fixture/.cargoless/
