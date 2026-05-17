@@ -1,0 +1,154 @@
+# cargoless dedicated build/test gate — fully independent of tf-multiverse's
+# `triform-builder` namespace and of the shared serial Forgejo Actions runner.
+#
+# Design: lightweight, fully independent of tf-multiverse's `triform-builder`
+# namespace and of the shared serial Forgejo runner. kubectl-exec stdout is
+# readable, which is the whole point — it eliminates the unreadable-Forgejo-
+# logs problem. A PVC-backed warm CARGO_HOME + persistent CARGO_TARGET_DIR is
+# the entire speedup.
+#
+# Image: registry.triform.cloud/mirror/triform-builder-v2:0.1 — the same
+# pre-baked toolchain image tf-multiverse's builders use. Chosen because
+# *pod-level egress to the public internet is blocked cluster-wide* (verified:
+# static.rust-lang.org / dockerhub / forgejo all time out from a pod, though
+# DNS resolves and node-level image pulls work). That makes `rustup component
+# add rustfmt/clippy` impossible at runtime, so the image MUST ship rustfmt +
+# clippy already — triform-builder-v2 does. It is pulled from the in-cluster
+# registry.triform.cloud (node-reachable) via the replicated `registry-pull`
+# imagePullSecret. ci-gate pins RUSTUP_TOOLCHAIN to the image's baked
+# toolchain so cargoless's rust-toolchain.toml (channel 1.85.0) does not
+# trigger a blocked network toolchain download.
+#
+# A pod with NO NetworkPolicy is denied public-internet egress on this
+# cluster (verified: static.rust-lang.org / forgejo / dockerhub all time out
+# from an unpoliced pod, while DNS resolves and node image-pulls work). The
+# NetworkPolicy below — scoped to THIS namespace only, mirroring the pattern
+# of triform-builder's own `builder-egress` policy — restores 80/443 egress
+# so `rustup component add rustfmt clippy` and the 1.85.0 toolchain fetch
+# work. Nothing in triform-builder or any Flux/Calico global resource is
+# touched.
+#
+# Source still never comes from an in-pod git fetch; ci-gate tar-streams the
+# tree in over `kubectl exec` stdin, exactly like tf-multiverse
+# scripts/check-remote (auth-free, deterministic).
+#
+# Applied by scripts/ci-gate --provision. Do NOT touch triform-builder.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-builder
+    app.kubernetes.io/part-of: cargoless
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cargoless-cache
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-builder
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # triform-replicated-fsn: longhorn replicated, Retain reclaim policy — same
+  # class the tf-multiverse fsn check/clippy builders use, so it is known-good
+  # capacity on the fsn nodes. WaitForFirstConsumer binds it where the pod lands.
+  storageClassName: triform-replicated-fsn
+  resources:
+    requests:
+      storage: 40Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cargoless-builder
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-builder
+spec:
+  replicas: 1
+  # RWO PVC: a rolling update would deadlock (new pod cannot mount the volume
+  # while the old pod still holds it). Recreate tears the old pod down first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-builder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cargoless-builder
+    spec:
+      # Long-lived idle build host; ci-gate kubectl-execs into it on demand.
+      terminationGracePeriodSeconds: 5
+      imagePullSecrets:
+        - name: registry-pull
+      containers:
+        - name: builder
+          image: registry.triform.cloud/mirror/triform-builder-v2:0.1
+          command: ["sleep", "infinity"]
+          env:
+            # All warm state lives on the PVC so it survives pod restarts and
+            # stays hot across consecutive ci-gate runs. RUSTUP_HOME is on the
+            # PVC too: the image's baked toolchain is 1.93.1, but cargoless
+            # pins channel 1.85.0 in rust-toolchain.toml (matches CI's
+            # rust:1.85-bookworm). ci-gate seeds /cache/rustup with the 1.85.0
+            # toolchain + rustfmt + clippy ONCE; subsequent runs are offline-
+            # fast against the warm PVC copy.
+            - name: CARGO_HOME
+              value: /cache/cargo
+            - name: RUSTUP_HOME
+              value: /cache/rustup
+            - name: CARGO_TARGET_DIR
+              value: /cache/target
+            - name: CARGO_INCREMENTAL
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: cargoless-cache
+---
+# Namespace-scoped egress allow. Without this, an unpoliced pod on this
+# cluster cannot reach the public internet (empirically verified). Mirrors
+# triform-builder's own `builder-egress` shape but lives entirely in the
+# cargoless-builder namespace and selects only the cargoless builder pod —
+# it does not reference or alter any tf-multiverse resource.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cargoless-builder-egress
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-builder
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-builder
+  policyTypes: [Egress]
+  egress:
+    # DNS to in-cluster resolvers.
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+      to:
+        - namespaceSelector: {}
+    # HTTP/HTTPS to the public internet (rustup toolchain + components,
+    # crates.io once cargoless grows real deps). Private ranges excluded.
+    - ports:
+        - {port: 80, protocol: TCP}
+        - {port: 443, protocol: TCP}
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]

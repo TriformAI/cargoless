@@ -83,3 +83,59 @@ Wave 2 (after the tf-proto contract is merged green): `build-cas`,
 `devserver`, `cli-ux`, `integration`.
 Recycle: shut an agent down once its epic is merged green; re-spawn/re-engage
 on demand. Keep the team ≤10 and lean.
+
+## Dedicated build gate (`scripts/ci-gate`)
+
+The shared Forgejo Actions runner is a single serial runner contended by
+tf-multiverse + ~12 agents (frequently ~40min backlogged) and its job logs
+are **not** readable over the Forgejo REST API. It is therefore unusable as a
+fast pre-integration merge gate. cargoless has its own.
+
+**What it is.** A dedicated, isolated Kubernetes builder
+(`deploy/cargoless-builder.k8s.yaml`): namespace `cargoless-builder`, a
+single `Deployment/cargoless-builder` pod running the pre-baked
+`registry.triform.cloud/mirror/triform-builder-v2` toolchain image, a
+40Gi RWO PVC (`cargoless-cache`) holding the warm `CARGO_HOME`,
+`CARGO_TARGET_DIR` and a PVC-resident rustup `1.85.0` toolchain (matches CI's
+`rust:1.85-bookworm` and `rust-toolchain.toml`), plus a namespace-scoped
+egress `NetworkPolicy`. It is **fully independent** of tf-multiverse's
+`triform-builder` namespace and of the Forgejo runner — nothing in
+`triform-builder` is referenced or modified.
+
+**Why it works as the gate.** `kubectl exec` stdout *is* readable, so the
+real per-check PASS/FAIL and the actual compiler/test output land on your
+terminal — the unreadable-Forgejo-logs problem disappears.
+
+**How the lead / agents invoke it** (from the cargoless repo root):
+
+```
+scripts/ci-gate <ref>        # verify a branch/sha before integration
+scripts/ci-gate origin/main  # default ref if omitted
+scripts/ci-gate --provision  # (re)apply the builder manifest if it drifts
+```
+
+The `<ref>` must exist in the local clone — `ci-gate` never fetches/pulls
+(agents don't; the lead already has the branches). The tree at that ref is
+`git archive`-streamed into the pod over `kubectl exec` stdin (tracked files
+only, no in-pod git, no registry auth, deterministic). It then runs, in the
+streamed tree, the exact four checks `.forgejo/workflows/ci.yml` runs:
+
+| check | command |
+|---|---|
+| build  | `cargo build --workspace --all-targets` |
+| test   | `cargo test --workspace` |
+| fmt    | `cargo fmt --all -- --check` |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` |
+
+It prints a per-check verdict table and exits `0` iff all four are green
+(`1` if any red, `2` on transport/setup error). All four run even if an
+early one fails (`CI_GATE_KEEP_GOING=0` to stop at first failure). Remote
+cargo invocations carry the operator-sanctioned
+`TRIFORM_OPERATOR_APPROVED_BUILD=1` escape (the operator explicitly
+authorised cargoless its own kubectl/remote-cargo builder).
+
+**Integration protocol.** An agent reports `branch + commit` to the lead as
+before; the lead runs `scripts/ci-gate <branch>` and merges into `main` only
+on `ALL GREEN`. The warm PVC target cache makes repeat runs a relink, not a
+from-scratch rebuild. Forgejo CI still runs per-branch as the durable record;
+`ci-gate` is the fast readable gate that actually unblocks merges.
