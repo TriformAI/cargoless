@@ -1,10 +1,24 @@
 # Naming-drift inventory — pre-D1 catalog
 
-> **Status:** evidence-bundle for the post-D1 rename sweep. Pre-stages
-> the WHERE (this document) so that the D1 decision (the WHAT — see
-> [`D1-NAME-RECON.md`](D1-NAME-RECON.md)) translates into a small
-> focused commit instead of a 4-hour discovery exercise. Author:
-> `docs-launch-lead` (2026-05-17).
+> **✅ RESOLVED 2026-05-17 — D1 = `cargoless`** (operator decision; see
+> [`D1-NAME-RECON.md`](D1-NAME-RECON.md)). The rename landed as the #87
+> surgical commit, scope-reduced because #89 first consolidated all
+> banner rendering to a single `tf_core::BUILD_ID` constant (already
+> `"cargoless"`): the rename touched `[package]`/`[[bin]]` name,
+> ci-gate `-p` flag, binstall/release.yml `PKG`/`BIN`, the CAS
+> temp-prefix, the test env-var, doc-comment command hints, and the
+> forward-facing docs — NOT the banner sites (#89 owned those).
+> Internal libs `tf-proto`/`tf-cas`/`tf-core` + the `crates/tf-cli/`
+> directory path were intentionally retained (Tier C). This document
+> is preserved as the historical pre-rename catalog. The field-tier
+> companion (runtime-output cross-check) is
+> [`NAMING-DRIFT-FIELD-CROSS-CHECK.md`](NAMING-DRIFT-FIELD-CROSS-CHECK.md).
+>
+> **Original status (pre-resolution):** evidence-bundle for the post-D1
+> rename sweep. Pre-staged the WHERE (this document) so that the D1
+> decision (the WHAT — see [`D1-NAME-RECON.md`](D1-NAME-RECON.md))
+> translated into a small focused commit instead of a 4-hour discovery
+> exercise. Author: `docs-launch-lead` (2026-05-17).
 
 ---
 

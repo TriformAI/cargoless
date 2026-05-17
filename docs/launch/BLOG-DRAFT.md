@@ -116,7 +116,7 @@ five minutes ago, the input hash matches a previous cycle's
 rebuilt at all**. `trunk serve` and `bacon` rebuild unconditionally,
 no matter how identical the input.
 
-**A continuous verdict stream with per-file granularity.** `tftrunk
+**A continuous verdict stream with per-file granularity.** `cargoless
 watch` is a long-running command whose stdout is a timestamped
 stream of file-level verdicts. You see *which* file went red, not
 just *that* the tree went red. The stream is plain text; you can
@@ -130,7 +130,7 @@ byte-unchanged. Anything reading the pointer (a static server, a CI
 step, an agent inspector) is guaranteed never to see a broken
 artifact. That's verdict→trust collapsed to zero.
 
-**Verdict↔exit-code coherence.** `tftrunk check` exits 0 on green,
+**Verdict↔exit-code coherence.** `cargoless check` exits 0 on green,
 non-zero on red, with diagnostics formatted file:line:col + severity
 + code + message. This is the boring corner the project spent the
 most field-bug iterations on: the exit code and the printed
@@ -233,7 +233,7 @@ and `ac7-verdict` keys on the release SHA.
 
 ```bash
 cargo install --git https://github.com/TriformAI/cargoless.git \
-              tf-cli --branch main --locked
+              cargoless --branch main --locked
 ```
 
 Once `v0.1.0` ships, the install path becomes:
@@ -250,10 +250,10 @@ Then, in any Rust+WASM project (auto-detected on `cdylib + wasm32` or
 `leptos`):
 
 ```bash
-$ tftrunk check
+$ cargoless check
 ok green — every tracked file compiles
 
-$ tftrunk watch
+$ cargoless watch
 >> [+   0.083s] daemon up, watching /work/my-app
 >> [+   0.741s] /work/my-app/src/lib.rs: Green
 ^C
@@ -263,7 +263,7 @@ For the build/publish loop (requires the upstream `trunk` for the
 WASM artifact step):
 
 ```bash
-$ tftrunk build --watch --out ./dist
+$ cargoless build --watch --out ./dist
 >> publishing latest-green to .cargoless/latest-green → ./dist
 ok green — latest-green @ <hash>
 ```
@@ -328,7 +328,7 @@ what we deliberately did **not** do:
 
 The launch-hardening process for this v0 was 12 field findings over
 3 weeks of dogfooding a real Leptos project on a clean Linux box; 11
-fixed before launch, 1 closed as a design question (`tftrunk clean`
+fixed before launch, 1 closed as a design question (`cargoless clean`
 semantics — non-breaking, safe-either-way). The full evidence trail
 is at [`docs/dogfood/PHASE-2-REPORT.md`](https://github.com/TriformAI/cargoless/blob/main/docs/dogfood/PHASE-2-REPORT.md).
 
@@ -376,7 +376,7 @@ post is requested and gratefully received.
 
 ```bash
 cargo install --git https://github.com/TriformAI/cargoless.git \
-              tf-cli --branch main --locked
+              cargoless --branch main --locked
 ```
 
 Repository: [github.com/TriformAI/cargoless](https://github.com/TriformAI/cargoless)
@@ -406,9 +406,10 @@ the tool report when it breaks.
       shape used to produce them.
 - [ ] Latency table populated (cargo-check-bound on all three tools;
       no sub-second artifact-publish claim).
-- [ ] D1 product name resolved; every `<pubname>` and `cargoless` /
-      `tftrunk` instance audited for consistency with the picked
-      name.
+- [x] D1 product name resolved = `cargoless` (operator, 2026-05-17);
+      `tftrunk`/`tf-cli` drift renamed to `cargoless` in the #87
+      surgical rename-commit; internal `tf-proto`/`tf-cas`/`tf-core`
+      crate names intentionally retained.
 - [ ] Install command verified to work in a clean environment on the
       target platforms (Linux x86_64, macOS aarch64, macOS x86_64).
 - [ ] Repository URL audited; no `forgejo.triform.dev` URLs in

@@ -152,7 +152,11 @@ basis). This is the **headline install path** in the README. Slow
 > every push to Forgejo `main` auto-replicates to GitHub within seconds
 > (`sync_on_commit: true`). End-to-end install proven anonymously:
 > `cargo install --git https://github.com/TriformAI/cargoless.git tf-cli
-> --branch main --locked` succeeds in a clean env.
+> --branch main --locked` succeeds in a clean env. (Historical: that probe
+> used the pre-D1 package arg `tf-cli`; post-D1 (#87) the package is
+> `cargoless`, so the live command is now
+> `cargo install --git https://github.com/TriformAI/cargoless.git cargoless
+> --branch main --locked` — see §8 #1.)
 
 ### 3.2 Prebuilts via `cargo binstall` — three targets at first release
 
@@ -461,9 +465,9 @@ called out, not invented.
 
 | # | Open question | Owner | Blocks |
 |---|---|---|---|
-| 1 | **D1/CWDL-12 — public product name.** Affects: crate names on crates.io, the binary name `tftrunk`, the binstall `bin-dir` and `pkg-url` template, the README install commands, the launch blog title. | lead | EVERYTHING. No release can fire under "cargoless" because that is the placeholder/repo identifier, not a public name commitment. |
+| 1 | ~~**D1/CWDL-12 — public product name.**~~ **CLOSED 2026-05-17 — operator picked `cargoless`** (incumbent working name; uniquely free across crates.io / GitHub / npm / pypi per docs-launch-lead's D1-NAME-RECON evidence bundle). Resolved in the #87 surgical rename-commit: `[package] name` + `[[bin]] name` (tf-cli/tftrunk → cargoless), binstall `bin-dir` + release.yml `PKG`/`BIN` → cargoless, README/blog install commands → cargoless. BUILD_ID already consolidated to the single literal `"cargoless"` via #89. Internal libs (tf-proto/tf-cas/tf-core) intentionally retained per NAMING-DRIFT-INVENTORY Tier C; `crates/tf-cli/` directory path unchanged (internal). | — (resolved) | — |
 | 2 | ~~**Mac builder strategy.**~~ **CLOSED 2026-05-17 by §8 #8 (b)**. GitHub Actions free-tier provides `macos-14` (Apple Silicon, aarch64) and `macos-13` (Intel, x86_64) runners. Both targets ship as prebuilts in release `0.1.0`. See §3.3 and §5. No further action required. | — (resolved) | — |
-| 3 | **crates.io crate-name resolution.** Are `tf-proto` / `tf-cas` / `tf-core` / `tf-cli` going to be the published names (likely collisions), or are they internal-only with a renamed top-level crate (option 4.2.b), or all renamed under a `<pubname>-*` namespace (option 4.2.a)? | operator + lead, post-D1 | `tag-validate` and `publish-*` job names; the `bin-dir` template. |
+| 3 | ~~**crates.io crate-name resolution.**~~ **CLOSED 2026-05-17 by D1 (#87) — option 4.2.b**: only the top-level binary crate is published, renamed `tf-cli` → **`cargoless`**; the internal libs `tf-proto` / `tf-cas` / `tf-core` stay `publish`-internal under their tf-* names (no crates.io collision since they aren't published standalone). `publish-cargoless` job + binstall `bin-dir` updated accordingly in the #87 rename-commit. | — (resolved) | — |
 | 4 | ~~**CHANGELOG.md format & seeding.**~~ **CLOSED 2026-05-17 — Keep a Changelog v1.1.0 style chosen; CHANGELOG.md scaffold seeded.** Initial entry `## [0.0.0] - 2026-05-17` for pre-launch state; `## [Unreleased]` section for in-progress work. `tag-validate` regex in `.github/workflows/release.yml.draft` was already in place (`^##[[:space:]]+\[?${VERSION}\]?`, accepts both `## 0.1.0` and `## [0.1.0]`); now there's a real file for it to validate against. | — (resolved) | — |
 | 5 | **crates.io token automation timeline.** Operator-run for `0.1.0` is approved. Is `0.2.0`-automatable, or is human-in-the-loop the permanent model? | operator | Whether `publish-*` jobs ever lose `if: false`. |
 | 6 | ~~**GitHub release-asset URL shape.**~~ **CLOSED 2026-05-17 — verified via static analysis.** GitHub's canonical asset URL shape `https://github.com/{owner}/{repo}/releases/download/{tag}/{filename}` is well-documented and matches the `binstall` `pkg-url` template `{repo}/releases/download/v{version}/{name}-v{version}-{target}{archive-suffix}` after substitution. **One BUG SURFACED + FIXED during verification**: the workflow's `Package tarball` step previously had `NAME="tftrunk"` (binary name), but binstall's `{name}` template resolves to `package.name` (= `tf-cli`), not `[[bin]].name`. Without correction, the tarball would have been published as `tftrunk-v0.1.0-<target>.tgz` but binstall would have looked for `tf-cli-v0.1.0-<target>.tgz` — a 404 at install time. **Fix**: split `NAME` → `PKG` (package name, used for tarball + dir to match `binstall {name}`) + `BIN` (binary name, used for the file inside the dir to match `binstall bin-dir` tail). Cleaner D1 rename surface too — two clearly-labeled vars instead of one ambiguous one. Static-analysis verification was strictly cheaper than the throwaway-test path AND surfaced the bug the test would have caught only after burning a build cycle. | — (resolved) | — |
@@ -501,8 +505,9 @@ discussions, not silent re-additions to `release.yml`.
 ## 10. Path to first real-fire — checklist
 
 ```
-[ ] Lead/operator picks D1 (CWDL-12) — public name locked.
-[ ] Rename tf-cli binary if D1 != "tftrunk"; rename crates per §4.2 decision.
+[x] Lead/operator picks D1 (CWDL-12) — public name locked = `cargoless` (2026-05-17).
+[x] Rename tf-cli→cargoless ([package]+[[bin]] name) per §4.2 option (b);
+    internal tf-proto/tf-cas/tf-core retained. Done in #87 surgical rename-commit.
 [ ] crates.io name(s) reserved by operator (cargo publish --dry-run).
 [ ] Hoist version → [workspace.package].version = "0.1.0"; crates inherit.
 [ ] Update path-deps to include version (publish-ready); Cargo.lock regenerated.

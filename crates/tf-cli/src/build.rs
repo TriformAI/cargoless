@@ -36,9 +36,9 @@ use crate::config::Config;
 use crate::ui;
 
 /// FIELD FINDING #7 (#54 part-2): preflight check for the `trunk` binary
-/// before `tftrunk build` invokes it as a subprocess.
+/// before `cargoless build` invokes it as a subprocess.
 ///
-/// Pre-fix UX: a fresh-machine `tftrunk build --watch --out /tmp/dist`
+/// Pre-fix UX: a fresh-machine `cargoless build --watch --out /tmp/dist`
 /// failed with `could not launch trunk build: No such file or directory
 /// (os error 2)` — the error was technically correct but did not tell
 /// the user that THEY are responsible for installing `trunk` (cargoless
@@ -79,7 +79,7 @@ fn require_trunk_or_exit() -> Result<(), ExitCode> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             ui::error(
                 "`trunk` is not installed (or not on PATH).\n  \
-                 `tftrunk build` wraps `trunk build` to produce the WASM \
+                 `cargoless build` wraps `trunk build` to produce the WASM \
                  artifact — install it with:\n      \
                  cargo install --locked trunk\n  \
                  (cargoless replaces `trunk serve` for the verdict + \
@@ -204,7 +204,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 
     write_status(verdict_of(session.tree_state()));
     // FIELD FINDING #13b (#88): the publisher watch loop has the SAME
-    // orphan risk as `tftrunk watch` — `tftrunk build --watch --out
+    // orphan risk as `cargoless watch` — `cargoless build --watch --out
     // dist &` then closing the shell would leave a ~2GB orphan
     // holding RA + cargo + trunk. Same parent-death guard.
     let parent = crate::orphan::ParentWatch::capture();

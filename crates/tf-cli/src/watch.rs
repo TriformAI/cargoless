@@ -140,7 +140,7 @@ pub fn run(cfg: &Config) -> ExitCode {
     // so we keep them both in this single thread.
     let lifecycle = session.subscribe_lifecycle();
     // FIELD FINDING #13b (#88): snapshot the parent pid BEFORE the loop.
-    // `tftrunk watch &` then closing the shell would otherwise leave
+    // `cargoless watch &` then closing the shell would otherwise leave
     // this daemon orphaned, holding rust-analyzer + cargo + ~2GB RSS,
     // until the user `pkill`s it by hand. Polled cheaply each loop
     // iteration; on parent-death we run the same graceful shutdown the

@@ -1,5 +1,13 @@
 [package]
-name = "tf-cli"
+# D1 RESOLVED 2026-05-17 (operator decision; Plane CWDL-12 / D-RELEASE §8 #1
+# + §8 #3 crate-name, both CLOSED): the shipping product name is `cargoless`
+# (incumbent working name — uniquely free across crates.io/GitHub/npm/pypi
+# per the D1-NAME-RECON evidence bundle). Only this published binary crate
+# is renamed; internal libs (tf-proto/tf-cas/tf-core) stay tf-* per
+# NAMING-DRIFT-INVENTORY Tier C. Crate directory stays crates/tf-cli/
+# (internal path; only [package] name + [[bin]] name are user-facing).
+# Phase-B `version.workspace = true` preserved unchanged below.
+name = "cargoless"
 version.workspace = true  # CWDL-71 Phase B: inherits from [workspace.package]
 edition.workspace = true
 rust-version.workspace = true
@@ -26,21 +34,23 @@ workspace = true
 # integration path too — that's actually better coverage.
 #
 # Install consequence — the documented install command for outside users is:
-#   cargo install --git https://github.com/TriformAI/cargoless.git tf-cli \
+#   cargo install --git https://github.com/TriformAI/cargoless.git cargoless \
 #                 --branch main --locked
-# (no `--features integration` needed anymore). The explicit `tf-cli` package
-# arg is REQUIRED because `cargo install --git` walks the entire repo for
-# Cargo.toml files and refuses to pick when multiple installable binary crates
-# exist — the bench/{harness,fixture} sub-workspaces produce `ra-latency`,
-# `cargoless-bench`, and `cargoless-bench-fixture` binaries that cargo treats
-# as install candidates. README install command (in agent/builder-infra's
-# pending integration) reflects this.
+# (no `--features integration` needed anymore). The explicit `cargoless`
+# package arg is REQUIRED because `cargo install --git` walks the entire repo
+# for Cargo.toml files and refuses to pick when multiple installable binary
+# crates exist — the bench/{harness,fixture} sub-workspaces produce
+# `ra-latency`, `cargoless-bench`, and `cargoless-bench-fixture` binaries that
+# cargo treats as install candidates. README install command reflects this.
 [features]
 default = ["integration"]
 integration = []
 
 [[bin]]
-name = "tftrunk"
+# D1 RESOLVED = `cargoless` (was placeholder `tftrunk`). Users type
+# `cargoless check` / `cargoless watch` / etc. Auto-derives the
+# `CARGO_BIN_EXE_cargoless` test env var (see tests/diagnostics_field_finding_2.rs).
+name = "cargoless"
 path = "src/main.rs"
 
 [dependencies]
@@ -54,9 +64,11 @@ tf-core = { path = "../tf-core", version = "0.0.0" }  # publish-ready
 # Only `cargo-binstall` reads these keys, at install time on a user's
 # machine, to fetch a prebuilt tarball instead of compiling from source.
 #
-# Status: PLACEHOLDER binary name (`tftrunk`). Locked when D1/CWDL-12 picks
-# the public product name. DO NOT cut a real release tag while D1 is open
-# (see D-RELEASE §8 #1).
+# Status: D1 RESOLVED 2026-05-17 = `cargoless` (Plane CWDL-12 / D-RELEASE
+# §8 #1 + §8 #3 CLOSED). bin-dir below is renamed to `cargoless` per
+# builder-infra's binstall/CI spec; it stays in lockstep with
+# `.github/workflows/release.yml`'s `BIN=cargoless` var (both landed in
+# this same D1-rename commit — builder-infra ci-gate-reviews the pair).
 #
 # Template variables binstall resolves:
 #   {repo}            — package.repository (workspace-inherited from root
@@ -84,13 +96,14 @@ pkg-fmt = "tgz"
 
 # Inside the tarball, layout is:
 #   {name}-v{version}-{target}/
-#     tftrunk         ← the binary (renamed at D1)
+#     cargoless       ← the binary (D1 RESOLVED = cargoless, was tftrunk)
 #     README.md
 #     LICENSE
-# TODO(D1/CWDL-12): if D1 renames the binary from `tftrunk`, update both
-# this `bin-dir` AND `.github/workflows/release.yml`'s `BIN=` var in the
-# Package tarball step. These two places MUST stay in sync.
-bin-dir = "{name}-v{version}-{target}/tftrunk"
+# D1 RESOLVED: bin-dir tail = `cargoless`, in lockstep with
+# `.github/workflows/release.yml`'s `BIN=cargoless` var (Package tarball
+# step). Both renamed together in this commit; pkg-url above is templated
+# ({name} auto-resolves to package.name = cargoless) so it needs no edit.
+bin-dir = "{name}-v{version}-{target}/cargoless"
 
 # Per-target overrides not needed for 0.1.0 — all three triples
 # (x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin)
@@ -98,5 +111,5 @@ bin-dir = "{name}-v{version}-{target}/tftrunk"
 # layout (e.g., Windows .zip post-v1), add:
 #   [package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]
 #   pkg-fmt = "zip"
-#   bin-dir = "{name}-v{version}-{target}/tftrunk.exe"
+#   bin-dir = "{name}-v{version}-{target}/cargoless.exe"
 # Windows is v1 parking-lot per CLAUDE.md — not in 0.1.0 scope.
