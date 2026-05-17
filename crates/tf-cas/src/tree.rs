@@ -23,6 +23,12 @@
 //! * **Files** — recorded as `(relpath, content-hash)`. Directories carry no
 //!   bytes of their own; an empty directory is not a compile input and is not
 //!   recorded (documented v0 cut).
+//! * **`dist/`** — excluded for the same reason as `target/`: it is Trunk's
+//!   *build output*, not an input. If it were hashed, every successful build
+//!   would change the source-tree hash and AC#5 dedupe could never fire on the
+//!   real `TrunkCompiler` path. (The CAS cache directory must likewise live
+//!   *outside* the watched tree — decision D6/D10's global cache root — so it
+//!   is never walked here; that invariant is the orchestrator's to uphold.)
 
 use std::fs;
 use std::io;
@@ -34,7 +40,7 @@ use crate::sha256::sha256_hex;
 
 /// Directory names pruned from the walk. Fixed and documented on purpose — see
 /// the module docs for why this is not a `.gitignore` engine in v0.
-pub const EXCLUDED_DIRS: &[&str] = &["target", ".git"];
+pub const EXCLUDED_DIRS: &[&str] = &["target", ".git", "dist"];
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -192,11 +198,16 @@ mod tests {
         fs::write(d.join("target/debug/app.wasm"), b"BUILD OUTPUT").unwrap();
         fs::create_dir_all(d.join(".git")).unwrap();
         fs::write(d.join(".git/HEAD"), b"ref: refs/heads/main").unwrap();
+        // `dist/` is Trunk's output — excluded so a successful build never
+        // changes the source-tree hash (AC#5 on the real compile path).
+        fs::create_dir_all(d.join("dist")).unwrap();
+        fs::write(d.join("dist/index.html"), b"<html>built</html>").unwrap();
+        fs::write(d.join("dist/app_bg.wasm"), b"\0asm BUILD OUTPUT").unwrap();
 
         assert_eq!(
             clean,
             hash_source_tree(&d).unwrap(),
-            "target/ and .git/ must not affect the source-tree hash"
+            "target/, .git/ and dist/ must not affect the source-tree hash"
         );
 
         // But a real source addition must.

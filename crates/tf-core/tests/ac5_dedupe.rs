@@ -82,7 +82,11 @@ fn same_source_state_twice_is_a_cache_hit_and_build_is_skipped() {
     write_project(&project).unwrap();
 
     let runs = Arc::new(AtomicUsize::new(0));
-    let store = LocalDiskStore::new(project.join(".tf-cache"));
+    // The CAS cache MUST live outside the watched source tree (D6/D10 global
+    // cache root). If it were under `project/`, the first build's stored
+    // artifact would become a new source-tree input and the second
+    // `assemble_identity` would see a different state — defeating dedupe.
+    let store = LocalDiskStore::new(scratch("dedupe-cache"));
     let orch = BuildOrchestrator::new(store, CountingCompiler { runs: runs.clone() }, &project);
 
     // 1. First build of this exact source state → a real compile.
@@ -168,7 +172,8 @@ fn release_profile_does_not_alias_a_dev_artifact() {
 
     let runs = Arc::new(AtomicUsize::new(0));
     let orch = BuildOrchestrator::new(
-        LocalDiskStore::new(project.join(".tf-cache")),
+        // Out-of-tree cache root (see the dedupe test for why).
+        LocalDiskStore::new(scratch("profile-cache")),
         CountingCompiler { runs: runs.clone() },
         &project,
     );
