@@ -34,7 +34,7 @@ CI-green ≠ field-proven. v0 was engineering-feature-complete at `3cfc835` but 
 | **F7** `build --watch --out` undocumented trunk dep | ✅ FIXED + VERIFIED (commit 2f19b52) |
 | **F8** verdict says GREEN while cargo check says red | ❌ **LAUNCH-BLOCKER STILL OPEN** — first fix (5869757) went wrong direction |
 | **F9** clean ignores in-project `.cargoless/` | (known unresolved design question — task #30) |
-| **F10** status reports stale daemon as live | ⏳ fix in flight (dev-fixer-3 / #62) |
+| **F10** status reports stale daemon as live | ✅ FIXED (dev-fixer-3 / #56; ff'd as 7e3e46b post-report) |
 | **F11** `--debounce-ms` CLI flag claimed but missing | ✅ FIXED + VERIFIED (cycled through dev-fixer-2/3) |
 
 | Other field PASSes |
@@ -222,12 +222,12 @@ cli-status
 ```
 **Recommendation:** address the design question before launch; either `clean` removes in-project `.cargoless/` too (with `--keep-status` opt-out), OR the README/`--help` explicitly clarifies the boundary.
 
-### F10 — `tftrunk status` reports stale daemon as live (IN-FLIGHT FIX)
+### F10 — `tftrunk status` reports stale daemon as live (FIXED)
 
 **Severity:** medium UX.
 **Original field:** after killing a `tftrunk watch`, `tftrunk status` reads the stale `.cargoless/cli-status` and reports `daemon live — pid 72792, verdict green (6s ago)` with confidence. No pid liveness check.
-**Status:** task #56 → dev-fixer-3 bundle (#62 in flight at time of report).
-**Recommendation:** `kill(pid, 0)` ping; on `EPERM`/`ESRCH`, report `no daemon (stale status file from pid X, last seen N seconds ago)` and remove the file.
+**Status:** ✅ FIXED — task #56 / dev-fixer-3 bundle ff'd to main as commit `7e3e46b fix(#56): tftrunk status — pid liveness check (kill(pid, 0))` (2026-05-17, post-report-commit).
+**Implementation:** `pid_is_alive(pid) -> Option<bool>` via `kill(pid, 0)`; on dead pid, reports distinct "stale status: pid X no longer running, run `cargoless watch` to restart" with exit code 3 (was misleading 0/live). EPERM edge case (pid exists but lack permission to signal) treated as "dead" per false-suppress-vs-false-contradict asymmetry (mirrors #55's classification design) — implausible for the daemon under user's own uid.
 
 ### F11 — `--debounce-ms` CLI flag was claimed in commit message but not implemented (CLOSED)
 
@@ -262,7 +262,7 @@ The user-visible drift mostly happens in error messages that reference `cargoles
 4. **D1 name decision** before any public copy.
 5. **F1 Forgejo auth-wall fix** — github mirror (already in flight via D-RELEASE/#58) is the right call; cannot launch with the cargoless source unreachable.
 6. **F3b zombie reaper** — get the proc-macro-srv path closed (#61); not a launch blocker on its own but a `ps -ef` screenshot will be embarrassing.
-7. **F10 status pid-liveness** — should land before launch (in flight via #62).
+7. ~~**F10 status pid-liveness** — should land before launch (in flight via #62).~~ ✅ LANDED post-report (#56 ff'd as 7e3e46b).
 8. **Tested-only-once F6-NEG-A** — one more visual confirmation that the `analyzer restarted` line actually appears in the stream (heuristic-grep PASSed; want a human-readable line).
 
 ## Process note
