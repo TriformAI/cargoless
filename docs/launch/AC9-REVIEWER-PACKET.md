@@ -82,7 +82,12 @@ appendix block itself is removed at publish — it is scaffolding.)
 1. **Numbers gate.** Every `_PENDING_` replaced with the confirmed
    two-source figure (bench-lead #102/#116/#119 + dogfood-lead #117
    anchor). If *any* remain PENDING, **do not publish** — partial is a
-   blocker, not a ship-with-caveat.
+   blocker, not a ship-with-caveat. **Numeric re-traceability**:
+   every cited numeric figure re-checked against its named source
+   (`AC7-THROUGHPUT-REPORT.md` §X via the post-#147 inline-baseline-
+   naming pattern). Sign of drift across multiple occurrences is the
+   marketing-creep signature (#145 CATCH-1 class — the gate must
+   catch FILLED→SOURCE-DRIFT, not just PENDING→FILLED).
 2. **Verbatim-block reconciliation.** The bench-lead Framing-C verbatim
    paragraph is reconciled with the confirmed numbers (kept verbatim
    until the numbers exist; not silently "improved" before then).
@@ -96,9 +101,12 @@ appendix block itself is removed at publish — it is scaffolding.)
 5. **Repo-URL audit.** Zero `forgejo.triform.dev` URLs in
    contributor-facing copy (Forgejo is internal-CI only;
    contributor-facing = `github.com/TriformAI/cargoless`).
-6. **D1-name consistency.** No `tftrunk` / `tf-cli` / `<pubname>=TBD`
-   in the published copy (the `<pubname>` install-block residual is
-   builder-infra's #96 lane — confirm it landed before publish).
+6. **D1-name consistency.** No `tftrunk` / `tf-cli` / `tf-proto` /
+   `tf-cas` / `tf-core` / `<pubname>=TBD` in the published copy
+   (post-#97 full one-token brand on `main`; D1-completeness
+   CI-enforced forward by `scripts/d1-drift-guard` (#96), but the
+   guard is out-of-scope for `docs/` by design — this checklist line
+   is the publish-surface gate).
 7. **Agent-frame consistency.** Title + lead + "what we are honest
    about" all consistent with the agent-loop positioning (no leftover
    "human live-reload replacement" phrasing).

@@ -35,12 +35,15 @@ contract is built against a fixed target. Where a decision is still formally
 open, the contract is built so the open choice is **additive**, never a
 reshape.
 
-### D1 — Product name *(owner: Lead; status: OPEN, due Sprint 1 Fri)*
-The shipping name is undecided. `cargoless` is the repo/binary placeholder; `tf`
-is rejected (Terraform collision). **Contract impact:** none — no public name is
-hardcoded in `cargoless-proto`; crate is `cargoless-proto` purely as an internal seam name.
-Rationale captured so downstream README/crates.io reservation is unblocked the
-moment the Lead picks; nothing in code blocks on it.
+### D1 — Product name *(owner: Lead; **RESOLVED 2026-05-17: `cargoless`** — operator decision, NAMING-DRIFT-INVENTORY closure, executed in #87 + #97 + #135)*
+The shipping product, the published crate, and the binary are all
+**`cargoless`**; internal library crates are `cargoless-proto` /
+`cargoless-cas` / `cargoless-core` (post-#97 full one-token brand on
+`main`). `tf` was rejected (Terraform collision). **Contract impact:**
+none — no public name is hardcoded in `cargoless-proto`; the crate
+name *is* the chosen brand, not a placeholder. D1-completeness is
+CI-enforced forward by `scripts/d1-drift-guard` (#96, with allowlist
+spec in [`docs/design/D-DRIFT-GUARD.md`](design/D-DRIFT-GUARD.md)).
 
 ### D2 — Audience wedge: Leptos-first vs broad Rust+WASM *(owner: Lead; OPEN)*
 Documented stance: **Leptos-first for zero-config defaults, mechanism stays
@@ -206,8 +209,8 @@ shapes above are designed so that is purely additive.
 | 4 never **publish** red | `BecameRed` edge + `BuildResult.artifact: None` on failure ⇒ publisher provably keeps the prior `.cargoless/latest-green` (headless; the v0.1 server is a downstream consumer of this guarantee) |
 | 5 CAS dedupe | `BuildIdentity` componentwise equality ⇒ `InputHash` equality; `BuildOutcome::Deduplicated` is the observable proof |
 | 6 survives RA kill | model emits `StateEvent`s; a restarted analyzer re-emits **level** `FileVerdict`s to re-sync subscribers — no edge replay needed |
-| 2a RA-incremental hint ≤1s | `LspEvent::Diagnostics` emit boundary in `tf_core::lsp` — RA-native severity:Error can flip RED instantly (F8-redo), but **cannot** drive GREEN (asymmetric-evidence rule) |
-| 2b authoritative verdict ≤ bare `cargo check` + 10% | `apply_event(FlycheckEnded)` boundary in `tf_core::model` — cargo-check (rustc) tier is the only signal that drives GREEN; cargoless's added overhead is the watch+debounce+emit loop, not cargo's runtime |
+| 2a RA-incremental hint ≤1s | `LspEvent::Diagnostics` emit boundary in `cargoless_core::lsp` — RA-native severity:Error can flip RED instantly (F8-redo), but **cannot** drive GREEN (asymmetric-evidence rule) |
+| 2b authoritative verdict ≤ bare `cargo check` + 10% | `apply_event(FlycheckEnded)` boundary in `cargoless_core::model` — cargo-check (rustc) tier is the only signal that drives GREEN; cargoless's added overhead is the watch+debounce+emit loop, not cargo's runtime |
 | 1 (headless) / 3 (publish latency) / 7 (two-mode) | unblocked, not closed here — depend on auto-detect (D7), the S1/two-mode bench, and the publisher; contract is the seam they build against |
 | AC#2 split rationale | see [`docs/design/D-A2-RENEGOTIATION.md`](design/D-A2-RENEGOTIATION.md) §1–§2: single-line AC#2 conflated two phenomena the verdict architecture genuinely separates; zero code change, spec catching up to code |
 

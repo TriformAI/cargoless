@@ -42,9 +42,10 @@ neither isn't here.
   agent-edit-batch unit — the cost unit that matches how AI agents
   actually drive the loop). See
   [`docs/bench/AC7-THROUGHPUT-REPORT.md §8.5`](docs/bench/AC7-THROUGHPUT-REPORT.md#85-clean-c2-109--headline-two-source-confirmed).
-- **Fleet-tested at ~20 agents on a 16 GB box** with the default RAM
-  ladder (Tier-3 proc-macro-off ON by default — safety field-verified
-  on real Leptos, no false-GREEN). See
+- **Fleet-tested at ~20 agents on a 16 GB box** with Tier-3 enabled
+  (`TF_RA_PROCMACRO_OFF=1`) for that test — safety field-verified on
+  real Leptos, no false-GREEN; Tier-3 ships safe-as-default
+  *candidate*, opt-in today via the env var. See
   [`AC7-THROUGHPUT-REPORT.md §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve)
   for the per-N curve and compound-fit table.
 - **Opt-in `TF_RA_IDLE_EVICT=1`** for tighter RAM budgets (88-97% RA

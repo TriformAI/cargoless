@@ -1,9 +1,12 @@
 # cargoless v0 — Execution Playbook
 
-Working name **cargoless** (repo/binary placeholder). Shipping product name is
-open decision **D1** (Plane CWDL-12). Authoritative backlog: Plane project
-**CWDL** (82 issues; CWDL-1 is the Definition-of-Done umbrella with the 9 ACs as
-sub-issues).
+Product, published crate, and binary are all **`cargoless`** (operator
+decision D1 RESOLVED 2026-05-17; CWDL-12 closed). Internal library
+crates are `cargoless-proto` / `cargoless-cas` / `cargoless-core`
+(post-#97 full one-token brand on `main`; D1-completeness CI-enforced
+forward by `scripts/d1-drift-guard` (#96)). Authoritative backlog:
+Plane project **CWDL** (CWDL-1 is the Definition-of-Done umbrella
+with the 9 ACs as sub-issues).
 
 ## Vision cut (apply to every change)
 
