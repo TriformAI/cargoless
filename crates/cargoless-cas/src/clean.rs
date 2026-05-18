@@ -21,6 +21,14 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, Path};
+use std::time::{Duration, SystemTime};
+
+/// The temp-file name prefix `LocalDiskStore::put` writes before its atomic
+/// rename (`.tmp.{key}.{pid}.{seq}` — see `lib.rs::tmp_path`, the #2
+/// concurrent-writer-safety contract). The single shared constant the
+/// orphan sweep matches, so the prefix cannot silently drift apart
+/// between the writer and the sweeper.
+pub const PUT_TMP_PREFIX: &str = ".tmp.";
 
 /// Why a cache root was rejected as unsafe to wipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,10 +124,142 @@ pub fn clean_cache(root: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(root)
 }
 
+/// Conservative default age below which a `.tmp.*` file is assumed to
+/// still belong to an in-flight `put` and is left alone. A real `put`
+/// temp lives from `File::create` to `rename` — milliseconds; one hour
+/// is many orders of magnitude beyond that, so a `.tmp.*` older than
+/// this is *provably* a dead-writer orphan (same conservative
+/// "older-than ⇒ not in-flight" reasoning the ci-gate per-ref prune
+/// uses). Tunable via the explicit-`older_than` argument.
+pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// Sweep dead-writer `.tmp.*` orphans from a shared CAS directory.
+///
+/// `LocalDiskStore::put` is crash-safe by atomic temp+rename (#2); but a
+/// writer that dies *between* `File::create` and `rename` leaves its
+/// `.tmp.{key}.{pid}.{seq}` behind. That is **not** a correctness bug —
+/// `get` only ever reads `path_for(key)`, never a `.tmp.*`; the final
+/// content is unaffected — but in a long-lived shared `--cas-dir` across
+/// a crashing agent fleet the orphans accumulate (the non-gating
+/// follow-up dev-fixer flagged on the #2 scoped-review). `clean_cache`
+/// already removes them (it wipes everything), but that is the
+/// destructive user `tf clean`; this is the targeted, routine-safe
+/// reclaim that needs no full wipe.
+///
+/// Safety / non-interference:
+/// * operates **only inside `cache_dir`**, **only** on the cache root's
+///   own direct entries, never recursing into the content-addressed
+///   subtree;
+/// * removes **only** regular files whose name starts with
+///   [`PUT_TMP_PREFIX`] — never a content entry, never a directory;
+/// * removes one **only** if its mtime is older than `older_than`, so a
+///   concurrently-in-flight `put`'s fresh temp (lifetime ≪ 1s) is never
+///   touched — no race with a live writer, by construction;
+/// * best-effort per entry: a stat/remove failure on one orphan (e.g. a
+///   peer fleet process won the unlink) is skipped, not propagated —
+///   housekeeping must never fail its caller. Only an unreadable
+///   `cache_dir` is an `Err`; a missing one is `Ok(0)`.
+///
+/// Returns the number of orphans actually removed (observability).
+pub fn sweep_tmp_orphans(cache_dir: impl AsRef<Path>, older_than: Duration) -> io::Result<usize> {
+    let dir = cache_dir.as_ref();
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(PUT_TMP_PREFIX) {
+            continue;
+        }
+        // file_type()/metadata: skip on any error (a racing peer may have
+        // already removed it); never follow into directories.
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let age = now.duration_since(mtime).unwrap_or_default();
+        if age < older_than {
+            continue; // possibly an in-flight put — leave it.
+        }
+        if fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ───────────────── #182 .tmp.* orphan sweep ─────────────────
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("cl-182-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn sweep_removes_only_old_tmp_files_not_content_or_dirs() {
+        let dir = scratch("matrix");
+        // Two dead-writer orphans, a real content entry, a subdir whose
+        // name even starts with the tmp prefix (must be untouched — not a
+        // file), and an unrelated file.
+        fs::write(dir.join(".tmp.abc.123.0"), b"partial").unwrap();
+        fs::write(dir.join(".tmp.def.456.1"), b"partial2").unwrap();
+        fs::write(dir.join("a1b2c3deadbeef"), b"real cached artifact").unwrap();
+        fs::write(dir.join("not-a-temp.txt"), b"keep").unwrap();
+        fs::create_dir_all(dir.join(".tmp.adir.789.2")).unwrap();
+
+        // older_than = ZERO ⇒ every .tmp.* file is "old enough" ⇒ the
+        // age guard is exercised at its permissive bound; only the two
+        // regular .tmp.* files go.
+        let n = sweep_tmp_orphans(&dir, Duration::ZERO).unwrap();
+        assert_eq!(n, 2, "exactly the two .tmp.* regular files removed");
+        assert!(!dir.join(".tmp.abc.123.0").exists());
+        assert!(!dir.join(".tmp.def.456.1").exists());
+        // Content entry, unrelated file, and the .tmp.-prefixed DIR all
+        // survive — never a content/dir/non-tmp deletion.
+        assert!(dir.join("a1b2c3deadbeef").exists(), "content entry safe");
+        assert!(dir.join("not-a-temp.txt").exists(), "non-tmp file safe");
+        assert!(
+            dir.join(".tmp.adir.789.2").is_dir(),
+            ".tmp.-prefixed directory must NOT be removed (not a file)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_leaves_fresh_tmp_in_flight_writes_untouched() {
+        // A just-created .tmp.* (age ≈ 0) under a 1h threshold ⇒ possibly
+        // an in-flight put ⇒ MUST be left (no race with a live writer).
+        let dir = scratch("inflight");
+        fs::write(dir.join(".tmp.live.999.0"), b"being written").unwrap();
+        let n = sweep_tmp_orphans(&dir, ORPHAN_MIN_AGE).unwrap();
+        assert_eq!(n, 0, "fresh temp under threshold must not be swept");
+        assert!(
+            dir.join(".tmp.live.999.0").exists(),
+            "an in-flight put's fresh temp survives the sweep"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_missing_dir_is_ok_zero() {
+        let missing = std::env::temp_dir().join(format!("cl-182-absent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        assert_eq!(sweep_tmp_orphans(&missing, Duration::ZERO).unwrap(), 0);
+    }
 
     #[test]
     fn dangerous_roots_are_refused() {
