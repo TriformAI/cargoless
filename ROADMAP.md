@@ -1,19 +1,27 @@
 # Roadmap
 
-> **Status snapshot (2026-05-18):** v0 is feature-complete; launch
-> hardening complete and AC#7 numbers landed (two-source-confirmed in
-> [`docs/bench/AC7-THROUGHPUT-REPORT.md`](docs/bench/AC7-THROUGHPUT-REPORT.md):
-> ≈2.05× per-edit CPU vs `trunk serve`, the RAM ladder, and the
-> fleet-scale compound-fit table). v0.1 (browser/HTTP adapter) is
-> deferred. v1 is the long-horizon parking lot.
+> **Status snapshot (2026-05-18):** the **repo-scoped Model-R daemon**
+> is feature-complete; launch hardening in progress. Fleet RAM is
+> **measured flat** — ≈1 GiB across N ∈ {1,2,4,8,16,20} active
+> worktrees, ≈19–30× collapse vs the per-worktree-daemon model, one
+> multiplexed rust-analyzer mechanism-verified
+> ([`AC7-THROUGHPUT-REPORT.md §11.4`](docs/bench/AC7-THROUGHPUT-REPORT.md),
+> Model-R Leg-C v4) — this *replaces* the prior cycle's Model-A
+> "~19.4 GiB BORDERLINE" extrapolation. The ≈2.05× per-edit CPU win vs
+> `trunk serve` is **unchanged under Model R** (two-source-confirmed,
+> §8.5). The browser/HTTP adapter remains deferred (orthogonal to the
+> daemon). **The public-launch GO and the version tag (`v1.0` vs
+> `v0.2`) are the operator's decision** — this roadmap describes
+> capabilities, not a chosen tag.
 
-cargoless is phased **v0 → v0.1 → v1**. The scope of each phase is
-deliberately tight: v0 is the smallest thing that delivers the vision claim
-(*"the codebase always knows what works, and tells you the moment it
-doesn't"*), v0.1 is the obvious next adapter, v1 is the rest of the
-ambitious-but-not-now ideas. Anything that doesn't sharpen the codebase's
-self-knowledge or reduce the latency from brokenness to signal is **not**
-v0 — it goes to v0.1 or v1.
+cargoless's earlier per-worktree single-tree checker (the `watch`-per-WT
+shape) was a **superseded internal intermediate**; the repo-scoped
+daemon (`serve --repo`, one multiplexed RA) is the architecture. The
+browser/reload adapter is the obvious next adapter (deferred,
+orthogonal); the parking lot is the rest of the ambitious-but-not-now
+ideas. Anything that doesn't sharpen the codebase's self-knowledge or
+reduce the latency from brokenness to signal is **not** in the launch
+surface — it goes to the deferred adapter or the parking lot.
 
 > **Name:** the product, the published crate, and the binary are all
 > **`cargoless`** (operator decision D1, 2026-05-17). Internal library
@@ -127,10 +135,17 @@ half-done.
 
 ### v0.1 perf follow-up — the RAM ladder (full design in `D-RAM-TIERS.md`)
 
-cargoless's steady-state footprint is rust-analyzer-dominated
-(~1.5-2 GB per daemon on proc-macro-heavy projects such as Leptos,
-because RA runs proc-macro expansion by default). The launch RAM
-story is **the honest tiered ladder** (numbers from
+**The launch fleet-RAM story is Model R's measured architectural
+collapse** (one multiplexed rust-analyzer, total RSS flat in worktree
+count — see the status snapshot + `AC7-THROUGHPUT-REPORT §11.4`). The
+per-RA tiered ladder below is now **secondary**: it tunes the
+footprint of the *single shared* analyzer (a constant-factor
+reduction), it is no longer the fleet-scale lever it had to be in the
+per-worktree-daemon model. The single shared RA's steady-state
+footprint is still rust-analyzer-dominated (~1.5-2 GB on
+proc-macro-heavy projects such as Leptos, because RA runs proc-macro
+expansion by default), and the honest tiered ladder still applies to
+that one process (numbers from
 [`AC7-THROUGHPUT-REPORT §10`](docs/bench/AC7-THROUGHPUT-REPORT.md#10-stage-2--per-tier-rss-delta)
 + [`D-RAM-TIERS.md`](docs/design/D-RAM-TIERS.md) verdict table):
 
@@ -143,8 +158,9 @@ story is **the honest tiered ladder** (numbers from
   **Shipped default-safe** (#126 RA-native-downrank
   + no-wrong-verdict proof); field-verified on real 38-`view!`-site
   Leptos (#130 — no false-GREEN; ≈5× faster-to-RED, n=1-scoped, not
-  a universal speedup). This is the **load-bearing existence-rung**
-  for the fleet-scale case.
+  a universal speedup). Under Model R this is a **secondary
+  constant-factor reduction on the one shared RA**, not the
+  fleet-scale lever (the architecture is the fleet-scale answer).
 - **Tier-4 idle-evict** (`TF_RA_IDLE_EVICT=1`) — designed +
   prototyped + measured (#122/#125, default-off in v0). Per-event
   ≈88-97 % RA-RSS reclaim validated; sustained reduction is
@@ -158,14 +174,21 @@ story is **the honest tiered ladder** (numbers from
   flag, so the memory win lands without the user having to know the
   knob exists.
 
-The fleet-scale existence answer (20 agents on a 16 GB host) is
-**compound**: Tier-3 (already shipped default-safe) brings the
-extrapolated 20-agent footprint to ≈19.4 GiB (borderline); Tier-3 +
-idle-evict at real minute-gaps to ≈14-18 GiB (probably yes);
-`--features csr` where narrowable to ≈10.6 GiB (comfortable).
-See [`AC7-THROUGHPUT-REPORT §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve)
-for the per-N curve and compound-fit table verbatim. Full v0.1 design
-work tracked in [`D-RAM-TIERS.md`](docs/design/D-RAM-TIERS.md).
+The fleet-scale answer is **no longer compound, and no longer an
+extrapolation**: Model R's repo-scoped daemon multiplexes one
+rust-analyzer across all worktrees, so total fleet RAM is **measured
+flat — ≈1 GiB across N ∈ {1,2,4,8,16,20}, ≈19–30× below the
+per-worktree-daemon model**, mechanism own-eyes-verified (one RA LSP +
+one proc-macro-srv constant across N). This *replaces* the prior
+cycle's Model-A "Tier-3 → ≈19.4 GiB borderline / Tier-3+idle-evict →
+≈14-18 GiB / `--features csr` → ≈10.6 GiB" **compound extrapolation**.
+The ladder above still reduces the single shared RA's footprint
+(secondary constant-factor); it is not the existence answer — the
+architecture is. See
+[`AC7-THROUGHPUT-REPORT §11.4`](docs/bench/AC7-THROUGHPUT-REPORT.md)
+for the measured per-N curve + the v1→v3 honest audit trail. Full
+single-RA-ladder design tracked in
+[`D-RAM-TIERS.md`](docs/design/D-RAM-TIERS.md).
 
 ---
 
