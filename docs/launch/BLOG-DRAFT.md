@@ -293,19 +293,28 @@ own-eyes-verified — exactly one `rust-analyzer` LSP + its one
 5. **Measured under driven per-WT activity** (idle worktrees are
    deactivated by design — activity-activation); "active-fleet RAM,"
    stated as such, not an idle floor.
-6. **Found-and-in-fix (disclosed, named):** the steady-state
+6. **Found-and-fixed (disclosed, named):** the steady-state
    fleet-RAM thesis is measured-confirmed; a separate shutdown defect
-   was caught pre-launch by the bench rigor — the proven
-   rust-analyzer **Supervisor reap discipline** (FF #3b/#44/#61/#128:
-   kill+wait+pgid/setsid) **was not invoked on the new serve-loop's
-   `SIGTERM` path**, so a clean `kill -TERM` exited without reaping
-   RA. #198 (@`baeac6b`) structurally restores it (every shutdown
-   path routed back through that proven reap). It is
-   **zombies (0 RSS), PID-hygiene under restart-churn — NOT a RAM
-   leak**; they reparent to init, structurally outside the
+   was caught pre-launch by the bench rigor. The Model-R `serve`
+   serve-loop initially had **no `SIGTERM` handler**, so a clean
+   `kill -TERM` terminated it without running the proven rust-analyzer
+   **Supervisor reap discipline** (FF #3b/#44/#61/#128:
+   kill+wait+pgid/setsid), accumulating zombie/orphan RA under fleet
+   restart-churn. **Fixed (#198, integrated):** a std-only
+   `SIGTERM`/`SIGINT` handler routing **every** shutdown path through
+   the proven Supervisor reap (single-funnel). Verification:
+   **structurally proven** (independent scoped-confirm — single-funnel
+   no-bypass, proven cores byte-untouched) and integrated;
+   **live-fleet corroboration deferred to post-#199** (the shared
+   builder pod was in a degraded state — an unrelated infra issue,
+   #199, in-fix — that could not bring rust-analyzer up to run the
+   runtime probe; **no fabricated runtime number is claimed** — the
+   discipline refusing to manufacture a datum it couldn't honestly
+   obtain). It is **zombies (0 RSS), PID-hygiene under restart-churn —
+   NOT a RAM leak**; they reparent to init, structurally outside the
    descendant-scoped RSS measurement (an earlier "~10 GiB" inference
    was wrong and is **retracted**). A known-pattern regression caught
-   and structurally restored — it does **not** impugn the measured
+   and structurally fixed — it does **not** impugn the measured
    ≈1 GiB headline.
 
 The per-RA footprint ladder (Leg B) still applies, but under Model R
@@ -524,17 +533,24 @@ we deliberately did **not** do:
   fleet is a stated **projection** of the measured flat-vs-N
   structure (one-RA-per-cluster implies it holds), never claimed
   measured beyond N=20. Separately, the bench rigor caught a shutdown
-  defect pre-launch: the proven rust-analyzer **Supervisor reap
-  discipline** (FF #3b/#44/#61/#128: kill+wait+pgid/setsid) was **not
-  invoked on the new serve-loop's `SIGTERM` path**, so a clean `kill
-  -TERM` exited without reaping RA. #198 (@`baeac6b`) structurally
-  restores it (every shutdown path routed back through that proven
-  reap). It is **zombies (0 RSS), PID-hygiene under
-  restart-churn — NOT a RAM leak** (they reparent to init, outside
-  the descendant-scoped RSS measurement; an earlier "~10 GiB"
-  inference was wrong and is **retracted**). A known-pattern
-  regression caught and structurally restored — it does not impugn
-  the measured ≈1 GiB headline.
+  defect pre-launch: the Model-R `serve` serve-loop initially had
+  **no `SIGTERM` handler**, so a clean `kill -TERM` terminated it
+  without running the proven rust-analyzer **Supervisor reap
+  discipline** (FF #3b/#44/#61/#128: kill+wait+pgid/setsid),
+  accumulating zombie/orphan RA under fleet restart-churn. **Fixed
+  (#198, integrated):** a std-only `SIGTERM`/`SIGINT` handler routing
+  **every** shutdown path through the proven Supervisor reap
+  (single-funnel). Verification: **structurally proven** (independent
+  scoped-confirm — single-funnel no-bypass, proven cores
+  byte-untouched) and integrated; **live-fleet corroboration deferred
+  to post-#199** (the shared builder pod was degraded — an unrelated
+  infra issue, #199, in-fix — and could not bring rust-analyzer up to
+  run the runtime probe; **no fabricated runtime number is claimed**).
+  It is **zombies (0 RSS), PID-hygiene under restart-churn — NOT a RAM
+  leak** (they reparent to init, outside the descendant-scoped RSS
+  measurement; an earlier "~10 GiB" inference was wrong and is
+  **retracted**). A known-pattern regression caught and structurally
+  fixed — it does not impugn the measured ≈1 GiB headline.
 - **Idle-evict's 5 % sustained reduction is a workload-conservative
   floor, not a ceiling.** Mechanism (≈88–97 % per-event reclaim) is
   fully validated; sustained magnitude scales with `gap / RA-busy-
@@ -655,12 +671,18 @@ the tool report when it breaks.
       projected-beyond** caveats present and not softened; the per-RA
       tier ladder (≈−19 % / −53 % / −75 %) is framed as a **secondary
       constant-factor**, no "low RSS by default" claim anywhere.
-- [ ] FIELD FINDING A disclosed with the **accurate mechanism**: the
-      proven rust-analyzer **Supervisor reap discipline** (FF
-      #3b/#44/#61/#128) not invoked on the new serve-loop `SIGTERM`
-      path; #198 (@`baeac6b`) restores it; zombies/0-RSS/PID-hygiene,
-      **NOT a RAM leak**. **No `#183`/GracefulShutdown mis-attribution;
-      the retracted "~10 GiB" figure does not appear.**
+- [ ] FIELD FINDING A disclosed with the **accurate mechanism + the
+      honest verification shape**: serve-loop had no `SIGTERM` handler
+      → clean `kill -TERM` skipped the proven Supervisor reap (FF
+      #3b/#44/#61/#128); **Fixed (#198, integrated)** = std-only
+      single-funnel handler; verification **structurally proven +
+      integrated**, **live-fleet corroboration explicitly deferred to
+      post-#199** (degraded builder pod = unrelated infra #199;
+      **no fabricated runtime number** — stated as a strength, not
+      hidden); zombies/0-RSS/PID-hygiene, **NOT a RAM leak**. **No
+      `#183`/GracefulShutdown mis-attribution; the retracted "~10 GiB"
+      figure does not appear; #199 named as unrelated infra, not
+      conflated with FF-A.**
 - [ ] Latency presented as the **dual-tier split** (AC#2a hint ≤1s /
       AC#2b cargo-check-bound authoritative), not a single sub-1s
       headline; no sub-second artifact-publish claim; re-asserted
