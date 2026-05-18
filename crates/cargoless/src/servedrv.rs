@@ -72,6 +72,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -119,10 +120,69 @@ enum Ctrl {
     Spawned(WorkspaceConfigHash, Arc<LspClient>),
 }
 
+/// Process-global SIGTERM/SIGINT stop flag — the serve loop polls it
+/// each iteration. Always present (the loop reads it on every target);
+/// set ONLY by [`on_term`], whose entire body is one atomic store
+/// (async-signal-safe — no allocation / locking / reentrancy).
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// SIGTERM/SIGINT handler: flip the stop flag, nothing else (the
+/// async-signal-safety contract — an atomic store is on the SS-safe
+/// list; a handler must not allocate, lock, or do I/O).
+#[cfg(unix)]
+extern "C" fn on_term(_sig: core::ffi::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Install SIGTERM + SIGINT → [`SHUTDOWN`]. std-only, NO `signal`/`libc`
+/// crate (house dependency-minimal) — the SAME `unsafe extern "C"`
+/// libc-symbol idiom `analyzer.rs` already uses for `setsid()` in
+/// `pre_exec`. This is FIELD FINDING A / #198's structural restore: the
+/// proven `analyzer::Supervisor` reap (`do_shutdown` = monitor-join +
+/// `kill()`+`wait()`, plus the `process_group(0)`+`setsid` pgid
+/// discipline #3b/#44/#61/#128) only runs on normal scope-unwind; a
+/// default-disposition SIGTERM bypasses unwind entirely, so we route the
+/// signal to a polled flag ⇒ the loop returns normally ⇒ the proven
+/// reap actually executes AT THE SEAM. Non-unix: no-op (the fleet
+/// restart-churn seam is POSIX `kill -TERM`; supported targets are all
+/// unix per D-RELEASE §3).
+#[cfg(unix)]
+fn install_signal_stops() {
+    // POSIX-stable on the only supported OS families (linux-gnu +
+    // apple-darwin): SIGINT = 2, SIGTERM = 15.
+    const SIGINT: core::ffi::c_int = 2;
+    const SIGTERM: core::ffi::c_int = 15;
+    unsafe extern "C" {
+        // signal(2): we need only "flip a flag on delivery", not the
+        // full sigaction surface. Return (previous handler, pointer-
+        // width) is intentionally discarded — never called through.
+        fn signal(signum: core::ffi::c_int, handler: extern "C" fn(core::ffi::c_int)) -> usize;
+    }
+    // SAFETY: the registered handler's whole body is a single atomic
+    // store (async-signal-safe). Same unsafe-extern-libc-symbol house
+    // pattern as analyzer.rs's pre_exec `setsid()`.
+    unsafe {
+        let _ = signal(SIGTERM, on_term);
+        let _ = signal(SIGINT, on_term);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_stops() {}
+
 /// Run the live repo-scoped Model R daemon loop. Replaces serve.rs's
-/// park. Returns when the parent is orphaned (FIELD-FINDING-#13b parity)
-/// — OS-default signal handling otherwise (Supervisors drop ⇒ RAs
-/// reaped).
+/// park. Exits on SIGTERM/SIGINT (the operator / fleet restart-churn
+/// path), parent-orphan (#13b parity), or watcher-disconnect — and on
+/// EVERY exit explicitly reaps every per-cluster rust-analyzer child via
+/// the proven `analyzer::Supervisor` teardown.
+///
+/// FIELD FINDING A / #198: the prior "OS-default signal handling …
+/// Supervisors drop ⇒ RAs reaped" claim was FALSE — a
+/// default-disposition SIGTERM terminates the process WITHOUT
+/// unwinding, so the implicit `clusters` drop (and thus the proven
+/// reap) never ran ⇒ zombie/orphan rust-analyzer under fleet
+/// restart-churn. Fixed by routing the signal to a polled flag + an
+/// explicit single-funnel reap at the seam (see the loop's exit block).
 pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // ---- cluster assignment (pure, gated cores) ----------------------
     // Each discovered worktree → its WorkspaceConfig → cluster hash.
@@ -174,13 +234,24 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // The settled routed batch's file list, awaiting its SwitchOverlay.
     let mut pending_batch: BTreeMap<WtId, Vec<PathBuf>> = BTreeMap::new();
 
+    // FIELD FINDING A / #198: arm SIGTERM/SIGINT → graceful loop-exit
+    // BEFORE announcing "up", so a fleet `kill -TERM` during/just-after
+    // bring-up still routes through the proven per-cluster RA reap.
+    install_signal_stops();
     crate::ui::wait("repo-scoped Model R daemon up. Ctrl-C / SIGTERM to stop.");
 
     // ---- the serve loop (single owner ⇒ Judgment A holds composed) ---
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            crate::ui::warn(
+                "SIGTERM/SIGINT received — draining: reaping per-cluster \
+                 rust-analyzer children (FIELD FINDING A / #198).",
+            );
+            break;
+        }
         if parent.orphaned() {
             crate::ui::warn("parent process exited — shutting down (FIELD FINDING #13b parity).");
-            return ExitCode::SUCCESS;
+            break;
         }
 
         // (v) respawn-staleness closure: the SOLE site a cluster's
@@ -214,7 +285,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return ExitCode::SUCCESS,
+            Err(RecvTimeoutError::Disconnected) => break,
         }
         for (wt, batch) in repo_watch.poll(Instant::now()) {
             let Some(h) = wt_hash.get(&wt).cloned() else {
@@ -257,6 +328,27 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             }
         }
     }
+
+    // ── FIELD FINDING A / #198 — the structural reap AT THE SEAM ──
+    // The [[proven-core-precondition-violated-at-integration-seam]]
+    // pattern, made VISIBLE here (exactly like the #193 take_followup
+    // WHY-comment): EVERY serve-loop exit — SIGTERM/SIGINT, parent-
+    // orphan, watcher-disconnect — funnels to this ONE site. Clearing
+    // `clusters` drops each `ClusterState`, whose `_supervisor:
+    // analyzer::Supervisor` `Drop` runs `do_shutdown`: join the monitor
+    // thread + `kill()`+`wait()` the rust-analyzer child (and the
+    // `process_group(0)`+`setsid` pgid discipline #3b/#44/#61/#128 takes
+    // its proc-macro-srv descendants). Done EXPLICITLY — not via the
+    // invisible "a normal return drops the BTreeMap which drops
+    // ClusterState which drops Supervisor which reaps" chain. That very
+    // invisibility is *why* #198's clean-SIGTERM gap went unnoticed (the
+    // prior doc even asserted "Supervisors drop ⇒ RAs reaped" as if it
+    // were obvious/automatic — but a default-disposition SIGTERM never
+    // unwinds, so it wasn't). One funnel ⇒ no future exit path can
+    // silently skip the reap. Proven cores (analyzer/clusterdrv/…)
+    // UNTOUCHED — this restores their precondition at the wire seam.
+    clusters.clear();
+    ExitCode::SUCCESS
 }
 
 /// WtId (PathBuf) → the `String` key `ClusterLifecycle` uses.
