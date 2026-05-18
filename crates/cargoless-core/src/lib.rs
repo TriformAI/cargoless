@@ -9,6 +9,7 @@
 //! Skeleton only exposes a build identifier so the workspace links and CI is
 //! green-on-empty (decision D10).
 
+pub mod activity;
 pub mod analyzer;
 pub mod build;
 pub mod config;
