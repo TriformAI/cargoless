@@ -232,8 +232,10 @@ jobs:
           set -euo pipefail
           cargo build -p cargoless --release --locked --target ${{ matrix.target }}
           # D1 RESOLVED 2026-05-17 = `cargoless` (was placeholder `tftrunk`).
-          # Strip path + bin-dir in crates/tf-cli/Cargo.toml
-          # [package.metadata.binstall] renamed in lockstep (same commit).
+          # Strip path + bin-dir in crates/cargoless/Cargo.toml
+          # [package.metadata.binstall] renamed in lockstep (same commit;
+          # crate-dir moved tf-cli/→cargoless/ at #87, internals dir-rename
+          # at #97 @4f762ba).
           BIN=target/${{ matrix.target }}/release/cargoless
           # macOS doesn't have GNU strip by default; native `strip` works
           # but the codepath differs. The `|| true` covers the very rare
@@ -261,8 +263,9 @@ jobs:
           # D1 RESOLVED: PKG (crate) + BIN (binary) both = cargoless. Kept
           # as two vars (not collapsed) so the binstall-{name}-vs-bin-dir
           # design intent stays legible and a future divergence is a
-          # one-line change. Lockstep with crates/tf-cli/Cargo.toml
-          # [package.metadata.binstall] (same D1-rename commit).
+          # one-line change. Lockstep with crates/cargoless/Cargo.toml
+          # [package.metadata.binstall] (the crate-dir moved tf-cli/→cargoless/
+          # at #87's D1-rename commit).
           PKG="cargoless"     # package name → tarball/dir name (matches binstall {name})
           BIN="cargoless"     # binary name  → file name inside dir (matches binstall bin-dir tail)
           TARGET="${{ matrix.target }}"
@@ -387,8 +390,9 @@ jobs:
   # LICENSE. Matches binstall's bin-dir
   # `{name}-v{version}-{target}/cargoless` exactly.
   #
-  # The pkg-url + bin-dir templates in crates/tf-cli/Cargo.toml binstall
-  # metadata depend on this exact URL shape. If D1 renames the package
+  # The pkg-url + bin-dir templates in crates/cargoless/Cargo.toml binstall
+  # metadata depend on this exact URL shape (crate-dir was crates/tf-cli/
+  # pre-D1 #87). If D1 renames the package
   # (which changes the dir/tarball name) or the binary (which changes the
   # file inside), update BOTH places in lockstep — the workflow `PKG/BIN`
   # vars + the binstall `pkg-url`/`bin-dir` templates.
@@ -460,12 +464,15 @@ jobs:
   #     env:
   #       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
   #
-  # Dep order verified via cargo metadata on origin/main @ 3cfc835:
-  #   tf-proto → tf-cas → tf-core → cargoless   (D1: tf-cli renamed → cargoless)
+  # Dep order verified via cargo metadata on origin/main (post-#97 @4f762ba —
+  # pre-#97 this verified at @3cfc835 with tf-* internal names):
+  #   cargoless-proto → cargoless-cas → cargoless-core → cargoless
+  #   (D1: tf-cli renamed → cargoless at #87; internals tf-{proto,cas,core}
+  #    renamed → cargoless-* at #97; full one-token brand on main.)
   # Each depends on its predecessor; crates.io needs ~30s propagation between
   # publishes before the next crate can resolve its deps.
   # ─────────────────────────────────────────────────────────────────────────
-  publish-tf-proto:
+  publish-cargoless-proto:   # was publish-tf-proto pre-#97
     needs: tag-validate
     if: false  # operator-run for 0.1.0; flip when 0.2.0 automation lands
     runs-on: ubuntu-latest
@@ -474,12 +481,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      - run: cargo publish -p tf-proto --locked
+      - run: cargo publish -p cargoless-proto --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
-  publish-tf-cas:
-    needs: publish-tf-proto
+  publish-cargoless-cas:     # was publish-tf-cas pre-#97
+    needs: publish-cargoless-proto
     if: false
     runs-on: ubuntu-latest
     steps:
@@ -487,12 +494,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      - run: sleep 30 && cargo publish -p tf-cas --locked
+      - run: sleep 30 && cargo publish -p cargoless-cas --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
-  publish-tf-core:
-    needs: publish-tf-cas
+  publish-cargoless-core:    # was publish-tf-core pre-#97
+    needs: publish-cargoless-cas
     if: false
     runs-on: ubuntu-latest
     steps:
@@ -500,12 +507,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.85"
-      - run: sleep 30 && cargo publish -p tf-core --locked
+      - run: sleep 30 && cargo publish -p cargoless-core --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
-  publish-cargoless:   # D1 RESOLVED: was publish-tf-cli (crate renamed tf-cli→cargoless)
-    needs: publish-tf-core
+  publish-cargoless:   # D1 RESOLVED: was publish-tf-cli (crate renamed tf-cli→cargoless at #87)
+    needs: publish-cargoless-core
     if: false
     runs-on: ubuntu-latest
     steps:

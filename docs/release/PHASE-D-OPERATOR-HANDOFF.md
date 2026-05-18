@@ -148,22 +148,29 @@ git checkout v0.1.0     # work from the tag, never HEAD
 # published (you burn the version). This dry-runs every crate + asserts
 # the topo order + token presence FIRST. Non-zero exit ⇒ STOP, fix,
 # re-run; do NOT proceed to the publishes below until it is all-green.
-# (Crate set + order are cargo-metadata-derived, so this is correct
-# whether internals are tf-* or, post-#97, cargoless-*.)
+# (Crate set + order are cargo-metadata-derived, so this stays correct
+# across the #97 internals rename — the workspace crates are cargoless-*.)
 ./scripts/crates-io-preflight        # MUST exit 0 before any line below
 
-cargo publish -p tf-proto --locked     # (internal crate names — see NOTE)
-cargo publish -p tf-cas   --locked
-cargo publish -p tf-core  --locked
-cargo publish -p cargoless --locked    # the user-facing crate
+cargo publish -p cargoless-proto --locked   # internal libs — see NOTE
+cargo publish -p cargoless-cas   --locked
+cargo publish -p cargoless-core  --locked
+cargo publish -p cargoless       --locked   # the user-facing crate
 ```
 
-**NOTE on crate names** (depends on D1-rename #87's final decision):
-- If only the top-level crate renamed (`tf-cli`→`cargoless`, internals stay
-  `tf-proto`/`tf-cas`/`tf-core`): publish order as above. The internal
-  crates either publish under `tf-*` (if free) or are marked
-  `publish = false` and only `cargoless` ships to crates.io as a
-  self-contained binary crate. **Confirm which at finalize-time** (TBD-marker).
+**NOTE on crate names** — RESOLVED by #97 (internal-crate rename landed on
+main @ `4f762ba`; the pre-#97 "internals might stay `tf-*`" conditional is
+now moot — do NOT publish any `tf-*` package, none exist post-#97):
+- All four workspace crates publish, in the topological order above:
+  `cargoless-proto` → `cargoless-cas` → `cargoless-core` → `cargoless`.
+  #97 renamed the internal libs `tf-{proto,cas,core}` → `cargoless-*`
+  (operator override of NAMING-DRIFT-INVENTORY Tier-C — full one-token
+  brand), so there is no `publish = false` fallback and no separate
+  name-collision question: they ship to crates.io under their
+  `cargoless-*` names. (`scripts/crates-io-preflight` derives this set +
+  order from `cargo metadata`, so it self-corrected across the rename;
+  the literal commands above are what the operator hand-runs and MUST
+  match — they now do.)
 - crates.io token: operator configures `~/.cargo/credentials.toml` or
   `CARGO_REGISTRY_TOKEN` env once, before the first `cargo publish`.
   Never committed; never in CI for 0.1.0.
@@ -248,7 +255,8 @@ If `v0.1.0` ships and a launch-blocker is discovered post-tag:
    working, which is correct):
    ```bash
    cargo yank --version 0.1.0 cargoless
-   cargo yank --version 0.1.0 tf-core    # + tf-cas, tf-proto if published
+   cargo yank --version 0.1.0 cargoless-core   # + cargoless-cas, cargoless-proto if published
+   # (internals renamed by #97; pre-#97 these were tf-{core,cas,proto})
    ```
 3. **Fix forward** — the bug fix lands on main via the normal
    ci-gate→ff flow; cut `v0.1.1` when green. Never re-cut `v0.1.0`
@@ -292,12 +300,14 @@ GitHub-release artifacts have been smoke-tested.
       builder-infra artifact; pointer only).
 - [ ] D-A2 honest save→verdict claim wording (operator decision #48 —
       human/operator-gated; will NOT close in an agent session)
-- [ ] crate-publish name confirmation — **depends on #97** (internal
-      tf-{proto,cas,core}→cargoless-* rename). If #97 lands: §2.2 publish
-      list becomes `cargoless-proto/cas/core` + `cargoless`. If #97 is
-      deferred: internals stay `tf-*` (publish under `tf-*` if free, else
-      `publish = false`). Confirm at the #97 decision point; §2.2 NOTE
-      already enumerates both branches.
+- [✅] crate-publish name confirmation — **RESOLVED by #97** (internal-crate
+      rename `tf-{proto,cas,core}` → `cargoless-*` landed on main @ `4f762ba`,
+      operator override of NAMING-DRIFT-INVENTORY Tier-C). §2.2 publish list
+      is now `cargoless-proto` → `cargoless-cas` → `cargoless-core` →
+      `cargoless`; §2.2 NOTE and yank command updated in lockstep. No
+      `publish=false` fallback path — all four ship to crates.io under
+      `cargoless-*`. (Surfaced by #96's invariant-guard recon; the pre-#97
+      conditional framing in §2.2 NOTE is removed.)
 - [ ] Actual launch date (operator decides; this doc is
       name-and-mechanism ready, date is a business call)
 - [ ] AC#9 launch blog ≥2-reviewer sign-off (human-gated; will NOT close
