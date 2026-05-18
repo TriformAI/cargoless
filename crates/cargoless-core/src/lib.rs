@@ -11,6 +11,7 @@
 
 pub mod activity;
 pub mod analyzer;
+pub mod barrier;
 pub mod build;
 pub mod cache_layout;
 pub mod cluster;
