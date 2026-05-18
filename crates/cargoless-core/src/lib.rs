@@ -24,6 +24,7 @@ pub mod overlay;
 pub mod procmacro;
 pub mod recovery;
 pub mod repo;
+pub mod shutdown;
 pub mod structural;
 pub mod transport;
 pub mod watcher;
