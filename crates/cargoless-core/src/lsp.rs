@@ -877,6 +877,61 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    // -----------------------------------------------------------------------
+    // #180: env-test serialization (fleet-wide gate-reliability fix)
+    //
+    // `init_opts_from_env_handles_explicit_{disabled,enabled}` (+ the
+    // `_features_from_env_csv` test, which also reads `TF_PROC_MACRO` via
+    // `InitOpts::from_env_and_project`) mutate the PROCESS-GLOBAL
+    // environment. cargo's default test harness runs tests on multiple
+    // threads, so two of them racing the same var intermittently makes
+    // the "disabled" assertion observe the "enabled" writer ⇒ a spurious
+    // gate RED — byte-identical on main, fleet-wide intermittent, and was
+    // blocking bench-lead's #8-ready. Fix: serialize EVERY env-mutating
+    // test in this module behind one process-global lock, and
+    // save/restore the var as an RAII critical section. The LOCK is the
+    // race fix (save/restore alone does not prevent the interleave);
+    // dependency-free (no `serial_test`); poison-tolerant via
+    // `into_inner` (a panicking test must not wedge the rest — same
+    // discipline as `analyzer.rs`'s `lock()`).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds `ENV_LOCK` for its whole lifetime and save/restores one env
+    /// var. Field drop order is declaration order, and `Drop::drop` runs
+    /// before fields drop, so the restore happens *while still locked*
+    /// and the lock releases *after* restore — exactly the required
+    /// set→read→assert→restore→unlock ordering.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var(key).ok();
+            // SAFETY: ENV_LOCK serializes every env-mutating test in this
+            // module, so no concurrent env reader/writer exists for the
+            // guard's lifetime (the edition-2024 set_var hazard the
+            // `unsafe` marks is exactly cross-thread concurrency).
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev, _lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still under ENV_LOCK (`_lock` drops after this).
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn encode_then_read_roundtrips() {
         let body = br#"{"jsonrpc":"2.0","method":"x"}"#;
@@ -1446,49 +1501,30 @@ mod tests {
 
     #[test]
     fn init_opts_from_env_handles_explicit_disabled() {
-        let prev = std::env::var("TF_PROC_MACRO").ok();
-        // SAFETY: single-threaded test, no concurrent env readers.
-        unsafe { std::env::set_var("TF_PROC_MACRO", "disabled") };
+        // #180: serialized + save/restored via the shared ENV_LOCK.
+        let _g = EnvGuard::set("TF_PROC_MACRO", "disabled");
         let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
         assert!(!opts.proc_macro_enabled);
-        // Restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("TF_PROC_MACRO", v),
-                None => std::env::remove_var("TF_PROC_MACRO"),
-            }
-        }
     }
 
     #[test]
     fn init_opts_from_env_handles_explicit_enabled() {
-        let prev = std::env::var("TF_PROC_MACRO").ok();
-        unsafe { std::env::set_var("TF_PROC_MACRO", "enabled") };
+        let _g = EnvGuard::set("TF_PROC_MACRO", "enabled");
         let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
         assert!(opts.proc_macro_enabled);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("TF_PROC_MACRO", v),
-                None => std::env::remove_var("TF_PROC_MACRO"),
-            }
-        }
     }
 
     #[test]
     fn init_opts_features_from_env_csv() {
-        let prev = std::env::var("TF_FEATURES").ok();
-        unsafe { std::env::set_var("TF_FEATURES", "csr, hydrate ,") };
+        // #180: also serialized — `from_env_and_project` reads
+        // `TF_PROC_MACRO` too, so this must not run concurrently with the
+        // proc-macro env tests (every env-mutating test shares ENV_LOCK).
+        let _g = EnvGuard::set("TF_FEATURES", "csr, hydrate ,");
         let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
         assert_eq!(
             opts.features,
             vec!["csr".to_string(), "hydrate".to_string()]
         );
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("TF_FEATURES", v),
-                None => std::env::remove_var("TF_FEATURES"),
-            }
-        }
     }
 
     #[test]
