@@ -280,7 +280,7 @@ impl FleetConfig {
                 cfg.provenance.corun = Source::Env;
             }
         }
-        if let Some(v) = env("CARGOLESS_AUTH_TOKEN").filter(|s| !s.is_empty()) {
+        if let Some(v) = env("CARGOLESS_AUTH_TOKEN").filter(|s| !s.trim().is_empty()) {
             cfg.auth_token = Some(v);
             cfg.provenance.auth_token = Source::Env;
         }
@@ -306,7 +306,7 @@ impl FleetConfig {
             cfg.corun = b;
             cfg.provenance.corun = Source::Cli;
         }
-        if let Some(v) = ov.auth_token {
+        if let Some(v) = ov.auth_token.filter(|s| !s.trim().is_empty()) {
             cfg.auth_token = Some(v);
             cfg.provenance.auth_token = Source::Cli;
         }
@@ -333,11 +333,26 @@ impl FleetConfig {
         }
     }
 
+    /// The auth token iff one is **effectively** present — `Some(secret)`
+    /// only when configured AND non-blank (not empty, not whitespace-only).
+    /// A blank token is treated as **absent**: the real invariant the
+    /// security policy models is "an effective shared secret exists", not
+    /// the `Option::is_some` proxy. CWDL #197 — `--auth-token ""` /
+    /// `[fleet] auth_token = ""` / `CARGOLESS_AUTH_TOKEN=" "` must NOT
+    /// yield an unauthenticated non-loopback socket. All three config
+    /// sources also reject a blank token at parse time; this is the single
+    /// consulted predicate (used by [`security_check`](Self::security_check)
+    /// and `transport::authorizer_for`) so no current/future path can
+    /// reintroduce a blank effective secret.
+    pub fn effective_auth_token(&self) -> Option<&str> {
+        self.auth_token.as_deref().filter(|t| !t.trim().is_empty())
+    }
+
     /// #14 pre-flight: non-loopback bind without an auth token is an unsafe
     /// network exposure. Inert until #14 wires it into the daemon startup
     /// path; provided now so the contract + message are frozen.
     pub fn security_check(&self) -> Result<(), FleetConfigError> {
-        if self.requires_auth() && self.auth_token.is_none() {
+        if self.requires_auth() && self.effective_auth_token().is_none() {
             let value = self.bind.map(|a| a.to_string()).unwrap_or_default();
             return Err(FleetConfigError::BadBind {
                 value,
@@ -448,12 +463,17 @@ fn apply_tf_toml_overlay(cfg: &mut FleetConfig, text: &str) -> Result<(), FleetC
                 cfg.corun = b;
                 cfg.provenance.corun = Source::TfToml;
             }
-            ("fleet", "auth_token") => {
+            // Blank (empty / whitespace-only) ⇒ NOT a token: falls to the
+            // tolerant `_` arm, uniform with the env + CLI paths (CWDL
+            // #197 — `[fleet] auth_token = ""` must not yield an
+            // unauthenticated non-loopback socket).
+            ("fleet", "auth_token") if !val.trim().is_empty() => {
                 cfg.auth_token = Some(val);
                 cfg.provenance.auth_token = Source::TfToml;
             }
-            // Tolerant: any other (section,key) belongs to the CLI
-            // `Config` reader or a future consumer — ignore silently.
+            // Tolerant: any other (section,key) — incl. a blank
+            // `auth_token` (handled above) — belongs to the CLI `Config`
+            // reader or a future consumer; ignore silently.
             _ => {}
         }
     }
@@ -680,6 +700,91 @@ mod tests {
         assert_eq!(c.auth_token.as_deref(), Some("from-env"));
         assert_eq!(c.provenance.auth_token, Source::Env);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────── CWDL #197: blank auth_token is NOT a token ─────────
+
+    #[test]
+    fn blank_auth_token_is_no_token_via_cli_env_toml() {
+        // Empty AND whitespace-only, every source ⇒ parsed as no token
+        // (uniform with the env path's long-standing empty-filter).
+        for blank in ["", "   ", "\t", " \n "] {
+            // CLI
+            let ov = FleetOverrides {
+                auth_token: Some(blank.to_string()),
+                ..FleetOverrides::default()
+            };
+            let c = FleetConfig::resolve_layered(std::path::Path::new("/nonexistent"), ov, &no_env)
+                .unwrap();
+            assert_eq!(c.auth_token, None, "CLI blank {blank:?} ⇒ no token");
+            assert_eq!(c.effective_auth_token(), None);
+
+            // env
+            let env = |k: &str| (k == "CARGOLESS_AUTH_TOKEN").then(|| blank.to_string());
+            let c = FleetConfig::resolve_layered(
+                std::path::Path::new("/nonexistent"),
+                FleetOverrides::default(),
+                &env,
+            )
+            .unwrap();
+            assert_eq!(c.auth_token, None, "env blank {blank:?} ⇒ no token");
+            assert_eq!(c.effective_auth_token(), None);
+
+            // tf.toml
+            let dir = std::env::temp_dir().join(format!(
+                "cl-cfg-blank-{}-{}",
+                std::process::id(),
+                blank.len()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("tf.toml"),
+                format!("[fleet]\nauth_token = \"{blank}\"\n"),
+            )
+            .unwrap();
+            let c = FleetConfig::resolve_layered(&dir, FleetOverrides::default(), &no_env).unwrap();
+            assert_eq!(c.auth_token, None, "toml blank {blank:?} ⇒ no token");
+            assert_eq!(c.effective_auth_token(), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn blank_auth_token_nonloopback_refuses_security_check() {
+        // THE security property: a blank token on a non-loopback bind
+        // is REFUSED exactly like None — no unauthenticated public
+        // socket. (parse path AND a directly-blank FleetConfig — the
+        // effective_auth_token defense-in-depth seam.)
+        let ov = FleetOverrides {
+            bind: Some("0.0.0.0:8080".to_string()),
+            auth_token: Some("   ".to_string()),
+            ..FleetOverrides::default()
+        };
+        let c = FleetConfig::resolve_layered(std::path::Path::new("/nonexistent"), ov, &no_env)
+            .unwrap();
+        assert!(
+            matches!(c.security_check(), Err(FleetConfigError::BadBind { .. })),
+            "non-loopback + blank CLI token MUST refuse (no unauth socket)"
+        );
+
+        // Defense-in-depth: even a FleetConfig that already holds a
+        // blank auth_token (bypassing the parse-reject) is refused —
+        // security_check models "effective secret present", not is_none.
+        let mut c2 = FleetConfig::defaults();
+        c2.bind = Some("0.0.0.0:9090".parse().unwrap());
+        c2.auth_token = Some(" \t ".to_string());
+        assert_eq!(c2.effective_auth_token(), None);
+        assert!(
+            matches!(c2.security_check(), Err(FleetConfigError::BadBind { .. })),
+            "blank token in FleetConfig + non-loopback MUST still refuse"
+        );
+
+        // A real token on the same bind is accepted (no over-rejection).
+        let mut ok = FleetConfig::defaults();
+        ok.bind = Some("0.0.0.0:9090".parse().unwrap());
+        ok.auth_token = Some("s3cr3t".to_string());
+        assert!(ok.security_check().is_ok());
+        assert_eq!(ok.effective_auth_token(), Some("s3cr3t"));
     }
 
     #[test]
