@@ -137,8 +137,11 @@ mod tests {
     const REPO: &str = "/Users/iggy/Documents/GitHub/tf-multiverse";
 
     fn wt(path: &str) -> WorktreeEntry {
-        // `super` = the `repo` module; topology is its sibling submodule.
-        let mut v = super::topology::parse_worktree_porcelain(&format!(
+        // Absolute path: inside `mod tests`, `super` is the `watch`
+        // module, NOT `repo` — `crate::repo::topology` is unambiguous
+        // (rustc's own E0433 suggestion; matches the file-level
+        // `use super::topology::WorktreeEntry` which IS at `repo` scope).
+        let mut v = crate::repo::topology::parse_worktree_porcelain(&format!(
             "worktree {path}\nHEAD a\nbranch refs/heads/x\n"
         ));
         v.pop().expect("one entry")
