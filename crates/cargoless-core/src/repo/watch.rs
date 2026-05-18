@@ -38,9 +38,12 @@
 //! `list_worktrees` vs `parse_worktree_porcelain` split); its routing
 //! behaviour is fully covered by the pure tests here.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::topology::WorktreeEntry;
+use crate::watcher::{ChangeBatch, Debouncer};
 
 /// Stable identifier for a worktree in routed events: its absolute root
 /// path (as `git worktree list` reported it). Path-keyed, not an index —
@@ -127,6 +130,111 @@ impl WtRouter {
             )
         });
         if is_noise { None } else { Some(wt) }
+    }
+}
+
+/// Repo-scoped watch coalescer (#4 I/O-shell increment, Model R Stream
+/// B): the pure composition of the backstop-CLEAR'd [`WtRouter`]
+/// (`route_for_monitoring`) with one **per-worktree**
+/// [`crate::watcher::Debouncer`]. Raw fs path-changes across the whole
+/// repo go in; per-worktree debounced `(WtId, ChangeBatch)`es come out.
+///
+/// Pure: the caller supplies the clock (`Instant`), so the routing +
+/// per-WT coalescing rule is unit-tested deterministically without
+/// sleeping or a live `notify` watcher. The thin `notify`-thread adapter
+/// that pumps real OS events through this is the serve-loop capstone's
+/// concern (it has no standalone consumer until then — the same
+/// pure-core-first split that kept the flycheck barrier / cluster
+/// lifecycle pure).
+///
+/// ## Contained correctness properties (falsifiable; lean on proven
+/// cores — NOT a new backstop target)
+///
+/// * **No fabricated WtId.** The *only* `WtId`s that can ever appear in
+///   [`poll`](Self::poll) output are exact [`WtRouter::route_for_monitoring`]
+///   results. A path that routes to `None` (under no worktree, or
+///   `target/`/`.git/` build-noise inside one) is dropped —
+///   [`record`](Self::record) returns `false` and creates no debouncer
+///   entry. (Leans entirely on the backstop-CLEAR'd router.)
+/// * **Per-WT debounce isolation.** Each `WtId` owns its *own*
+///   `Debouncer` instance (distinct pending-set + distinct quiet timer),
+///   so worktree V's edit churn can never delay, merge into, or suppress
+///   worktree W's batch. This is structural — a property of *distinct
+///   instances*, not of timing — and is exactly why the multiplexed
+///   verdict per WT stays attributable.
+/// * **Deterministic emission order.** A `BTreeMap` keys the debouncers,
+///   so `poll` yields ready worktrees in sorted `WtId` order regardless
+///   of `record` order — no spurious churn from fs-event arrival order
+///   (same determinism rationale as `cluster_worktrees`).
+#[derive(Debug)]
+pub struct RepoWatchRouter {
+    router: WtRouter,
+    quiet: Duration,
+    /// `WtId → that worktree's own debouncer`. Lazily created on the
+    /// first routed change for a worktree; a worktree with nothing
+    /// pending simply never `poll`s `Some` (cheap to keep tracked).
+    debouncers: BTreeMap<WtId, Debouncer>,
+}
+
+impl RepoWatchRouter {
+    /// Build from a (longest-prefix) [`WtRouter`] and the per-worktree
+    /// debounce quiet-window.
+    pub fn new(router: WtRouter, quiet: Duration) -> Self {
+        Self {
+            router,
+            quiet,
+            debouncers: BTreeMap::new(),
+        }
+    }
+
+    /// Record one raw fs path-change observed at `now`.
+    ///
+    /// Routed (under a worktree, not build-noise) ⇒ recorded into *that
+    /// worktree's own* debouncer; returns `true`. Unrouted (`None` from
+    /// [`WtRouter::route_for_monitoring`]) ⇒ dropped, no debouncer entry
+    /// created; returns `false`. No `WtId` is ever fabricated.
+    pub fn record(&mut self, abs_path: &Path, now: Instant) -> bool {
+        let wt: WtId = match self.router.route_for_monitoring(abs_path) {
+            Some(w) => w.to_path_buf(),
+            None => return false,
+        };
+        // Local copy so the `or_insert_with` closure does not borrow
+        // `self` while `self.debouncers` is mutably borrowed.
+        let quiet = self.quiet;
+        self.debouncers
+            .entry(wt)
+            .or_insert_with(|| Debouncer::new(quiet))
+            .record(abs_path.to_path_buf(), now);
+        true
+    }
+
+    /// Every worktree whose batch has settled as of `now`, drained, in
+    /// deterministic (`BTreeMap`-sorted) `WtId` order. A worktree with
+    /// nothing pending contributes nothing (never an empty batch).
+    pub fn poll(&mut self, now: Instant) -> Vec<(WtId, ChangeBatch)> {
+        let mut out = Vec::new();
+        for (wt, deb) in self.debouncers.iter_mut() {
+            if let Some(batch) = deb.poll(now) {
+                out.push((wt.clone(), batch));
+            }
+        }
+        out
+    }
+
+    /// Soonest any worktree's batch could next yield, given `now` — the
+    /// `min` across worktrees (used to size the capstone watcher
+    /// thread's blocking recv timeout). `None` ⇒ nothing pending
+    /// anywhere.
+    pub fn time_until_ready(&self, now: Instant) -> Option<Duration> {
+        self.debouncers
+            .values()
+            .filter_map(|d| d.time_until_ready(now))
+            .min()
+    }
+
+    /// The underlying router (inspection / capstone reuse).
+    pub fn router(&self) -> &WtRouter {
+        &self.router
     }
 }
 
@@ -257,5 +365,144 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(r.route(Path::new("/anything")), None);
         assert_eq!(r.route_for_monitoring(Path::new("/anything")), None);
+    }
+
+    // --- RepoWatchRouter (#4 I/O-shell: route + per-WT debounce) --------
+
+    const QUIET: Duration = Duration::from_millis(100);
+
+    fn two_wt_router() -> WtRouter {
+        // Main (repo root) + the nested gitignored-subtree worktree.
+        WtRouter::new([wt(REPO), wt(&format!("{REPO}/.claude/worktrees/agent-x"))].iter())
+    }
+    fn main_a() -> String {
+        format!("{REPO}/crates/physics/src/a.rs")
+    }
+    fn main_b() -> String {
+        format!("{REPO}/crates/physics/src/b.rs")
+    }
+    fn nested() -> String {
+        format!("{REPO}/.claude/worktrees/agent-x/src/lib.rs")
+    }
+
+    #[test]
+    fn repo_watch_routes_and_debounces_per_wt() {
+        let mut rw = RepoWatchRouter::new(two_wt_router(), QUIET);
+        let t0 = Instant::now();
+        assert!(rw.record(Path::new(&main_a()), t0));
+        // Not quiet yet ⇒ nothing.
+        assert!(rw.poll(t0 + Duration::from_millis(99)).is_empty());
+        // Quiet elapsed ⇒ (main, [a.rs]).
+        let out = rw.poll(t0 + QUIET);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, PathBuf::from(REPO));
+        assert_eq!(out[0].1, vec![PathBuf::from(main_a())]);
+        // Drained — a second poll yields nothing.
+        assert!(rw.poll(t0 + QUIET + QUIET).is_empty());
+    }
+
+    #[test]
+    fn repo_watch_per_wt_isolation() {
+        // V's continued churn must not delay/suppress W's settled batch,
+        // and W settles on ITS OWN timer (distinct Debouncer instances).
+        let mut rw = RepoWatchRouter::new(two_wt_router(), QUIET);
+        let t0 = Instant::now();
+        rw.record(Path::new(&main_a()), t0); // main @ t0
+        rw.record(Path::new(&nested()), t0); // nested @ t0
+        // Nested keeps churning at t0+50 — resets ONLY nested's timer.
+        rw.record(Path::new(&nested()), t0 + Duration::from_millis(50));
+        // At t0+100: main's quiet elapsed (settled); nested's timer was
+        // reset at t0+50 so only 50ms quiet ⇒ NOT ready.
+        let out = rw.poll(t0 + QUIET);
+        assert_eq!(out.len(), 1, "only main settled; nested still churning");
+        assert_eq!(out[0].0, PathBuf::from(REPO));
+        // Nested settles independently once ITS quiet elapses.
+        let out2 = rw.poll(t0 + Duration::from_millis(150));
+        assert_eq!(out2.len(), 1);
+        assert_eq!(
+            out2[0].0,
+            PathBuf::from(format!("{REPO}/.claude/worktrees/agent-x"))
+        );
+    }
+
+    #[test]
+    fn repo_watch_unrouted_dropped_no_fabricated_wtid() {
+        let mut rw = RepoWatchRouter::new(two_wt_router(), QUIET);
+        let t0 = Instant::now();
+        // Under no worktree.
+        assert!(!rw.record(Path::new("/etc/passwd"), t0));
+        // Build-noise inside a routed worktree (target/ and .git/).
+        assert!(!rw.record(Path::new(&format!("{REPO}/target/debug/x")), t0));
+        assert!(!rw.record(Path::new(&format!("{REPO}/.git/index")), t0));
+        // No debouncer entry was fabricated ⇒ nothing ever settles.
+        assert!(rw.poll(t0 + QUIET + QUIET).is_empty());
+        assert_eq!(rw.time_until_ready(t0), None);
+    }
+
+    #[test]
+    fn repo_watch_deterministic_sorted_wtid_order() {
+        let mut rw = RepoWatchRouter::new(two_wt_router(), QUIET);
+        let t0 = Instant::now();
+        // Record nested BEFORE main (reverse of sorted order).
+        rw.record(Path::new(&nested()), t0);
+        rw.record(Path::new(&main_a()), t0);
+        let out = rw.poll(t0 + QUIET);
+        assert_eq!(out.len(), 2);
+        // BTreeMap ⇒ sorted WtId order regardless of record order:
+        // REPO (shorter) sorts before its nested child.
+        assert_eq!(out[0].0, PathBuf::from(REPO));
+        assert_eq!(
+            out[1].0,
+            PathBuf::from(format!("{REPO}/.claude/worktrees/agent-x"))
+        );
+    }
+
+    #[test]
+    fn repo_watch_batch_has_only_that_wts_paths() {
+        let mut rw = RepoWatchRouter::new(two_wt_router(), QUIET);
+        let t0 = Instant::now();
+        rw.record(Path::new(&main_a()), t0);
+        rw.record(Path::new(&main_b()), t0);
+        rw.record(Path::new(&nested()), t0);
+        let out = rw.poll(t0 + QUIET);
+        assert_eq!(out.len(), 2);
+        let agent = format!("{REPO}/.claude/worktrees/agent-x");
+        let main = out
+            .iter()
+            .find(|(w, _)| w.as_path() == Path::new(REPO))
+            .unwrap();
+        // Debouncer's BTreeSet ⇒ sorted, deduped batch.
+        assert_eq!(
+            main.1,
+            vec![PathBuf::from(main_a()), PathBuf::from(main_b())]
+        );
+        let nest = out
+            .iter()
+            .find(|(w, _)| w.as_path() == Path::new(&agent))
+            .unwrap();
+        assert_eq!(nest.1, vec![PathBuf::from(nested())], "no cross-WT bleed");
+    }
+
+    #[test]
+    fn repo_watch_time_until_ready_is_min_across_wts() {
+        let mut rw = RepoWatchRouter::new(two_wt_router(), QUIET);
+        let t0 = Instant::now();
+        rw.record(Path::new(&main_a()), t0); // main last_change = t0
+        rw.record(Path::new(&nested()), t0 + Duration::from_millis(50)); // nested last_change = t0+50
+        // Query @ t0+60: main elapsed 60 ⇒ 40 left; nested elapsed 10 ⇒
+        // 90 left; min = 40ms (the sooner-ready worktree).
+        assert_eq!(
+            rw.time_until_ready(t0 + Duration::from_millis(60)),
+            Some(Duration::from_millis(40))
+        );
+    }
+
+    #[test]
+    fn repo_watch_empty_router_drops_all() {
+        let mut rw = RepoWatchRouter::new(WtRouter::new(std::iter::empty()), QUIET);
+        let t0 = Instant::now();
+        assert!(!rw.record(Path::new(&main_a()), t0));
+        assert!(rw.poll(t0 + QUIET + QUIET).is_empty());
+        assert_eq!(rw.time_until_ready(t0), None);
     }
 }
