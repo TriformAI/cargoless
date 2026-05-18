@@ -68,6 +68,29 @@ BUILDER_CONTAINER="builder"
 MANIFEST="$REPO_ROOT/deploy/cargoless-builder.k8s.yaml"
 CI_GATE_KEEP_GOING="${CI_GATE_KEEP_GOING:-1}"
 APPROVE="TRIFORM_OPERATOR_APPROVED_BUILD=1"   # operator-sanctioned build escape
+
+# ── Per-ref CARGO_TARGET_DIR — verdict-integrity invariant (STOP-class) ──────
+# deploy/cargoless-builder.k8s.yaml pins pod env CARGO_TARGET_DIR=/cache/target
+# (ONE PVC dir, EVERY branch, every concurrent gate). cargo's fingerprint does
+# NOT encode git-ref identity, so two different branches building into that one
+# dir can alias: a `cargo test` phase can re-run a FOREIGN branch's compiled
+# test binary (evidenced: a #7 gate on base 4687e3c — no config.rs — ran 10
+# `config::tests::` from a concurrent #1 branch). A green-mechanism that can
+# execute another branch's tests is launch-blocking — the product's whole
+# claim is "the codebase knows what's green".
+#
+# Structural fix (not flock-serialize, which only orders the aliasing): give
+# each gated commit its OWN target dir, keyed by the resolved full SHA. A git
+# SHA is content-addressed, so $CI_TARGET_ROOT/<SHA> is only ever written from
+# THAT commit's identical source — the test binaries in it provably belong to
+# the gated ref and nothing else (own-branch provenance becomes a filesystem
+# invariant, not a hope). Same-SHA re-gates still reuse the dir (preserves the
+# diagnosed-same-SHA-re-gate / 2×-reconfirm speed); different SHAs are
+# physically isolated; cargo's own target lock handles same-SHA concurrency.
+# The #81 mtime-bump stays — it keeps a same-SHA re-gate fresh vs that SHA's
+# own cached artifacts and is defense-in-depth.
+CI_TARGET_ROOT="${CI_GATE_TARGET_ROOT:-/cache/ci-targets}"
+CTARGET=""   # set once $SHA is resolved (below); injected into every pod cargo
 FJ_API="${FJ_API:-https://forgejo.triform.dev/api/v1}"
 FJ_REPO="${FJ_REPO:-triform/cargoless}"
 REMOTE_SRC="/work/src"
@@ -96,6 +119,12 @@ command -v git >/dev/null || die "git not found"
 SHA="$(git -C "$REPO_ROOT" rev-parse --verify "${REF}^{commit}" 2>/dev/null)" \
   || die "ref '$REF' not found in local clone. Pass a local branch or a ref the lead already has."
 SHORT="$(git -C "$REPO_ROOT" rev-parse --short "$SHA")"
+
+# Per-ref isolated target dir (see CI_TARGET_ROOT block above). Keyed by the
+# full content-addressed SHA so the dir's compiled artifacts provably belong
+# to THIS ref only. Injected as an env-assignment prefix on every in-pod
+# cargo (overrides the pod's pinned CARGO_TARGET_DIR=/cache/target).
+CTARGET="CARGO_TARGET_DIR=$CI_TARGET_ROOT/$SHA"
 
 # ── D1 brand-completion enforced invariant (#96) — fast local pre-flight ─────
 # Greps the gated ref's tree for banned old-brand tokens (see
@@ -136,14 +165,23 @@ POD="$(kubectl -n "$BUILDER_NS" get pod -l "$BUILDER_SEL" \
 kexec()  { kubectl exec      -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- "$@"; }
 kexec_i() { kubectl exec -i   -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- "$@"; }
 
-# Fresh source dir per run; CARGO_TARGET_DIR lives OUTSIDE this dir (on the
-# PVC) so the warm target cache survives the wipe — only a relink, not a
-# from-scratch rebuild, on each run. git archive => tracked files only.
+# Fresh source dir per run; the per-ref CARGO_TARGET_DIR
+# ($CI_TARGET_ROOT/$SHA) lives OUTSIDE this dir on the PVC so a same-SHA
+# re-gate reuses that ref's own warm cache (relink, not from-scratch) while
+# different SHAs stay physically isolated (verdict-integrity invariant).
+# git archive => tracked files only.
 stream_tree() {
   echo "[ci-gate] ref=$REF sha=$SHORT pod=$BUILDER_NS/$POD"
+  echo "[ci-gate] per-ref target dir: $CI_TARGET_ROOT/$SHA (isolated; pod's /cache/target NOT used)"
   echo "[ci-gate] streaming tree into pod (git archive | kubectl exec tar -x)..."
-  kexec bash -c "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC" \
-    || die "could not reset $REMOTE_SRC in pod"
+  kexec bash -c "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && mkdir -p $CI_TARGET_ROOT/$SHA" \
+    || die "could not reset $REMOTE_SRC / create per-ref target dir in pod"
+  # Bound PVC growth: best-effort prune sibling per-ref target dirs untouched
+  # for >24h (a gate runs in minutes; >24h ⇒ provably not an in-flight
+  # concurrent gate's dir, so removing it cannot false-red a live run). Never
+  # touches THIS $SHA's dir. Failure here never fails the gate (|| true) — a
+  # housekeeping miss must not block a verdict.
+  kexec bash -c "find $CI_TARGET_ROOT -mindepth 1 -maxdepth 1 -type d ! -name $SHA -mtime +1 -exec rm -rf {} + 2>/dev/null || true" || true
   git -C "$REPO_ROOT" archive --format=tar "$SHA" \
     | kexec_i tar -x -C "$REMOTE_SRC" \
     || die "source transfer failed"
@@ -178,7 +216,7 @@ if [ "$MODE" = "bench" ]; then
   echo "======================================================================"
   set +e
   BENCH_OUT="$(kexec_i bash -c \
-    "cd $REMOTE_SRC && $APPROVE bash bench/run.sh 2>&1")"
+    "cd $REMOTE_SRC && $APPROVE $CTARGET bash bench/run.sh 2>&1")"
   set -e
   printf '%s\n' "$BENCH_OUT"
   VERDICT="$(printf '%s\n' "$BENCH_OUT" | grep -m1 '^S1_VERDICT:' || true)"
@@ -244,9 +282,9 @@ run_check() {
     # exclusive lock for the cargo lifetime; -w timeout → rc 75 (distinct,
     # LOUD — a 40m wait is a real anomaly worth reding + diagnosing, never
     # silently masked).
-    incmd="cd $REMOTE_SRC && ( flock -w $HEAVY_LOCK_WAIT 9 || { echo '::ci-gate:: F-K heavy-lock wait timeout (${HEAVY_LOCK_WAIT}s) — concurrent gate stuck?'; exit 75; }; $APPROVE cargo ${cmd} ) 9>$HEAVY_LOCK 2>&1"
+    incmd="cd $REMOTE_SRC && ( flock -w $HEAVY_LOCK_WAIT 9 || { echo '::ci-gate:: F-K heavy-lock wait timeout (${HEAVY_LOCK_WAIT}s) — concurrent gate stuck?'; exit 75; }; $APPROVE $CTARGET cargo ${cmd} ) 9>$HEAVY_LOCK 2>&1"
   else
-    incmd="cd $REMOTE_SRC && $APPROVE cargo ${cmd} 2>&1"
+    incmd="cd $REMOTE_SRC && $APPROVE $CTARGET cargo ${cmd} 2>&1"
   fi
   set +e
   out="$(kexec_i bash -c "$incmd")"
