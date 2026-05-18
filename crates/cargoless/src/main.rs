@@ -27,6 +27,7 @@ mod clean;
 mod config;
 mod cratemap;
 mod orphan;
+mod serve;
 mod statusfile;
 mod ui;
 mod watch;
@@ -38,6 +39,8 @@ enum Cmd {
     Build,
     Status,
     Clean,
+    /// Model R Stream B #3: repo-scoped daemon (`serve --repo <path>`).
+    Serve,
     Help,
     Version,
 }
@@ -62,6 +65,25 @@ struct Opts {
     /// cargo-check invocation. Comma-separated. Default (when unset):
     /// `default`. Plumbed via `TF_FEATURES` env.
     features: Option<String>,
+    // ── Model R Stream B #3 `serve` flags ───────────────────────────
+    // Plain Option-of-value (no clap types): main builds a
+    // `serve::ServeOpts` from these, which maps to the frozen
+    // `cargoless_core::FleetOverrides`. cargoless-core never gains an
+    // arg-parsing dep (the frozen A↔B contract boundary).
+    /// `serve --repo <path>` — repo root for the repo-scoped daemon.
+    repo: Option<PathBuf>,
+    /// `serve --bind HOST:PORT` — network transport addr (Stream E #10
+    /// binds it; #3 resolves+carries).
+    bind: Option<String>,
+    /// `serve --no-corun` — disable corun batching (design §7).
+    no_corun: bool,
+    /// `serve --cas-dir <path>` — shared CAS dir (fleet dedup).
+    cas_dir: Option<PathBuf>,
+    /// `serve --state-dir <path>` — state/cache root override.
+    state_dir: Option<PathBuf>,
+    /// `serve --auth-token <secret>` — bearer token (#14 enforces;
+    /// prefer the `CARGOLESS_AUTH_TOKEN` env for secrets).
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +115,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "build" => Cmd::Build,
         "status" => Cmd::Status,
         "clean" => Cmd::Clean,
+        "serve" => Cmd::Serve,
         "help" | "-h" | "--help" => Cmd::Help,
         "version" | "-V" | "--version" => Cmd::Version,
         other => return Err(ParseError::UnknownCommand(other.to_string())),
@@ -134,6 +157,33 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 let v = it.next().ok_or(ParseError::MissingValue("--features"))?;
                 opts.features = Some(v.clone());
             }
+            // ── Model R Stream B #3 `serve` flags ───────────────────
+            "--repo" => {
+                opts.repo = Some(PathBuf::from(
+                    it.next().ok_or(ParseError::MissingValue("--repo"))?,
+                ));
+            }
+            "--bind" => {
+                opts.bind = Some(it.next().ok_or(ParseError::MissingValue("--bind"))?.clone());
+            }
+            "--no-corun" => opts.no_corun = true,
+            "--cas-dir" => {
+                opts.cas_dir = Some(PathBuf::from(
+                    it.next().ok_or(ParseError::MissingValue("--cas-dir"))?,
+                ));
+            }
+            "--state-dir" => {
+                opts.state_dir = Some(PathBuf::from(
+                    it.next().ok_or(ParseError::MissingValue("--state-dir"))?,
+                ));
+            }
+            "--auth-token" => {
+                opts.auth_token = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--auth-token"))?
+                        .clone(),
+                );
+            }
             "-h" | "--help" => {
                 return Ok(Parsed {
                     cmd: Cmd::Help,
@@ -158,6 +208,8 @@ fn usage() {
     println!("                        Maintain the latest-green artifact in <DIR>");
     println!("  status                Daemon liveness + current verdict + latest-green");
     println!("  clean                 Remove the local content-addressed cache");
+    println!("  serve --repo <DIR>    Model R repo-scoped daemon: auto-discovers");
+    println!("                        worktrees, one shared daemon for the fleet");
     println!();
     println!("FLAGS:");
     println!("  --root <DIR>          Project root (default: current directory)");
@@ -188,8 +240,29 @@ fn usage() {
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
     println!();
-    println!("v0 is headless: no `serve`, no HTTP/browser (that is v0.1).");
-    println!("Working name only — the shipping name is decision D1 (CWDL-12).");
+    println!("SERVE FLAGS (Model R repo-scoped daemon):");
+    println!("  --repo <DIR>          Repo root to serve (required for serve)");
+    println!(
+        "  --bind HOST:PORT      Network transport addr (default: none — \
+         loopback/in-proc;"
+    );
+    println!("                        non-loopback requires --auth-token; also TF_BIND)");
+    println!("  --no-corun            Disable corun batching (also TF_NO_CORUN)");
+    println!("  --cas-dir <DIR>       Shared CAS dir for fleet dedup (also TF_CAS_DIR)");
+    println!("  --state-dir <DIR>     State/cache root (also TF_STATE_DIR)");
+    println!(
+        "  --auth-token <SECRET> Bearer token for authed HTTP \
+         (prefer CARGOLESS_AUTH_TOKEN env)"
+    );
+    println!();
+    println!(
+        "check/watch/build/status/clean are single-project (headless, no \
+         HTTP/browser)."
+    );
+    println!(
+        "serve is the Model R repo-scoped daemon (one shared daemon \
+         auto-discovering the fleet)."
+    );
 }
 
 fn main() -> ExitCode {
@@ -215,6 +288,21 @@ fn main() -> ExitCode {
         Cmd::Version => {
             println!("{}", cargoless_core::build_id());
             return ExitCode::SUCCESS;
+        }
+        // Model R Stream B #3: `serve` is repo-scoped (FleetConfig), NOT a
+        // single-WASM-project command — it must dispatch BEFORE the v0
+        // `config::Config::resolve` front-door below (that detector would
+        // wrongly reject a repo root that isn't a cdylib/leptos crate).
+        // serve owns its own config resolution via FleetConfig.
+        Cmd::Serve => {
+            return serve::run(&serve::ServeOpts {
+                repo: parsed.opts.repo.clone(),
+                bind: parsed.opts.bind.clone(),
+                no_corun: parsed.opts.no_corun,
+                cas_dir: parsed.opts.cas_dir.clone(),
+                state_dir: parsed.opts.state_dir.clone(),
+                auth_token: parsed.opts.auth_token.clone(),
+            });
         }
         _ => {}
     }
@@ -268,7 +356,7 @@ fn main() -> ExitCode {
         Cmd::Build => build::run(&cfg, parsed.opts.out.as_deref()),
         Cmd::Status => statusfile::run_status(&cfg),
         Cmd::Clean => clean::run(&cfg),
-        Cmd::Help | Cmd::Version => unreachable!("handled above"),
+        Cmd::Help | Cmd::Version | Cmd::Serve => unreachable!("handled above"),
     }
 }
 
