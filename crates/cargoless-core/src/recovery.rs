@@ -46,9 +46,14 @@
 //! set). [`replay`] captures the generation it started for; before applying
 //! each overlay it re-checks the live generation. If a newer respawn bumped it
 //! mid-replay, the in-flight replay is **aborted** ([`ReplayOutcome::Superseded`])
-//! — the newer respawn will drive its own fresh, complete replay. A partial
-//! overlay-set is never left applied to an RA that is about to be replaced
-//! anyway, and is never silently treated as complete.
+//! — the newer respawn will drive its own fresh, complete replay. A single
+//! [`RecoverySink::reapply`] is atomic from `replay`'s view, so the precise,
+//! honestly-stated guarantee is: once supersession is observable `replay`
+//! issues **no further** reapplies and returns `Superseded` (**never**
+//! `Completed`); at most the one overlay in flight when the newer respawn
+//! landed is applied to the about-to-be-discarded RA — harmless, since that RA
+//! is replaced anyway and the newer generation re-replays the full set. A
+//! superseded partial pass is never silently treated as complete.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -387,32 +392,41 @@ mod tests {
 
     #[test]
     fn recovery_replay_superseded_by_newer_generation_aborts_cleanly() {
-        // The launch-critical respawn-during-replay race: a second base-RA
-        // respawn bumps the generation while overlay #2 is being applied. The
-        // in-flight replay MUST abort as Superseded — never report a partial
-        // set as Completed, never keep pushing into a doomed RA.
+        // The launch-critical respawn-during-replay race. A single
+        // `sink.reapply` is ATOMIC from `replay`'s view — `replay` cannot
+        // un-ring a sink call already in flight. So the honest, guaranteed
+        // property is: once a newer respawn is observable, `replay` issues
+        // NO FURTHER reapplies and returns `Superseded` (never `Completed`);
+        // at most the single overlay in flight when the respawn landed is
+        // applied to the about-to-be-discarded RA (harmless — the newer
+        // respawn drives its own full fresh replay).
+        //
+        // Here the respawn lands DURING C's reapply (`bumping_at(2)`): A, B
+        // apply normally; C is the in-flight one (unavoidably applied); D is
+        // NOT issued — the fence trips before it. ⇒ Superseded{3}, [A,B,C],
+        // D never pushed into the doomed RA, and crucially NOT Completed.
         let queue = q(&[("A", "a"), ("B", "b"), ("C", "c"), ("D", "d")]);
         let genr = Generation::new();
         let g = genr.bump(); // gen 1
-        // Bump generation (a newer respawn) right before the 3rd apply.
         let mut sink = MockSink::new().bumping_at(2, &genr);
         match replay(&queue, &mut sink, &genr, g) {
             ReplayOutcome::Superseded {
                 applied_before_abort,
             } => assert_eq!(
-                applied_before_abort, 2,
-                "A,B applied; newer respawn at C ⇒ abort before C/D"
+                applied_before_abort, 3,
+                "A,B normal; respawn during C (in-flight, atomic) ⇒ C applied, \
+                 D never issued — Superseded, never Completed"
             ),
             other => panic!("expected Superseded, got {other:?}"),
         }
-        // C and D were NOT pushed into the doomed RA.
+        // D was NOT pushed into the doomed RA; C was (in-flight, unavoidable).
         let names: Vec<String> = sink
             .applied
             .borrow()
             .iter()
             .map(|(w, _)| w.clone())
             .collect();
-        assert_eq!(names, ["A", "B"]);
+        assert_eq!(names, ["A", "B", "C"], "D must never reach the doomed RA");
     }
 
     #[test]
