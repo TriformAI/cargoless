@@ -76,6 +76,37 @@ distinct_ra() {
   done
   echo "$n"
 }
+# v3: decompose the RA processes — the load-bearing mechanism check.
+# ra_lsp = rust-analyzer language servers (cmdline has 'rust-analyzer'
+#          but NOT 'proc-macro'); the THESIS = this is 1, constant
+#          across N (one server multiplexed). ra_pmsrv = its
+#          proc-macro-srv child(ren). N-scaling ra_lsp ⇒ thesis FALSE.
+ra_decomp() {  # prints "lsp=<n> pmsrv=<n> other=<n>"
+  local root=$1 lsp=0 pm=0 oth=0 p cl
+  for p in $(kids "$root" | sort -u); do
+    cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+    case "$cl" in
+      *proc-macro*) pm=$((pm+1)) ;;
+      *rust-analyzer*) lsp=$((lsp+1)) ;;
+      *) oth=$((oth+1)) ;;
+    esac
+  done
+  echo "lsp=$lsp pmsrv=$pm other=$oth"
+}
+dump_tree() {  # full descendant (pid rss cmdline) — own-eyes process identity
+  local root=$1 p cl rss
+  for p in $(kids "$root" | sort -u); do
+    cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)
+    rss=$(awk '/^VmRSS:/{print $2}' "/proc/$p/status" 2>/dev/null)
+    printf '    pid=%-7s rss=%-9s %s\n' "$p" "${rss:-?}kB" "${cl:0:150}"
+  done
+}
+zombie_ra_count() {  # surviving defunct/live rust-analyzer anywhere (post-reap)
+  local z l
+  z=$(ps -eo pid,stat,comm 2>/dev/null | awk '$2 ~ /Z/ && $3 ~ /rust-analyz/' | wc -l)
+  l=$(pgrep -x rust-analyzer 2>/dev/null | wc -l)
+  echo "defunct=$z live_orphan=$l"
+}
 
 say "SRC=$SRC NLIST=[$NLIST] MAXN=$MAXN WARM=${WARM_SECS}s SAMPLE=${SAMPLE_SECS}s"
 [ -d "$SRC/crates/cargoless" ] || die "no cargoless crate under SRC=$SRC"
@@ -169,37 +200,49 @@ for N in $NLIST; do
   # ordering was the v1 ra-never-spawned bug (waited for RA before
   # causing the activity that spawns it).
   touch_wts "$N"
-  warmed=0
+  warmed=0; ra_spawn_s=-1
   for s in $(seq 1 "$WARM_SECS"); do
     sleep 1
     kill -0 "$SPID" 2>/dev/null || { say "serve died during warm (N=$N)"; tail -20 "/tmp/mrfleet-serve-$N.log"; break; }
     # keep nudging activity every 10s in case the first batch debounced
     [ $((s % 10)) -eq 0 ] && touch_wts "$N"
-    [ "$(distinct_ra "$SPID")" -ge 1 ] && { warmed=1; break; }
+    if [ "$(distinct_ra "$SPID")" -ge 1 ]; then warmed=1; ra_spawn_s=$s; break; fi
   done
   if [ "$warmed" -ne 1 ]; then
     echo "CELL N=$N RESULT=FAIL reason=ra-never-spawned-within-${WARM_SECS}s-post-activity"
     tail -8 "/tmp/mrfleet-serve-$N.log"
     reap "$SPID"; continue
   fi
+  say "CELL N=$N: RA spawned at +${ra_spawn_s}s post-activity"
   # all N worktrees active; let the one multiplexed RA index + settle
   touch_wts "$N"
   sleep "$SETTLE_SECS"
   # sample peak + avg over the steady window
   peak=0; sum=0; cnt=0; ra_seen=0
-  for _ in $(seq 1 "$SAMPLE_SECS"); do
+  mid=$(( SAMPLE_SECS / 2 )); [ "$mid" -lt 1 ] && mid=1
+  for s in $(seq 1 "$SAMPLE_SECS"); do
     kill -0 "$SPID" 2>/dev/null || break
     r=$(tree_rss_kb "$SPID"); d=$(distinct_ra "$SPID")
     [ "$r" -gt "$peak" ] && peak=$r
     sum=$((sum + r)); cnt=$((cnt + 1))
     [ "$d" -gt "$ra_seen" ] && ra_seen=$d
+    # v3: CONCURRENT process-identity capture — same live daemon
+    # instance as the RSS sample (eliminates the probe-reconciliation
+    # gap). Decompose + full cmdline tree at mid-window.
+    if [ "$s" -eq "$mid" ]; then
+      decomp=$(ra_decomp "$SPID")
+      echo "CELL N=$N MIDSAMPLE ra_decomp=[$decomp] (lsp=1 constant-across-N ⇒ one-multiplexed-RA MECHANISM-confirmed; lsp scaling-with-N ⇒ thesis FALSE)"
+      echo "CELL N=$N PROCTREE:"
+      dump_tree "$SPID"
+    fi
     sleep 1
   done
   avg=0; [ "$cnt" -gt 0 ] && avg=$((sum / cnt))
   peak_mib=$((peak / 1024)); avg_mib=$((avg / 1024))
-  echo "CELL N=$N RESULT=OK peak_kb=$peak avg_kb=$avg peak_MiB=$peak_mib avg_MiB=$avg_mib distinct_ra=$ra_seen samples=$cnt"
+  echo "CELL N=$N RESULT=OK peak_kb=$peak avg_kb=$avg peak_MiB=$peak_mib avg_MiB=$avg_mib distinct_ra=$ra_seen ra_decomp=[${decomp:-NA}] ra_spawn_s=$ra_spawn_s samples=$cnt"
   reap "$SPID"
-  sleep 2
+  sleep 3
+  echo "CELL N=$N POSTREAP $(zombie_ra_count) (zombie/orphan-RA-on-shutdown characterization — FIELD-FINDING-#3b/#128 class)"
 done
 
 echo "=== MODELR-FLEET COMPLETE $(date -u +%FT%TZ) ==="
