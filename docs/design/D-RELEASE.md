@@ -452,9 +452,11 @@ pkg-url = "{repo}/releases/download/v{version}/{name}-v{version}-{target}{archiv
 pkg-fmt = "tgz"
 
 # Inside the tarball, the binary lives at:
-#   {name}-v{version}-{target}/tftrunk
-# where `tftrunk` is the CURRENT placeholder binary name (D1/CWDL-12 may rename).
-bin-dir = "{name}-v{version}-{target}/tftrunk"
+#   {name}-v{version}-{target}/cargoless
+# where `cargoless` is the [[bin]] name (D1/CWDL-12 → `cargoless` resolved
+# at #87; pre-D1 this template held the placeholder `tftrunk`, kept in
+# sync with release.yml `BIN=cargoless`).
+bin-dir = "{name}-v{version}-{target}/cargoless"
 
 # Per-target overrides (defaults above apply to x86_64-unknown-linux-gnu and
 # both Apple targets — same tarball layout, same pkg-url template). No
@@ -463,7 +465,7 @@ bin-dir = "{name}-v{version}-{target}/tftrunk"
 # .zip post-v1), add:
 #   [package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]
 #   pkg-fmt = "zip"
-#   bin-dir = "{name}-v{version}-{target}/tftrunk.exe"
+#   bin-dir = "{name}-v{version}-{target}/cargoless.exe"
 ```
 
 **No real fire required for the stub to be useful** — once committed, anyone
