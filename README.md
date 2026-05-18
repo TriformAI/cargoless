@@ -46,16 +46,20 @@ cargoless is a **repo-scoped daemon**: one `cargoless serve --repo
 worktree. That architecture — not a per-daemon tuning knob — is what
 makes the agent-fleet case work.
 
-- **Fleet RAM is flat, not linear — measured.** Across **N=1→20
-  active worktrees** total cargoless RSS stays **≈1 GiB** (measured
-  peak 1003–1068 MiB, avg 980–1034 MiB; N=20 ≈ N=1 — it does **not**
-  grow with worktree count). The mechanism is own-eyes-verified:
-  exactly **one** multiplexed rust-analyzer + its proc-macro-srv,
-  constant across all N. Versus the per-worktree-daemon model's
+- **Model R removes the per-worktree multiplication — measured.**
+  cargoless's fleet-RAM cost is **structural, not linear in worktree
+  count**: total RSS stays **≈1 GiB across the measured N ∈ {1, 2, 4,
+  8, 16, 20}** active worktrees (aggregate peak 1003–1068 MiB, avg
+  980–1034 MiB; N=20 ≈ N=1). The mechanism is own-eyes-verified on the
+  real wired `serve --repo` daemon: **exactly one** rust-analyzer LSP
+  + its one proc-macro-srv, constant across every N — one analyzer
+  LSP-overlay-multiplexed across the workspace-cluster, not
+  one-RA-per-worktree. Versus the per-worktree-daemon model's
   measured-linear ≈1.5 GiB × 20 ≈ ≈30 GiB, that is a **≈19–30×
-  fleet-RAM collapse, measured — not extrapolated.** See
-  [`AC7-THROUGHPUT-REPORT.md §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve)
-  (Model-R Leg-C v4).
+  fleet-RAM collapse, measured — replacing the prior cycle's
+  Model-A "~19.4 GiB BORDERLINE" *extrapolation*.** See
+  [`AC7-THROUGHPUT-REPORT.md §11.4`](docs/bench/AC7-THROUGHPUT-REPORT.md)
+  (Model-R Leg-C v4, measured-not-extrapolated).
 - **2.05× faster cargo-check vs `trunk serve`** (two-source verified;
   agent-edit-batch unit). **Unchanged under Model R** — the
   green-edge-rebuild model that produces the CPU win is preserved by
@@ -64,13 +68,16 @@ makes the agent-fleet case work.
 
 **Honest caveats — these are the claim's integrity, not footnotes:**
 
-1. **The absolute ≈1 GiB is fixture-dependent** (a Leptos-class
-   honest-size project, smaller than tf-multiverse). The load-bearing
-   claim is the **flatness / one-multiplexed-RA structure**, *not* the
-   absolute number — a bigger workspace shifts the constant up but
-   does not make it scale with N.
-2. **Measured to N=20.** Beyond that is a stated curve-shape
-   projection (flat by construction — one RA), not a measurement.
+1. **The win is structural, not an absolute number.** The absolute
+   ≈0.9–1 GiB is **fixture-dependent** (a Leptos-class honest-size
+   project, smaller than tf-multiverse); a larger workspace yields a
+   different absolute but the **same flat-vs-N structure**. The
+   load-bearing claim is *"Model R removes the per-worktree
+   multiplication"* (one multiplexed RA), **not** "≈1 GiB on
+   tf-multiverse."
+2. **Measured to N=20.** The 589/617-worktree fleet is a
+   **curve-shape projection** (one-RA-per-cluster implies it holds),
+   stated as *projection*, never *measured*, beyond N=20.
 3. **Verdict-correctness is a closed chain, not pure-unit end-to-end:**
    structurally proven in the cores **plus** the live multiplexed
    runtime integration-validated via the #15 bench + Track-1 dogfood.
@@ -80,20 +87,25 @@ makes the agent-fleet case work.
 5. **RAM measured under driven per-WT activity.** Idle worktrees are
    deactivated by design (activity-activation); the ≈1 GiB is "RAM
    under an actively-driven fleet," stated as such — not an idle floor.
-6. **Found-and-in-fix:** a separate shutdown-RA-reap defect (the
-   serve-loop does not reap its rust-analyzer child on `SIGTERM`) is
-   in the fix pipeline. It is **PID/zombie accumulation under fleet
-   restart-churn — NOT a RAM leak**, and does **not** affect the
-   steady-state ≈1 GiB measurement (which is descendant-scoped and
-   structurally uncontaminated). Disclosed as found, routed, fixing —
-   launch-relevant for restart-churn hygiene, not for the RAM number.
+6. **Found-and-in-fix (disclosed, named):** the steady-state
+   fleet-RAM thesis is measured-confirmed; a **separate shutdown
+   RA-reap defect** — the serve-loop does not `wait()`-reap its
+   rust-analyzer child on shutdown — was found, routed (#198), and is
+   in the fix pipeline. It is **PID-hygiene under restart-churn, NOT
+   a RAM leak**: the leaked RA processes are **zombies (0 RSS)** that
+   reparent to init and are structurally outside the
+   **descendant-scoped** RSS measurement (verified — an earlier
+   "~10 GiB" inference was wrong and is **retracted**). It does not
+   impugn the fleet-RAM thesis; launch-relevant only for restart-churn
+   process hygiene, not the steady-state RAM story.
 
 Version (`v1.0` vs `v0.2`) and public-launch GO are the **operator's
 call** — this document describes capabilities, not a chosen tag.
 
 v0.1 browser/HTTP adapter remains deferred (orthogonal to Model R).
-Fleet-scale methodology + the measured per-N curve:
-[`AC7-THROUGHPUT-REPORT.md §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve).
+Fleet-scale methodology + the measured per-N curve + the v1→v3 honest
+audit trail:
+[`AC7-THROUGHPUT-REPORT.md §11.4`](docs/bench/AC7-THROUGHPUT-REPORT.md).
 
 ---
 
@@ -353,13 +365,17 @@ daemon the answer is **measured flat**:
 | 20 | ≈1 GiB (N=20 ≈ N=1) | **1** |
 | per-worktree-daemon model, 20 | ≈1.5 GiB × 20 ≈ **≈30 GiB** (measured-linear) | 20 |
 
-⇒ a **≈19–30× fleet-RAM collapse, measured — not extrapolated**
-(`AC7-THROUGHPUT-REPORT §11`, Model-R Leg-C v4). The mechanism is
-own-eyes-verified: across every N there is **exactly one** multiplexed
-`rust-analyzer` + its `proc-macro-srv`; total RSS does not grow with
-worktree count. *(Exact per-N figures reconcile against bench-lead's
-§11-v4 prose on landing; the structure — flat, one RA — is the
-measured, mechanism-confirmed claim.)*
+⇒ a **≈19–30× fleet-RAM collapse, measured — replacing the prior
+cycle's Model-A "~19.4 GiB BORDERLINE" extrapolation**
+(`AC7-THROUGHPUT-REPORT §11.4`, Model-R Leg-C v4, measured on the real
+wired `serve --repo` daemon, N ∈ {1,2,4,8,16,20}). The mechanism is
+own-eyes-verified: across every N there is **exactly one**
+`rust-analyzer` LSP + its one `proc-macro-srv`; total RSS does not
+grow with worktree count. *(Figures are bench-lead's #15
+measured-not-extrapolated delivery; the final exact-figure
+cross-check against the landed §11.4 prose is a publish-time
+numbers-gate step — the structure, flat + one RA, is the measured,
+mechanism-confirmed claim.)*
 
 **The honest interpretation — inline, load-bearing:**
 
@@ -427,13 +443,16 @@ missable:
   idle-evict (`TF_RA_IDLE_EVICT=1`) opt-in, per-event reclaim
   ≈88-97 % validated, sustained magnitude scales with
   `gap / RA-busy-time`.
-- **Found-and-in-fix:** the shutdown-RA-reap defect (serve-loop does
-  not reap its RA child on `SIGTERM`) — PID/zombie under
-  restart-churn, **not a RAM leak**, does not touch the steady-state
-  ≈1 GiB; disclosed, routed, fixing.
-- **Methodology audit trail is open** (`AC7-THROUGHPUT-REPORT §11.3`):
-  discarded measurement attempts kept with reasons, not salvaged —
-  the discipline that earns the fleet-scale claim, named openly.
+- **Found-and-in-fix:** the shutdown RA-reap defect (serve-loop does
+  not `wait()`-reap its RA child) — **zombies (0 RSS), PID-hygiene
+  under restart-churn, not a RAM leak**; reparent to init, structurally
+  outside the descendant-scoped RSS measurement (an earlier "~10 GiB"
+  inference was wrong and is **retracted**). Routed #198, fixing. Does
+  not impugn the fleet-RAM thesis.
+- **Methodology audit trail is open** (`AC7-THROUGHPUT-REPORT §11.4`,
+  the v1→v3 honest audit trail): discarded measurement attempts kept
+  with reasons, not salvaged — the discipline that earns the
+  fleet-scale claim, named openly.
 
 ### Architectural asymmetry (why the numbers come out this way)
 
@@ -480,8 +499,9 @@ numbers.
   proven end-to-end on launch-critical changes (#136 → §7 binstall
   CATCH → #140 fix-source; #96 self-dogfood).
 - **Model-R fleet-RAM is measured, not extrapolated:** flat ≈1 GiB
-  across N=1→20, one multiplexed RA mechanism own-eyes-verified
-  (`AC7-THROUGHPUT-REPORT §11` Leg-C v4) — the prior narrative's
+  across measured N ∈ {1,2,4,8,16,20}, one-multiplexed-RA mechanism
+  own-eyes-verified
+  (`AC7-THROUGHPUT-REPORT §11.4` Leg-C v4) — the prior narrative's
   disclosed-extrapolation gap is **closed by measurement**.
 - **`AC#7` resolution:** cargoless wins on per-edit CPU (2.05×,
   two-source) **and** on the fleet axis where `trunk serve`'s
@@ -533,7 +553,7 @@ acknowledgement is itself a GitHub-issue-worthy event.
 ## Status
 
 Repo-scoped Model-R daemon feature-complete on `main`; fleet-RAM
-flatness measured (`AC7-THROUGHPUT-REPORT §11` Leg-C v4); launch
+flatness measured (`AC7-THROUGHPUT-REPORT §11.4` Leg-C v4); launch
 hardening in progress. The public-launch GO and the version tag
 (`v1.0` vs `v0.2`) are the **operator's decision** — this document
 states capabilities, not a chosen tag or a ship date. Tracked
