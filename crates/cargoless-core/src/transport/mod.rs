@@ -45,9 +45,12 @@
 //! ignore are all hand-rolled in-crate already). Best-effort throughout:
 //! a transport failure is surfaced as a typed error, never a panic.
 
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use cargoless_proto::Diagnostic;
+
+use crate::config::{FleetConfig, FleetConfigError};
 
 pub mod discovery;
 pub mod http;
@@ -168,6 +171,98 @@ impl Authorizer for AllowAll {
     fn authorize(&self, _token: Option<&str>) -> bool {
         true
     }
+}
+
+/// #14 — bearer-token [`Authorizer`] for network (`--bind`) mode.
+///
+/// Allows a request iff it presents `Authorization: Bearer <token>` whose
+/// value equals the configured secret. A request with no token is denied
+/// (⇒ the HTTP adapter's existing clean `401`); the #10 seam is unchanged
+/// — this is pure policy swapped in via [`authorizer_for`].
+///
+/// ## Constant-time content compare (the load-bearing security property)
+///
+/// The token compare must not early-return on the first differing byte —
+/// that leaks, via response timing, a prefix-matching oracle that turns
+/// secret recovery from `O(charset^len)` into `O(charset*len)`. The
+/// content comparison here folds every byte into a single accumulator
+/// with `|=` and only inspects the accumulator at the end: the work is
+/// independent of *where* (or whether) a mismatch occurs.
+///
+/// Length is compared first and may short-circuit: this is the standard
+/// token-compare discipline (ring `verify_slices_are_equal`, OpenSSL
+/// `CRYPTO_memcmp` both require equal length). A bearer token's *length*
+/// is low-entropy and not the secret; its *content* is. Equalising the
+/// loop bound on unequal lengths would compare against attacker-chosen
+/// bytes and still reveal nothing the length didn't — the standard
+/// trade, made explicit.
+pub struct BearerToken {
+    secret: Vec<u8>,
+}
+
+impl BearerToken {
+    /// The configured shared secret (from `--auth-token` /
+    /// `CARGOLESS_AUTH_TOKEN` / `tf.toml [fleet] auth_token`, resolved
+    /// through the frozen #1 `FleetConfig` contract).
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self {
+            secret: secret.into().into_bytes(),
+        }
+    }
+}
+
+/// Constant-time-content byte-slice equality (see [`BearerToken`] docs).
+/// `#[inline(never)]` so an optimiser can't peel the loop into an
+/// early-exit shape that reintroduces the timing oracle.
+#[inline(never)]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+impl Authorizer for BearerToken {
+    fn authorize(&self, token: Option<&str>) -> bool {
+        match token {
+            // No credential presented ⇒ deny (HTTP adapter → 401).
+            None => false,
+            Some(presented) => constant_time_eq(presented.as_bytes(), &self.secret),
+        }
+    }
+}
+
+/// Select the network [`Authorizer`] for a resolved [`FleetConfig`],
+/// **failing closed**.
+///
+/// This is the #14 policy seam binding (the HTTP adapter takes the
+/// returned `Arc<dyn Authorizer>` unchanged — `D-FLEET §10.4`):
+///
+/// * non-loopback `bind` **without** an `auth_token` ⇒ `Err` (the
+///   [`FleetConfig::security_check`] by-construction refusal — the
+///   daemon must NOT serve an unauthenticated socket reachable
+///   off-host; surfacing the typed config error is the safe failure,
+///   never a silent [`AllowAll`] on a public bind);
+/// * an `auth_token` present ⇒ [`BearerToken`] (enforced even on a
+///   loopback bind — opting into auth is always honoured);
+/// * otherwise (no token; absent or loopback `bind`) ⇒ [`AllowAll`],
+///   the #10 localhost-only posture, unchanged.
+///
+/// Pure: no I/O, no socket — the serve/daemon I/O-shell calls this and
+/// hands the result to `HttpServer::bind`. Exhaustively unit-tested over
+/// the loopback/non-loopback × token/no-token matrix.
+pub fn authorizer_for(cfg: &FleetConfig) -> Result<Arc<dyn Authorizer>, FleetConfigError> {
+    // Fail closed first: a network-reachable bind with no token is
+    // refused here, not downgraded to permissive.
+    cfg.security_check()?;
+    Ok(match &cfg.auth_token {
+        Some(secret) => Arc::new(BearerToken::new(secret.clone())),
+        None => Arc::new(AllowAll),
+    })
 }
 
 /// A transport error. Best-effort discipline: adapters return this, never
@@ -405,6 +500,105 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::FleetConfig;
+
+    // ───────────────────────── #14 auth ─────────────────────────
+
+    #[test]
+    fn bearer_token_accepts_exact_denies_wrong_and_none() {
+        let a = BearerToken::new("s3cr3t-abc");
+        assert!(a.authorize(Some("s3cr3t-abc")), "exact match ⇒ allow");
+        assert!(!a.authorize(Some("s3cr3t-abd")), "1-byte-off ⇒ deny");
+        assert!(!a.authorize(Some("s3cr3t-ab")), "prefix (shorter) ⇒ deny");
+        assert!(
+            !a.authorize(Some("s3cr3t-abcd")),
+            "superstring (longer) ⇒ deny"
+        );
+        assert!(!a.authorize(Some("")), "empty presented ⇒ deny");
+        assert!(!a.authorize(None), "no credential ⇒ deny (→ adapter 401)");
+    }
+
+    #[test]
+    fn constant_time_eq_is_correct_total_and_length_safe() {
+        // Correctness (the timing property itself is structural — no
+        // early return over content — and asserted by code review, not a
+        // flaky wall-clock test; here we pin the FUNCTIONAL contract).
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd")); // last byte differs
+        assert!(!constant_time_eq(b"abc", b"Xbc")); // first byte differs
+        assert!(!constant_time_eq(b"abc", b"ab")); // length differs
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        // A first-byte mismatch and a last-byte mismatch are both `false`
+        // — the accumulator folds the whole equal-length slice; position
+        // of the mismatch never short-circuits.
+        assert_eq!(
+            constant_time_eq(b"\x00xxxxxxxx", b"\xffxxxxxxxx"),
+            constant_time_eq(b"xxxxxxxx\x00", b"xxxxxxxx\xff"),
+            "mismatch position must not change the result path"
+        );
+    }
+
+    fn cfg_bind_token(bind: Option<&str>, token: Option<&str>) -> FleetConfig {
+        let mut c = FleetConfig::defaults();
+        c.bind = bind.map(|b| b.parse().expect("test bind addr"));
+        c.auth_token = token.map(str::to_string);
+        c
+    }
+
+    #[test]
+    fn authorizer_for_loopback_no_token_is_allowall_open_posture() {
+        // #10 posture preserved: loopback bind, no token ⇒ AllowAll
+        // (open, localhost-only — D-FLEET §10.4).
+        let c = cfg_bind_token(Some("127.0.0.1:8080"), None);
+        let a = authorizer_for(&c).expect("loopback no-token must not error");
+        assert!(a.authorize(None), "AllowAll ⇒ no-token allowed on loopback");
+        assert!(a.authorize(Some("whatever")));
+    }
+
+    #[test]
+    fn authorizer_for_non_loopback_no_token_fails_closed() {
+        // THE load-bearing security property: a network-reachable bind
+        // with no auth_token is REFUSED here (security_check by
+        // construction) — never silently downgraded to AllowAll on a
+        // public socket.
+        let c = cfg_bind_token(Some("0.0.0.0:8080"), None);
+        let r = authorizer_for(&c);
+        assert!(
+            matches!(r, Err(FleetConfigError::BadBind { .. })),
+            "non-loopback + no token MUST be a refused config error, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn authorizer_for_token_present_is_bearer_even_on_loopback() {
+        // Opting into auth is always honoured (loopback too).
+        let c = cfg_bind_token(Some("127.0.0.1:8080"), Some("tok-XYZ"));
+        let a = authorizer_for(&c).expect("token present ⇒ ok");
+        assert!(a.authorize(Some("tok-XYZ")), "correct token allowed");
+        assert!(!a.authorize(Some("tok-xyz")), "wrong token denied");
+        assert!(!a.authorize(None), "no token denied when policy is bearer");
+    }
+
+    #[test]
+    fn authorizer_for_non_loopback_with_token_is_bearer_enforced() {
+        let c = cfg_bind_token(Some("0.0.0.0:8080"), Some("net-secret"));
+        let a = authorizer_for(&c).expect("non-loopback + token ⇒ ok");
+        assert!(a.authorize(Some("net-secret")));
+        assert!(!a.authorize(Some("net-secre")));
+        assert!(
+            !a.authorize(None),
+            "public bind w/ bearer ⇒ no-token denied"
+        );
+    }
+
+    #[test]
+    fn authorizer_for_no_bind_defaults_open_v0_compat() {
+        // No daemon/network at all (v0 default) ⇒ AllowAll, no error.
+        let c = FleetConfig::defaults();
+        let a = authorizer_for(&c).expect("no bind ⇒ no auth required");
+        assert!(a.authorize(None));
+    }
 
     #[test]
     fn request_roundtrips_and_rejects_unknown_op() {
