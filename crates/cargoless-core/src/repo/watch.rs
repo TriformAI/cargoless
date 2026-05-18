@@ -40,6 +40,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use super::topology::WorktreeEntry;
@@ -236,6 +237,61 @@ impl RepoWatchRouter {
     pub fn router(&self) -> &WtRouter {
         &self.router
     }
+}
+
+/// RAII guard for [`raw_repo_watch`]: dropping it stops the underlying
+/// `notify` watcher (unregisters the OS watch) — the same hold-for-RAII
+/// lifecycle shape as [`crate::watcher`]'s `WatchHandle`.
+pub struct RawWatchHandle {
+    watcher: notify::RecommendedWatcher,
+}
+
+impl RawWatchHandle {
+    /// Stop watching now (also happens automatically on drop). Consumes
+    /// the handle; the move of `self.watcher` is also what marks the
+    /// hold-for-RAII field used (clippy-clean, no dead_code).
+    pub fn stop(self) {
+        let _ = self.watcher;
+    }
+}
+
+/// RAW repo-scoped filesystem watcher — every changed path under `root`,
+/// with **NO ignore-filter** (the §4 inversion). [`RepoWatchRouter`]
+/// owns routing + the universal `target/`/`.git` noise floor + per-WT
+/// debounce; a *watcher-level* ignore filter here would blind the daemon
+/// to gitignored worktree subtrees — exactly the
+/// `.claude/worktrees/*`-for-96.6%-of-the-fleet case the inversion
+/// exists for. Returns a channel of changed absolute paths + a handle
+/// whose `drop` stops the watch.
+///
+/// This is the irreducibly-live `notify` glue the pure §4 core (#4
+/// `RepoWatchRouter`) was decomposed away from; it lives in
+/// `cargoless-core` because this crate **owns the `notify` dependency**
+/// (the binary must not add it — CLAUDE.md dependency discipline). The
+/// capstone-wire feeds these raw paths straight into
+/// [`RepoWatchRouter::record`].
+///
+/// Honest boundary: like [`crate::watcher`]'s live `watch()`, the actual
+/// fs-event delivery is the live-`notify` boundary — integration-
+/// validated downstream (#15-bench / Track-1 dogfood), not pure-unit
+/// asserted here (a pure unit test cannot deterministically drive real
+/// OS fs events). Construction + RAII teardown ARE unit-checked.
+pub fn raw_repo_watch(root: &Path) -> notify::Result<(RawWatchHandle, Receiver<PathBuf>)> {
+    let (tx, rx) = channel::<PathBuf>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            for p in ev.paths {
+                // A dead receiver just means the daemon is shutting
+                // down — ignore the send error (mirrors watcher.rs).
+                let _ = tx.send(p);
+            }
+        }
+    })?;
+    {
+        use notify::Watcher as _;
+        watcher.watch(root, notify::RecursiveMode::Recursive)?;
+    }
+    Ok((RawWatchHandle { watcher }, rx))
 }
 
 #[cfg(test)]
@@ -504,5 +560,35 @@ mod tests {
         assert!(!rw.record(Path::new(&main_a()), t0));
         assert!(rw.poll(t0 + QUIET + QUIET).is_empty());
         assert_eq!(rw.time_until_ready(t0), None);
+    }
+
+    // --- raw_repo_watch (capstone-wire incr-1: live-notify boundary) ---
+
+    #[test]
+    fn raw_repo_watch_constructs_and_raii_drops_clean() {
+        // Construction on a real dir succeeds; RAII drop (and the
+        // explicit `stop()`) tear the OS watch down without panic. We do
+        // NOT assert fs-event delivery — that is the live-notify
+        // boundary (integration-validated downstream #15/Track-1, the
+        // same boundary watcher::watch()'s thread lives under); a pure
+        // unit test cannot deterministically drive real OS fs events.
+        let dir = std::env::temp_dir().join(format!("cl-rrw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (handle, rx) = raw_repo_watch(&dir).expect("constructs on a real dir");
+        // The receiver is the PathBuf stream callers expect; nothing was
+        // changed so nothing is fabricated (non-blocking check).
+        assert!(
+            rx.try_recv().is_err(),
+            "no events fabricated on a quiet dir"
+        );
+        handle.stop(); // explicit teardown path — no panic
+
+        // And the implicit RAII path: a fresh handle dropped at scope end.
+        let (h2, _rx2) = raw_repo_watch(&dir).expect("re-constructs");
+        drop(h2); // must not panic
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
