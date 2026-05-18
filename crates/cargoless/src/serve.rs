@@ -159,21 +159,18 @@ pub fn run(opts: &ServeOpts) -> ExitCode {
     // worse than the v0 single-watch case, so the proven `orphan` guard
     // the v0 loop trusts is wired in from #3.
     let parent = crate::orphan::ParentWatch::capture();
-    ui::wait("repo-scoped daemon up (harness). Ctrl-C / SIGTERM to stop.");
-
-    loop {
-        if parent.orphaned() {
-            ui::warn(
-                "parent process exited — shutting down so no orphaned \
-                 repo daemon is left running (FIELD FINDING #13b parity).",
-            );
-            return ExitCode::SUCCESS;
-        }
-        // #4 seam: this 250ms park is exactly what the routed watcher
-        // stream replaces (recv_timeout on the (WtId, ChangeBatch)
-        // channel). Bounded so orphan-detection latency stays ≤ this.
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    // capstone-wire: the live repo-scoped Model R driver supersedes the
+    // #3 park-skeleton. It faithfully composes the proven cores
+    // (clusterdrv A+B, barrier, multiplex incl. reset(),
+    // cluster/clustermgr, activitymgr, repo::watch) into the live
+    // multiplexed verdict pipeline, holds the process, and orphan-guards
+    // internally. Honest verification boundary
+    // (cores-structurally-proven + integration-validated-downstream via
+    // #15/Track-1, NOT pure-unit-end-to-end) is documented in
+    // `crate::servedrv`. NOTE (flag-at-land, doc-only follow-up): this
+    // module's header doc still describes the pre-capstone park-skeleton
+    // and wants a refresh — tracked, non-correctness.
+    crate::servedrv::run(scope, &parent)
 }
 
 /// §3.3 bring-up banner: one process, the discovered+classified topology,
