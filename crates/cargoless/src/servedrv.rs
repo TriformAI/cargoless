@@ -72,7 +72,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
@@ -99,8 +99,6 @@ const QUIET: Duration = Duration::from_millis(200);
 /// `SpawnRa` arm); the `ClusterDriver`/`OverlayMultiplexer` are mutated
 /// only from the single serve loop (Judgment A as composed).
 struct ClusterState {
-    /// RA workspace root (a representative worktree of the cluster).
-    root: PathBuf,
     /// RAII: dropping the supervisor kills + reaps the RA (TeardownRa).
     _supervisor: Supervisor,
     /// The currently-live RA's client; `None` until the first
@@ -321,7 +319,6 @@ fn spawn_cluster(
     clusters.insert(
         h.clone(),
         ClusterState {
-            root,
             _supervisor: supervisor,
             lsp: None,
             mux: OverlayMultiplexer::new(),
