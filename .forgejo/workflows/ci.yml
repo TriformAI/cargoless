@@ -17,11 +17,12 @@ on:
 # dubious-ownership refusal when the root-owned container checks out the tree.
 #
 # Cargo.lock IS committed. The zero-external-deps era ended when daemon-core
-# added `notify` (tf-core) for the FS watcher; the workspace now has a real
-# resolved graph. A committed lock + `--locked` makes the dependency graph a
-# deterministic, reviewable input — which is also exactly what the contract
-# already promised (`tf_proto::BuildIdentity.cargo_lock` hashes Cargo.lock as
-# part of the artifact identity). `--locked` additionally makes CI fail loud
+# added `notify` (cargoless-core, was `tf-core` pre-#97) for the FS watcher;
+# the workspace now has a real resolved graph. A committed lock + `--locked`
+# makes the dependency graph a deterministic, reviewable input — which is
+# also exactly what the contract already promised
+# (`cargoless_proto::BuildIdentity.cargo_lock` hashes Cargo.lock as
+# part of the artifact identity; module path was `tf_proto::` pre-#97). `--locked` additionally makes CI fail loud
 # if Cargo.lock drifts from Cargo.toml instead of silently re-resolving. fmt
 # does not resolve deps so it omits `--locked`; bench drives bench/run.sh.
 
