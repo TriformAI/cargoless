@@ -15,6 +15,7 @@ pub mod build;
 pub mod cache_layout;
 pub mod cluster;
 pub mod config;
+pub mod corun;
 pub mod diagnostics_store;
 pub mod idle;
 pub mod lsp;
