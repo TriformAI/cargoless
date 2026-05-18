@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod analyzer;
 pub mod build;
+pub mod cache_layout;
 pub mod config;
 pub mod diagnostics_store;
 pub mod idle;
