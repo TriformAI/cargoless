@@ -82,6 +82,20 @@ spec:
     spec:
       # Long-lived idle build host; ci-gate kubectl-execs into it on demand.
       terminationGracePeriodSeconds: 5
+      # CWDL #199 infra-(b): container PID-1 reaper. The container command is
+      # `sleep infinity` — `sleep` never wait()s, so reparented orphans (a
+      # ci-gate run's rust-analyzer / rustc / pkill that outlive their
+      # `kubectl exec`) become PERMANENT zombies under PID 1, accumulating
+      # monotonically (observed: 21 zombies / 27 procs incl rust-analyzer +
+      # rustc + the pkill that tried to clean them). `tini`/`dumb-init` is
+      # NOT in triform-builder-v2:0.1, so the image-free fix is
+      # shareProcessNamespace: the Kubernetes infra *pause* container
+      # becomes PID 1 of the shared pod PID namespace and IS a reaper —
+      # zombies are reaped with no image rebuild. Single-container pod ⇒
+      # negligible cross-container-visibility blast radius. This also
+      # removes the in-pod PID/resource pressure that compounds the
+      # exit-137 instability (infra-(a)) on this shared builder.
+      shareProcessNamespace: true
       imagePullSecrets:
         - name: registry-pull
       containers:
@@ -105,12 +119,23 @@ spec:
             - name: CARGO_INCREMENTAL
               value: "0"
           resources:
+            # CWDL #199 infra-(a1): ephemeral-storage was UNACCOUNTED
+            # (request 0) — that is precisely why a prior replica was the
+            # node-DiskPressure eviction victim ("Container builder ... has
+            # larger consumption of ephemeral-storage ... request is 0" →
+            # Evicted, exit 137). A request makes the scheduler reserve +
+            # not single this pod out first under node disk pressure; a
+            # limit caps the container writable-layer/tmp growth. (Warm
+            # build state — CARGO_HOME/target/src.d — lives on the /cache
+            # PVC volume, NOT ephemeral, so a modest request is right.)
             requests:
               cpu: "2"
               memory: 4Gi
+              ephemeral-storage: 1Gi
             limits:
               cpu: "8"
               memory: 16Gi
+              ephemeral-storage: 8Gi
           volumeMounts:
             - name: cache
               mountPath: /cache
