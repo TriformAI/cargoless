@@ -18,18 +18,33 @@
 //!
 //! ## Asymmetric honesty invariant (load-bearing)
 //!
-//! GREEN does not merely *skip* writing — it **clears** the file. A red
-//! diagnostics file left lingering after the tree went green would tell a
-//! querying agent "still broken" when it is not: a false-red, exactly the
-//! failure class cargoless exists to eliminate (cf. FIELD FINDING #8 —
-//! verdict/diagnostics disagreement is a launch-blocker-class defect). The
-//! retained file therefore tracks the verdict edge precisely:
+//! GREEN does not merely *skip* writing — it **atomically overwrites the
+//! file with `[]`** (the empty sentinel) using the *same* temp-file +
+//! rename primitive the RED path uses. A red diagnostics file left
+//! lingering after the tree went green would tell a querying agent "still
+//! broken" when it is not: a false-red, exactly the failure class
+//! cargoless exists to eliminate (cf. FIELD FINDING #8 — verdict/
+//! diagnostics disagreement is a launch-blocker-class defect; #176
+//! hardening: the GREEN transition must not be able to leave a stale red
+//! file, so it does NOT use `remove_file` whose failure modes — busy,
+//! perm, transient — leave the prior *red* bytes in place; an atomic
+//! rename-over deterministically replaces them, and `[]` is already this
+//! module's defined "nothing actionable" value, so `get_diagnostics` ⇒
+//! empty exactly as an absent file would). One write primitive, one
+//! failure surface, shared with the well-exercised RED path. The retained
+//! file therefore tracks the verdict edge precisely:
 //!
 //! | tree verdict | diagnostics present | action |
 //! |---|---|---|
-//! | GREEN | (any) | **remove** the file (terse: green retains nothing) |
+//! | GREEN | (any) | atomically overwrite with `[]` (terse: green retains nothing actionable; rename-over so a clear-failure cannot leave a stale red file — #176) |
 //! | RED | non-empty | write the full list (verbose) |
 //! | RED | empty (RA silent so far) | write `[]` — itself honest info: "red, specifics not yet available"; the authoritative `verdict=red` in `cli-status` still stands |
+//!
+//! GREEN and RED-empty therefore produce a byte-identical `[]` file; that
+//! is intentional — both mean "no actionable diagnostics", and the
+//! authoritative red/green distinction lives in `cli-status` `verdict=`
+//! (the sidecar never carries the verdict — criterion-4 sidecar
+//! discipline).
 //!
 //! ## Path / state-dir note
 //!
@@ -172,17 +187,27 @@ fn atomic_write(path: &Path, body: &str) {
     }
 }
 
-/// Remove the retained-diagnostics file (the GREEN action — terse: a green
-/// tree retains nothing, and any prior red file must not linger as a
-/// false-red).
+/// The GREEN action: retain "nothing actionable" by atomically writing
+/// the empty sentinel `[]` — **not** `remove_file` (#176 hardening). A
+/// `remove_file` failure (busy / perm / transient fs) would leave the
+/// prior *red* bytes in place = a stale false-red, the FIELD-FINDING-#8
+/// scar class. An atomic temp+rename-over of `[]` (the same primitive the
+/// RED path uses, and `[]` is already this module's "nothing actionable"
+/// value so `get_diagnostics` ⇒ empty exactly as an absent file would)
+/// deterministically replaces any prior red content with one shared,
+/// well-exercised write path. Best-effort and infallible to the caller —
+/// the authoritative verdict is `cli-status` `verdict=`; this sidecar
+/// never carries it.
 pub fn clear(wt_root: &Path) {
-    let _ = std::fs::remove_file(diagnostics_path(wt_root));
+    atomic_write(&diagnostics_path(wt_root), &serialize(&[]));
 }
 
 /// Persist (or clear) the retained diagnostics for `wt_root` to match the
 /// `tree` verdict edge. See the module-level asymmetric honesty table.
 ///
-/// * `TreeState::Green` ⇒ [`clear`] (remove the file).
+/// * `TreeState::Green` ⇒ [`clear`] — atomically overwrite with `[]`
+///   (#176: rename-over, NOT `remove_file`, so a clear-failure cannot
+///   leave a stale red file). Byte-identical to the RED-empty result.
 /// * `TreeState::Red`   ⇒ atomically write the full diagnostic list
 ///   (an empty `[]` when RA has not reported specifics yet — itself
 ///   honest: "red, details pending"; `cli-status` `verdict=red` stands).
@@ -263,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn green_clears_red_persists_then_get_reads_it_back() {
+    fn green_overwrites_red_with_empty_sentinel_no_stale_red() {
         let mut root = std::env::temp_dir();
         root.push(format!(
             "cargoless-ds-{}-{}",
@@ -284,25 +309,51 @@ mod tests {
         )];
         persist(&root, TreeState::Red, &diags);
         assert_eq!(get_diagnostics(&root), diags, "red retains the full list");
-        assert!(diagnostics_path(&root).exists());
+        let path = diagnostics_path(&root);
+        assert!(path.exists());
+        let red_bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            red_bytes.contains("mismatched types"),
+            "red file holds the real diagnostic bytes"
+        );
 
-        // GREEN → file removed (the asymmetric honesty invariant: a green
-        // tree must NOT leave a stale red file that reads as false-red).
+        // GREEN → #176 hardening: the file is atomically OVERWRITTEN with
+        // the empty sentinel `[]` (NOT removed). The load-bearing
+        // anti-stale-red invariant: the prior red bytes are
+        // deterministically gone — a `remove_file` that silently failed
+        // would have left them, the FIELD-FINDING-#8 false-red class.
         persist(&root, TreeState::Green, &[]);
         assert!(
-            !diagnostics_path(&root).exists(),
-            "green must clear the retained red file (no false-red)"
+            path.exists(),
+            "#176: green overwrites with [] (atomic rename-over), it does not remove"
+        );
+        let green_bytes = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            green_bytes, "[]",
+            "green file is exactly the empty sentinel"
+        );
+        assert!(
+            !green_bytes.contains("mismatched types"),
+            "no stale red bytes survive the green transition (the #176 invariant)"
         );
         assert_eq!(
             get_diagnostics(&root),
             Vec::<Diagnostic>::new(),
-            "query after green ⇒ empty (nothing retained)"
+            "query after green ⇒ empty, exactly as an absent file would read"
         );
 
+        // Green-after-green idempotency: still exactly `[]`, still empty.
+        persist(&root, TreeState::Green, &[]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        assert_eq!(get_diagnostics(&root), Vec::<Diagnostic>::new());
+
         // RED again but RA silent so far → empty array retained (honest
-        // "red, details pending"), still queryable without panic.
+        // "red, details pending"); byte-identical to the green file —
+        // intentional: the red/green distinction lives in cli-status
+        // verdict=, never in this sidecar (criterion-4 sidecar discipline).
         persist(&root, TreeState::Red, &[]);
-        assert!(diagnostics_path(&root).exists());
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
         assert_eq!(get_diagnostics(&root), Vec::<Diagnostic>::new());
 
         let _ = std::fs::remove_dir_all(&root);
