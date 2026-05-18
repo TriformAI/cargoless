@@ -137,6 +137,34 @@ impl OverlayMultiplexer {
     pub fn open_paths(&self) -> impl Iterator<Item = &Path> {
         self.open.iter().map(PathBuf::as_path)
     }
+
+    /// Forget ALL driver state — clear the open-set **and** the applied
+    /// overlay-set. Use exactly when the underlying rust-analyzer
+    /// process was **(re)started**: a freshly-spawned RA has *nothing*
+    /// open, so the multiplexer must not believe any prior overlay is
+    /// still live.
+    ///
+    /// ## #3 capstone-wire incr-0 — the Supervisor-respawn seam, closed
+    /// ## structurally
+    ///
+    /// `analyzer::Supervisor` does AC#6 *transparent* RA restart. Without
+    /// this, the next [`switch_to`](Self::switch_to)`(target)` would
+    /// `overlay::diff` against the **stale** `applied` and lower an
+    /// already-tracked path to `DidChange` (or no-op) — but the fresh RA
+    /// never opened it, so it never receives that worktree's overlay ⇒ a
+    /// **wrong / cross-WT verdict** (the very spatial-isolation failure
+    /// the multiplexer exists to prevent, re-introduced at the respawn
+    /// seam). After `reset`, `switch_to(target)` diffs against the empty
+    /// applied set ⇒ every `target` path is an `Apply`, and `lower` sees
+    /// an empty open-set ⇒ every path is a `DidOpen` (never a
+    /// `DidChange`/no-op against a file the fresh RA never opened). The
+    /// live serve-loop calls this from the Supervisor `on_spawn` hook, so
+    /// respawn-overlay-correctness is a property of the program shape,
+    /// not a remembered step.
+    pub fn reset(&mut self) {
+        self.open.clear();
+        self.applied = OverlaySet::new();
+    }
 }
 
 /// Attribute diagnostics to the worktree whose overlay is applied. Since
@@ -317,5 +345,90 @@ mod tests {
         assert_eq!(tagged, vec![("wt-A".to_string(), d.clone())]);
         // Empty in ⇒ empty out (no fabricated attribution).
         assert!(tag_for_worktree(&"wt-A".to_string(), &[]).is_empty());
+    }
+
+    // --- reset() — the Supervisor-respawn seam (capstone-wire incr-0) ---
+
+    #[test]
+    fn reset_then_switch_reopens_all_not_didchange() {
+        // THE respawn-correctness case. WT-A applied (RA has a.rs, z.rs
+        // open). The RA process is restarted ⇒ reset(). Re-selecting the
+        // SAME overlay-set MUST re-DidOpen both (the fresh RA never
+        // opened them) — NOT no-op (the bug: stale `applied` ⇒ diff
+        // yields nothing ⇒ fresh RA never receives the overlay ⇒ wrong
+        // verdict).
+        let mut m = OverlayMultiplexer::new();
+        let s = oset(&[("a.rs", "A"), ("z.rs", "Z")]);
+        m.switch_to(&s);
+        assert_eq!(opened(&m), vec!["a.rs", "z.rs"]);
+        m.reset();
+        assert!(
+            opened(&m).is_empty(),
+            "reset clears the open-set (fresh RA has nothing open)"
+        );
+        let verbs = m.switch_to(&s);
+        assert_eq!(
+            verbs,
+            vec![
+                LspVerb::DidOpen {
+                    path: "a.rs".into(),
+                    content: "A".into()
+                },
+                LspVerb::DidOpen {
+                    path: "z.rs".into(),
+                    content: "Z".into()
+                },
+            ],
+            "post-reset, the same set re-DidOpens every path (never no-op/DidChange)"
+        );
+        assert_eq!(opened(&m), vec!["a.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn reset_then_changed_content_is_didopen_not_didchange() {
+        // A path that was open with old content, then RA restarts and
+        // its content changed: must be DidOpen (fresh RA, fresh open),
+        // NOT DidChange against a buffer the new RA never had.
+        let mut m = OverlayMultiplexer::new();
+        m.switch_to(&oset(&[("a.rs", "old")]));
+        m.reset();
+        let verbs = m.switch_to(&oset(&[("a.rs", "new")]));
+        assert_eq!(
+            verbs,
+            vec![LspVerb::DidOpen {
+                path: "a.rs".into(),
+                content: "new".into()
+            }],
+            "post-reset a changed file is a fresh DidOpen, not DidChange"
+        );
+    }
+
+    #[test]
+    fn reset_on_fresh_multiplexer_is_a_noop() {
+        // reset() must be total/idempotent — calling it on an
+        // already-empty multiplexer (e.g. respawn before any switch)
+        // changes nothing and the subsequent base switch is still empty.
+        let mut m = OverlayMultiplexer::new();
+        m.reset();
+        assert!(opened(&m).is_empty());
+        assert_eq!(m.switch_to(&OverlaySet::new()), vec![]);
+        m.reset();
+        assert!(opened(&m).is_empty());
+    }
+
+    #[test]
+    fn reset_then_base_switch_emits_no_stale_close() {
+        // After reset the applied set is empty, so switching to base
+        // emits NOTHING — crucially NOT a DidClose for the pre-reset
+        // paths (the fresh RA never had them open; a spurious didClose
+        // of an unopened URI is wrong-shaped even if RA tolerates it).
+        let mut m = OverlayMultiplexer::new();
+        m.switch_to(&oset(&[("a.rs", "A"), ("b.rs", "B")]));
+        m.reset();
+        assert_eq!(
+            m.switch_to(&OverlaySet::new()),
+            vec![],
+            "post-reset→base: no stale DidClose for never-opened (fresh-RA) files"
+        );
     }
 }
