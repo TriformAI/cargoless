@@ -10,6 +10,7 @@
 //! green-on-empty (decision D10).
 
 pub mod activity;
+pub mod activitymgr;
 pub mod analyzer;
 pub mod barrier;
 pub mod build;
