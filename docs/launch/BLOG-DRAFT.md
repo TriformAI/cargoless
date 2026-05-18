@@ -204,8 +204,8 @@ Numbers from
 | Rung | Per-daemon RSS (Leptos fixture) | What it costs | What it gates |
 |---|---:|---|---|
 | **default** (Tier-1/2 ON, shipped) | ≈1.71 GiB (≈**−19 %** vs pre-tier 2.12 GiB) | nothing — behaviour-neutral, no opt-in | the universal honest default |
-| **+ proc-macro-off** (Tier-3, `TF_RA_PROCMACRO_OFF=1`, shipped default-safe; field-verified on real 38-`view!` Leptos — no false-GREEN) | ≈0.97 GiB (≈**−56 %**) | RA's view of `view!`-style macros; rustc still catches them on the verdict tier | the default RAM rung |
-| **+ `--features csr`** (project-narrowable only) | ≈0.53 GiB (≈**−78 %**) + CPU collapse to ≈0.24 s/edit | requires the project to actually be narrowable | the v0.1 auto-narrow default |
+| **+ proc-macro-off** (Tier-3, `TF_RA_PROCMACRO_OFF=1`, shipped default-safe; field-verified on real 38-`view!` Leptos — no false-GREEN) | ≈0.97 GiB (≈**−53 %** vs `AC7-THROUGHPUT-REPORT §5/A2` baseline 2.08 GB) | RA's view of `view!`-style macros; rustc still catches them on the verdict tier | the default RAM rung |
+| **+ `--features csr`** (project-narrowable only) | ≈0.53 GiB (≈**−75 %** vs `§5/A2` baseline) + CPU collapse to ≈0.24 s/edit | requires the project to actually be narrowable | the v0.1 auto-narrow default |
 
 **Tier-3 latency observation (n=1 caveat travels):** on the same real
 38-`view!` Leptos, proc-macro-off was ≈5× faster to RED (5.1 s vs
@@ -397,8 +397,9 @@ what we deliberately did **not** do:
   prebuilt artifact, no CI coverage.
 - **Memory is the tiered ladder, never one number.** Steady-state
   RSS is rust-analyzer-dominated; cargoless does not magically make
-  RA small. The ladder (default ≈−19 % / Tier-3 ≈−56 % / `--features
-  csr` ≈−78 %) is the honest framing — quoting only the default
+  RA small. The ladder (default ≈−19 % / Tier-3 ≈−53 % / `--features
+  csr` ≈−75 %, per `AC7-THROUGHPUT-REPORT §5`/§10) is the honest
+  framing — quoting only the default
   under-sells, quoting only Tier-3/csr over-sells. Tier-3 is
   *shipped default-safe* (you don't need to flip a flag to get the
   fleet RAM win; field-verified on real Leptos, no false-GREEN).
@@ -522,8 +523,10 @@ the tool report when it breaks.
       headline; no sub-second artifact-publish claim.
 - [x] D1 product name resolved = `cargoless` (operator, 2026-05-17);
       `tftrunk`/`tf-cli` drift renamed to `cargoless` in the #87
-      surgical rename-commit; internal `tf-proto`/`tf-cas`/`tf-core`
-      crate names intentionally retained.
+      surgical rename-commit; internal crates renamed to
+      `cargoless-proto`/`cargoless-cas`/`cargoless-core` in #97
+      (post-#97 full one-token brand on `main`); D1-completeness
+      CI-enforced forward by `scripts/d1-drift-guard` (#96).
 - [ ] Install command verified to work in a clean environment on the
       target platforms (Linux x86_64, macOS aarch64, macOS x86_64).
 - [ ] Repository URL audited; no `forgejo.triform.dev` URLs in

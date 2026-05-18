@@ -1,10 +1,12 @@
 # Roadmap
 
-> **Status snapshot (2026-05-17):** v0 is feature-complete and undergoing
-> launch hardening. v0.1 (browser/HTTP adapter) is deferred. v1 is the
-> long-horizon parking lot. Headline performance numbers from the AC#7
-> comparative benchmark are pending and will be published in the README and
-> launch blog when they land.
+> **Status snapshot (2026-05-18):** v0 is feature-complete; launch
+> hardening complete and AC#7 numbers landed (two-source-confirmed in
+> [`docs/bench/AC7-THROUGHPUT-REPORT.md`](docs/bench/AC7-THROUGHPUT-REPORT.md):
+> ≈2.05× per-edit CPU vs `trunk serve`, the RAM ladder, and the
+> fleet-scale compound-fit table). v0.1 (browser/HTTP adapter +
+> auto-narrow features + Tier-3/4 RAM-roadmap maturation) is deferred.
+> v1 is the long-horizon parking lot.
 
 cargoless is phased **v0 → v0.1 → v1**. The scope of each phase is
 deliberately tight: v0 is the smallest thing that delivers the vision claim
@@ -16,7 +18,8 @@ v0 — it goes to v0.1 or v1.
 
 > **Name:** the product, the published crate, and the binary are all
 > **`cargoless`** (operator decision D1, 2026-05-17). Internal library
-> crates remain `tf-proto` / `tf-cas` / `tf-core`. The capabilities
+> crates are `cargoless-proto` / `cargoless-cas` / `cargoless-core`
+> (post-#97 full one-token brand on `main`). The capabilities
 > described here are unaffected.
 
 ---
@@ -137,7 +140,8 @@ story is **the honest tiered ladder** (numbers from
   glibc-arena cap is the entire delta (RA-thread fragmentation
   reclaim; zero functional effect).
 - **Tier-3 proc-macro-off as default** (`TF_RA_PROCMACRO_OFF=1`) —
-  ≈**−56 %** RSS. **Shipped default-safe** (#126 RA-native-downrank
+  ≈**−53 %** RSS (`AC7-THROUGHPUT-REPORT §5/A3` vs A2 baseline 2.08 GB).
+  **Shipped default-safe** (#126 RA-native-downrank
   + no-wrong-verdict proof); field-verified on real 38-`view!`-site
   Leptos (#130 — no false-GREEN; ≈5× faster-to-RED, n=1-scoped, not
   a universal speedup). This is the **load-bearing existence-rung**
@@ -148,8 +152,9 @@ story is **the honest tiered ladder** (numbers from
   workload-shape-dependent (function of `gap / RA-busy-time` —
   ≈5 % on the bench's tight-gap Leptos regime, larger at real
   minute-scale agent-think-gaps).
-- **`--features csr`** (project-narrowable only) — ≈**−78 %** RSS
-  + CPU collapse. The v0.1 auto-narrow change makes the narrowed
+- **`--features csr`** (project-narrowable only) — ≈**−75 %** RSS
+  (`AC7-THROUGHPUT-REPORT §5/A4` vs same A2 baseline) + CPU collapse.
+  The v0.1 auto-narrow change makes the narrowed
   configuration the **auto-detected default** rather than an opt-in
   flag, so the memory win lands without the user having to know the
   knob exists.

@@ -236,8 +236,8 @@ Not one number — a ladder, each rung with its own provenance and gate.
 | Rung | Per-daemon RSS (Leptos fixture) | What it costs | What it gates |
 |---|---:|---|---|
 | **default** (Tier-1/2 ON, shipped) | ≈1.71 GiB (≈**−19 %** vs pre-tier baseline 2.12 GiB) | nothing — behaviour-neutral, no opt-in | the universal honest default |
-| **+ proc-macro-off** (Tier-3 — `TF_RA_PROCMACRO_OFF=1`, shipped default-safe via #126; field-verified #130) | ≈0.97 GiB (≈**−56 %**) | RA's proc-macro view of `view!`-style macros — but the verdict tier still catches them via rustc on the cargo-check side (no false-GREEN, field-confirmed on real 38-`view!` Leptos) | the default RAM rung |
-| **+ `--features csr`** (project-narrowable only) | ≈0.53 GiB (≈**−78 %**) + CPU collapse to ≈0.24 s/edit | requires the project to actually be narrowable to `csr` features | the v0.1 auto-narrow default (named perf follow-up) |
+| **+ proc-macro-off** (Tier-3 — `TF_RA_PROCMACRO_OFF=1`, shipped default-safe via #126; field-verified #130) | ≈0.97 GiB (≈**−53 %** vs `AC7-THROUGHPUT-REPORT §5/A2` baseline 2.08 GB) | RA's proc-macro view of `view!`-style macros — but the verdict tier still catches them via rustc on the cargo-check side (no false-GREEN, field-confirmed on real 38-`view!` Leptos) | the default RAM rung |
+| **+ `--features csr`** (project-narrowable only) | ≈0.53 GiB (≈**−75 %** vs `§5/A2` baseline) + CPU collapse to ≈0.24 s/edit | requires the project to actually be narrowable to `csr` features | the v0.1 auto-narrow default (named perf follow-up) |
 
 Citation: `AC7-THROUGHPUT-REPORT §10` (per-tier RSS-delta @ `ab0d51b`,
 factorial Tier-1 × Tier-2, A0 in-band gate) +
