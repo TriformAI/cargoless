@@ -89,10 +89,14 @@ makes the agent-fleet case work.
    under an actively-driven fleet," stated as such — not an idle floor.
 6. **Found-and-in-fix (disclosed, named):** the steady-state
    fleet-RAM thesis is measured-confirmed; a **separate shutdown
-   RA-reap defect** — the serve-loop does not `wait()`-reap its
-   rust-analyzer child on shutdown — was found, routed (#198), and is
-   in the fix pipeline. It is **PID-hygiene under restart-churn, NOT
-   a RAM leak**: the leaked RA processes are **zombies (0 RSS)** that
+   defect** was caught pre-launch by the bench rigor — the proven
+   rust-analyzer **Supervisor reap discipline** (FF #3b/#44/#61/#128:
+   kill+wait+pgid/setsid) **was not invoked on the new serve-loop's
+   `SIGTERM` path**, so a clean `kill -TERM` exited without reaping RA.
+   A known-pattern regression, structurally restored: #198 (@`baeac6b`,
+   in-pipeline) routes every shutdown path back through that proven
+   Supervisor reap. It is **PID-hygiene under restart-churn, NOT a RAM
+   leak**: the leaked RA processes are **zombies (0 RSS)** that
    reparent to init and are structurally outside the
    **descendant-scoped** RSS measurement (verified — an earlier
    "~10 GiB" inference was wrong and is **retracted**). It does not
@@ -393,14 +397,15 @@ mechanism-confirmed claim.)*
   constant-factor** reduction on the *one* shared RA, not the
   fleet-scale lever. Model R is the fleet-scale answer; Leg B tunes
   the constant.
-- **Found-and-in-fix (disclosed, not hidden):** a separate
-  shutdown-RA-reap defect (the serve-loop does not reap its
-  rust-analyzer child on `SIGTERM`) is in the fix pipeline. It is
-  **PID/zombie accumulation under fleet restart-churn — NOT a RAM
-  leak**; the steady-state ≈1 GiB above is descendant-scoped and
-  structurally uncontaminated by it. Launch-relevant for
-  restart-churn hygiene, disclosed as found/routed/fixing — not
-  overstated, not concealed.
+- **Found-and-in-fix (disclosed, not hidden):** the proven
+  rust-analyzer Supervisor reap discipline (FF #3b/#44/#61/#128) was
+  not invoked on the new serve-loop's `SIGTERM` path; #198
+  (@`baeac6b`, in-pipeline) restores it. A known-pattern regression
+  caught pre-launch by the bench rigor — **zombies (0 RSS),
+  PID-hygiene under restart-churn, NOT a RAM leak**; the steady-state
+  ≈1 GiB above is descendant-scoped and structurally uncontaminated
+  by it (zombies reparent to init, outside the measured subtree).
+  Disclosed as found/routed/fixing — not overstated, not concealed.
 
 ### Latency: two tiers, not one number
 
@@ -443,12 +448,16 @@ missable:
   idle-evict (`TF_RA_IDLE_EVICT=1`) opt-in, per-event reclaim
   ≈88-97 % validated, sustained magnitude scales with
   `gap / RA-busy-time`.
-- **Found-and-in-fix:** the shutdown RA-reap defect (serve-loop does
-  not `wait()`-reap its RA child) — **zombies (0 RSS), PID-hygiene
-  under restart-churn, not a RAM leak**; reparent to init, structurally
-  outside the descendant-scoped RSS measurement (an earlier "~10 GiB"
-  inference was wrong and is **retracted**). Routed #198, fixing. Does
-  not impugn the fleet-RAM thesis.
+- **Found-and-in-fix:** the proven rust-analyzer Supervisor reap
+  discipline (FF #3b/#44/#61/#128) was not invoked on the new
+  serve-loop's `SIGTERM` path; #198 (@`baeac6b`) restores it
+  (every shutdown path routed back through the proven Supervisor
+  reap). A known-pattern regression caught pre-launch by the bench
+  rigor — **zombies (0 RSS), PID-hygiene under restart-churn, not a
+  RAM leak**; reparent to init, structurally outside the
+  descendant-scoped RSS measurement (an earlier "~10 GiB" inference
+  was wrong and is **retracted**). Does not impugn the fleet-RAM
+  thesis.
 - **Methodology audit trail is open** (`AC7-THROUGHPUT-REPORT §11.4`,
   the v1→v3 honest audit trail): discarded measurement attempts kept
   with reasons, not salvaged — the discipline that earns the
