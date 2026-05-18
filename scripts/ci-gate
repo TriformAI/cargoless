@@ -98,14 +98,15 @@ SHA="$(git -C "$REPO_ROOT" rev-parse --verify "${REF}^{commit}" 2>/dev/null)" \
 SHORT="$(git -C "$REPO_ROOT" rev-parse --short "$SHA")"
 
 # ── D1 brand-completion enforced invariant (#96) — fast local pre-flight ─────
-# Greps the gated ref's tree for banned old-brand tokens
-# (tftrunk | tf[-_]{trunk,cli,proto,cas,core}) in the brand-load-bearing
-# surface (crates/ scripts/ .github/ .forgejo/ deploy/) and asserts every
-# hit is on the committed scripts/.d1-drift-allowlist. Runs LOCALLY in the
-# invoking shell (no kubectl/pod work) so a brand-residual fails FAST
-# without burning a full pod build. Soft-skips when the guard is absent
-# (gracefully degrades on pre-#96 historical commits — keeps re-gating
-# old SHAs viable). See scripts/d1-drift-guard for scope/rationale.
+# Greps the gated ref's tree for banned old-brand tokens (see
+# scripts/d1-drift-guard TOKEN_RE for the precise regex) in the brand-
+# load-bearing surface (crates/ scripts/ .github/ .forgejo/ deploy/) and
+# asserts every hit is on the committed scripts/.d1-drift-allowlist.
+# Runs LOCALLY in the invoking shell (no kubectl/pod work) so a brand-
+# residual fails FAST without burning a full pod build. Soft-skips when
+# the guard is absent (gracefully degrades on pre-#96 historical commits
+# — keeps re-gating old SHAs viable). See scripts/d1-drift-guard for
+# the full scope/rationale.
 if [ -x "$REPO_ROOT/scripts/d1-drift-guard" ]; then
   echo
   echo "======================================================================"
