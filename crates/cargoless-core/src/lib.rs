@@ -16,6 +16,7 @@ pub mod config;
 pub mod idle;
 pub mod lsp;
 pub mod model;
+pub mod overlay;
 pub mod procmacro;
 pub mod repo;
 pub mod structural;
