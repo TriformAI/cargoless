@@ -299,8 +299,8 @@ own-eyes-verified — exactly one `rust-analyzer` LSP + its one
    rust-analyzer **Supervisor reap discipline** (FF #3b/#44/#61/#128:
    kill+wait+pgid/setsid) **was not invoked on the new serve-loop's
    `SIGTERM` path**, so a clean `kill -TERM` exited without reaping
-   RA. #198 (@`baeac6b`, in-pipeline) structurally restores it
-   (every shutdown path routed back through that proven reap). It is
+   RA. #198 (@`baeac6b`) structurally restores it (every shutdown
+   path routed back through that proven reap). It is
    **zombies (0 RSS), PID-hygiene under restart-churn — NOT a RAM
    leak**; they reparent to init, structurally outside the
    descendant-scoped RSS measurement (an earlier "~10 GiB" inference
@@ -527,9 +527,9 @@ we deliberately did **not** do:
   defect pre-launch: the proven rust-analyzer **Supervisor reap
   discipline** (FF #3b/#44/#61/#128: kill+wait+pgid/setsid) was **not
   invoked on the new serve-loop's `SIGTERM` path**, so a clean `kill
-  -TERM` exited without reaping RA. #198 (@`baeac6b`, in-pipeline)
-  structurally restores it (every shutdown path routed back through
-  that proven reap). It is **zombies (0 RSS), PID-hygiene under
+  -TERM` exited without reaping RA. #198 (@`baeac6b`) structurally
+  restores it (every shutdown path routed back through that proven
+  reap). It is **zombies (0 RSS), PID-hygiene under
   restart-churn — NOT a RAM leak** (they reparent to init, outside
   the descendant-scoped RSS measurement; an earlier "~10 GiB"
   inference was wrong and is **retracted**). A known-pattern

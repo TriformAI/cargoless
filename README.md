@@ -93,8 +93,8 @@ makes the agent-fleet case work.
    rust-analyzer **Supervisor reap discipline** (FF #3b/#44/#61/#128:
    kill+wait+pgid/setsid) **was not invoked on the new serve-loop's
    `SIGTERM` path**, so a clean `kill -TERM` exited without reaping RA.
-   A known-pattern regression, structurally restored: #198 (@`baeac6b`,
-   in-pipeline) routes every shutdown path back through that proven
+   A known-pattern regression, structurally restored: #198 (@`baeac6b`)
+   routes every shutdown path back through that proven
    Supervisor reap. It is **PID-hygiene under restart-churn, NOT a RAM
    leak**: the leaked RA processes are **zombies (0 RSS)** that
    reparent to init and are structurally outside the
@@ -400,7 +400,7 @@ mechanism-confirmed claim.)*
 - **Found-and-in-fix (disclosed, not hidden):** the proven
   rust-analyzer Supervisor reap discipline (FF #3b/#44/#61/#128) was
   not invoked on the new serve-loop's `SIGTERM` path; #198
-  (@`baeac6b`, in-pipeline) restores it. A known-pattern regression
+  (@`baeac6b`) restores it. A known-pattern regression
   caught pre-launch by the bench rigor — **zombies (0 RSS),
   PID-hygiene under restart-churn, NOT a RAM leak**; the steady-state
   ≈1 GiB above is descendant-scoped and structurally uncontaminated
