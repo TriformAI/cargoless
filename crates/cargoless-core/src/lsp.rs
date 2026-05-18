@@ -840,6 +840,23 @@ impl LspClient {
         )
     }
 
+    /// `textDocument/didClose` — RA drops the buffer overlay for `uri`
+    /// and reverts to its base/on-disk content for that file.
+    ///
+    /// #5 (Model R Stream C) I/O-shell primitive: the overlay multiplexer
+    /// lowers [`crate::overlay::OverlayOp::Close`] to exactly this. It is
+    /// the load-bearing isolation op — when switching the single shared RA
+    /// from worktree V to worktree W, every file V overlaid but W does not
+    /// must be `did_close`d, else V's content contaminates W's verdict
+    /// (the failure the one-RA-multiplex must never allow; `overlay::diff`
+    /// guarantees the Close set, this verb executes it).
+    pub fn did_close(&self, abs_path: &str) -> io::Result<()> {
+        self.notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": uri_from_path(abs_path) } }),
+        )
+    }
+
     /// Monotonic LSP id for any future request-style call.
     pub fn next_request_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
