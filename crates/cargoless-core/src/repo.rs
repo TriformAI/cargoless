@@ -39,6 +39,7 @@
 //! tf.toml-less worktree. This is the load-bearing semantic of #175.
 
 pub mod topology;
+pub mod watch;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
