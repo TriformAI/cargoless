@@ -135,6 +135,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 
     use cargoless_core::build::{BuildOrchestrator, TrunkCompiler};
 
+    use crate::cratemap::{self, CrateMap};
     use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
 
     let Some(out) = out else {
@@ -210,7 +211,39 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
 
     let root_for_status = project_root.clone();
     let started = statusfile::now_unix();
-    let write_status = |verdict: Verdict| {
+    // Model R #172 (closes the #9 build.rs scope boundary): the publisher
+    // path now carries the SAME per-crate roll-up as the `watch` path, so
+    // an agent gating per-crate gets the same surface regardless of
+    // whether the user ran `watch` or `build --watch`. Resolve the
+    // workspace crate map ONCE at startup (dependency-free Cargo.toml
+    // scan — `cratemap`, integrated with #9). Empty ⇒ no `crates=` line,
+    // `verdict=` stands alone (unchanged v0 behaviour for single-crate).
+    let crate_map: CrateMap = CrateMap::from_workspace(&project_root);
+    let verdict_of = |s: cargoless_core::TreeState| match s {
+        cargoless_core::TreeState::Green => Verdict::Green,
+        cargoless_core::TreeState::Red => Verdict::Red,
+    };
+    // Takes `&session` (not a bare verdict) so it rolls diagnostics up
+    // per-crate, exactly as `watch`'s write_status does (#9). Same
+    // honesty invariant: if an error is unattributable to a known crate,
+    // omit `crates=` entirely (empty ⇒ no line) so a partial map never
+    // reads as a false per-crate all-green — `verdict=` stays
+    // authoritative. `current_diagnostics()` is the small changed-file
+    // list the red edges already surface.
+    let write_status = |session: &cargoless_core::model::ModelSession| {
+        let tree = session.tree_state();
+        let verdict = verdict_of(tree);
+        let (crates, red_diagnostics) = if crate_map.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            let pc = cratemap::aggregate(&session.current_diagnostics(), &crate_map);
+            let crates = if pc.all_errors_attributed {
+                pc.verdicts
+            } else {
+                Vec::new()
+            };
+            (crates, pc.error_count)
+        };
         statusfile::write(
             &root_for_status,
             &Status {
@@ -219,26 +252,13 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 started,
                 updated: statusfile::now_unix(),
                 verdict_str: verdict.as_str().to_string(),
-                // Model R #9 scope boundary (deliberate, not an
-                // oversight): the per-crate roll-up is wired into the
-                // `watch` path (the agent-gating use case in
-                // `D-FLEET-SHARED-DAEMON` §9). `build --watch` is the
-                // publisher path; it emits a valid schema=2 file with NO
-                // `crates=` line — the honesty invariant (never a false
-                // per-crate all-green) holds trivially and `verdict=`
-                // stays authoritative. Per-crate for the publisher path
-                // is a tracked follow-up, not a silent degradation.
-                crates: Vec::new(),
-                red_diagnostics: 0,
+                crates,
+                red_diagnostics,
             },
         );
     };
-    let verdict_of = |s: cargoless_core::TreeState| match s {
-        cargoless_core::TreeState::Green => Verdict::Green,
-        cargoless_core::TreeState::Red => Verdict::Red,
-    };
 
-    write_status(verdict_of(session.tree_state()));
+    write_status(&session);
     // FIELD FINDING #13b (#88): the publisher watch loop has the SAME
     // orphan risk as `cargoless watch` — `cargoless build --watch --out
     // dist &` then closing the shell would leave a ~2GB orphan
@@ -302,18 +322,18 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                         }
                     }
                 }
-                write_status(verdict_of(session.tree_state()));
+                write_status(&session);
             }
             Ok(cargoless_core::StateEvent::BecameRed) => {
                 ui::warn("RED — holding last green (AC#4)");
-                write_status(Verdict::Red);
+                write_status(&session);
             }
             Ok(cargoless_core::StateEvent::FileVerdict { path, state }) => {
                 ui::step(format!("{path}: {state:?}"));
-                write_status(verdict_of(session.tree_state()));
+                write_status(&session);
             }
             Err(RecvTimeoutError::Timeout) => {
-                write_status(verdict_of(session.tree_state()));
+                write_status(&session);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 statusfile::clear(&project_root);
