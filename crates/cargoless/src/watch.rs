@@ -156,11 +156,18 @@ pub fn run(cfg: &Config) -> ExitCode {
     // file-verdict edges already make; the list is small (errors+warnings
     // for changed files) so doing it every heartbeat is cheap.
     let write_status = |session: &cargoless_core::model::ModelSession| {
-        let verdict = verdict_of(session.tree_state());
+        let tree = session.tree_state();
+        let verdict = verdict_of(tree);
+        // Fetch the diagnostic list ONCE and reuse it for both the #9
+        // per-crate roll-up and the #11 red-state retention — it is the
+        // same `current_diagnostics()` call the red / file-verdict edges
+        // already make; the list is small (changed-file errors+warnings)
+        // so doing it every heartbeat is cheap.
+        let diags = session.current_diagnostics();
         let (crates, red_diagnostics) = if crate_map.is_empty() {
             (Vec::new(), 0)
         } else {
-            let pc = cratemap::aggregate(&session.current_diagnostics(), &crate_map);
+            let pc = cratemap::aggregate(&diags, &crate_map);
             // Honesty invariant: if an error could not be attributed to a
             // known crate, a partial map would falsely read all-green —
             // omit `crates=` entirely (empty ⇒ no line); `verdict=` still
@@ -184,6 +191,11 @@ pub fn run(cfg: &Config) -> ExitCode {
                 red_diagnostics,
             },
         );
+        // Model R #11: retain the full diagnostic list for a red tree
+        // (queryable via `cargoless_core::diagnostics_store::get_diagnostics`),
+        // and CLEAR it on green so a stale red file never reads as a
+        // false-red (the asymmetric honesty invariant — see the module).
+        cargoless_core::diagnostics_store::persist(&root, tree, &diags);
     };
     write_status(&session);
     // FIELD FINDING #6-NEG-A (#51): subscribe to the lifecycle channel
