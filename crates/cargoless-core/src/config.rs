@@ -708,7 +708,10 @@ mod tests {
     fn blank_auth_token_is_no_token_via_cli_env_toml() {
         // Empty AND whitespace-only, every source ⇒ parsed as no token
         // (uniform with the env path's long-standing empty-filter).
-        for blank in ["", "   ", "\t", " \n "] {
+        // Single-line whitespace only — a raw newline is not a valid
+        // single-line `tf.toml` basic-string value (would split the
+        // line-based reader); `\t`/spaces fully exercise the trim guard.
+        for blank in ["", "   ", "\t", " \t "] {
             // CLI
             let ov = FleetOverrides {
                 auth_token: Some(blank.to_string()),
