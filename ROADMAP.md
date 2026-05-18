@@ -49,6 +49,13 @@ v0.1.
 - **`cargoless clean`** — clear the content-addressed cache.
 - **Zero-config auto-detection** — a `cdylib` + `wasm32` / `leptos` project
   needs no flags; auto-detected on first run.
+- **Agent-edit-batch as the cost unit.** The primary consumer is an AI
+  agent writing whole files atomically (`Write`/`Edit` of a complete
+  file). cargoless optimizes for the per-batch verdict, not
+  per-keystroke; the structural-completeness trigger
+  (`TF_STRUCTURAL_TRIGGER=1`, default-off v0 spike) is the seam that
+  makes "only-meaningful-states-cached" a guarantee. See
+  [`docs/design/D-OPENCLOSED.md`](docs/design/D-OPENCLOSED.md).
 
 ### The nine acceptance criteria (v0 definition of done)
 
@@ -56,14 +63,14 @@ v0.1.
 |---|---------|--------|
 | 1 | Zero-config headless startup within 30s — daemon up + config auto-detected + watch→verdict pipeline live, zero manual config | ✅ field-PASS (~0.08s to streaming on the dogfood project) |
 | 2a | RA-incremental **hint** median ≤1s on a committed reference project (fast hint; does not by itself prove the tree compiles) | ✅ field-PASS post-debouncer-fix (~0.74s on Leptos) |
-| 2b | **Authoritative** verdict median ≤ bare `cargo check` +10% (cargo-check tier; no sub-1s promise — cargo's own runtime dominates) | ⏳ MEASURABLE-PASS pending the comparative bench landing the relative-cost number ([D-A2](docs/design/D-A2-RENEGOTIATION.md) §2/§8-Q1) |
-| 3 | Median green-save → latest-green artifact *published* latency, threshold from evidence (no sub-second artifact claim) | ⏳ measured by the AC#7 comparative bench; threshold published when bench reports |
-| 4 | Never publish red — `.cargoless/latest-green` only advances on green; a red tree or failed build never moves it | ⏳ verification-in-flight (publish-cycle empirical test landing; structural PASS already verified) |
+| 2b | **Authoritative** verdict median ≤ bare `cargo check` +10% (cargo-check tier; no sub-1s promise — cargo's own runtime dominates) | ✅ MEASURABLE-PASS (`AC7-THROUGHPUT-REPORT §8.5`: cargoless 3.35s vs trunk 6.89s CPU/edit, two-source-confirmed) |
+| 3 | Median green-save → latest-green artifact *published* latency, threshold from evidence (no sub-second artifact claim) | ✅ AC#4 publish-cycle empirical PASS; AC#7 §2.2 artifact-tier measured |
+| 4 | Never publish red — `.cargoless/latest-green` only advances on green; a red tree or failed build never moves it | ✅ PASS (publish-cycle empirical test + structural verification) |
 | 5 | CAS dedupe — identical source state is a cache hit, build skipped | ✅ structural PASS (integration tested) |
 | 6 | Survives `kill -9` of rust-analyzer — daemon survives + transparently restarts | ✅ field-PASS (RA respawn under 1s; restart line surfaces to the watch stream) |
-| 7 | Published two-mode benchmarks (checker save→verdict + artifact save→publish, reported separately) | ⏳ in flight; results published with caveats |
+| 7 | Published two-mode benchmarks (checker save→verdict + artifact save→publish, reported separately) | ✅ MARGINAL→PASS-with-compound-framing (`AC7-THROUGHPUT-REPORT` §8.5 + §11 — 2-of-2 dimensions clearly better vs `trunk serve`: per-edit CPU + fleet-capability) |
 | 8 | README / ROADMAP / CONTRIBUTING / LICENSE present | ✅ (this commit) |
-| 9 | Launch blog post reviewed by ≥2 people incl. one outside the team | ⏳ draft pending review |
+| 9 | Launch blog post reviewed by ≥2 people incl. one outside the team | ⏳ draft ready; reviewer gate pre-publish per [`AC9-REVIEWER-PACKET.md`](docs/launch/AC9-REVIEWER-PACKET.md) |
 
 For the full evidence trail of the field-PASSes, residual issues, and the
 production-hardening sweep that closed 11 of 12 dogfood findings, see
@@ -116,19 +123,45 @@ surface area for a feature that is strictly additive on top of the
 publisher contract. Better to ship v0 honest and small than v0 + v0.1
 half-done.
 
-### v0.1 perf follow-up — auto-narrow `--features` (single highest-leverage perf change)
+### v0.1 perf follow-up — the RAM ladder (full design in `D-RAM-TIERS.md`)
 
-The **single highest-leverage performance follow-up** is **auto-narrow
-`--features`**: cargoless's steady-state footprint is rust-analyzer-dominated
-(~2 GB default on proc-macro-heavy projects such as Leptos, because RA runs
-proc-macro expansion by default). The `--features` knob already cuts that
-materially (≈75%, *pending* bench-lead's two-source confirmation); v0.1
-makes the narrowed configuration the **auto-detected default** rather than
-an opt-in flag, so the memory win lands without the user having to know the
-knob exists. This is *not* a v0 claim — v0 ships honest about RA-dominated
-memory; the auto-narrow change is the v0.1 work that moves the default. It
-is the largest single lever on the perf story and is named here so the
-roadmap reflects where the throughput follow-up effort goes first.
+cargoless's steady-state footprint is rust-analyzer-dominated
+(~1.5-2 GB per daemon on proc-macro-heavy projects such as Leptos,
+because RA runs proc-macro expansion by default). The launch RAM
+story is **the honest tiered ladder** (numbers from
+[`AC7-THROUGHPUT-REPORT §10`](docs/bench/AC7-THROUGHPUT-REPORT.md#10-stage-2--per-tier-rss-delta)
++ [`D-RAM-TIERS.md`](docs/design/D-RAM-TIERS.md) verdict table):
+
+- **default** Tier-1/2 (shipped, behaviour-neutral, no opt-in) —
+  ≈**−19 %** RSS vs pre-tier baseline. The `MALLOC_ARENA_MAX=2`
+  glibc-arena cap is the entire delta (RA-thread fragmentation
+  reclaim; zero functional effect).
+- **Tier-3 proc-macro-off as default** (`TF_RA_PROCMACRO_OFF=1`) —
+  ≈**−56 %** RSS. **Shipped default-safe** (#126 RA-native-downrank
+  + no-wrong-verdict proof); field-verified on real 38-`view!`-site
+  Leptos (#130 — no false-GREEN; ≈5× faster-to-RED, n=1-scoped, not
+  a universal speedup). This is the **load-bearing existence-rung**
+  for the fleet-scale case.
+- **Tier-4 idle-evict** (`TF_RA_IDLE_EVICT=1`) — designed +
+  prototyped + measured (#122/#125, default-off in v0). Per-event
+  ≈88-97 % RA-RSS reclaim validated; sustained reduction is
+  workload-shape-dependent (function of `gap / RA-busy-time` —
+  ≈5 % on the bench's tight-gap Leptos regime, larger at real
+  minute-scale agent-think-gaps).
+- **`--features csr`** (project-narrowable only) — ≈**−78 %** RSS
+  + CPU collapse. The v0.1 auto-narrow change makes the narrowed
+  configuration the **auto-detected default** rather than an opt-in
+  flag, so the memory win lands without the user having to know the
+  knob exists.
+
+The fleet-scale existence answer (20 agents on a 16 GB host) is
+**compound**: Tier-3 (already shipped default-safe) brings the
+extrapolated 20-agent footprint to ≈19.4 GiB (borderline); Tier-3 +
+idle-evict at real minute-gaps to ≈14-18 GiB (probably yes);
+`--features csr` where narrowable to ≈10.6 GiB (comfortable).
+See [`AC7-THROUGHPUT-REPORT §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve)
+for the per-N curve and compound-fit table verbatim. Full v0.1 design
+work tracked in [`D-RAM-TIERS.md`](docs/design/D-RAM-TIERS.md).
 
 ---
 

@@ -6,20 +6,21 @@
 > (project blog, dev.to, personal blog, GitHub release notes, etc.)
 > gets a frozen copy at publish time.
 >
-> **PENDING markers:** `_PENDING_` (and the `<!-- PENDING bench-lead
-> Component-2 -->` comment) marks every spot where the final copy
-> depends on BOTH bench-lead's throughput report (CPU-seconds/edit,
-> RSS, saves-per-CPU-minute on the Leptos fixture) AND the independent
-> second-host cross-check. The verbatim "~half / ~2 GB / ~75%" prose
-> is bench-lead's explicit pre-confirmation estimate, kept verbatim
-> and labelled as such; numeric tables stay `_PENDING_` until the
-> two-source confirmation lands, then a small follow-up commit fills
-> them. No headline number is finalized in this draft.
+> **Numbers status:** **two-source CONFIRMED + landed** (post-#101
+> scope resolution: ship v0, default narrative). Headline ≈2.05×
+> per-edit CPU win (`AC7-THROUGHPUT-REPORT §8.5`, two-methodology
+> Δ≈1%); RAM tiered ladder (§10); fleet-scale compound-fit table
+> (§11 @ commit `6497273` — used verbatim, including the
+> disclosed-extrapolation caveat for the 16 GB / 20-agent projection).
+> The verbatim "~half / ~2 GB / ~75%" prose stays as bench-lead's
+> exact wording; the data tables follow it with concrete cited values.
 >
-> **Positioning:** locked to **Framing C — throughput, not speed.**
-> The earlier Framing A (speed) and Framing B (architectural-honesty)
-> scaffolding has been removed; this draft commits to "cargoless
-> doesn't burn your CPU" as the differentiator.
+> **Positioning:** **agent-loop substrate** (operator-resolved). The
+> primary consumer is an AI agent writing whole files atomically; the
+> cost unit is **per agent-edit-batch**, not per-keystroke. This
+> composes with the Framing-C honest-throughput thesis (CPU win + RAM
+> ladder + honestly-bounded latency); the human reading still works,
+> but the design center is the agent loop.
 
 ---
 
@@ -174,60 +175,83 @@ v0.1 auto-narrow change makes the narrowed config the default. Saying
 "low RSS" here would be the kind of selectively-true marketing this
 project exists to not do.
 
-> **All numbers in this section are PENDING bench-lead's Component-2
-> two-source confirmation.** The `~half` / `~2 GB` / `~75%` figures
-> are bench-lead's explicit pre-confirmation estimate; the tables stay
-> _PENDING_ until the independent second-host cross-check lands.
+That summary is now **two-source-confirmed** for CPU
+([`AC7-THROUGHPUT-REPORT §8.5`](https://github.com/TriformAI/cargoless/blob/main/docs/bench/AC7-THROUGHPUT-REPORT.md#85-clean-c2-109--headline-two-source-confirmed),
+two independent methodologies that share only the correctness
+invariants — Δ≈1%) and refined for memory into the **honest tiered
+ladder** below.
 
-**Qualitative comparison** (numbers PENDING two-source confirmation):
+### Leg A — per-edit CPU (the headline)
 
-| Tool | CPU per edit | Peak RSS | Verdict honesty |
-|---|---|---|---|
-| cargoless | LOW — ~½ of `trunk serve`; CAS skips identical inputs, warm RA avoids cold-start per cycle | HIGH by default — RA-dominated (~2 GB on proc-macro projects); `--features` cuts ~75%, v0.1 auto-narrows the default | publishes green only; pointer atomic |
-| `trunk serve` | HIGH — rebuilds-everything per save | MEDIUM — HTTP + WS + browser-keepalive | serves on every build, red or green |
-| `bacon` †| MEDIUM — spawns fresh cargo per cycle | LOW — terminal-only | terminal-only |
+| Tool | CPU-seconds per edit (median) | Two-source verdict |
+|---|---:|---|
+| **cargoless** | **3.35 s** | TWO-SOURCE-CONFIRMED (3.389 / 3.348, Δ−1.2 %) |
+| `trunk serve` | 6.89 s | TWO-SOURCE-CONFIRMED (6.963 / 6.887, Δ−1.1 %) |
+| `bacon` † | 0.48 s | TWO-SOURCE-CONFIRMED (0.493 / 0.476, Δ−3.4 %) |
 
-† Not like-for-like vs `bacon`: it is a terminal save→verdict checker,
-not a build+publish loop. Its row is the checker tier only; the
-artifact-publish dimension has no `bacon` counterpart.
+cargoless does **≈2.05× less per-edit CPU than `trunk serve`** —
+citable with two-source provenance. † `bacon` is not a like-for-like
+comparator: terminal save→verdict checker, not a build+publish loop.
 
-<!--
-PENDING bench-lead Component-2 two-source confirmation. Cells stay
-_PENDING_ until BOTH bench-lead's throughput report (CPU-seconds/edit,
-peak RSS, saves-per-CPU-minute; Leptos fixture; 3 tools) AND the
-independent second-host cross-check land. A small follow-up commit
-then fills them. Do not substitute a single-source estimate for
-_PENDING_; the verbatim "~half / ~2 GB / ~75%" prose above is
-bench-lead's explicit pre-confirmation estimate, marked as such.
--->
+### Leg B — RAM tiered ladder (honest, composed-not-conflated)
 
-**Measured numbers** — _PENDING bench-lead Component-2 two-source
-confirmation_ (from `bench/run.sh` + an independent second host):
+Not one number — a ladder, each rung with its own provenance and gate.
+Numbers from
+[`AC7-THROUGHPUT-REPORT §10`](https://github.com/TriformAI/cargoless/blob/main/docs/bench/AC7-THROUGHPUT-REPORT.md#10-stage-2--per-tier-rss-delta)
+(per-tier RSS-delta factorial) +
+[`D-RAM-TIERS.md`](https://github.com/TriformAI/cargoless/blob/main/docs/design/D-RAM-TIERS.md).
 
-| Tool | CPU-seconds per edit (median) | Peak RSS (MB) | Saves per CPU-minute |
-|---|---|---|---|
-| cargoless | _PENDING_ | _PENDING_ | _PENDING_ |
-| `trunk serve` | _PENDING_ | _PENDING_ | _PENDING_ |
-| `bacon` †| _PENDING_ | _PENDING_ | _PENDING_ |
+| Rung | Per-daemon RSS (Leptos fixture) | What it costs | What it gates |
+|---|---:|---|---|
+| **default** (Tier-1/2 ON, shipped) | ≈1.71 GiB (≈**−19 %** vs pre-tier 2.12 GiB) | nothing — behaviour-neutral, no opt-in | the universal honest default |
+| **+ proc-macro-off** (Tier-3, `TF_RA_PROCMACRO_OFF=1`, shipped default-safe; field-verified on real 38-`view!` Leptos — no false-GREEN) | ≈0.97 GiB (≈**−56 %**) | RA's view of `view!`-style macros; rustc still catches them on the verdict tier | the default RAM rung |
+| **+ `--features csr`** (project-narrowable only) | ≈0.53 GiB (≈**−78 %**) + CPU collapse to ≈0.24 s/edit | requires the project to actually be narrowable | the v0.1 auto-narrow default |
 
-† `bacon` is not a like-for-like comparator — checker, not
-build+publish; the row is the checker tier only.
+**Tier-3 latency observation (n=1 caveat travels):** on the same real
+38-`view!` Leptos, proc-macro-off was ≈5× faster to RED (5.1 s vs
+25.8 s) — mechanistically expected (proc-macro `view!` expansion sat
+on the verdict critical-path; removing it shortened it). We say *"no
+latency penalty observed; faster on macro-heavy projects (n=1,
+direction unambiguous + mechanistically expected)"* — never an
+unqualified "proc-macro-off is faster" universal-speedup claim.
 
-Raw save→verdict is reported in **two tiers**, not one number (the
-honest-split per [`docs/design/D-A2-RENEGOTIATION.md`](https://github.com/TriformAI/cargoless/blob/main/docs/design/D-A2-RENEGOTIATION.md)):
-a **RA-incremental hint** (AC#2a — median ≤1s, ~0.74s field-measured;
-can flip RED instantly, does not by itself prove compilation) and the
-**authoritative cargo-check verdict** (AC#2b — bounded by `cargo
-check`; seconds on small projects, ~20-30s on a Leptos-sized tree;
-the only tier that drives GREEN). cargoless shows both, live, with
-timestamps — the latency gap is readable directly off any pair of
-lines, not hidden.
+### Leg C — fleet-scale (the agent-loop case)
 
-| Tool | Hint (AC#2a) | Authoritative verdict (AC#2b) | Save→artifact published |
-|---|---|---|---|
-| cargoless | _PENDING_ (≤1s target) | _PENDING_ (cargo-check +≤10% target) | _PENDING_ |
-| `trunk serve` | n/a (no hint tier) | _PENDING_ | _PENDING_ |
-| `bacon` †| n/a (no hint tier) | _PENDING_ | n/a (terminal-only) |
+The launch-load-bearing question: *at agent-fleet scale (N daemons),
+does the default fit a real 16 GB host?* Measured at N=1,2,4,8
+([`AC7-THROUGHPUT-REPORT §11`](https://github.com/TriformAI/cargoless/blob/main/docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve)
+@ commit `6497273`); the 20-agent rows are **explicit extrapolations**
+from the measured per-daemon footprint (true cgroup-OOM observation
+was env-infeasible in the read-only-cgroup builder pod — a
+post-launch hardening nice-to-have, decision-unchanging). Compound-fit
+table verbatim:
+
+| Compound path | Per-daemon | 20 agents | Fits 16 GB? |
+|---|---:|---:|---|
+| Tier-1/2 default (§10) | ≈1.5 GiB | ≈30 GiB | NO (model-A fails — OOMs at ≈10 daemons) |
+| + idle-evict alone (bench regime) | ≈1.43 GiB | ≈28.6 GiB | NO (≈5 % shave) |
+| **+ Tier-3 `--proc-macro disabled`** (#126 default-safe + #130 field-verified) | **≈0.97 GiB** | **≈19.4 GiB** | **BORDERLINE** (+≈3 GiB over) |
+| Tier-3 + idle-evict (real minute-gap fleet) | ≈0.7-0.9 GiB | ≈14-18 GiB | **PROBABLY YES** |
+| **`--features csr`** (project-narrowable) | **≈0.53 GiB** | **≈10.6 GiB** | **YES — comfortable** |
+
+`TF_RA_IDLE_EVICT=1` is the opt-in lever. Per-event reclaim is large
+(≈88-97 % at N=1; multi-daemon evictions captured at N=4 ≈25 % and
+N=8 ≈39 %); sustained reduction at the bench's tight-gap Leptos
+regime is only ≈5 % (RA's 65-70 s re-index consumes most of the
+75 s gap). Real minute-scale agent-think-gaps shift the ratio
+favorably — the 5 % is a **conservative floor**, not a ceiling.
+
+### Latency: two tiers, not one number
+
+Raw save→verdict is reported in **two tiers**
+([`D-A2-RENEGOTIATION.md`](https://github.com/TriformAI/cargoless/blob/main/docs/design/D-A2-RENEGOTIATION.md)):
+a **RA-incremental hint** (AC#2a — median ≤1 s, ≈0.74 s
+field-measured; can flip RED instantly, does not by itself prove
+compilation) and the **authoritative cargo-check verdict** (AC#2b —
+bounded by `cargo check`; seconds on small projects, ≈20-30 s on a
+Leptos-sized tree; the only tier that drives GREEN). cargoless shows
+both, live, with timestamps — the latency gap is readable directly
+off any pair of lines, not hidden.
 
 On a real Leptos project the **authoritative** verdict (AC#2b) lands
 within the cargo-check-bound band for all three tools — none of them
@@ -363,23 +387,49 @@ what we deliberately did **not** do:
   for the WASM artifact step — `trunk` is doing the actual cargo +
   wasm-bindgen work; cargoless drives the watch and publish loop on
   top.
-- **Single-machine, single-developer.** Remote CAS, shared caches,
-  team features are v1.
+- **Single-machine, single-developer (plus agent fleet — see Leg-C).**
+  Remote CAS, shared caches, team auth are v1. The "agent fleet" case
+  the launch headline addresses is N independent cargoless daemons
+  on one host, each driven by its own agent — not a coordinated
+  multi-agent build system.
 - **Linux + macOS only.** Windows is v1 parking-lot per the design
   doc; `cargo install` works there on a best-effort basis but no
   prebuilt artifact, no CI coverage.
-- **Memory is not a v0 win.** Steady-state RSS is rust-analyzer-
-  dominated (~2 GB default on proc-macro projects); cargoless does not
-  make that smaller by default in v0. The `--features` knob recovers
-  most of it today, and the v0.1 auto-narrow change makes the narrowed
-  config the default. We will not quote a flattering RSS number we
-  can't honestly default to. (Figures _PENDING_ bench-lead's
-  two-source confirmation.)
-- **The benchmark is INCONCLUSIVE on raw speed.** We measured. We
-  reported. We did not silently miss the threshold and ship anyway.
-  The save→verdict story is the honest dual-tier split (fast hint +
-  cargo-check-bound authoritative verdict), not a single sub-1s
-  headline. See the methodology section above.
+- **Memory is the tiered ladder, never one number.** Steady-state
+  RSS is rust-analyzer-dominated; cargoless does not magically make
+  RA small. The ladder (default ≈−19 % / Tier-3 ≈−56 % / `--features
+  csr` ≈−78 %) is the honest framing — quoting only the default
+  under-sells, quoting only Tier-3/csr over-sells. Tier-3 is
+  *shipped default-safe* (you don't need to flip a flag to get the
+  fleet RAM win; field-verified on real Leptos, no false-GREEN).
+- **The 16 GB / 20-agent answer is disclosed-extrapolation.** The
+  read-only-cgroup constraint in our builder pod made a true
+  cgroup-OOM observation infeasible (`AC7-THROUGHPUT-REPORT §11`
+  provenance); the 20-agent rows extrapolate the measured per-daemon
+  footprint linearly. A direct cgroup-OOM confirm is a post-launch
+  hardening nice-to-have, not decision-changing.
+- **Idle-evict's 5 % sustained reduction is a workload-conservative
+  floor, not a ceiling.** Mechanism (≈88–97 % per-event reclaim) is
+  fully validated; sustained magnitude scales with `gap / RA-busy-
+  time` (Leptos RA's 65-70 s re-index in a 75 s gap is the bench
+  shape; real minute-scale agent-think-gaps shift it favorably).
+  Default-off in v0; opt-in via `TF_RA_IDLE_EVICT=1`.
+- **The benchmark is HONEST on raw speed.** We measured, the first
+  passes had methodology bugs, we caught them via physical-
+  impossibility sanity checks, we documented the audit trail
+  (`AC7-THROUGHPUT-REPORT §11.3` superseded-with-reason). The
+  save→verdict story is the honest dual-tier split (RA-hint ≤1 s +
+  cargo-check-bound authoritative), not a single sub-1s headline;
+  the throughput win is two-source-confirmed at ≈2.05× per-edit CPU
+  vs `trunk serve`. Honest beats favorable — here, with the methodology
+  bugs fixed, honest IS favorable.
+- **The structural-trigger is a correctness property, not a v0 CPU
+  win for the agent-write population.** Dogfood #117 (survivorship-
+  free, N=16) found `.rs` OPEN ≈0 % for Claude `Write` — agents emit
+  complete whole-file Rust. The trigger's value is *only-meaningful-
+  states-cached* (it guarantees we never cache a half-written state)
+  and the *conditional* benefit for fleets that do emit OPEN
+  intermediate Rust. We do not claim it as a check-skip headline.
 
 The launch-hardening process for this v0 was 12 field findings over
 3 weeks of dogfooding a real Leptos project on a clean Linux box; 11
