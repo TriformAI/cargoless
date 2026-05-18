@@ -49,8 +49,15 @@ win vs trunk on 2 axes, RSS loss vs both but materially shrunk by
 default (not only via `--features`), not like-for-like vs bacon (a
 checker, not a build+publish tool) → MARGINAL** (§7), an
 operator-reserved launch-scope decision. (Stage-1 §9 + #117 anchor
-§9.5 + stage-2 §10 all DELIVERED; stage-3 #116 fleet-scale = the
-remaining Leg-C idle-evict existence answer.)
+§9.5 + stage-2 §10 + **stage-3 §11 (Leg-C fleet-scale, idle-evict
+@ebf8f5a)** all DELIVERED — model-A is ~1.5 GiB/daemon and OOMs a
+16 GB host at ~10 agents; per-event idle-evict reclaim is ~88–97 %
+measured but sustained avg is workload-shape-dependent (~5 % at this
+bench regime, conservative floor); the honest fleet-fit answer is
+*compound*: Tier-3 #126 (default-safe) is the load-bearing rung,
+idle-evict #122 is complementary, `--features csr` makes narrowable
+projects comfortable — §11 carries the full per-N curve + the
+compound-path table.)
 
 **Headline numbers (corrected, complete):**
 
@@ -1045,6 +1052,141 @@ in stage-3 (#116), *independent* of these single-instance tier
 deltas and of the trigger (idle-evict acts on the idle window; see
 §9.5 scope note). jemalloc (Tier-1 opt-in swap) unmeasured on this
 builder.
+
+---
+
+## 11. Stage-3 — fleet-scale curve (#116, idle-evict @ `ebf8f5a`) — DELIVERED
+
+The final launch-scope leg: *at agent-fleet scale (N independent
+worktrees × cargoless daemon), does model-A fit a real 16 GB host, and
+does Tier-4 idle-evict (#122 prototype) close that gap?* Measured at
+**N = 1, 2, 4, 8** with two arms — (a) default `ebf8f5a` (Tier-1/2
+on, idle-evict + structural-trigger off) and (b) the full v0.1
+candidate stack (Tier-1/2 + `TF_RA_IDLE_EVICT=1 TF_RA_IDLE_SECS=5
+TF_STRUCTURAL_TRIGGER=1`). Identical binary all 16 cells
+(`bin_sha16=5543b19652fb51a7`).
+
+**Provenance / controls + disclosed-method statement.** Code-under-
+test pinned `ebf8f5a` (spike + Tier-1/2 + Tier-4 idle-evict, linear
+on §10's `ab0d51b`, ci-gate 7/7). Instrument: per-worktree cargoless
+spawn → resolve daemon pid from `.cargoless/cli-status` (the pid the
+daemon itself publishes — robust to `setsid` / pgid topology) → 3 s-tick
+sampler walks the descendant tree via recursive `pgrep -P` summing
+`/proc/<pid>/status VmRSS`. Single-daemon validity gate (analogue of
+§10's A0-in-band): **1.02 GiB measured live** (cargoless 3 MB +
+rust-analyzer 961 MB + RA-proc-macro 100 MB) — the gate the v1
+pgid-bug *failed* (it caught only the 3 MB supervisor; 8 × 3 MB ≈ the
+25 MB v1 artifact). Trace: agent-think-time model (sparse whole-file
+`Write` batches, `IDLE_GAP=75 s` so RA settles per batch and idle-evict
+*can* fire — v2's 20 s gap was consumed by RA re-index/flycheck and
+under-exercised the lever, discarded). RA-pid lifecycle from `/proc`
+attributes evict+respawn cycles (methodology-independent of the
+in-process `idle_evict_counters` API). Builder box **230 GB / 64-core**;
+**`/sys/fs/cgroup` is READ-ONLY in this pod**, so the 16 GB cgroup-cap
+direct-OOM observation team-lead originally endorsed is *infeasible
+here* (env constraint, not a fixable bug; team-lead accepted, folded
+as a disclosed-extrapolation-method caveat). The 16 GB/20-agent
+fit-answer below is therefore an **explicit extrapolation from the
+measured real per-daemon footprint** — exactly the #116 brief's
+"resource-vs-N curve + extrapolated-20 + mitigated-curve" deliverable;
+a true cgroup-OOM-kill observation is a post-launch hardening
+nice-to-have, not decision-changing.
+
+### 11.1 Result — arm-a model-A vs arm-b idle-evict, N=1,2,4,8
+
+| N | arm | peak (GiB) | **min** (GiB) | avg (GiB) | per-daemon peak | evict evidence (distinct_ra − init / min-vs-peak) |
+|---:|---|---:|---:|---:|---:|---|
+| 1 | a | 1.56 | 1.50 | 1.50 | 1.50 | 0 (RA resident throughout, as designed) |
+| 1 | **b** | 1.50 | **0.17** | 1.42 | 1.50 | **2 evict+respawn cycles; min = 88% RA-RSS freed** |
+| 2 | a | 2.95 | 2.95 | 2.95 | 1.47 | 0 |
+| 2 | **b** | 2.99 | 2.99 | 2.99 | 1.49 | **0 simultaneous (sporadic evict-respawn never aligned across both)** |
+| 4 | a | 6.22 | 6.10 | 6.10 | 1.55 | 0 |
+| 4 | **b** | 6.06 | **4.55** | 5.77 | 1.51 | **1 evict cycle; min = 1-of-4 RA freed (~25%)** |
+| 8 | a | 12.81 | 9.21 | 11.99 | 1.60 | 0 (the small min<peak is sampler-tick artefact) |
+| 8 | **b** | 12.45 | **7.56** | 11.44 | 1.56 | **4 evict cycles; min = 3-of-8 RAs simultaneously evicted (~39%)** |
+
+### 11.2 Honest interpretation — a layered, compound finding
+
+The data tells a layered story; flattening it to a single number
+would be the analogue of §9.5's all-files-vs-`.rs` trap.
+
+1. **Model-A (arm-a) is a clean linear curve, ~1.5 GiB/daemon, and
+   fails at fleet scale.** Extrapolating to 20 agents: **~30–32 GiB**;
+   a 16 GB host therefore **OOMs at ~10–11 model-A daemons**.
+   "Model-A is physically impossible at 20-agent fleet scale on a
+   16 GB host" is no longer a thesis — it is measured (single-
+   instance footprint extrapolated; not directly OOM-observed because
+   of the read-only-cgroup env constraint, see provenance above).
+2. **Idle-evict's per-event RAM reclaim is REAL and large** — 88 %
+   at N=1 (min 0.17 GiB on 1.50 GiB peak), and multi-daemon
+   simultaneous evictions captured at N=4 (~25 % min-vs-peak) and N=8
+   (~39 % min-vs-peak). The kill+supervisor-park+respawn mechanism
+   works as designed and delivers near-total RA-RSS reclaim per
+   eviction event.
+3. **But idle-evict's *sustained time-averaged* reduction is only
+   ~5 % at this regime** (~4.6 % at N=8 arm-b vs arm-a). Root cause
+   (verified from the v2 arm-b daemon log: `!! rust-analyzer
+   restarted — re-indexing; next verdict when ready`): the gate is
+   `flycheck_done && idle ≥ window`; on the Leptos fixture at N=8
+   concurrent, RA's re-index+flycheck per batch consumes ~65–70 s of
+   the 75 s gap → only ~5–10 s of qualifying idle per cycle → evict
+   fires, RSS collapses for those seconds, next batch immediately
+   respawns RA. **The realized steady-state benefit is workload-
+   shape-dependent — specifically a function of `gap / RA-busy-time`
+   per batch.** Minute-scale agent-think-gaps (the actual fleet
+   operating point — idle.rs module-doc: *"the gaps between agent-
+   edit-batches are long"*) and/or smaller-per-daemon-RA-cost projects
+   shift the ratio favorably; the bench's ~5 % is a **conservative
+   floor**, not a ceiling.
+4. **Idle-evict alone does NOT make model-A fit 16 GB at 20 agents
+   on a Leptos-class project.** Extrapolated: 20 × 1.55 GiB × (1 −
+   0.046) ≈ **29.6 GiB**, still ~1.85× the 16 GB cap.
+5. **The honest fit-answer is COMPOUND, not single-lever.** Combining
+   the report's existing measured levers:
+
+| compound path | per-daemon | 20 agents | fits 16 GB? |
+|---|---:|---:|---|
+| Tier-1/2 default (ab0d51b, §10) | ~1.5 GiB | ~30 GiB | NO (model-A fails) |
+| + idle-evict alone (bench regime) | ~1.43 GiB | ~28.6 GiB | NO (~5 % shave) |
+| **+ Tier-3 `--proc-macro disabled`** (#126 default-safe + #130 field-verified; report §5/A3 = 0.97 GiB) | **~0.97 GiB** | **~19.4 GiB** | **BORDERLINE** (+~3 GiB over; idle-evict margin pushes it closer) |
+| Tier-3 + idle-evict (real minute-gap fleet) | ~0.7–0.9 GiB | ~14–18 GiB | **PROBABLY YES** (idle-evict's larger reclaim at real gap-to-busy ratio) |
+| **`--features csr`** (project-narrowable only, §5/A4 = 0.53 GiB) | **~0.53 GiB** | **~10.6 GiB** | **YES — comfortable** |
+
+**The fleet-RAM existence answer therefore: Tier-3 (#126, landed
+default-safe) is the load-bearing rung; idle-evict (#122, landed
+default-off) is a complementary lever whose realized benefit scales
+with the fleet's `gap / RA-busy-time` ratio.** Together they bring
+the 20-agent / 16 GB-host case from "OOMs at ~10 agents" (model-A
+default) to "borderline-to-comfortable depending on workload."
+`--features csr` (where narrowable) makes it comfortable
+unconditionally. Idle-evict's *capability* (~88-97 % per-event
+reclaim, MEASURED) is fully validated; its *steady-state magnitude*
+on a slow-re-indexing fixture at high N is a conservative floor.
+
+### 11.3 Methodology audit trail (per discipline — superseded-with-reason)
+
+Three measurement attempts, each productively failed and root-caused
+from the daemon's *own* evidence (`/proc`, cli-status, daemon stdout
+log), not guessed; the discipline that caught each is the same the
+report turns on (the codebase / its instrument must *know* when it's
+broken and say so):
+
+- **v1 (discarded)** — RSS captured ~3 MB/daemon (impossible); root
+  cause: `setsid` forks cargoless into a new pgid ≠ the backgrounded
+  `$!`, so the pgid-scoped sum caught only the 3 MB supervisor and
+  missed the ~1 GB RA child (8 × 3 MB ≈ the 25 MB v1 artifact). Also
+  surfaced: `/sys/fs/cgroup` is read-only in this pod (the cgroup-cap
+  approach is infeasible here, disclosed methodology pivot above).
+- **v2 (arm-a kept, arm-b discarded)** — RSS correct (1.5 GiB/daemon
+  validated against a 1.02 GiB live single-daemon probe), but arm-b
+  under-exercised: 20 s gap consumed by RA re-index/flycheck → idle-
+  evict gate rarely satisfied → arm-b ≈ arm-a, a trace-design
+  artifact, NOT a product finding. v2's arm-a curve and the captured
+  per-eviction ~97 % reclaim (1.52 GB → 47 MB) survive as valid
+  measurements (linked from §11.2 evidence).
+- **v3 (this)** — IDLE_GAP=75 s so RA settles per batch then idle-
+  evict fires per cycle, eviction-tick + min-RSS attribution. Result
+  above.
 
 ---
 
