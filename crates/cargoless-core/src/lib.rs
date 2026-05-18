@@ -20,6 +20,7 @@ pub mod diagnostics_store;
 pub mod idle;
 pub mod lsp;
 pub mod model;
+pub mod multiplex;
 pub mod overlay;
 pub mod procmacro;
 pub mod recovery;
