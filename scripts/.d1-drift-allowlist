@@ -1,0 +1,73 @@
+# scripts/.d1-drift-allowlist — D1-completeness enforced invariant (#96)
+#
+# Format: <path>:<context-regex>
+#   A banned-token hit (tftrunk | tf[-_]{trunk,cli,proto,cas,core}) in the
+#   enforced scope (crates/ scripts/ .github/ .forgejo/ deploy/) MUST be on
+#   a line where this <context-regex> matches. The path+regex pair is
+#   high-precision: a future commit adding a banned token WITHOUT the
+#   matching context regex WILL fire scripts/d1-drift-guard.
+#
+# Comments allowed (#-prefixed lines), blank lines ignored.
+#
+# Companion: tf-multiverse is NOT in the banned token set (different
+# monorepo) — refs to it across the repo are NOT enforced here. The
+# guard's TOKEN_RE deliberately excludes `multiverse` so the 9 contextual
+# independence-narration tf-multiverse refs (scripts/ci-gate ×2,
+# deploy/cargoless-builder.k8s.yaml ×6, .forgejo/workflows/ci.yml ×1)
+# never enter the violation loop, requiring no allowlist entries.
+#
+# When you change a §9a wire-format byte-constant, the cargoless-cas
+# determinism suite goes RED (not this guard) — they enforce different
+# invariants. This file documents the design intent of the wire-consts.
+#
+# Lead-ratified allowlist spec, 2026-05-18, post-#136 baseline @ 491cf20.
+# See #96 task + the #136 landing report for the full justification chain.
+
+# ── (1) §9a frozen wire-format byte-constants — load-bearing
+#        Changing any of these = different InputHash = silent cache
+#        corruption. The cargoless-cas determinism suite catches the
+#        runtime effect; this allowlist documents the design intent.
+crates/cargoless-cas/src/identity.rs:b"tf-cas/(input-hash/v1|absent:)
+crates/cargoless-cas/src/tree.rs:b"tf-cas/source-tree/v1
+crates/cargoless-core/src/build.rs:b"tf-core/dist/v1
+crates/cargoless-core/src/structural.rs:b"tf-cas/input-hash/v1
+
+# ── (2) cargoless/Cargo.toml rename-provenance comments (#87 narration)
+#        3 comment lines documenting the tf-cli→cargoless [package]/[[bin]]
+#        + crate-dir rename. Each is the form `was placeholder \`tftrunk\``
+#        or `directory moved crates/tf-cli/ → crates/cargoless/`.
+crates/cargoless/Cargo.toml:(was placeholder `tftrunk`|directory moved crates/tf-cli|was tftrunk)
+
+# ── (3) #89 BUILD_ID drift-guard test literal + rationale comments
+#        The test ASSERTS BUILD_ID does NOT contain "tf-trunk" — the
+#        literal "tf-trunk" is load-bearing for the test mechanic.
+#        Six lines in crates/cargoless-core/src/lib.rs (test fn + 4
+#        rationale comments + 1 assertion message).
+crates/cargoless-core/src/lib.rs:tf-trunk
+
+# ── (4) watch.rs F13a/#89 rationale comment (paired with #89 narration)
+crates/cargoless/src/watch.rs:was the divergent site
+
+# (Allowlist section "(5) tf-multiverse" intentionally omitted — see header:
+#  the guard's TOKEN_RE excludes `multiverse`, so no allowlist entry is
+#  needed and adding one would be dead code never consulted.)
+
+# ── BOOTSTRAP: the drift-guard mechanism's OWN files
+#        These two files define the enforcement mechanism — the guard's
+#        TOKEN_RE (banned set) and this allowlist (allowed contexts) —
+#        so banned-token refs in them ARE the mechanism, by definition
+#        allowed. A future commit changing either file IS a change to
+#        the guard discipline itself and deserves independent review.
+#        Broad pattern is honest scoping: any line in these files that
+#        contains a banned token is part of the rules.
+scripts/d1-drift-guard:tftrunk|tf[-_](trunk|cli|proto|cas|core)
+scripts/.d1-drift-allowlist:tftrunk|tf[-_](trunk|cli|proto|cas|core)
+
+# ── (5) past-tense brand-rename narration in CI/release-infra
+#        ("was X pre-Y", "D1 RESOLVED", "pre-D1", "pre-#97", "at #87",
+#         "crate-dir moved tf-cli/", "renamed → cargoless", "was publish-tf")
+#        Annotated historical attribution preserved per the #136 principle:
+#        live imperative = current reality; historical record = annotated.
+#        A future stale ref WITHOUT this context fires the guard.
+.github/workflows/release.yml:(was |pre-D1|pre-#|D1 RESOLVED|crate-dir|→cargoless|renamed)
+.forgejo/workflows/ci.yml:(was |pre-#|module path was)

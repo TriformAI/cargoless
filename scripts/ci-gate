@@ -97,6 +97,36 @@ SHA="$(git -C "$REPO_ROOT" rev-parse --verify "${REF}^{commit}" 2>/dev/null)" \
   || die "ref '$REF' not found in local clone. Pass a local branch or a ref the lead already has."
 SHORT="$(git -C "$REPO_ROOT" rev-parse --short "$SHA")"
 
+# ── D1 brand-completion enforced invariant (#96) — fast local pre-flight ─────
+# Greps the gated ref's tree for banned old-brand tokens
+# (tftrunk | tf[-_]{trunk,cli,proto,cas,core}) in the brand-load-bearing
+# surface (crates/ scripts/ .github/ .forgejo/ deploy/) and asserts every
+# hit is on the committed scripts/.d1-drift-allowlist. Runs LOCALLY in the
+# invoking shell (no kubectl/pod work) so a brand-residual fails FAST
+# without burning a full pod build. Soft-skips when the guard is absent
+# (gracefully degrades on pre-#96 historical commits — keeps re-gating
+# old SHAs viable). See scripts/d1-drift-guard for scope/rationale.
+if [ -x "$REPO_ROOT/scripts/d1-drift-guard" ]; then
+  echo
+  echo "======================================================================"
+  echo "=== d1-drift :: scripts/d1-drift-guard $SHORT  [local pre-flight; no pod]"
+  echo "======================================================================"
+  if "$REPO_ROOT/scripts/d1-drift-guard" "$SHA"; then
+    echo "--- d1-drift: PASS"
+  else
+    echo "--- d1-drift: FAIL (D1 brand-residual outside allowlist — see violations above)"
+    echo
+    echo "======================================================================"
+    echo "=== ci-gate verdict   ref=$REF  sha=$SHORT  (d1-drift pre-flight FAILED)"
+    echo "======================================================================"
+    printf '  %-12s %s\n' "d1-drift" "FAIL"
+    echo "  (build/test/fmt/clippy/integ-* SKIPPED — pre-flight failed; pod work not started)"
+    echo "=== RESULT: RED — do NOT integrate $SHORT"
+    echo "    fix the residual OR add a justified scripts/.d1-drift-allowlist entry"
+    exit 1
+  fi
+fi
+
 POD="$(kubectl -n "$BUILDER_NS" get pod -l "$BUILDER_SEL" \
   --field-selector=status.phase=Running \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"

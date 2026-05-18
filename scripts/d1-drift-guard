@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# scripts/d1-drift-guard — enforces D1-completeness as a CI-time invariant (#96).
+#
+# WHY THIS EXISTS
+#   Across this session the D1 brand-rename (`tftrunk`→`cargoless` at #87)
+#   landed in 4 commits-with-residuals (lsp.rs, orphan/build/watch.rs,
+#   main.rs, statusfile.rs) — every parallel branch reintroduced stale old
+#   names because no enforced invariant existed; #97 added an analogous
+#   internal-crate rename (`tf-{proto,cas,core}`→`cargoless-*`) with the
+#   same surface. Per-branch rediscovery is unbounded. This guard makes
+#   D1-completeness a true invariant going forward: any commit reintroducing
+#   a banned old token in the brand-load-bearing surface fails ci-gate.
+#
+# WHAT IT CHECKS
+#   Greps the gated ref's tree for banned tokens
+#     tftrunk | tf[-_]{trunk,cli,proto,cas,core}
+#   in the ENFORCED SCOPE
+#     crates/  scripts/  .github/  .forgejo/  deploy/
+#   and asserts every hit is on the committed allowlist
+#     scripts/.d1-drift-allowlist   (path:context-regex format).
+#
+#   tf-multiverse is intentionally NOT in the banned set (it's the OTHER
+#   monorepo — references documenting "we're independent of tf-multiverse"
+#   are allowlisted by file).
+#
+# WHAT IT DOES NOT CHECK
+#   - docs/* (historical narration — that's #132's content-cleanup lane).
+#   - §9a wire-format byte-constant CORRECTNESS — changing one is caught
+#     by the cargoless-cas determinism suite at test time, not here. This
+#     guard merely documents the design intent (allowlist entry per const).
+#   - Build/test/lint correctness — that's ci-gate's existing 7 checks.
+#
+# HONEST SCOPE
+#   This is a NECESSARY-NOT-SUFFICIENT guard. It catches token-level
+#   residuals (a stale `tf-cli` or `tftrunk` re-appearing). It cannot catch
+#   semantic-level brand drift (e.g. a doc paragraph that uses old names
+#   without the literal token — vanishingly unlikely). The high-value
+#   class — `cargo publish -p tf-proto` in release.yml — IS caught (the
+#   token `tf-proto` would fire without the historical-context regex).
+#
+# USAGE
+#   scripts/d1-drift-guard [<ref>]      # default: HEAD
+#
+#   Exit codes:
+#     0 = clean (all hits allowlisted)
+#     1 = violation (≥1 banned-token hit outside allowlist)
+#     2 = setup error (missing allowlist file, no git repo, etc.)
+#
+# RUN CONTEXT
+#   - As a local pre-flight inside scripts/ci-gate (fail-fast, no pod work).
+#   - Standalone on any ref for ad-hoc audit.
+#   - Operates on a git REF (no working-tree dependency) — uses
+#     `git grep <ref>` so it can audit any commit without checkout.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  || { echo "::d1-drift:: not in a git repo" >&2; exit 2; }
+ALLOWLIST="${D1_DRIFT_ALLOWLIST:-$ROOT/scripts/.d1-drift-allowlist}"
+REF="${1:-HEAD}"
+
+# Banned old-brand tokens (D1 rename source side: #87 + #97).
+# Note: tf-multiverse is NOT in this regex (it's the other monorepo;
+# references to it are allowlisted by file).
+TOKEN_RE='tftrunk|tf[-_](trunk|cli|proto|cas|core)'
+
+# Enforced scope: code + CI + build infra. docs/* is out of scope here
+# (historical narration is #132's chartered lane).
+SCOPE=( crates scripts .github .forgejo deploy )
+
+[ -r "$ALLOWLIST" ] \
+  || { echo "::d1-drift:: allowlist not found: $ALLOWLIST" >&2; exit 2; }
+
+# Read allowlist: skip blank/comment lines.
+# Each entry: <path>:<context-regex>
+# A banned-token hit MUST be on a line where the regex matches.
+mapfile -t ALLOW < <(grep -vE '^[[:space:]]*(#|$)' "$ALLOWLIST")
+
+# Resolve ref to a SHA (validates existence + makes output stable).
+SHA="$(git -C "$ROOT" rev-parse --verify "${REF}^{commit}" 2>/dev/null)" \
+  || { echo "::d1-drift:: ref '$REF' not found" >&2; exit 2; }
+
+# Get all banned-token hits in the gated ref's tree.
+# `git grep <ref>` operates on the tree at that commit — no checkout.
+# Format: "<sha>:<path>:<lineno>:<line content>"
+HITS_RAW="$(git -C "$ROOT" grep -nE "$TOKEN_RE" "$SHA" -- "${SCOPE[@]}" 2>/dev/null || true)"
+
+violations=0
+total_hits=0
+allowed_hits=0
+
+if [ -n "$HITS_RAW" ]; then
+  while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    total_hits=$((total_hits + 1))
+    # Strip "<sha>:" prefix from `git grep <ref>` output.
+    rest="${hit#*:}"
+    path="${rest%%:*}"
+    rest="${rest#*:}"
+    lineno="${rest%%:*}"
+    content="${rest#*:}"
+
+    allowed=0
+    for entry in "${ALLOW[@]}"; do
+      apath="${entry%%:*}"
+      apat="${entry#*:}"
+      [ "$path" = "$apath" ] || continue
+      if printf '%s\n' "$content" | grep -qE -- "$apat"; then
+        allowed=1
+        break
+      fi
+    done
+
+    if [ "$allowed" -eq 1 ]; then
+      allowed_hits=$((allowed_hits + 1))
+    else
+      printf '::d1-drift:: VIOLATION  %s:%s\n              %s\n' \
+        "$path" "$lineno" "$content" >&2
+      violations=$((violations + 1))
+    fi
+  done <<< "$HITS_RAW"
+fi
+
+if [ "$violations" -gt 0 ]; then
+  {
+    printf '\n::d1-drift:: %d unallowlisted D1-residual(s) under %s (%s)\n' \
+      "$violations" "$REF" "$(git -C "$ROOT" rev-parse --short "$SHA")"
+    printf '            EITHER fix the residual (preferred — D1-rename completion is the v0 brand)\n'
+    printf '            OR add a justified entry to scripts/.d1-drift-allowlist\n'
+    printf '            (format: <path>:<context-regex>; see file header).\n'
+  } >&2
+  exit 1
+fi
+
+echo "[d1-drift-guard] ${total_hits} hit(s) under ${REF} ($(git -C "$ROOT" rev-parse --short "$SHA")), ${allowed_hits} allowlisted, 0 violations ✓"
+exit 0
