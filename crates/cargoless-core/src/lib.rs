@@ -20,6 +20,7 @@ pub mod lsp;
 pub mod model;
 pub mod procmacro;
 pub mod repo;
+pub mod shutdown;
 pub mod structural;
 pub mod watcher;
 
