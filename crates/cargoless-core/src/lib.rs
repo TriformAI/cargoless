@@ -15,6 +15,7 @@ pub mod barrier;
 pub mod build;
 pub mod cache_layout;
 pub mod cluster;
+pub mod clustermgr;
 pub mod config;
 pub mod corun;
 pub mod diagnostics_store;
