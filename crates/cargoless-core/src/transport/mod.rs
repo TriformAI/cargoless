@@ -228,6 +228,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 impl Authorizer for BearerToken {
     fn authorize(&self, token: Option<&str>) -> bool {
+        // Consumer-side make-the-bad-state-unrepresentable (CWDL #197):
+        // a BearerToken whose configured secret is empty or
+        // whitespace-only authorizes NOTHING. Even if some future config
+        // path reconstructed an empty-secret bearer, it fails CLOSED
+        // (deny → 401) — never an empty-`Authorization: Bearer ` bypass.
+        // `[].iter().all(..)` is vacuously true ⇒ an empty secret denies.
+        if self.secret.iter().all(u8::is_ascii_whitespace) {
+            return false;
+        }
         match token {
             // No credential presented ⇒ deny (HTTP adapter → 401).
             None => false,
@@ -259,8 +268,15 @@ pub fn authorizer_for(cfg: &FleetConfig) -> Result<Arc<dyn Authorizer>, FleetCon
     // Fail closed first: a network-reachable bind with no token is
     // refused here, not downgraded to permissive.
     cfg.security_check()?;
-    Ok(match &cfg.auth_token {
-        Some(secret) => Arc::new(BearerToken::new(secret.clone())),
+    // Single source of truth for "an effective secret exists" (CWDL
+    // #197): a blank (empty / whitespace-only) configured token is NOT a
+    // token — `effective_auth_token()` returns `None`, so a blank token
+    // yields `AllowAll` only where `security_check` already permits it
+    // (loopback / no bind); a non-loopback blank token was refused by
+    // `security_check` above. No `BearerToken` is ever built from a
+    // blank secret.
+    Ok(match cfg.effective_auth_token() {
+        Some(secret) => Arc::new(BearerToken::new(secret)),
         None => Arc::new(AllowAll),
     })
 }
@@ -591,6 +607,54 @@ mod tests {
             !a.authorize(None),
             "public bind w/ bearer ⇒ no-token denied"
         );
+    }
+
+    // ───────── CWDL #197: blank secret is not auth ─────────
+
+    #[test]
+    fn authorizer_for_non_loopback_blank_token_fails_closed() {
+        // A blank (empty / whitespace-only) auth_token on a public bind
+        // is treated as NO token ⇒ security_check refusal — never a
+        // silent AllowAll or an empty-bearer on an off-host socket.
+        for blank in ["", "   ", "\t "] {
+            let c = cfg_bind_token(Some("0.0.0.0:8080"), Some(blank));
+            let r = authorizer_for(&c);
+            assert!(
+                matches!(r, Err(FleetConfigError::BadBind { .. })),
+                "non-loopback + blank {blank:?} MUST refuse (got Ok ⇒ \
+                 unauthenticated public socket)"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_with_empty_or_blank_secret_authorizes_nothing() {
+        // Consumer-side make-the-bad-state-unrepresentable: even if an
+        // empty/blank-secret BearerToken were constructed by some path,
+        // it denies EVERY request (fail-closed → 401), never an
+        // empty-`Bearer ` bypass.
+        for blank in ["", "   ", "\t"] {
+            let bt = BearerToken::new(blank);
+            assert!(!bt.authorize(None), "blank-secret bearer denies None");
+            assert!(
+                !bt.authorize(Some("")),
+                "blank-secret bearer denies empty presented"
+            );
+            assert!(
+                !bt.authorize(Some(blank)),
+                "blank-secret bearer denies the blank itself"
+            );
+            assert!(
+                !bt.authorize(Some("anything")),
+                "blank-secret bearer denies any token"
+            );
+        }
+        // A loopback bind with a blank token ⇒ no token ⇒ AllowAll
+        // (unchanged #10 localhost posture; blank only ever downgrades
+        // where security_check already permits open).
+        let c = cfg_bind_token(Some("127.0.0.1:8080"), Some("  "));
+        let a = authorizer_for(&c).expect("loopback blank ⇒ AllowAll, not Err");
+        assert!(a.authorize(None), "loopback no-effective-token ⇒ AllowAll");
     }
 
     #[test]
