@@ -83,9 +83,14 @@ const PIN_MARKER: &str = "PIN";
 /// Scheme version for the combined-corun key preimage. Bumping this is a
 /// deliberate, repo-visible move of the entire corun keyspace (every prior
 /// `combined/<key>` becomes unreachable) — never silent, exactly like
-/// `cargoless-cas`'s `tf-cas/input-hash/v1`. The distinct path segment
-/// (`combined-overlay-set`) guarantees a corun key can never collide with a
-/// build-identity `InputHash` even at the same SHA-256 primitive.
+/// `cargoless-cas::identity`'s frozen `input_hash` SCHEME constant. (That
+/// constant's own wire string is a §9a-frozen pre-rename literal, kept
+/// verbatim + allowlisted *there* because renaming it would move the whole
+/// CAS keyspace; this brand-new corun keyspace deliberately uses a
+/// cargoless-branded scheme tag instead — no old-brand residual.) The
+/// distinct path segment (`combined-overlay-set`) guarantees a corun key
+/// can never collide with a build-identity `InputHash` even at the same
+/// SHA-256 primitive.
 const COMBINED_SCHEME: &[u8] = b"cargoless/cache/combined-overlay-set/v1";
 
 /// Content hash of one worktree's overlay-set (the `git diff base..<wt>` file
