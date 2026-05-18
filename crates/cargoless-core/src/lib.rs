@@ -12,6 +12,7 @@
 pub mod analyzer;
 pub mod build;
 pub mod cache_layout;
+pub mod corun;
 pub mod idle;
 pub mod lsp;
 pub mod model;
