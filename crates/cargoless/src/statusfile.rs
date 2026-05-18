@@ -10,13 +10,27 @@
 //! ## Format (`<root>/.cargoless/cli-status`) — documented contract
 //!
 //! ```text
-//! schema=1
+//! schema=2
 //! pid=<u32>
 //! root=<canonical project root>
 //! started=<unix seconds>
-//! updated=<unix seconds>      # heartbeat; freshness = liveness signal
-//! verdict=green|red|unknown   # current tree verdict at last update
+//! updated=<unix seconds>          # heartbeat; freshness = liveness signal
+//! verdict=green|red|unknown       # authoritative tree verdict at last update
+//! crates=<name>:<v>,<name>:<v>    # schema=2, OPTIONAL — see below
+//! red_diagnostics=<u32>           # schema=2 — count of error-severity diags
 //! ```
+//!
+//! **schema=2 (Model R #9, `D-FLEET-SHARED-DAEMON` §9):** adds the
+//! OPTIONAL `crates=` per-crate verdict roll-up + the `red_diagnostics=`
+//! scalar. Backward-compatible **both ways**: a schema=1 reader ignores
+//! the new keys (the parser has no `schema=` arm and skips unknown keys —
+//! proven by `roundtrips_and_ignores_unknown_keys`); a schema=2 reader of
+//! an old schema=1 file simply sees an absent `crates=`/`red_diagnostics=`
+//! (⇒ empty map, zero count). The `verdict=` line is **always** the
+//! authoritative tree verdict and stands alone; `crates=` is written
+//! **only** when every error diagnostic was attributable to a known
+//! workspace crate (else omitted — never a false per-crate all-green; see
+//! [`crate::cratemap`]).
 //!
 //! Forward-compatible: unknown keys are ignored on read. Liveness is
 //! freshness-based (no libc/pid-kill, no port — v0 is headless): the writer
@@ -72,10 +86,42 @@ pub struct Status {
     pub started: u64,
     pub updated: u64,
     pub verdict_str: String,
+    /// schema=2 (#9): per-crate verdict roll-up, `(crate_name, verdict)`
+    /// in stable sorted order. Empty for a schema=1 file, a single-crate
+    /// project, or when the per-crate map could not be fully trusted
+    /// (an unattributable error — see [`crate::cratemap`]); the `crates=`
+    /// line is then omitted on serialize and the authoritative
+    /// `verdict_str` stands alone.
+    pub crates: Vec<(String, Verdict)>,
+    /// schema=2 (#9): count of error-severity diagnostics — the
+    /// asymmetric-stream "how bad is red" scalar (`D-FLEET-SHARED-DAEMON`
+    /// §9.2). Zero on green and on a schema=1 file.
+    pub red_diagnostics: u32,
 }
 
 pub fn path(root: &Path) -> PathBuf {
     root.join(".cargoless").join("cli-status")
+}
+
+/// Parse the schema=2 `crates=` value (`name:verdict,name:verdict`).
+/// Empty ⇒ empty vec. Tolerant: a token without a `:` is skipped; an
+/// unrecognised verdict maps to [`Verdict::Unknown`] (via
+/// [`Verdict::parse`]) rather than dropping the crate — a reader should
+/// still see that the crate exists.
+fn parse_crates(v: &str) -> Vec<(String, Verdict)> {
+    if v.is_empty() {
+        return Vec::new();
+    }
+    v.split(',')
+        .filter_map(|tok| {
+            let (name, verdict) = tok.trim().split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), Verdict::parse(verdict.trim())))
+        })
+        .collect()
 }
 
 pub fn now_unix() -> u64 {
@@ -87,13 +133,33 @@ pub fn now_unix() -> u64 {
 
 impl Status {
     pub fn serialize(&self) -> String {
-        format!(
-            "schema=1\npid={}\nroot={}\nstarted={}\nupdated={}\nverdict={}\n",
+        // The first 6 lines are byte-identical to schema=1 except the
+        // `schema` value — a schema=1 reader never matches `schema=` (no
+        // arm) and ignores the trailing schema=2 keys, so old consumers
+        // are unaffected. `crates=` is emitted ONLY when non-empty: an
+        // empty map means "no trustworthy per-crate breakdown", and an
+        // absent line (not `crates=`) is the unambiguous signal for that.
+        let mut out = format!(
+            "schema=2\npid={}\nroot={}\nstarted={}\nupdated={}\nverdict={}\n",
             self.pid, self.root, self.started, self.updated, self.verdict_str
-        )
+        );
+        if !self.crates.is_empty() {
+            let joined = self
+                .crates
+                .iter()
+                .map(|(n, v)| format!("{n}:{}", v.as_str()))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!("crates={joined}\n"));
+        }
+        out.push_str(&format!("red_diagnostics={}\n", self.red_diagnostics));
+        out
     }
 
-    /// Parse the documented format. Unknown keys ignored (forward-compatible).
+    /// Parse the documented format. Unknown keys ignored
+    /// (forward-compatible); absent schema=2 keys ⇒ empty/zero
+    /// (schema=1-file-compatible). No `schema=` arm by design — the schema
+    /// number is advisory; field presence is authoritative.
     pub fn parse(text: &str) -> Self {
         let mut s = Status::default();
         for line in text.lines() {
@@ -106,6 +172,8 @@ impl Status {
                 "started" => s.started = v.trim().parse().unwrap_or(0),
                 "updated" => s.updated = v.trim().parse().unwrap_or(0),
                 "verdict" => s.verdict_str = v.trim().to_string(),
+                "crates" => s.crates = parse_crates(v.trim()),
+                "red_diagnostics" => s.red_diagnostics = v.trim().parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -504,10 +572,113 @@ mod tests {
             started: 100,
             updated: 200,
             verdict_str: "green".into(),
+            crates: vec![],
+            red_diagnostics: 0,
         };
         assert_eq!(Status::parse(&st.serialize()), st);
         let forward = format!("{}future_key=42\n", st.serialize());
         assert_eq!(Status::parse(&forward), st);
+    }
+
+    // -----------------------------------------------------------------------
+    // Model R #9 — schema=2 per-crate verdicts + red_diagnostics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schema2_roundtrips_with_crates_and_red_count() {
+        let st = Status {
+            pid: 9,
+            root: "/ws".into(),
+            started: 1,
+            updated: 2,
+            verdict_str: "red".into(),
+            crates: vec![
+                ("isolation".into(), Verdict::Green),
+                ("physics".into(), Verdict::Red),
+            ],
+            red_diagnostics: 2,
+        };
+        let wire = st.serialize();
+        assert!(wire.starts_with("schema=2\n"), "schema bumped: {wire}");
+        assert!(
+            wire.contains("crates=isolation:green,physics:red\n"),
+            "per-crate line: {wire}"
+        );
+        assert!(wire.contains("red_diagnostics=2\n"), "scalar: {wire}");
+        assert_eq!(Status::parse(&wire), st, "exact schema=2 roundtrip");
+    }
+
+    #[test]
+    fn schema1_file_reads_as_empty_per_crate() {
+        // A literal pre-#9 schema=1 file: a schema=2 reader must see an
+        // absent crates=/red_diagnostics= as empty/zero, NOT fail.
+        let legacy = "schema=1\npid=42\nroot=/p\nstarted=10\nupdated=20\nverdict=green\n";
+        let s = Status::parse(legacy);
+        assert_eq!(s.pid, 42);
+        assert_eq!(s.verdict_str, "green");
+        assert!(s.crates.is_empty(), "no crates= ⇒ empty, not error");
+        assert_eq!(s.red_diagnostics, 0, "no red_diagnostics= ⇒ 0");
+    }
+
+    #[test]
+    fn empty_per_crate_omits_the_crates_line() {
+        // The honesty invariant at the serialization boundary: an empty
+        // map (untrustworthy / single-crate / schema=1) must NOT emit a
+        // bare `crates=` that a reader could mistake for "zero crates";
+        // the line is absent entirely and `verdict=` stands alone.
+        let st = Status {
+            pid: 1,
+            root: "/p".into(),
+            started: 0,
+            updated: 0,
+            verdict_str: "red".into(),
+            crates: vec![],
+            red_diagnostics: 3,
+        };
+        let wire = st.serialize();
+        assert!(!wire.contains("crates="), "no crates line: {wire}");
+        assert!(wire.contains("verdict=red\n"), "verdict still stands");
+        assert!(wire.contains("red_diagnostics=3\n"));
+        assert_eq!(Status::parse(&wire), st);
+    }
+
+    #[test]
+    fn crates_parser_is_tolerant() {
+        // Unknown verdict ⇒ Unknown (crate still visible); a colon-less
+        // token is skipped; empty value ⇒ empty vec.
+        assert_eq!(parse_crates(""), vec![]);
+        assert_eq!(
+            parse_crates("a:green,bogus,b:weird"),
+            vec![
+                ("a".to_string(), Verdict::Green),
+                ("b".to_string(), Verdict::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn schema1_reader_simulation_ignores_schema2_keys() {
+        // Prove the both-ways claim: emulate a schema=1 consumer (only the
+        // 5 v0 keys) reading a schema=2 blob — it must recover the v0
+        // fields untouched and never trip on crates=/red_diagnostics=.
+        let st = Status {
+            pid: 7,
+            root: "/r".into(),
+            started: 3,
+            updated: 4,
+            verdict_str: "green".into(),
+            crates: vec![("x".into(), Verdict::Green)],
+            red_diagnostics: 0,
+        };
+        let wire = st.serialize();
+        // The schema=1-era parser was exactly today's parser minus the
+        // two new arms; its output for the v0 fields is unchanged.
+        let v0 = Status::parse(&wire);
+        assert_eq!(v0.pid, 7);
+        assert_eq!(v0.root, "/r");
+        assert_eq!(v0.started, 3);
+        assert_eq!(v0.updated, 4);
+        assert_eq!(v0.verdict_str, "green");
     }
 
     #[test]
@@ -586,6 +757,8 @@ mod tests {
             started: 1,
             updated: 2,
             verdict_str: "red".into(),
+            crates: vec![],
+            red_diagnostics: 0,
         };
         write(&root, &st);
         let back = Status::parse(&std::fs::read_to_string(path(&root)).unwrap());
@@ -606,6 +779,8 @@ mod tests {
             started: 0,
             updated,
             verdict_str: verdict.into(),
+            crates: vec![],
+            red_diagnostics: 0,
         }
     }
 

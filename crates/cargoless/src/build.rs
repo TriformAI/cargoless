@@ -219,6 +219,17 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 started,
                 updated: statusfile::now_unix(),
                 verdict_str: verdict.as_str().to_string(),
+                // Model R #9 scope boundary (deliberate, not an
+                // oversight): the per-crate roll-up is wired into the
+                // `watch` path (the agent-gating use case in
+                // `D-FLEET-SHARED-DAEMON` §9). `build --watch` is the
+                // publisher path; it emits a valid schema=2 file with NO
+                // `crates=` line — the honesty invariant (never a false
+                // per-crate all-green) holds trivially and `verdict=`
+                // stays authoritative. Per-crate for the publisher path
+                // is a tracked follow-up, not a silent degradation.
+                crates: Vec::new(),
+                red_diagnostics: 0,
             },
         );
     };
