@@ -566,7 +566,8 @@ mod tests {
         let r = authorizer_for(&c);
         assert!(
             matches!(r, Err(FleetConfigError::BadBind { .. })),
-            "non-loopback + no token MUST be a refused config error, got {r:?}"
+            "non-loopback + no token MUST be a refused config error \
+             (Ok would mean a public socket got a silent AllowAll)"
         );
     }
 
