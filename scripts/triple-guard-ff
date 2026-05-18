@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+#
+# scripts/triple-guard-ff — the structural literal-fast-forward guard for
+# integrating a ci-gate-verified SHA onto `main`.
+#
+# WHY THIS EXISTS
+#
+# Integration onto the always-green `main` is a literal, non-force
+# fast-forward of a ci-gate-verified SHA. The safety of that push rests
+# on a small set of invariants that MUST all hold. Historically these
+# were an inline-bash "triple-guard" the integrator echoed per push; one
+# of the checks (`g2`) was formulated `origin/main == HEAD~1`, which only
+# models a *single-commit* cherry-pick. A legitimate *multi-commit*
+# cascade cherry-pick (N>1) made `HEAD~1 != origin/main`, the inline
+# guard *echoed* a STOP but the shell composition did not abort, and the
+# push proceeded (the outcome was independently verified a safe pure ff,
+# but the discipline depended on remembering to stop — textual, not
+# structural).
+#
+# This script is the fix-forward (directed; standing-protocol + future
+# cycles). Two properties, by construction:
+#
+#  1. generalized-g2 — correct for ANY N>=1:
+#       g1  WT HEAD == the ci-gate-verified SHA
+#       g2a origin/main == the intended cherry-pick base
+#           (the REAL "base did not move under me / no other agent
+#            advanced main" concern — correct for any N, where the old
+#            HEAD~1 form was a too-narrow N==1 proxy)
+#       g2b origin/main..GATED == exactly the intended commit set:
+#           a linear range (no merges), count == EXPECTED_N when given
+#       g3  origin/main is-ancestor-of GATED  (⇒ pure fast-forward,
+#           no divergence, no history rewrite)
+#       no-force: the refspec is constructed here as the literal
+#           `<sha>:refs/heads/main`; there is no code path that adds
+#           `--force`/`-f`/`+`.
+#
+#  2. structural hard-exit — the push is UNREACHABLE unless every check
+#     passed. `set -euo pipefail` + each check `|| die` + the `git push`
+#     as the final statement ⇒ a failed check exits non-zero *before*
+#     control can reach the push. "Skip the stop" is unrepresentable,
+#     not a thing you must remember to do (the same
+#     make-the-bad-state-unrepresentable principle the proven cores use,
+#     applied to the guard itself).
+#
+# USAGE
+#   scripts/triple-guard-ff <gated-sha> <intended-base-sha> [expected-N]
+#                           [--dry-run] [--assume-origin-main <sha>]
+#
+#   <gated-sha>          the SHA scripts/ci-gate verified 7/7 ALL GREEN
+#                        (MUST equal the current worktree HEAD).
+#   <intended-base-sha>  the SHA the increment was cherry-picked ONTO
+#                        (= origin/main at branch-creation time).
+#   [expected-N]         optional: the exact number of commits the
+#                        cherry-pick added (origin/main..GATED). When
+#                        given it is asserted (defence-in-depth; the
+#                        integrator SHOULD pass it). When omitted, the
+#                        range is still required linear + >=1 + a true
+#                        fast-forward.
+#   --dry-run            run every check, print the verdict, but DO NOT
+#                        push (self-test / rehearsal).
+#   --assume-origin-main <sha>
+#                        (test only) use <sha> as origin/main instead of
+#                        fetching — lets the check logic be exercised
+#                        against historical (base,gated,N) tuples and
+#                        adversarial negatives without a live remote.
+#
+# EXIT 0 iff all checks pass AND (the push succeeded OR --dry-run).
+# EXIT non-zero (and NO push) on ANY failed check — that is the point.
+set -euo pipefail
+
+prog=${0##*/}
+die() { printf '%s: FAIL: %s\n' "$prog" "$*" >&2; exit 1; }
+ok()  { printf '%s: ok: %s\n'  "$prog" "$*"; }
+
+# ---- args -----------------------------------------------------------
+GATED=""
+BASE=""
+EXPECT_N=""
+DRY_RUN=0
+ASSUME_OM=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --assume-origin-main) ASSUME_OM="${2:-}"; shift 2 ;;
+    --*) die "unknown flag: $1" ;;
+    *)
+      if   [ -z "$GATED" ]; then GATED="$1"
+      elif [ -z "$BASE"  ]; then BASE="$1"
+      elif [ -z "$EXPECT_N" ]; then EXPECT_N="$1"
+      else die "unexpected extra argument: $1"
+      fi
+      shift ;;
+  esac
+done
+
+[ -n "$GATED" ] || die "missing <gated-sha> (the ci-gate-verified SHA)"
+[ -n "$BASE"  ] || die "missing <intended-base-sha> (the cherry-pick base)"
+
+# Resolve to full 40-hex object names; reject anything that is not a
+# real commit (a literal SHA in the refspec also defeats the historical
+# \$VAR:refs/heads/main shell-mangle trap).
+GATED=$(git rev-parse --verify "${GATED}^{commit}") \
+  || die "gated-sha is not a commit: ${GATED}"
+BASE=$(git rev-parse --verify "${BASE}^{commit}") \
+  || die "intended-base-sha is not a commit: ${BASE}"
+case "$GATED" in
+  ????????????????????????????????????????) : ;;
+  *) die "resolved gated-sha is not a 40-hex object: $GATED" ;;
+esac
+
+if [ -n "$EXPECT_N" ]; then
+  case "$EXPECT_N" in
+    ''|*[!0-9]*) die "expected-N must be a positive integer: $EXPECT_N" ;;
+  esac
+  [ "$EXPECT_N" -ge 1 ] || die "expected-N must be >= 1: $EXPECT_N"
+fi
+
+# ---- g1: WT HEAD == the ci-gate-verified SHA ------------------------
+WT_HEAD=$(git rev-parse --verify HEAD)
+[ "$WT_HEAD" = "$GATED" ] \
+  || die "g1: worktree HEAD ($WT_HEAD) != gated-sha ($GATED) — the verdict does not transfer to an un-gated tree"
+ok "g1 WT-HEAD == gated-sha ($GATED)"
+
+# ---- resolve origin/main (live, unless --assume-origin-main) --------
+if [ -n "$ASSUME_OM" ]; then
+  OM=$(git rev-parse --verify "${ASSUME_OM}^{commit}") \
+    || die "--assume-origin-main is not a commit: ${ASSUME_OM}"
+  ok "origin/main ASSUMED = $OM (test mode; no fetch)"
+else
+  git fetch origin --quiet || die "git fetch origin failed"
+  OM=$(git rev-parse --verify origin/main) \
+    || die "cannot resolve origin/main"
+  ok "origin/main (fetched) = $OM"
+fi
+
+# ---- g2a: origin/main == intended cherry-pick base ------------------
+# The REAL "did main move under me / did another agent advance it"
+# check — correct for ANY N (the old `origin/main == HEAD~1` was a
+# single-commit-only proxy that mis-fired on a legitimate N>1 range).
+[ "$OM" = "$BASE" ] \
+  || die "g2a: origin/main ($OM) != intended cherry-pick base ($BASE) — base moved (another integration landed?); re-branch onto then-current main + re-gate. NOT a false positive: STOP."
+ok "g2a origin/main == intended-base ($BASE) — base unmoved"
+
+# ---- g3: origin/main is-ancestor-of GATED (pure fast-forward) -------
+git merge-base --is-ancestor "$OM" "$GATED" \
+  || die "g3: origin/main ($OM) is NOT an ancestor of gated ($GATED) — divergence / would require a non-fast-forward or force. STOP."
+ok "g3 origin/main is-ancestor-of gated — pure fast-forward (no divergence/rewrite)"
+
+# ---- g2b: origin/main..GATED == exactly the intended commit set ----
+# Linear (no merge commits), at least one commit, and == EXPECTED_N
+# when the integrator declared it. Given g2a (origin/main == base) and
+# g3 (ff), this range is exactly the commits the cherry-pick added.
+RANGE_N=$(git rev-list --count "${OM}..${GATED}")
+[ "$RANGE_N" -ge 1 ] \
+  || die "g2b: origin/main..gated is empty — nothing to integrate"
+MERGES_IN_RANGE=$(git rev-list --count --merges "${OM}..${GATED}")
+[ "$MERGES_IN_RANGE" -eq 0 ] \
+  || die "g2b: origin/main..gated contains $MERGES_IN_RANGE merge commit(s) — a cascade cherry-pick must be a LINEAR range. STOP."
+if [ -n "$EXPECT_N" ]; then
+  [ "$RANGE_N" -eq "$EXPECT_N" ] \
+    || die "g2b: origin/main..gated has $RANGE_N commit(s), integrator declared $EXPECT_N — unexpected commit count (foreign/missing commit?). STOP."
+  ok "g2b origin/main..gated == exactly $RANGE_N commit(s) (== declared N), linear"
+else
+  ok "g2b origin/main..gated == $RANGE_N commit(s), linear (no expected-N declared)"
+fi
+
+# ---- ALL CHECKS PASSED — only now is the push reachable ------------
+# Structural: every check above either passed or `die`d (exit 1) under
+# `set -e`. There is NO control path that reaches this line without all
+# of g1/g2a/g2b/g3 holding. The refspec is the literal verified SHA;
+# there is no --force/-f/+ anywhere in this script.
+if [ "$DRY_RUN" -eq 1 ]; then
+  ok "DRY-RUN: all guards passed; would push ${GATED}:refs/heads/main (NO push performed)"
+  exit 0
+fi
+
+printf '%s: pushing literal fast-forward %s..%s -> main\n' "$prog" "$OM" "$GATED"
+git push origin "${GATED}:refs/heads/main"
+
+# ---- post-push verify ----------------------------------------------
+git fetch origin --quiet || die "post-push: git fetch failed"
+NOM=$(git rev-parse --verify origin/main)
+[ "$NOM" = "$GATED" ] \
+  || die "post-push: origin/main ($NOM) != gated ($GATED) — push did not land as expected"
+git merge-base --is-ancestor "$BASE" "$NOM" \
+  || die "post-push: intended base is not an ancestor of the new origin/main — UNEXPECTED"
+ok "FF-CONFIRMED: origin/main == $GATED (pure ff from $BASE; no force, no divergence)"
+printf '%s: NOTE: mirror-verify (GitHub == Forgejo == %s) is a separate non-skippable gate — run it next.\n' "$prog" "$GATED"

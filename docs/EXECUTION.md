@@ -222,3 +222,39 @@ before; the lead runs `scripts/ci-gate <branch>` and merges into `main` only
 on `ALL GREEN`. The warm PVC target cache makes repeat runs a relink, not a
 from-scratch rebuild. Forgejo CI still runs per-branch as the durable record;
 `ci-gate` is the fast readable gate that actually unblocks merges.
+
+**Structural fast-forward guard (`scripts/triple-guard-ff`).** A
+ci-gate-verified SHA is integrated by a literal, non-force fast-forward of
+`main`. That push goes **through `scripts/triple-guard-ff`, never a bare
+`git push <sha>:refs/heads/main`** — the guard is the single source of truth
+for ff-safety and it enforces it *structurally*:
+
+```
+scripts/triple-guard-ff <gated-sha> <intended-base-sha> [expected-N]
+```
+
+It checks, before pushing:
+
+* **g1** worktree HEAD == the ci-gate-verified SHA (verdict-transfer: a
+  rebase/cherry-pick mints a new SHA ⇒ that exact SHA must be the gated one);
+* **g2a** `origin/main` == the intended cherry-pick base — the real "did
+  another integration land under me" check, correct for **any** N (the
+  retired inline form `origin/main == HEAD~1` only modelled a single-commit
+  cherry-pick and mis-fired on a legitimate N-commit cascade range);
+* **g2b** `origin/main..GATED` is a **linear** range (no merges), and ==
+  `expected-N` when the integrator declares it (defence-in-depth — pass it);
+* **g3** `origin/main` is-ancestor-of `GATED` ⇒ a pure fast-forward, no
+  divergence, no history rewrite.
+
+The `git push` is the **final statement**, reachable only after every check
+passed under `set -euo pipefail`; any failed check `exit`s non-zero *before*
+the push exists in the control flow, and the refspec is the literal verified
+SHA (no `--force`/`-f`/`+` anywhere). "Skip the stop" is therefore
+**unrepresentable**, not a discipline you must remember — the same
+make-the-bad-state-unrepresentable principle the proven cores use, applied to
+the integration guard itself. Any guard failure is a hard STOP + surface to
+the lead, **never** a documented-override candidate (the override is only for
+a heuristic mis-flag of a *proven-safe* push; a triple-guard-ff failure means
+the push is *not* proven safe). `--dry-run` rehearses every check without
+pushing. After a successful ff, `mirror-verify` (GitHub == Forgejo == SHA)
+remains a separate non-skippable gate.
