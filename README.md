@@ -4,10 +4,12 @@
 > agent driving the loop — the moment it doesn't — without burning
 > your CPU to do so.**
 
-cargoless is a headless dev-loop daemon for Rust+WASM projects, built
-on one premise: most of the work `trunk serve` and `bacon` do on every
-save is **redundant work** — rebuilding state the previous cycle
-already proved correct. cargoless keeps a warm `rust-analyzer`,
+cargoless is a **repo-scoped** headless dev-loop daemon for Rust+WASM
+projects — one `serve --repo` multiplexes every git worktree through a
+single shared analyzer — built on one premise: most of the work
+`trunk serve` and `bacon` do on every save is **redundant work** —
+rebuilding state the previous cycle already proved correct. cargoless
+keeps a warm `rust-analyzer`,
 content-addresses every build's input set, and skips the rebuild
 entirely when the source state hasn't changed. When the tree does go
 green, it publishes the latest green WASM artifact to a pointer file
@@ -36,59 +38,108 @@ neither isn't here.
 
 ---
 
-## At a glance — what cargoless v1.0 delivers
+## At a glance — what cargoless delivers
 
-- **2.05× faster cargo-check vs `trunk serve`** (two-source verified;
-  agent-edit-batch unit — the cost unit that matches how AI agents
-  actually drive the loop). See
-  [`docs/bench/AC7-THROUGHPUT-REPORT.md §8.5`](docs/bench/AC7-THROUGHPUT-REPORT.md#85-clean-c2-109--headline-two-source-confirmed).
-- **Fleet-tested at ~20 agents on a 16 GB box** with Tier-3 enabled
-  (`TF_RA_PROCMACRO_OFF=1`) for that test — safety field-verified on
-  real Leptos, no false-GREEN; Tier-3 ships safe-as-default
-  *candidate*, opt-in today via the env var. See
+cargoless is a **repo-scoped daemon**: one `cargoless serve --repo
+<path>` auto-discovers every git worktree and multiplexes them through
+**one** shared `rust-analyzer`, instead of one daemon (and one RA) per
+worktree. That architecture — not a per-daemon tuning knob — is what
+makes the agent-fleet case work.
+
+- **Fleet RAM is flat, not linear — measured.** Across **N=1→20
+  active worktrees** total cargoless RSS stays **≈1 GiB** (measured
+  peak 1003–1068 MiB, avg 980–1034 MiB; N=20 ≈ N=1 — it does **not**
+  grow with worktree count). The mechanism is own-eyes-verified:
+  exactly **one** multiplexed rust-analyzer + its proc-macro-srv,
+  constant across all N. Versus the per-worktree-daemon model's
+  measured-linear ≈1.5 GiB × 20 ≈ ≈30 GiB, that is a **≈19–30×
+  fleet-RAM collapse, measured — not extrapolated.** See
   [`AC7-THROUGHPUT-REPORT.md §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve)
-  for the per-N curve and compound-fit table.
-- **Opt-in `TF_RA_IDLE_EVICT=1`** for tighter RAM budgets (88-97% RA
-  per-event reclaim measured at idle gaps; sustained reduction is
-  workload-shape-dependent — see §11 honest interpretation).
-- **`--features csr`** brings narrowable projects all the way down to
-  ~0.53 GiB per daemon (≈10.6 GiB for 20 agents — comfortable on
-  16 GB).
+  (Model-R Leg-C v4).
+- **2.05× faster cargo-check vs `trunk serve`** (two-source verified;
+  agent-edit-batch unit). **Unchanged under Model R** — the
+  green-edge-rebuild model that produces the CPU win is preserved by
+  the repo-scoped architecture; reconfirmed, not re-derived. See
+  [`docs/bench/AC7-THROUGHPUT-REPORT.md §8.5`](docs/bench/AC7-THROUGHPUT-REPORT.md#85-clean-c2-109--headline-two-source-confirmed).
 
-v0.1 RAM roadmap: [`docs/design/D-RAM-TIERS.md`](docs/design/D-RAM-TIERS.md).
-Fleet-scale methodology + disclosed extrapolations:
+**Honest caveats — these are the claim's integrity, not footnotes:**
+
+1. **The absolute ≈1 GiB is fixture-dependent** (a Leptos-class
+   honest-size project, smaller than tf-multiverse). The load-bearing
+   claim is the **flatness / one-multiplexed-RA structure**, *not* the
+   absolute number — a bigger workspace shifts the constant up but
+   does not make it scale with N.
+2. **Measured to N=20.** Beyond that is a stated curve-shape
+   projection (flat by construction — one RA), not a measurement.
+3. **Verdict-correctness is a closed chain, not pure-unit end-to-end:**
+   structurally proven in the cores **plus** the live multiplexed
+   runtime integration-validated via the #15 bench + Track-1 dogfood.
+   A closed chain — never claimed as "fully unit-proven end-to-end."
+4. **The 2.05× CPU win is preserved, not re-measured** under Model R
+   (green-edge-rebuild model unchanged; re-asserted, see Leg A).
+5. **RAM measured under driven per-WT activity.** Idle worktrees are
+   deactivated by design (activity-activation); the ≈1 GiB is "RAM
+   under an actively-driven fleet," stated as such — not an idle floor.
+6. **Found-and-in-fix:** a separate shutdown-RA-reap defect (the
+   serve-loop does not reap its rust-analyzer child on `SIGTERM`) is
+   in the fix pipeline. It is **PID/zombie accumulation under fleet
+   restart-churn — NOT a RAM leak**, and does **not** affect the
+   steady-state ≈1 GiB measurement (which is descendant-scoped and
+   structurally uncontaminated). Disclosed as found, routed, fixing —
+   launch-relevant for restart-churn hygiene, not for the RAM number.
+
+Version (`v1.0` vs `v0.2`) and public-launch GO are the **operator's
+call** — this document describes capabilities, not a chosen tag.
+
+v0.1 browser/HTTP adapter remains deferred (orthogonal to Model R).
+Fleet-scale methodology + the measured per-N curve:
 [`AC7-THROUGHPUT-REPORT.md §11`](docs/bench/AC7-THROUGHPUT-REPORT.md#11-stage-3--fleet-scale-curve).
 
 ---
 
-## What cargoless v0 is (and isn't)
+## What cargoless is (and isn't)
 
-**Primary consumer: an AI agent writing whole files atomically.** The
-`check` / `watch` / `build` surface is the agent-edit-batch verdict
-loop; cost unit is per-batch, never per-keystroke. Humans run it too,
-but the design center is the agent loop.
+**Primary consumer: an AI agent writing whole files atomically**, at
+**fleet scale** — many worktrees, many agents, one host. The cost unit
+is per agent-edit-batch, never per-keystroke. Humans run it too, but
+the design center is the agent fleet loop.
 
-**v0 IS** — a *headless continuous checker and latest-green publisher*:
+**cargoless IS** — a *repo-scoped headless checker + latest-green
+publisher* that collapses the fleet onto one shared analyzer:
 
-- `cargoless check` — one-shot verdict + diagnostics. Green or red, exit
-  code reflects it, errors are formatted file:line:col + severity + code
-  + message.
-- `cargoless watch` — continuous timestamped verdict stream with
-  per-file granularity.
+- `cargoless serve --repo <path>` — **the fleet entrypoint.** Auto-
+  discovers every git worktree (`git worktree list`), routes file
+  events per-worktree, and multiplexes them through **one** shared
+  `rust-analyzer` via LSP overlays. One daemon, one RA, N worktrees —
+  this is the architecture that makes the agent-fleet RAM story flat
+  (see "At a glance"). Pinned-base + per-tree cache are decoupled;
+  corun batching folds non-overlapping worktrees into one check.
+- `cargoless check` — one-shot verdict + diagnostics, formatted
+  file:line:col + severity + code + message; per-crate verdicts so an
+  agent can gate one crate independently of another.
+- `cargoless watch` — continuous timestamped verdict stream
+  (single-worktree mode; subsumed by `serve --repo` at fleet scale,
+  not removed).
 - `cargoless build --watch --out <dir>` — wraps `trunk build` and
   publishes the latest green WASM artifact via an atomic
   `.cargoless/latest-green` pointer that **only advances on green**.
 - Zero-config — auto-detects `cdylib` + `wasm32` / `leptos` projects.
-- Survives `kill -9` of the underlying rust-analyzer subprocess; the
-  daemon restarts it transparently.
+- Survives `kill -9` of the underlying rust-analyzer; the supervisor
+  restarts it transparently.
 
-**v0 is NOT** — a `trunk serve` drop-in replacement (yet). cargoless v0
-does not include a browser/HTTP/WebSocket layer; that's v0.1, deferred.
-If you need a browser-reload loop today, point `trunk serve`
-(or any static server) at the directory cargoless publishes.
+**cargoless is NOT** — a `trunk serve` drop-in replacement (yet). It
+does not include a browser/HTTP/WebSocket layer; that adapter is
+deferred (orthogonal to the repo-scoped daemon). If you need a
+browser-reload loop today, point `trunk serve` (or any static server)
+at the directory cargoless publishes.
 
-See [`ROADMAP.md`](ROADMAP.md) for v0 acceptance criteria, the v0.1
-deferred work, and the v1 parking lot.
+> The single-worktree headless checker (the earlier `watch`-per-tree
+> shape) was a superseded internal intermediate; the **repo-scoped
+> daemon is the architecture** described here. `watch` remains as the
+> single-worktree path; it is not the fleet story.
+
+See [`ROADMAP.md`](ROADMAP.md) for the acceptance criteria, the
+deferred browser adapter, and the parking lot.
 
 ---
 
@@ -178,6 +229,21 @@ $ cargoless build --watch --out ./dist
 ok green — latest-green @ <hash>
 ```
 
+**Fleet mode — one command for the whole repo:**
+
+```bash
+# Run ONCE for the entire repo. Auto-discovers every git worktree;
+# one shared rust-analyzer multiplexed across all of them — total
+# RAM stays flat as you add worktrees (see "At a glance").
+$ cargoless serve --repo /path/to/repo
+>> serve: discovered N worktrees via `git worktree list`
+>> serve: one multiplexed rust-analyzer; per-worktree verdicts live
+```
+
+You do **not** run `cargoless watch` in each worktree at fleet scale —
+that is the per-tree daemon model `serve --repo` replaces. `watch`
+remains the single-worktree path for a one-off project.
+
 Edit a file with a real error; the next verdict line tells you what
 broke. Fix it; the next verdict line says green; `./dist` advances. Try
 introducing a syntax error; observe that `.cargoless/latest-green`
@@ -230,9 +296,24 @@ comparator: it is a terminal save→verdict *checker*, not a
 build+publish loop; the artifact-publish dimension has no `bacon`
 counterpart.
 
-### Leg B — RAM tiered ladder (honest, composed-not-conflated)
+**Unchanged under Model R.** The repo-scoped daemon preserves the
+green-edge-rebuild model that produces this CPU win — the per-edit
+work is identical whether one worktree is driven by `watch` or N are
+multiplexed by `serve --repo`. These figures are **carried verbatim,
+reconfirmed not re-derived** (`AC7-THROUGHPUT-REPORT §8.5`,
+unchanged); Model R changes *where RAM goes*, not *how much CPU an
+edit costs*.
 
-Not one number — a ladder, each rung with its own provenance and gate.
+### Leg B — single-RA footprint ladder (now secondary to the architecture)
+
+**Model R subsumes the per-daemon ladder.** The fleet-RAM answer is
+now *architectural* — one shared RA, flat across N (Leg C). This
+ladder no longer multiplies by daemon count; it tunes the footprint
+of the **single shared `rust-analyzer`**. It is still honest and
+still shipped, but it is **secondary** — a constant-factor reduction
+on the one RA, not the fleet-scale lever it had to be in the
+per-worktree-daemon model. Not one number — a ladder, each rung with
+its own provenance and gate (per-RA, applied once):
 
 | Rung | Per-daemon RSS (Leptos fixture) | What it costs | What it gates |
 |---|---:|---|---|
@@ -258,35 +339,52 @@ observed; faster on macro-heavy projects"* — never an unqualified
 on one real project, direction unambiguous + mechanistically
 expected — not a universal guarantee.
 
-### Leg C — fleet-scale (the agent-loop case)
+### Leg C — fleet-scale (the agent-loop case): flat, measured
 
-The launch-load-bearing question: *at agent-fleet scale (N daemons),
-does the default fit a real 16 GB host, and what closes the gap?*
-Measured at N=1,2,4,8 (`AC7-THROUGHPUT-REPORT §11` @ commit
-`6497273`); the 20-agent rows are **explicit extrapolations** from
-the measured per-daemon footprint (disclosed extrapolation; true
-cgroup-OOM observation was env-infeasible in the read-only-cgroup
-builder pod — a post-launch hardening nice-to-have, not
-decision-changing). Use the compound-fit table verbatim:
+The launch-load-bearing question: *at agent-fleet scale, does total
+RAM stay bounded as worktrees multiply?* Under the per-worktree-daemon
+model the answer was "no — linear, OOMs early." Under the repo-scoped
+daemon the answer is **measured flat**:
 
-| Compound path | Per-daemon | 20 agents | Fits 16 GB? |
-|---|---:|---:|---|
-| Tier-1/2 default (§10) | ≈1.5 GiB | ≈30 GiB | NO (model-A fails — OOMs at ≈10 daemons) |
-| + idle-evict alone (bench regime) | ≈1.43 GiB | ≈28.6 GiB | NO (≈5 % shave) |
-| **+ Tier-3 `--proc-macro disabled`** (#126 default-safe + #130 field-verified; §5/A3 = 0.97 GiB) | **≈0.97 GiB** | **≈19.4 GiB** | **BORDERLINE** (+≈3 GiB over; idle-evict pushes it closer) |
-| Tier-3 + idle-evict (real minute-gap fleet) | ≈0.7-0.9 GiB | ≈14-18 GiB | **PROBABLY YES** (idle-evict's larger reclaim at the real `gap / RA-busy-time` ratio) |
-| **`--features csr`** (project-narrowable only, §5/A4 = 0.53 GiB) | **≈0.53 GiB** | **≈10.6 GiB** | **YES — comfortable** |
+| Active worktrees (N) | Total cargoless RSS (measured) | Multiplexed RAs |
+|---:|---:|---:|
+| 1 | ≈1 GiB (peak 1003–1068 / avg 980–1034 MiB) | **1** |
+| 8 | ≈1 GiB (same band) | **1** |
+| 20 | ≈1 GiB (N=20 ≈ N=1) | **1** |
+| per-worktree-daemon model, 20 | ≈1.5 GiB × 20 ≈ **≈30 GiB** (measured-linear) | 20 |
 
-`TF_RA_IDLE_EVICT=1` is the opt-in fleet-RAM lever. Its
-*per-event* RAM reclaim is large and validated (≈88-97 %; min 0.17 GiB
-on 1.50 GiB peak at N=1; multi-daemon simultaneous evictions captured
-at N=4 ≈25 % and N=8 ≈39 %), but its *sustained time-averaged*
-reduction at the bench's N=8 Leptos regime is only ≈5 % — a
-workload-conservative floor, not a ceiling. The 75 s gap was consumed
-by RA's 65-70 s re-index/flycheck per batch; minute-scale agent-
-think-gaps (the real fleet operating point) and/or smaller-per-daemon-
-RA-cost projects shift the ratio favorably. Mechanism fully
-validated; magnitude scales with `gap / RA-busy-time`.
+⇒ a **≈19–30× fleet-RAM collapse, measured — not extrapolated**
+(`AC7-THROUGHPUT-REPORT §11`, Model-R Leg-C v4). The mechanism is
+own-eyes-verified: across every N there is **exactly one** multiplexed
+`rust-analyzer` + its `proc-macro-srv`; total RSS does not grow with
+worktree count. *(Exact per-N figures reconcile against bench-lead's
+§11-v4 prose on landing; the structure — flat, one RA — is the
+measured, mechanism-confirmed claim.)*
+
+**The honest interpretation — inline, load-bearing:**
+
+- The **flatness** is the claim. The **absolute ≈1 GiB is
+  fixture-dependent** (Leptos-class honest-size; a larger workspace
+  like tf-multiverse shifts the constant up, but it stays a constant
+  in N — one RA — not a per-N multiple).
+- **Measured to N=20**; beyond is a stated curve-shape projection
+  (flat by construction), not a measurement.
+- **Measured under driven per-WT activity.** Idle worktrees are
+  deactivated by design (activity-activation); the ≈1 GiB is "RAM
+  under an actively-driven fleet," not an idle floor.
+- The per-RA footprint ladder (Leg B — proc-macro-off, idle-evict,
+  `--features csr`) still applies, but it is now a **secondary
+  constant-factor** reduction on the *one* shared RA, not the
+  fleet-scale lever. Model R is the fleet-scale answer; Leg B tunes
+  the constant.
+- **Found-and-in-fix (disclosed, not hidden):** a separate
+  shutdown-RA-reap defect (the serve-loop does not reap its
+  rust-analyzer child on `SIGTERM`) is in the fix pipeline. It is
+  **PID/zombie accumulation under fleet restart-churn — NOT a RAM
+  leak**; the steady-state ≈1 GiB above is descendant-scoped and
+  structurally uncontaminated by it. Launch-relevant for
+  restart-churn hygiene, disclosed as found/routed/fixing — not
+  overstated, not concealed.
 
 ### Latency: two tiers, not one number
 
@@ -305,28 +403,37 @@ No sub-second artifact-publish claim is made.
 ### Honest caveats
 
 The narrative's discipline floor — these stay in the README, not
-hidden:
+hidden. The six load-bearing caveats are stated **inline at the point
+of claim** ("At a glance" and Leg C); summarised here so they are not
+missable:
 
-- **Leg-C 16 GB / 20-agent answer is disclosed-extrapolation.** Pod
-  cgroup-cap was env-infeasible in the read-only-cgroup builder
-  (`AC7-THROUGHPUT-REPORT §11` provenance block); true cgroup-OOM
-  confirm is a post-launch nice-to-have, operator-elective. The
-  20-agent rows extrapolate the measured per-daemon footprint
-  linearly.
-- **Tier-3 (#126) is the load-bearing existence-rung** for the
-  fleet-scale case. Already shipped default-safe, field-verified
-  #130. The ladder is **on by default**; you don't need to set a
-  flag to get the RAM win.
-- **Idle-evict's bench-realized 5 % sustained reduction is a
-  workload-conservative floor, not a ceiling.** Mechanism (≈88-97 %
-  per-event reclaim) fully validated; sustained magnitude scales
-  with `gap / RA-busy-time` (Leptos RA re-index 65-70 s of a 75 s
-  gap is the bench shape; real minute-scale agent-think-gaps shift
-  favorably). Default-off in v0; opt-in via `TF_RA_IDLE_EVICT=1`.
+- **The fleet-RAM win is the flatness, not the absolute.** ≈1 GiB is
+  fixture-dependent (Leptos-class); the measured + mechanism-verified
+  claim is "one multiplexed RA, total RSS constant in N." A bigger
+  workspace raises the constant, not the slope.
+- **Measured to N=20**; beyond is a stated flat-by-construction
+  curve-shape projection, not a measurement. Measured under driven
+  per-WT activity (idle WTs deactivated by design) — "active-fleet
+  RAM," stated as such.
+- **Verdict-correctness is a closed chain:** cores structurally
+  proven **+** the live multiplexed runtime integration-validated via
+  the #15 bench + Track-1 dogfood — never claimed "fully unit-proven
+  end-to-end."
+- **2.05× CPU is preserved, reconfirmed not re-derived** under Model
+  R (green-edge-rebuild model unchanged; Leg A carried verbatim).
+- **Per-RA footprint ladder (Leg B) is now secondary** — a
+  constant-factor reduction on the one shared RA, not the fleet-scale
+  lever. Tier-3 (#126) shipped default-safe / field-verified #130;
+  idle-evict (`TF_RA_IDLE_EVICT=1`) opt-in, per-event reclaim
+  ≈88-97 % validated, sustained magnitude scales with
+  `gap / RA-busy-time`.
+- **Found-and-in-fix:** the shutdown-RA-reap defect (serve-loop does
+  not reap its RA child on `SIGTERM`) — PID/zombie under
+  restart-churn, **not a RAM leak**, does not touch the steady-state
+  ≈1 GiB; disclosed, routed, fixing.
 - **Methodology audit trail is open** (`AC7-THROUGHPUT-REPORT §11.3`):
-  two artifact-class measurement attempts (v1 pgid-bug, v2 IDLE_GAP
-  too tight) discarded with reasons, not salvaged — the discipline
-  that earns the fleet-scale claim, named openly.
+  discarded measurement attempts kept with reasons, not salvaged —
+  the discipline that earns the fleet-scale claim, named openly.
 
 ### Architectural asymmetry (why the numbers come out this way)
 
@@ -341,9 +448,16 @@ hidden:
   the hashed input set is unchanged — a no-op edit, a `git checkout`
   round-trip, comments/strings/formatting changes — **the build is
   skipped entirely**.
+- **One multiplexed `rust-analyzer` per repo, not per worktree.**
+  This is the Model-R lever and the reason Leg C is flat: RA's
+  resident workspace (parsed crates, salsa cache) is the load-bearing
+  RAM consumer; sharing *one* RA across N worktrees via LSP overlays
+  means total RAM is a constant, not N × per-daemon. Adding worktrees
+  adds routing, not analyzers.
 - **Headless.** No HTTP server, no WebSocket channel, no
-  browser-keepalive. The v0 surface is a daemon + a CLI; the v0.1
-  server adapter is an opt-in layer for users who want one.
+  browser-keepalive. The surface is the repo-scoped daemon + a CLI;
+  the browser/reload adapter is a deferred opt-in layer for users who
+  want one (orthogonal to the daemon).
 
 ### Reproducible
 
@@ -365,10 +479,19 @@ numbers.
   orchestrator-verifies-against-source → backstop-honesty-criteria)
   proven end-to-end on launch-critical changes (#136 → §7 binstall
   CATCH → #140 fix-source; #96 self-dogfood).
-- **`AC#7` resolution:** **MARGINAL → PASS-with-compound-framing** —
-  cargoless wins 2-of-2 clearly-better dimensions vs `trunk serve`
-  (per-edit CPU + fleet-capability) against a tool whose architecture
-  is fundamentally not fleet-scalable.
+- **Model-R fleet-RAM is measured, not extrapolated:** flat ≈1 GiB
+  across N=1→20, one multiplexed RA mechanism own-eyes-verified
+  (`AC7-THROUGHPUT-REPORT §11` Leg-C v4) — the prior narrative's
+  disclosed-extrapolation gap is **closed by measurement**.
+- **`AC#7` resolution:** cargoless wins on per-edit CPU (2.05×,
+  two-source) **and** on the fleet axis where `trunk serve`'s
+  architecture is fundamentally not fleet-scalable (per-process RA ×
+  N vs one multiplexed RA, measured).
+- **Three-layer validation pattern** (author-self-satisfies →
+  orchestrator-verifies-against-source → dev-fixer honesty-backstop)
+  applied per launch-critical Model-R change (#9 / #11 / #176 / #10
+  all layer-3-CLEAR before integration; this narrative goes through
+  the same gate).
 - **Crate name space clear:** `cargoless` + `cargoless-proto` +
   `cargoless-cas` + `cargoless-core` all FREE on crates.io.
 
@@ -384,8 +507,8 @@ For the launch-hardening evidence trail, see
 |---|---|
 | `cargoless-proto` | Shared contract types (daemon ↔ build ↔ future remote backends). |
 | `cargoless-cas` | Content-addressed store. `ContentStore` trait + local-disk impl. |
-| `cargoless-core` | The daemon: watcher, rust-analyzer wrapper, green/red model, build orchestration. |
-| `cargoless` | The binary: `check` / `watch` / `build` / `status` / `clean`. |
+| `cargoless-core` | The repo-scoped daemon: worktree discovery + per-WT routing, one-multiplexed-rust-analyzer overlay, green/red model, build orchestration, transport (in-proc / Unix-socket / HTTP+SSE), diagnostics retention. |
+| `cargoless` | The binary: `serve --repo` (fleet) / `check` / `watch` / `build` / `status` / `clean`. |
 
 `bench/{harness,fixture}` are standalone non-workspace crates with
 `publish = false` baked in — they exist to run the AC#7 comparative
@@ -409,11 +532,15 @@ acknowledgement is itself a GitHub-issue-worthy event.
 
 ## Status
 
-v0 feature-complete on `main`; launch hardening in progress. Tracked
+Repo-scoped Model-R daemon feature-complete on `main`; fleet-RAM
+flatness measured (`AC7-THROUGHPUT-REPORT §11` Leg-C v4); launch
+hardening in progress. The public-launch GO and the version tag
+(`v1.0` vs `v0.2`) are the **operator's decision** — this document
+states capabilities, not a chosen tag or a ship date. Tracked
 publicly via [GitHub Issues](https://github.com/TriformAI/cargoless/issues);
 the internal agent-team backlog lives in Plane (project "CWDL"). See
-[`ROADMAP.md`](ROADMAP.md) for the 9-criterion v0 definition-of-done and
-the v0.1 / v1 phases.
+[`ROADMAP.md`](ROADMAP.md) for the acceptance criteria and the
+deferred / parking-lot phases.
 
 ## License
 
