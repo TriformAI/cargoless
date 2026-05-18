@@ -93,14 +93,30 @@ fi
 export PATH="$(dirname "$RA_BIN"):$PATH"
 say "rust-analyzer = $RA_BIN"
 
-# ── build the real wired daemon (operator-approved; hook-opaque here) ───
+# ── build the real wired daemon ────────────────────────────────────────
+# PER-REF ISOLATED target dir (the ci-gate 74b04df discipline, applied to
+# bench/): the pod pins a SHARED CARGO_TARGET_DIR=/cache/target that
+# accumulates stale binaries from every other agent's ci-gate. Building +
+# selecting there risks measuring an unprovenanced binary (the v1 #15 bug:
+# a stale debug #3-park-skeleton got picked). A ref-keyed private target
+# kills the ambiguity entirely — we measure ONLY what we just built here.
+REFTAG="$(cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || echo "$(date +%s)")"
+CTGT="/tmp/mrf-tgt-${REFTAG}"
+say "per-ref isolated CARGO_TARGET_DIR=$CTGT (shared /cache/target NOT used)"
+BUILD_START=$(date +%s)
 say "building cargoless (release) @ streamed tree ..."
-( cd "$SRC" && TRIFORM_OPERATOR_APPROVED_BUILD=1 cargo build -p cargoless --release --locked ) \
+( cd "$SRC" && CARGO_TARGET_DIR="$CTGT" TRIFORM_OPERATOR_APPROVED_BUILD=1 \
+  cargo build -p cargoless --release --locked ) \
   > /tmp/mrfleet-build.log 2>&1 || { tail -30 /tmp/mrfleet-build.log; die "cargoless build failed"; }
-BIN="$SRC/target/release/cargoless"
-[ -x "$BIN" ] || BIN="$(find "${CARGO_TARGET_DIR:-$SRC/target}" -maxdepth 3 -name cargoless -type f -perm -u+x 2>/dev/null | head -1)"
-[ -x "$BIN" ] || die "cargoless binary not found post-build"
-say "cargoless = $BIN ($("$BIN" --version 2>/dev/null | head -1))"
+BIN="$CTGT/release/cargoless"
+[ -x "$BIN" ] || die "release binary absent at $BIN post-build (build broken)"
+# Provenance guard: the binary MUST be newer than build-start — never
+# measure a stale/foreign artifact (the v1 #15 root-cause, now impossible
+# with a private target dir, asserted belt-and-braces).
+BIN_MTIME=$(stat -c %Y "$BIN" 2>/dev/null || echo 0)
+[ "$BIN_MTIME" -ge "$BUILD_START" ] \
+  || die "binary mtime $BIN_MTIME < build-start $BUILD_START — stale/unprovenanced, refusing to measure"
+say "cargoless = $BIN  mtime=$BIN_MTIME (≥ build-start $BUILD_START ✓ fresh)  ($("$BIN" --version 2>/dev/null | head -1))"
 
 # ── fixture fleet: ONE shared-Cargo.toml cluster, MAXN worktrees ────────
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -132,26 +148,42 @@ reap() {
 
 echo "=== MODELR-FLEET BUILD OK $(date -u +%FT%TZ) bin=$("$BIN" --version 2>/dev/null|tr -d '\n') ==="
 
+touch_wts() {  # trigger routed-change activity in base + first $1 worktrees
+  echo "// fleet-activate $(date -u +%s%N)" >> "$REPO/src/main.rs"
+  for k in $(seq 1 "$1"); do
+    echo "// fleet-activate $(date -u +%s%N) wt$k" >> "$WORK/wt$k/src/main.rs"
+  done
+}
+
 for N in $NLIST; do
   clean_state
   say "CELL N=$N start"
   "$BIN" serve --repo "$REPO" > "/tmp/mrfleet-serve-$N.log" 2>&1 &
   SPID=$!
-  # bounded warm: daemon discovers + spawns RA + settles
+  # let discovery+classification settle (serve log shows ~0.01s; be generous)
+  sleep 8
+  kill -0 "$SPID" 2>/dev/null || { echo "CELL N=$N RESULT=FAIL reason=serve-died-pre-activity"; tail -20 "/tmp/mrfleet-serve-$N.log"; reap "$SPID"; continue; }
+  # ACTIVITY-FIRST (v1 fix): the capstone-wire servedrv spawns the
+  # per-cluster RA on a ROUTED FILE-CHANGE, not at startup. Trigger
+  # activity in base + N worktrees, THEN wait for RA — the reverse
+  # ordering was the v1 ra-never-spawned bug (waited for RA before
+  # causing the activity that spawns it).
+  touch_wts "$N"
   warmed=0
-  for _ in $(seq 1 "$WARM_SECS"); do
+  for s in $(seq 1 "$WARM_SECS"); do
     sleep 1
     kill -0 "$SPID" 2>/dev/null || { say "serve died during warm (N=$N)"; tail -20 "/tmp/mrfleet-serve-$N.log"; break; }
+    # keep nudging activity every 10s in case the first batch debounced
+    [ $((s % 10)) -eq 0 ] && touch_wts "$N"
     [ "$(distinct_ra "$SPID")" -ge 1 ] && { warmed=1; break; }
   done
   if [ "$warmed" -ne 1 ]; then
-    echo "CELL N=$N RESULT=FAIL reason=ra-never-spawned-within-${WARM_SECS}s"
+    echo "CELL N=$N RESULT=FAIL reason=ra-never-spawned-within-${WARM_SECS}s-post-activity"
+    tail -8 "/tmp/mrfleet-serve-$N.log"
     reap "$SPID"; continue
   fi
-  # activate N worktrees (activity-activation #12 → per-WT overlay multiplex)
-  for k in $(seq 1 "$N"); do
-    echo "// fleet-activate $(date -u +%s) wt$k" >> "$WORK/wt$k/src/main.rs"
-  done
+  # all N worktrees active; let the one multiplexed RA index + settle
+  touch_wts "$N"
   sleep "$SETTLE_SECS"
   # sample peak + avg over the steady window
   peak=0; sum=0; cnt=0; ra_seen=0
