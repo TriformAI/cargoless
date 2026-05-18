@@ -24,6 +24,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::cratemap::{self, CrateMap};
 use crate::statusfile::{self, HEARTBEAT, Status, Verdict};
 use crate::ui;
 
@@ -144,7 +145,33 @@ pub fn run(cfg: &Config) -> ExitCode {
 
     let root = cfg.root.clone();
     let started = statusfile::now_unix();
-    let write_status = |verdict: Verdict| {
+    // Model R #9: resolve the workspace crate map ONCE at startup (a
+    // dependency-free Cargo.toml scan — see `cratemap`). Empty for a
+    // single-crate project or a detection miss, in which case the
+    // `crates=` line is simply never written and the authoritative
+    // `verdict=` line stands alone (unchanged v0 behaviour).
+    let crate_map: CrateMap = CrateMap::from_workspace(&cfg.root);
+    // Takes `&session` (not a bare verdict) so it can roll diagnostics up
+    // per-crate. `current_diagnostics()` is the same call the red /
+    // file-verdict edges already make; the list is small (errors+warnings
+    // for changed files) so doing it every heartbeat is cheap.
+    let write_status = |session: &cargoless_core::model::ModelSession| {
+        let verdict = verdict_of(session.tree_state());
+        let (crates, red_diagnostics) = if crate_map.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            let pc = cratemap::aggregate(&session.current_diagnostics(), &crate_map);
+            // Honesty invariant: if an error could not be attributed to a
+            // known crate, a partial map would falsely read all-green —
+            // omit `crates=` entirely (empty ⇒ no line); `verdict=` still
+            // carries the authoritative red.
+            let crates = if pc.all_errors_attributed {
+                pc.verdicts
+            } else {
+                Vec::new()
+            };
+            (crates, pc.error_count)
+        };
         statusfile::write(
             &root,
             &Status {
@@ -153,10 +180,12 @@ pub fn run(cfg: &Config) -> ExitCode {
                 started,
                 updated: statusfile::now_unix(),
                 verdict_str: verdict.as_str().to_string(),
+                crates,
+                red_diagnostics,
             },
         );
     };
-    write_status(verdict_of(session.tree_state()));
+    write_status(&session);
     // FIELD FINDING #6-NEG-A (#51): subscribe to the lifecycle channel
     // BEFORE entering the loop so the very first transparent RA restart is
     // already observable. Drained non-blockingly inside the loop body
@@ -241,11 +270,11 @@ pub fn run(cfg: &Config) -> ExitCode {
                         print_diagnostics(&cfg.root, &just_this_file);
                     }
                 }
-                write_status(verdict_of(session.tree_state()));
+                write_status(&session);
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Quiet tree: heartbeat the liveness signal.
-                write_status(verdict_of(session.tree_state()));
+                write_status(&session);
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // Pipeline shut down (RA unrecoverable / model dropped).
