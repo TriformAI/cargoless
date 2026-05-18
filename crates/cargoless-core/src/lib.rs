@@ -25,6 +25,7 @@ pub mod procmacro;
 pub mod recovery;
 pub mod repo;
 pub mod structural;
+pub mod transport;
 pub mod watcher;
 
 pub use cargoless_cas::{ContentStore, LocalDiskStore};
