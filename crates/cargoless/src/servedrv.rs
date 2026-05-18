@@ -341,7 +341,21 @@ fn step(
     };
     let action = cs.driver.on_event(ev);
     exec(cs, action, pending_batch);
-    while let Some(followup) = cs.driver.take_followup() {
+    // EXACTLY ONCE — `clusterdrv::take_followup` is structurally
+    // non-mutating (`self.current.as_ref().map(...)`, never clears
+    // `current`) and its doc contract is "the adapter calls this exactly
+    // once right after an `EmitVerdict`" (one event ⇒ (verdict,
+    // optional-next-switch) pair). A `while` here violates that
+    // precondition: after a settle with a queued/recheck next,
+    // `start_next_after_settle` sets `current = Some(next)` and nothing
+    // in the loop body clears it, so `take_followup` would re-yield
+    // `SwitchOverlay{next}` forever (non-terminating spin on the
+    // ≥2-WT-per-cluster serialization path). `if let` drives exactly one
+    // follow-up switch per settle; the next txn's barrier then advances
+    // on subsequent `DriverEvent::Lsp` in later serve-loop iterations —
+    // restoring the proven core's exactly-once precondition AT THE WIRE
+    // SEAM (the core is never weakened to accommodate a seam misuse).
+    if let Some(followup) = cs.driver.take_followup() {
         exec(cs, followup, pending_batch);
     }
 }
