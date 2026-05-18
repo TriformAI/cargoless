@@ -93,7 +93,27 @@ CI_TARGET_ROOT="${CI_GATE_TARGET_ROOT:-/cache/ci-targets}"
 CTARGET=""   # set once $SHA is resolved (below); injected into every pod cargo
 FJ_API="${FJ_API:-https://forgejo.triform.dev/api/v1}"
 FJ_REPO="${FJ_REPO:-triform/cargoless}"
-REMOTE_SRC="/work/src"
+
+# ── Per-ref SOURCE dir — verdict-integrity invariant, part 2 (STOP-class) ────
+# Per-ref CARGO_TARGET_DIR (above) isolates the *target* dir but NOT the
+# source: the old fixed `REMOTE_SRC=/work/src` is `rm -rf`'d + re-extracted
+# by every gate, and the cargoless-builder pod is SHARED across the fleet
+# (multiple agents) AND a single agent may run concurrent gates. Two
+# concurrent invocations RACE on one /work/src: gate A extracts SHA-A, gate
+# B `rm -rf`s + extracts SHA-B, gate A's cargo then compiles SHA-B's source
+# into A's (correctly-isolated) target dir → verdict labelled SHA-A, built
+# from SHA-B's source. Evidenced: two concurrently-launched re-vals of
+# distinct SHAs produced byte-identical test sets. The per-ref-target fix
+# could not catch this — the SOURCE itself was swapped.
+#
+# Completion of the same structural pattern: the source dir is ALSO keyed
+# to the content-addressed SHA ($REMOTE_SRC_ROOT/<SHA>). Source AND target
+# are now both per-ref, so concurrent gates are fully independent; the only
+# shared state left is the intended F-K heavy-lock + pod RAM + the
+# content-addressed CARGO_HOME (cargo-safe). Own-ref provenance — source and
+# compiled artifacts — is now a filesystem invariant end-to-end.
+REMOTE_SRC_ROOT="${CI_GATE_SRC_ROOT:-/work/src.d}"
+REMOTE_SRC=""   # set once $SHA is resolved (below): $REMOTE_SRC_ROOT/$SHA
 
 usage() { sed -n '2,/^set -euo pipefail/p' "$0" | sed -e 's/^# \?//' -e '$d'; }
 die() { echo "[ci-gate] ERROR: $*" >&2; exit 2; }
@@ -125,6 +145,9 @@ SHORT="$(git -C "$REPO_ROOT" rev-parse --short "$SHA")"
 # to THIS ref only. Injected as an env-assignment prefix on every in-pod
 # cargo (overrides the pod's pinned CARGO_TARGET_DIR=/cache/target).
 CTARGET="CARGO_TARGET_DIR=$CI_TARGET_ROOT/$SHA"
+# Per-ref source dir (see REMOTE_SRC_ROOT block above) — keyed to the same
+# content-addressed SHA so concurrent gates never race a shared /work/src.
+REMOTE_SRC="$REMOTE_SRC_ROOT/$SHA"
 
 # ── D1 brand-completion enforced invariant (#96) — fast local pre-flight ─────
 # Greps the gated ref's tree for banned old-brand tokens (see
@@ -172,16 +195,17 @@ kexec_i() { kubectl exec -i   -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" --
 # git archive => tracked files only.
 stream_tree() {
   echo "[ci-gate] ref=$REF sha=$SHORT pod=$BUILDER_NS/$POD"
+  echo "[ci-gate] per-ref source dir: $REMOTE_SRC (isolated; concurrent gates cannot race it)"
   echo "[ci-gate] per-ref target dir: $CI_TARGET_ROOT/$SHA (isolated; pod's /cache/target NOT used)"
   echo "[ci-gate] streaming tree into pod (git archive | kubectl exec tar -x)..."
   kexec bash -c "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && mkdir -p $CI_TARGET_ROOT/$SHA" \
     || die "could not reset $REMOTE_SRC / create per-ref target dir in pod"
-  # Bound PVC growth: best-effort prune sibling per-ref target dirs untouched
-  # for >24h (a gate runs in minutes; >24h ⇒ provably not an in-flight
-  # concurrent gate's dir, so removing it cannot false-red a live run). Never
-  # touches THIS $SHA's dir. Failure here never fails the gate (|| true) — a
-  # housekeeping miss must not block a verdict.
-  kexec bash -c "find $CI_TARGET_ROOT -mindepth 1 -maxdepth 1 -type d ! -name $SHA -mtime +1 -exec rm -rf {} + 2>/dev/null || true" || true
+  # Bound PVC growth: best-effort prune sibling per-ref SOURCE + TARGET dirs
+  # untouched for >24h (a gate runs in minutes; >24h ⇒ provably not an
+  # in-flight concurrent gate's dir, so removing it cannot false-red a live
+  # run). Never touches THIS $SHA's dirs. Failure here never fails the gate
+  # (|| true) — a housekeeping miss must not block a verdict.
+  kexec bash -c "find $CI_TARGET_ROOT $REMOTE_SRC_ROOT -mindepth 1 -maxdepth 1 -type d ! -name $SHA -mtime +1 -exec rm -rf {} + 2>/dev/null || true" || true
   git -C "$REPO_ROOT" archive --format=tar "$SHA" \
     | kexec_i tar -x -C "$REMOTE_SRC" \
     || die "source transfer failed"
