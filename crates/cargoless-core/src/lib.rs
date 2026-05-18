@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod analyzer;
 pub mod build;
+pub mod cluster;
 pub mod config;
 pub mod idle;
 pub mod lsp;
