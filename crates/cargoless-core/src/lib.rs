@@ -20,6 +20,7 @@ pub mod model;
 pub mod procmacro;
 pub mod repo;
 pub mod structural;
+pub mod transport;
 pub mod watcher;
 
 pub use cargoless_cas::{ContentStore, LocalDiskStore};
