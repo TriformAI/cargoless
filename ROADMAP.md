@@ -4,9 +4,8 @@
 > hardening complete and AC#7 numbers landed (two-source-confirmed in
 > [`docs/bench/AC7-THROUGHPUT-REPORT.md`](docs/bench/AC7-THROUGHPUT-REPORT.md):
 > ≈2.05× per-edit CPU vs `trunk serve`, the RAM ladder, and the
-> fleet-scale compound-fit table). v0.1 (browser/HTTP adapter +
-> auto-narrow features + Tier-3/4 RAM-roadmap maturation) is deferred.
-> v1 is the long-horizon parking lot.
+> fleet-scale compound-fit table). v0.1 (browser/HTTP adapter) is
+> deferred. v1 is the long-horizon parking lot.
 
 cargoless is phased **v0 → v0.1 → v1**. The scope of each phase is
 deliberately tight: v0 is the smallest thing that delivers the vision claim
