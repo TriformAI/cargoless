@@ -28,6 +28,7 @@ mod config;
 mod cratemap;
 mod orphan;
 mod serve;
+mod servedrv;
 mod statusfile;
 mod ui;
 mod watch;
