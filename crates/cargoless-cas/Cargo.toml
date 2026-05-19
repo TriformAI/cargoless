@@ -11,4 +11,4 @@ description = "Content-addressed artifact store: trait + local-disk implementati
 workspace = true
 
 [dependencies]
-cargoless-proto = { path = "../cargoless-proto", version = "0.0.0" }  # publish-ready: explicit version required by `cargo publish` even with path
+cargoless-proto = { path = "../cargoless-proto", version = "0.2.0" }  # publish-ready: explicit version required by `cargo publish` even with path

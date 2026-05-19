@@ -55,7 +55,7 @@ name = "cargoless"
 path = "src/main.rs"
 
 [dependencies]
-cargoless-core = { path = "../cargoless-core", version = "0.0.0" }  # publish-ready
+cargoless-core = { path = "../cargoless-core", version = "0.2.0" }  # publish-ready
 
 # ──────────────────────────────────────────────────────────────────────────
 # cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)
