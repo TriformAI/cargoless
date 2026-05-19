@@ -363,6 +363,53 @@ to run build/test/fmt/clippy/bench per branch + main; `scripts/ci-gate`
 continues to be the fast pre-integration merge gate. The release pipeline
 move is additive, not displacing.
 
+### 5.1 `image-cargoless-serve` — the central-daemon CD artifact
+
+Added by the central-daemon initiative (plan-approved; Increment 1b,
+surfaced by #226). This is **the only artifact carrying the
+`--features integration` wired daemon**. The `build` matrix above ships
+the *default-feature* binary for `cargo binstall` (the local dev tool);
+that binary is **not** the serve daemon — the wired daemon is
+deliberately excluded from the default workspace build (the same feature
+boundary `scripts/ci-gate`'s `integ-*` checks gate).
+
+```
+  image-cargoless-serve                              ── needs: tag-validate
+    └─ ubuntu-latest;  if: false (operator registry-credential stage, §8 #10)
+    └─ cargo build -p cargoless --features integration --release --locked
+       --target x86_64-unknown-linux-gnu
+    └─ docker build -f deploy/cargoless-serve.Dockerfile
+       (FROM triform-builder-v2:0.1 + baked 1.85.0 toolchain +
+        rust-analyzer + rust-src + the integration binary)
+    └─ docker push registry.triform.cloud/cargoless/cargoless-serve
+       :${VERSION}  (== git tag == workspace.package.version)
+       :git-${SHA}  (immutable provenance)
+```
+
+**Properties:**
+
+- `needs: tag-validate` (NOT `needs: build`) ⇒ the image version equals
+  the release version **by construction** (tag-validate already proves
+  `tag == [workspace.package].version`); the image is an independent CD
+  artifact and can neither wedge nor be wedged by the binstall matrix.
+- **digest == version**: `:${VERSION}` is the exact tag
+  `deploy/cargoless-serve.k8s.yaml` references; `:git-${SHA}` plus the
+  OCI `image.version`/`image.revision` labels make `docker inspect`
+  self-describing. The manifest MAY be pinned by `@sha256:` digest for
+  full immutability (recommended follow-up; not required for the
+  milestone).
+- **Baked, not runtime-installed**: `rust-analyzer` + the 1.85.0
+  toolchain are added at *image-build* time (network available on the GH
+  runner) precisely because in-cluster pod egress is blocked — the same
+  constraint documented in `deploy/cargoless-builder.k8s.yaml`'s header.
+- **`if: false` pending operator stage** — the established precedent for
+  "real dependency, operator-owned credential precondition not yet
+  resolved" (identical to `publish-*` + `FORGEJO_READONLY_TOKEN`). See
+  §8 #10 and `docs/release/PHASE-D-OPERATOR-HANDOFF.md` §2.3 for the two
+  preconditions (push credential secrets + external push-reachability of
+  `registry.triform.cloud` from a GH runner — the latter is an honest
+  **unverified** infra question, not an assumption).
+
 ---
 
 ## 6. The operator playbook (first real fire of `0.1.0`)
@@ -491,6 +538,7 @@ called out, not invented.
 | 7 | **GPG signing of release tags + tarball signatures.** v1 parking-lot per CLAUDE.md non-goals. Recorded here for the record — when someone asks "why no .asc files?" the answer is "deliberate 0.1.0 scope decision; see D-RELEASE §9." | lead | Nothing in v0.1.0; trust model for downstream packagers. |
 | 8 | ~~**Canonical install URL / public-source-access strategy.**~~ **FULLY CLOSED 2026-05-17 — operator picked (b) GitHub mirror; URL confirmed `https://github.com/TriformAI/cargoless`; cargoless content seeded to GitHub via force-push from `IggyGG@laptop` (HTTPS+PAT path, operator's keychain credential, admin permission verified). End-to-end anonymous install proven in clean cargoless-builder pod env: `cargo install --git https://github.com/TriformAI/cargoless.git tf-cli --branch main --locked` succeeded in 7s, produced working `tftrunk` binary.** `[workspace.package].repository` flipped from forgejo to the GitHub URL; README install commands rewritten to point at GitHub; CONTRIBUTING.md split into outside-contributor (GitHub PR target) and agent-team (Forgejo integration-CI workflow) sections. Per-repo Forgejo flip from earlier in the day (`private: false`) stays in place but is not load-bearing — the Forgejo instance's site-wide `[service].REQUIRE_SIGNIN_VIEW = true` setting overrides per-repo visibility; outside users access the project via GitHub. Forgejo remains the integration-CI side (cargoless-builder pod, ci-gate, S1 bench). Compound benefit realized: §8 #2 (Mac builder) ALSO closes via GH Actions free-tier macOS runners. See §1.1 for the runner-split summary. Anonymous-probe verification 2026-05-17: HTML 200 / `git ls-remote HEAD` returns SHA / `info/refs?service=git-upload-pack` returns 200 on GET. The install path is structurally unblocked. | — (resolved) | — |
 | 9 | ~~**Forgejo → GitHub mirror direction.**~~ **CLOSED 2026-05-17 — option (a) push-mirror selected and operational.** Configured via Forgejo API (`POST /api/v1/repos/triform/cargoless/push_mirrors`) with HTTPS+PAT shape (`remote_username: IggyGG, remote_password: <PAT-from-keychain>, use_ssh: false, interval: 8h0m0s, sync_on_commit: true, branch_filter: ""`). Every push to Forgejo `main` (and any tags) auto-replicates to GitHub within ~3–15s wall-clock; verified empirically across the launch-readiness push (e9ef58d) and dev-fixer-2 cherry-pick push (2f19b52) — both landed on GitHub without manual intervention. Forgejo daemon's outbound credentials carry a single GitHub PAT scoped to the TriformAI/cargoless repo only — small, well-defined auth surface. Manual dual-push (option b) is no longer used; it remains documented in commit history as the bootstrap alternative. | — (resolved) | — |
+| 10 | **`image-cargoless-serve` operator stage (central-daemon initiative, Increment 1b / #234).** Two preconditions before the §5.1 image-bake job activates: **(a)** repo secrets `REGISTRY_TRIFORM_USER` + `REGISTRY_TRIFORM_TOKEN` (push scope to `registry.triform.cloud/cargoless/*`) pre-staged — the publish-*/`FORGEJO_READONLY_TOKEN` precedent; **(b)** `registry.triform.cloud` is **PUSH-reachable from a GH Actions runner** — it is node-reachable IN-cluster for *pulls* (the replicated `registry-pull` secret), but external push-reachability from a GH runner is **UNVERIFIED** (honest open question, not assumed). If (b) is false the bake must move to an in-cluster DinD path — a separate increment, flagged not solved. Job is `if: false` until both resolve (flip → the credential gate; no other edit). See `docs/release/PHASE-D-OPERATOR-HANDOFF.md` §2.3. | operator + infra | `image-cargoless-serve` activation ⇒ the Increment-0+1 deploy milestone (the k8s manifest cannot pull a non-existent image). |
 
 ---
 
@@ -507,8 +555,21 @@ workflow or any prebuilt artifact.
 - **Homebrew formula / scoop manifest / winget / AUR / nix flake.** Third
   parties may package; project ships source + crates.io + Linux/macOS binstall
   prebuilts only.
-- **Container images.** No `Dockerfile`, no `docker.io/cargoless`. The product
-  is a local dev tool; containerizing it makes no sense.
+- **Container images — for the LOCAL-DEV-TOOL distribution.** The
+  binstall/crates.io product is a local dev tool; there is no
+  `docker.io/cargoless`, no container in the `cargo install` / `cargo
+  binstall` path. **SCOPED CARVE-OUT (provenance: the central-daemon
+  initiative, plan-approved; Increment 1b / #226 / #234):** the
+  *operational* central Model R daemon (`cargoless serve --repo` as an
+  in-cluster k8s Service, `deploy/cargoless-serve.k8s.yaml`) **does**
+  require a container image — `registry.triform.cloud/cargoless/
+  cargoless-serve` (`deploy/cargoless-serve.Dockerfile`, baked by the
+  `image-cargoless-serve` job, §5.1). This is **not** a silent
+  re-addition: it is a deliberate, documented scope change for a NEW
+  operational deployment surface that did not exist when this v0
+  non-goal was written. The original statement holds **unchanged** for
+  the local-dev-tool distribution; only the operational serve image is
+  carved out, with this provenance trail.
 - **deb / rpm / msi / pkg.** Same reasoning — `cargo install` is the canonical
   Rust ecosystem path.
 - **Auto-update.** The binary does not check for updates. Users run `cargo

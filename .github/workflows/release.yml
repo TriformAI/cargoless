@@ -452,6 +452,108 @@ jobs:
             --repo "$REPO"
 
   # ─────────────────────────────────────────────────────────────────────────
+  # image-cargoless-serve — bake + push the central-daemon product image.
+  #
+  # Increment 1b (surfaced by #226). This is the ONLY artifact carrying the
+  # `--features integration` WIRED daemon — the binstall `build` matrix
+  # above ships the DEFAULT-feature local-dev binary, which is NOT the
+  # serve daemon. See deploy/cargoless-serve.Dockerfile + D-RELEASE.md §5.1
+  # and the §9 scoped carve-out (the historical "no container images" v0
+  # non-goal is superseded for THIS operational image only, with
+  # provenance; the local-dev distribution is unchanged).
+  #
+  # `needs: tag-validate` ⇒ the image is built ONLY for a validated release
+  # tag, so the image `:${VERSION}` tag == [workspace.package].version
+  # == the git tag BY CONSTRUCTION (digest==version discipline). It does
+  # NOT `needs: build` — it is an independent CD artifact, not a binstall
+  # tarball, and must not be wedged by (or wedge) the prebuilt matrix.
+  #
+  # MARKED `if: false` PENDING THE OPERATOR REGISTRY-CREDENTIAL STAGE —
+  # exactly the publish-* / FORGEJO_READONLY_TOKEN precedent (a real
+  # dependency whose credential precondition is operator-owned and not yet
+  # resolved). Two operator/infra preconditions, documented in
+  # docs/release/PHASE-D-OPERATOR-HANDOFF.md §2.3:
+  #   (1) repo secrets REGISTRY_TRIFORM_USER + REGISTRY_TRIFORM_TOKEN
+  #       (push scope to registry.triform.cloud/cargoless/*) pre-staged;
+  #   (2) registry.triform.cloud is PUSH-REACHABLE from a GH Actions
+  #       runner (it is node-reachable IN-cluster for pulls; external
+  #       push reachability is UNVERIFIED — an honest open infra question,
+  #       NOT silently assumed). If (2) is false, the bake must move to an
+  #       in-cluster DinD path (separate increment) — flagged, not solved.
+  # Flip `if: false` → the credential/reachability gate once both resolve;
+  # no other edit needed (the job body is complete).
+  # ─────────────────────────────────────────────────────────────────────────
+  image-cargoless-serve:
+    needs: tag-validate
+    if: false  # operator registry-credential + reachability stage (handoff §2.3)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive version from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Install Rust toolchain (matches rust-toolchain.toml = 1.85)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          targets: x86_64-unknown-linux-gnu
+      - name: Build the integration (wired-daemon) release binary
+        run: |
+          set -euo pipefail
+          # The serve daemon ONLY exists under --features integration; the
+          # default build deliberately excludes it (ci-gate integ-* gate).
+          # --locked: same determinism discipline as every other release
+          # build (Appendix B).
+          cargo build -p cargoless --features integration --release --locked \
+            --target x86_64-unknown-linux-gnu
+          BIN=target/x86_64-unknown-linux-gnu/release/cargoless
+          strip "$BIN" || true
+          file "$BIN"
+      - name: Log in to registry.triform.cloud
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_TRIFORM_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TRIFORM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REGISTRY_USER:-}" ] || [ -z "${REGISTRY_TOKEN:-}" ]; then
+            echo "::error::REGISTRY_TRIFORM_USER / REGISTRY_TRIFORM_TOKEN not set."
+            echo "::error::Pre-stage them as repo secrets (push scope to"
+            echo "::error::registry.triform.cloud/cargoless/*) — see"
+            echo "::error::docs/release/PHASE-D-OPERATOR-HANDOFF.md §2.3."
+            exit 1
+          fi
+          printf '%s' "$REGISTRY_TOKEN" | docker login registry.triform.cloud \
+            -u "$REGISTRY_USER" --password-stdin
+      - name: Build + push image (digest == version)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMG=registry.triform.cloud/cargoless/cargoless-serve
+          # `:${VERSION}` is the exact tag deploy/cargoless-serve.k8s.yaml
+          # references (== the git tag == workspace.package.version, proven
+          # by tag-validate). `:git-${SHA}` is the immutable provenance tag.
+          docker build \
+            -f deploy/cargoless-serve.Dockerfile \
+            --build-arg VERSION="${VERSION}" \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg BIN_SRC=target/x86_64-unknown-linux-gnu/release/cargoless \
+            -t "${IMG}:${VERSION}" \
+            -t "${IMG}:git-${GITHUB_SHA}" \
+            .
+          docker push "${IMG}:${VERSION}"
+          docker push "${IMG}:git-${GITHUB_SHA}"
+          # Echo the pushed digest so the release log is self-describing
+          # (digest==version: the operator can pin the manifest by digest).
+          docker inspect --format '{{index .RepoDigests 0}}' "${IMG}:${VERSION}" || true
+          echo "Pushed ${IMG}:${VERSION} (+ :git-${GITHUB_SHA})."
+
+  # ─────────────────────────────────────────────────────────────────────────
   # publish-* — crates.io publish, topological order.
   #
   # MARKED `if: false` FOR 0.1.0. The first crates.io publish is OPERATOR-RUN

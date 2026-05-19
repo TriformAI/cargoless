@@ -181,6 +181,48 @@ Automating this (Forgejo/GitHub-Actions-secret) is a **post-0.2.0
 (post-first-release; the first release is now 0.2.0). Tracked, not
 launch-blocking.
 
+### 2.3 `image-cargoless-serve` — the central-daemon image stage (§8 #10)
+
+**Not on the `0.2.0` *binstall/crates.io* launch path.** This stage gates
+the *central-daemon deploy milestone* (Increment 1b / #234) — the
+`image-cargoless-serve` job (D-RELEASE §5.1) is `if: false` until the
+operator resolves BOTH preconditions below. It does NOT block the
+binstall/crates.io release; it blocks the `deploy/cargoless-serve.k8s.yaml`
+deployment (the manifest cannot pull a non-existent image).
+
+**Precondition (a) — push credential secrets** (the §2.1
+`FORGEJO_READONLY_TOKEN` precedent):
+
+1. Mint a registry credential with **push** scope limited to
+   `registry.triform.cloud/cargoless/*` (least-privilege — pull is the
+   existing in-cluster `registry-pull` secret; this is a *separate*
+   push-only credential, never the cluster pull secret).
+2. **github.com/TriformAI/cargoless** → Settings → Secrets and variables
+   → Actions → add two repository secrets, named **exactly**
+   `REGISTRY_TRIFORM_USER` and `REGISTRY_TRIFORM_TOKEN`. Never committed;
+   GH masks them in logs (the job pipes the token via `--password-stdin`,
+   never an arg).
+
+**Precondition (b) — external push-reachability (UNVERIFIED, honest open
+question, NOT assumed):** `registry.triform.cloud` is node-reachable
+*in-cluster* for image **pulls** (via the replicated `registry-pull`
+secret), but whether it is **push-reachable from a GitHub Actions
+runner** (external public internet) has **not been verified**. Before
+flipping `if: false`, confirm with a throwaway probe (e.g. a scratch tag
+or a manual `docker login` + tiny push from a GH runner). **If (b) is
+false**, the bake CANNOT run on GH Actions — it must move to an
+in-cluster builder with Docker-in-Docker (a separate, larger increment;
+the passive `cargoless-builder` pod has no DinD and tf-multiverse's
+DinD builders are a different namespace we must not touch). This is
+flagged, not solved here.
+
+**Activation:** once (a) and (b) both hold, flip the
+`image-cargoless-serve` job's `if: false` to the credential gate
+(`if: ${{ secrets.REGISTRY_TRIFORM_TOKEN != '' }}` or unconditional —
+the job body already fails loud + actionable if the secrets are absent).
+No other edit is required; the job body is complete and tag-validate
+already enforces `digest == version`.
+
 ---
 
 ## 3. Pre-tag checklist (all must be ✅ before cutting the launch tag)
