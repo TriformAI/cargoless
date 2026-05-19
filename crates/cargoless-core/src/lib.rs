@@ -39,7 +39,10 @@ pub use cargoless_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
     Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,
 };
-pub use config::{FleetConfig, FleetConfigError, FleetOverrides, Provenance, Source};
+pub use config::{
+    FleetConfig, FleetConfigError, FleetOverrides, Provenance, Source, TelemetryConfig,
+    TelemetryOverrides, TelemetryProvenance,
+};
 pub use model::LifecycleEvent;
 
 /// The single canonical identity string — `<product> <version>` — used

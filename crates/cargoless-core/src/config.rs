@@ -502,6 +502,264 @@ fn unquote(s: &str) -> String {
         .to_string()
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// #246 Wave-1 (5b) — Telemetry configuration (OTEL + SigNoz export seam).
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Pure-data struct living in `cargoless-core` so the daemon-runtime
+// re-resolution path has no CLI dependency. The `cargoless` binary owns
+// the actual `tracing` / `opentelemetry-*` SDK init (`telemetry.rs`) —
+// cores stay log-free per the Explore-confirmed crate-boundary discipline
+// (Wave-1 5a foundation lands in the binary, not here).
+//
+// All fields default to "no-op" — if `otel_endpoint` is `None`, the
+// binary-side `init_telemetry` is a no-op and zero OTEL overhead is paid.
+// Matches fleet convention (physics telemetry.rs:201-218) and the plan's
+// fail-soft requirement (telemetry MUST NOT wedge the daemon).
+//
+// Precedence: `CLI flag  >  environment  >  tf.toml  >  built-in default`
+// (identical to FleetConfig's layering rule).
+
+/// Per-field provenance for [`TelemetryConfig`] — mirror of [`Provenance`]
+/// for the FleetConfig surface. Surfaced so the codebase can always say
+/// *why* telemetry is configured the way it is (the vision-cut property).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetryProvenance {
+    pub otel_endpoint: Source,
+    pub otel_headers: Source,
+    pub otel_service_name: Source,
+    pub otel_log_level: Source,
+    pub otel_sampler_arg: Source,
+}
+
+impl Default for TelemetryProvenance {
+    fn default() -> Self {
+        Self {
+            otel_endpoint: Source::Default,
+            otel_headers: Source::Default,
+            otel_service_name: Source::Default,
+            otel_log_level: Source::Default,
+            otel_sampler_arg: Source::Default,
+        }
+    }
+}
+
+/// CLI-supplied telemetry overrides — the **injection struct** the CLI
+/// crate fills from clap (`--otel-endpoint`, `--otel-service-name`) and
+/// hands to [`TelemetryConfig::resolve`]. Plain `Option`-of-value, no clap
+/// types ⇒ core never gains an arg-parsing dependency.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetryOverrides {
+    pub otel_endpoint: Option<String>,
+    pub otel_service_name: Option<String>,
+}
+
+/// Fully-resolved telemetry configuration consumed by the binary-side
+/// `init_telemetry` (5a). `f64` precludes `Eq` but PartialEq is enough for
+/// every consumer (tests + diagnostics).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TelemetryConfig {
+    /// OTLP exporter endpoint (gRPC default). `None` ⇒ telemetry init is
+    /// a no-op (zero OTEL overhead for local `cargoless check` / ad-hoc
+    /// `serve` against no operator instance). Env: `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    pub otel_endpoint: Option<String>,
+    /// Optional OTLP headers (e.g. `Authorization=Bearer …`). Comma-
+    /// separated `key=value` pairs per OTEL spec. Env: `OTEL_EXPORTER_OTLP_HEADERS`.
+    pub otel_headers: Option<BTreeMap<String, String>>,
+    /// Service name (resource attr `service.name`). Default `"cargoless"`.
+    /// Env: `OTEL_SERVICE_NAME`.
+    pub otel_service_name: String,
+    /// OTLP log filter level — default `"warn"` matches fleet WARN+;
+    /// `INFO` captured by stdout filelog if operator runs one.
+    /// Env: `OTEL_LOG_LEVEL`.
+    pub otel_log_level: String,
+    /// Trace sampler ratio (AlwaysOn = 1.0 for v0/v0.1 low volume).
+    /// Env: `OTEL_TRACES_SAMPLER_ARG`.
+    pub otel_sampler_arg: f64,
+    /// Per-field provenance.
+    pub provenance: TelemetryProvenance,
+}
+
+impl TelemetryConfig {
+    /// All-defaults = telemetry init is a no-op (the safe v0-compatible
+    /// state — no endpoint ⇒ no exporters ⇒ no overhead).
+    pub fn defaults() -> Self {
+        Self {
+            otel_endpoint: None,
+            otel_headers: None,
+            otel_service_name: "cargoless".to_string(),
+            otel_log_level: "warn".to_string(),
+            otel_sampler_arg: 1.0,
+            provenance: TelemetryProvenance::default(),
+        }
+    }
+
+    /// Resolve telemetry config from process env + `tf.toml` + CLI overrides.
+    /// `repo_root` is the project/repo root (the `tf.toml` search path).
+    pub fn resolve(
+        repo_root: impl AsRef<Path>,
+        overrides: TelemetryOverrides,
+    ) -> Result<Self, FleetConfigError> {
+        let env = |k: &str| std::env::var(k).ok();
+        Self::resolve_layered(repo_root.as_ref(), overrides, &env)
+    }
+
+    /// Env-injected resolver (the unit-testable variant — `env` is the
+    /// only IO seam so precedence logic is pure).
+    pub fn resolve_layered(
+        repo_root: &Path,
+        ov: TelemetryOverrides,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, FleetConfigError> {
+        let mut cfg = Self::defaults();
+
+        // ---- layer 1: tf.toml (tolerant partial overlay) -------------
+        if let Ok(text) = std::fs::read_to_string(repo_root.join("tf.toml")) {
+            apply_telemetry_tf_toml_overlay(&mut cfg, &text)?;
+        }
+
+        // ---- layer 2: environment ------------------------------------
+        if let Some(v) = env("OTEL_EXPORTER_OTLP_ENDPOINT").filter(|s| !s.trim().is_empty()) {
+            cfg.otel_endpoint = Some(v);
+            cfg.provenance.otel_endpoint = Source::Env;
+        }
+        if let Some(v) = env("OTEL_EXPORTER_OTLP_HEADERS").filter(|s| !s.trim().is_empty()) {
+            cfg.otel_headers = Some(parse_otel_headers(&v));
+            cfg.provenance.otel_headers = Source::Env;
+        }
+        if let Some(v) = env("OTEL_SERVICE_NAME").filter(|s| !s.trim().is_empty()) {
+            cfg.otel_service_name = v;
+            cfg.provenance.otel_service_name = Source::Env;
+        }
+        if let Some(v) = env("OTEL_LOG_LEVEL").filter(|s| !s.trim().is_empty()) {
+            cfg.otel_log_level = v;
+            cfg.provenance.otel_log_level = Source::Env;
+        }
+        if let Some(v) = env("OTEL_TRACES_SAMPLER_ARG").filter(|s| !s.trim().is_empty()) {
+            cfg.otel_sampler_arg = parse_sampler_arg("env OTEL_TRACES_SAMPLER_ARG", &v)?;
+            cfg.provenance.otel_sampler_arg = Source::Env;
+        }
+
+        // ---- layer 3: explicit CLI flags (highest) -------------------
+        if let Some(v) = ov.otel_endpoint.filter(|s| !s.trim().is_empty()) {
+            cfg.otel_endpoint = Some(v);
+            cfg.provenance.otel_endpoint = Source::Cli;
+        }
+        if let Some(v) = ov.otel_service_name.filter(|s| !s.trim().is_empty()) {
+            cfg.otel_service_name = v;
+            cfg.provenance.otel_service_name = Source::Cli;
+        }
+
+        Ok(cfg)
+    }
+
+    /// `true` once an endpoint is resolved ⇒ binary-side `init_telemetry`
+    /// should actually spin up exporters. The single load-bearing predicate
+    /// for fail-soft init — no endpoint = no-op, never an OTLP connect
+    /// attempt + log noise.
+    pub fn enabled(&self) -> bool {
+        self.otel_endpoint
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// Parse a comma-separated `key=value,key=value` OTEL headers string
+/// (per the OTEL spec for `OTEL_EXPORTER_OTLP_HEADERS`). Tolerant on
+/// whitespace; silently skips malformed pairs (per fleet convention —
+/// telemetry MUST NOT wedge the daemon on a typo).
+fn parse_otel_headers(s: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for pair in s.split(',') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() && !v.is_empty() {
+                m.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    m
+}
+
+/// Parse the OTEL_TRACES_SAMPLER_ARG f64. Reuses [`FleetConfigError`] for
+/// consistency with the rest of the resolver surface — a malformed sampler
+/// arg is an actionable user error, not a "fail soft" surface (the
+/// fail-soft contract is for exporter unreachability at runtime, not for
+/// startup config typos).
+fn parse_sampler_arg(origin: &'static str, v: &str) -> Result<f64, FleetConfigError> {
+    f64::from_str(v.trim()).map_err(|_| FleetConfigError::BadBool {
+        origin,
+        key: "OTEL_TRACES_SAMPLER_ARG".to_string(),
+        value: v.to_string(),
+    })
+}
+
+/// Apply the **telemetry-owned** keys from a (shared) `tf.toml` over `cfg`.
+/// Same tolerant-overlay contract as [`apply_tf_toml_overlay`] — unknown
+/// sections/keys are ignored, owned keys' values are validated.
+///
+/// Owned keys (all under `[telemetry]`):
+/// - `otel_endpoint = "<url>"`
+/// - `otel_service_name = "<name>"`
+/// - `otel_log_level = "<level>"`
+/// - `otel_sampler_arg = <number>`
+/// - `otel_headers = "k1=v1,k2=v2"`
+fn apply_telemetry_tf_toml_overlay(
+    cfg: &mut TelemetryConfig,
+    text: &str,
+) -> Result<(), FleetConfigError> {
+    let mut section = String::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = name.trim().to_string();
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = unquote(val.trim());
+        match (section.as_str(), key) {
+            ("telemetry", "otel_endpoint") if !val.trim().is_empty() => {
+                cfg.otel_endpoint = Some(val);
+                cfg.provenance.otel_endpoint = Source::TfToml;
+            }
+            ("telemetry", "otel_service_name") if !val.trim().is_empty() => {
+                cfg.otel_service_name = val;
+                cfg.provenance.otel_service_name = Source::TfToml;
+            }
+            ("telemetry", "otel_log_level") if !val.trim().is_empty() => {
+                cfg.otel_log_level = val;
+                cfg.provenance.otel_log_level = Source::TfToml;
+            }
+            ("telemetry", "otel_sampler_arg") if !val.trim().is_empty() => {
+                cfg.otel_sampler_arg =
+                    parse_sampler_arg("tf.toml [telemetry] otel_sampler_arg", &val).map_err(
+                        |_| FleetConfigError::BadTfToml {
+                            line_no,
+                            line: raw.trim().to_string(),
+                            why: format!("`otel_sampler_arg` expects a number, got `{val}`"),
+                        },
+                    )?;
+                cfg.provenance.otel_sampler_arg = Source::TfToml;
+            }
+            ("telemetry", "otel_headers") if !val.trim().is_empty() => {
+                cfg.otel_headers = Some(parse_otel_headers(&val));
+                cfg.provenance.otel_headers = Source::TfToml;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Build a [`FleetOverrides`] from an already-collected string map — a
 /// convenience for the CLI crate / tests that have flag values as strings.
 /// Not used by core itself; keeps the string→typed boundary in one place.
@@ -814,5 +1072,228 @@ mod tests {
         assert_eq!(ov.repo, Some(PathBuf::from("/r")));
         assert_eq!(ov.corun, Some(false));
         assert_eq!(ov.cas_dir, None);
+    }
+
+    // ───────── #246 Wave-1 (5b) — TelemetryConfig tests ─────────
+    //
+    // Foundational property: defaults are a no-op (telemetry disabled).
+    // Every other field validates layering precedence (default < tf.toml <
+    // env < CLI) and the load-bearing `enabled()` predicate — the SINGLE
+    // gate that prevents OTEL init from spinning up exporters when no
+    // endpoint is configured.
+
+    #[test]
+    fn telemetry_defaults_are_disabled_no_endpoint() {
+        // THE no-op invariant: no endpoint resolved ⇒ binary-side
+        // init_telemetry is a no-op (zero OTEL overhead). This is the
+        // load-bearing fail-soft guarantee from the plan.
+        let c = TelemetryConfig::defaults();
+        assert_eq!(c.otel_endpoint, None);
+        assert_eq!(c.otel_headers, None);
+        assert_eq!(c.otel_service_name, "cargoless");
+        assert_eq!(c.otel_log_level, "warn");
+        assert_eq!(c.otel_sampler_arg, 1.0);
+        assert!(!c.enabled(), "defaults() MUST yield enabled=false");
+    }
+
+    #[test]
+    fn telemetry_resolve_no_inputs_equals_defaults() {
+        let tmp = std::env::temp_dir().join(format!("cl-otel-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let c =
+            TelemetryConfig::resolve_layered(&tmp, TelemetryOverrides::default(), &no_env).unwrap();
+        assert_eq!(c, TelemetryConfig::defaults());
+        assert!(!c.enabled());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn telemetry_enabled_iff_endpoint_set() {
+        // The single predicate that gates exporter init. Explicit
+        // verification — a regression that flips enabled() semantics is
+        // a load-bearing fail-soft regression.
+        let mut c = TelemetryConfig::defaults();
+        assert!(!c.enabled());
+        c.otel_endpoint = Some("http://otel:4317".to_string());
+        assert!(c.enabled());
+        // Blank endpoint is treated as "not set" (no surprise no-op
+        // bypass via empty string).
+        c.otel_endpoint = Some("   ".to_string());
+        assert!(!c.enabled(), "blank endpoint MUST NOT enable");
+        c.otel_endpoint = Some(String::new());
+        assert!(!c.enabled(), "empty endpoint MUST NOT enable");
+    }
+
+    #[test]
+    fn telemetry_env_precedence_over_tf_toml() {
+        let dir = std::env::temp_dir().join(format!("cl-otel-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tf.toml"),
+            "[telemetry]\n\
+             otel_endpoint = \"http://from-toml:4317\"\n\
+             otel_service_name = \"toml-svc\"\n\
+             otel_log_level = \"info\"\n\
+             otel_sampler_arg = 0.5\n",
+        )
+        .unwrap();
+
+        // toml-only baseline: every field comes from tf.toml.
+        let c =
+            TelemetryConfig::resolve_layered(&dir, TelemetryOverrides::default(), &no_env).unwrap();
+        assert_eq!(c.otel_endpoint.as_deref(), Some("http://from-toml:4317"));
+        assert_eq!(c.otel_service_name, "toml-svc");
+        assert_eq!(c.otel_log_level, "info");
+        assert_eq!(c.otel_sampler_arg, 0.5);
+        assert_eq!(c.provenance.otel_endpoint, Source::TfToml);
+        assert_eq!(c.provenance.otel_service_name, Source::TfToml);
+        assert!(c.enabled());
+
+        // env overrides toml across every field.
+        let env = |k: &str| match k {
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://from-env:4317".to_string()),
+            "OTEL_SERVICE_NAME" => Some("env-svc".to_string()),
+            "OTEL_LOG_LEVEL" => Some("debug".to_string()),
+            "OTEL_TRACES_SAMPLER_ARG" => Some("0.25".to_string()),
+            _ => None,
+        };
+        let c =
+            TelemetryConfig::resolve_layered(&dir, TelemetryOverrides::default(), &env).unwrap();
+        assert_eq!(c.otel_endpoint.as_deref(), Some("http://from-env:4317"));
+        assert_eq!(c.otel_service_name, "env-svc");
+        assert_eq!(c.otel_log_level, "debug");
+        assert_eq!(c.otel_sampler_arg, 0.25);
+        assert_eq!(c.provenance.otel_endpoint, Source::Env);
+        assert_eq!(c.provenance.otel_service_name, Source::Env);
+        assert_eq!(c.provenance.otel_log_level, Source::Env);
+        assert_eq!(c.provenance.otel_sampler_arg, Source::Env);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_cli_overrides_env_for_endpoint_and_service_name() {
+        // The two CLI-injected fields (`--otel-endpoint`, `--otel-service-name`)
+        // must beat env, matching FleetConfig's precedence rule.
+        let env = |k: &str| match k {
+            "OTEL_EXPORTER_OTLP_ENDPOINT" => Some("http://env:4317".to_string()),
+            "OTEL_SERVICE_NAME" => Some("env-svc".to_string()),
+            _ => None,
+        };
+        let ov = TelemetryOverrides {
+            otel_endpoint: Some("http://cli:4317".to_string()),
+            otel_service_name: Some("cli-svc".to_string()),
+        };
+        let c = TelemetryConfig::resolve_layered(std::path::Path::new("/nonexistent"), ov, &env)
+            .unwrap();
+        assert_eq!(c.otel_endpoint.as_deref(), Some("http://cli:4317"));
+        assert_eq!(c.otel_service_name, "cli-svc");
+        assert_eq!(c.provenance.otel_endpoint, Source::Cli);
+        assert_eq!(c.provenance.otel_service_name, Source::Cli);
+    }
+
+    #[test]
+    fn telemetry_headers_parse_comma_separated_kv() {
+        let env = |k: &str| match k {
+            "OTEL_EXPORTER_OTLP_HEADERS" => {
+                Some("Authorization=Bearer xyz, x-tenant = acme,malformed".to_string())
+            }
+            _ => None,
+        };
+        let c = TelemetryConfig::resolve_layered(
+            std::path::Path::new("/nonexistent"),
+            TelemetryOverrides::default(),
+            &env,
+        )
+        .unwrap();
+        let h = c.otel_headers.expect("headers set from env");
+        assert_eq!(
+            h.get("Authorization").map(String::as_str),
+            Some("Bearer xyz")
+        );
+        assert_eq!(h.get("x-tenant").map(String::as_str), Some("acme"));
+        // Tolerant: malformed pair (no `=`) silently dropped — telemetry
+        // MUST NOT wedge the daemon on a typo.
+        assert!(!h.contains_key("malformed"));
+        assert_eq!(h.len(), 2);
+        assert_eq!(c.provenance.otel_headers, Source::Env);
+    }
+
+    #[test]
+    fn telemetry_blank_env_endpoint_does_not_override_default() {
+        // Mirror of the FleetConfig blank-token defense: a blank env value
+        // is treated as "not set" — telemetry stays disabled rather than
+        // silently engaging a malformed exporter.
+        for blank in ["", " ", "\t  \t"] {
+            let env = |k: &str| (k == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| blank.to_string());
+            let c = TelemetryConfig::resolve_layered(
+                std::path::Path::new("/nonexistent"),
+                TelemetryOverrides::default(),
+                &env,
+            )
+            .unwrap();
+            assert_eq!(
+                c.otel_endpoint, None,
+                "blank env {blank:?} MUST NOT set endpoint"
+            );
+            assert!(!c.enabled(), "blank env {blank:?} ⇒ telemetry disabled");
+        }
+    }
+
+    #[test]
+    fn telemetry_malformed_sampler_arg_is_actionable_error() {
+        let env = |k: &str| (k == "OTEL_TRACES_SAMPLER_ARG").then(|| "not-a-number".to_string());
+        let err = TelemetryConfig::resolve_layered(
+            std::path::Path::new("/nonexistent"),
+            TelemetryOverrides::default(),
+            &env,
+        )
+        .unwrap_err();
+        // Reuses BadBool for sampler malformedness — same error shape
+        // every consumer already handles.
+        assert!(matches!(err, FleetConfigError::BadBool { .. }));
+    }
+
+    #[test]
+    fn telemetry_tf_toml_unknown_keys_tolerantly_ignored() {
+        // The [telemetry] section is a partial overlay over a shared
+        // tf.toml; unknown keys MUST be silently ignored (a future
+        // additive field like otel_compression should never break
+        // existing parsers on older binaries).
+        let dir = std::env::temp_dir().join(format!("cl-otel-tol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tf.toml"),
+            "[telemetry]\n\
+             otel_endpoint = \"http://here:4317\"\n\
+             otel_compression = \"gzip\"  # future key, today unknown\n\
+             [unrelated_section]\n\
+             totally_other = \"thing\"\n",
+        )
+        .unwrap();
+        let c =
+            TelemetryConfig::resolve_layered(&dir, TelemetryOverrides::default(), &no_env).unwrap();
+        assert_eq!(c.otel_endpoint.as_deref(), Some("http://here:4317"));
+        assert!(c.enabled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telemetry_blank_cli_overrides_do_not_clobber_env() {
+        // Defense-in-depth: `--otel-endpoint ""` MUST NOT wipe a perfectly
+        // good env-set endpoint (same blank-rejects-uniformly discipline
+        // as the auth_token surface).
+        let env = |k: &str| {
+            (k == "OTEL_EXPORTER_OTLP_ENDPOINT").then(|| "http://env-good:4317".to_string())
+        };
+        let ov = TelemetryOverrides {
+            otel_endpoint: Some("   ".to_string()),
+            otel_service_name: None,
+        };
+        let c = TelemetryConfig::resolve_layered(std::path::Path::new("/nonexistent"), ov, &env)
+            .unwrap();
+        assert_eq!(c.otel_endpoint.as_deref(), Some("http://env-good:4317"));
+        // env stays the winning provenance (CLI blank did not promote).
+        assert_eq!(c.provenance.otel_endpoint, Source::Env);
     }
 }
