@@ -23,9 +23,10 @@ use std::sync::mpsc::{Receiver, channel};
 use cargoless_proto::Diagnostic;
 
 use super::{
-    Request, TransitionEvent, TransportClient, TransportError, VerdictService, WorktreeStatus,
-    WorktreeSummary, event_from_json, event_to_json, status_from_json, status_to_json,
-    summaries_from_json, summaries_to_json,
+    PushOverlayAck, Request, TransitionEvent, TransportClient, TransportError, VerdictService,
+    WorktreeStatus, WorktreeSummary, event_from_json, event_to_json, pushoverlayack_from_json,
+    pushoverlayack_to_json, status_from_json, status_to_json, summaries_from_json,
+    summaries_to_json,
 };
 
 /// Response framing shared with the request side. A logical reply is one
@@ -50,6 +51,14 @@ fn dispatch_oneshot(svc: &dyn VerdictService, req: &Request) -> String {
         // Subscribe is not a one-shot; the server handles it as a stream
         // before reaching here. Defensive: never panic.
         Request::Subscribe => "null".to_string(),
+        // Increment 2: `PushOverlay` IS a one-shot (write-ingest →
+        // cheap ack; the verdict comes back via the read plane). One
+        // NDJSON request line in, one ack line out.
+        Request::PushOverlay {
+            worktree,
+            base_ref,
+            files,
+        } => pushoverlayack_to_json(&svc.push_overlay(worktree, base_ref, files)),
     }
 }
 
@@ -236,6 +245,23 @@ mod imp {
                 }
             });
             Ok(rx)
+        }
+
+        fn push_overlay(
+            &self,
+            worktree: &str,
+            base_ref: &str,
+            files: &[(String, String)],
+        ) -> Result<PushOverlayAck, TransportError> {
+            // One NDJSON request line out, one ack line back — the same
+            // one-shot shape as get_status/get_verdict.
+            let line = self.one_shot(&Request::PushOverlay {
+                worktree: worktree.to_string(),
+                base_ref: base_ref.to_string(),
+                files: files.to_vec(),
+            })?;
+            pushoverlayack_from_json(&line)
+                .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into()))
         }
     }
 }

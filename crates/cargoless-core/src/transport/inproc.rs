@@ -12,8 +12,8 @@ use std::sync::mpsc::Receiver;
 use cargoless_proto::Diagnostic;
 
 use super::{
-    TransitionEvent, TransportClient, TransportError, VerdictService, WorktreeStatus,
-    WorktreeSummary,
+    PushOverlayAck, TransitionEvent, TransportClient, TransportError, VerdictService,
+    WorktreeStatus, WorktreeSummary,
 };
 
 /// Wraps any [`VerdictService`] and presents it as a [`TransportClient`].
@@ -49,6 +49,17 @@ impl TransportClient for InProcClient {
 
     fn subscribe(&self) -> Result<Receiver<TransitionEvent>, TransportError> {
         Ok(self.service.subscribe())
+    }
+
+    fn push_overlay(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+    ) -> Result<PushOverlayAck, TransportError> {
+        // Single-binary mode: forward straight to the in-memory service —
+        // infallible, zero IPC (the in-proc adapter's whole point).
+        Ok(self.service.push_overlay(worktree, base_ref, files))
     }
 }
 

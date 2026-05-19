@@ -129,6 +129,27 @@ pub trait VerdictService: Send + Sync {
     /// Subscribe to the transition-event stream. The serve loop owns the
     /// fan-out; each call yields an independent `Receiver`.
     fn subscribe(&self) -> Receiver<TransitionEvent>;
+
+    /// Increment 2 (D-PUSHOVERLAY §2.4) — ingest a pushed overlay-set for
+    /// `worktree`. ADDITIVE with a **default body** so no existing impl
+    /// is forced to change (the v0.2.0 `MockService` and the in-proc /
+    /// Unix / HTTP read paths all keep compiling untouched). The real
+    /// implementor is the serve loop's `VerdictService`, which overrides
+    /// this to feed the per-WT overlay store; the default is an honest
+    /// refusal (`accepted: false`) — a service that has not opted into
+    /// push-ingest reports it stored nothing.
+    fn push_overlay(
+        &self,
+        worktree: &str,
+        _base_ref: &str,
+        _files: &[(String, String)],
+    ) -> PushOverlayAck {
+        PushOverlayAck {
+            worktree: worktree.to_string(),
+            accepted: false,
+            applied_files: 0,
+        }
+    }
 }
 
 /// The **client** counterpart of [`VerdictService`] — the uniform
@@ -148,6 +169,22 @@ pub trait TransportClient {
     /// service receiver back; Unix/HTTP spawn a reader thread that
     /// forwards decoded frames into a channel).
     fn subscribe(&self) -> Result<Receiver<TransitionEvent>, TransportError>;
+
+    /// Increment 2 — push an overlay-set to the daemon. ADDITIVE with a
+    /// default `Err` so existing clients/call-sites are unaffected; the
+    /// real implementors (`HttpClient`, `UnixClient`, `InProcClient`)
+    /// override it. Write-only: the verdict is NOT in the ack — the
+    /// caller then polls `get_status` / `subscribe` for it.
+    fn push_overlay(
+        &self,
+        _worktree: &str,
+        _base_ref: &str,
+        _files: &[(String, String)],
+    ) -> Result<PushOverlayAck, TransportError> {
+        Err(TransportError::Protocol(
+            "push_overlay unsupported by this transport".into(),
+        ))
+    }
 }
 
 /// Network-auth seam (Model R #14 — NOT implemented in #10). The HTTP
@@ -329,6 +366,17 @@ pub enum Request {
     GetDiagnostics(String),
     ListWorktrees,
     Subscribe,
+    /// Increment 2 (D-PUSHOVERLAY §2) — ADDITIVE write-ingest verb. The
+    /// five variants above are byte-frozen; this is appended last. The
+    /// thin push-client sends whole-file `(path, content)` pairs (never a
+    /// keystroke diff — the client owns its overlay-set). Write-only: it
+    /// does NOT carry a verdict back; the verdict reaches the client via
+    /// the already-shipped `subscribe`/`get_status` read plane.
+    PushOverlay {
+        worktree: String,
+        base_ref: String,
+        files: Vec<(String, String)>,
+    },
 }
 
 impl Request {
@@ -350,6 +398,19 @@ impl Request {
             "get_diagnostics" => Some(Request::GetDiagnostics(wt())),
             "list_worktrees" => Some(Request::ListWorktrees),
             "subscribe" => Some(Request::Subscribe),
+            // Increment 2: best-effort (mirrors the rules above) — a
+            // missing/`!array` `files` ⇒ empty vec, a malformed element
+            // (no `path`) is skipped; never a panic. `base_ref` absent ⇒
+            // empty string (same posture as `wt()`).
+            "push_overlay" => Some(Request::PushOverlay {
+                worktree: wt(),
+                base_ref: v
+                    .get("base_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                files: overlay_files_from_json(v.get("files")),
+            }),
             _ => None,
         }
     }
@@ -363,9 +424,94 @@ impl Request {
             }
             Request::ListWorktrees => serde_json::json!({"op":"list_worktrees"}),
             Request::Subscribe => serde_json::json!({"op":"subscribe"}),
+            Request::PushOverlay {
+                worktree,
+                base_ref,
+                files,
+            } => serde_json::json!({
+                "op": "push_overlay",
+                "worktree": worktree,
+                "base_ref": base_ref,
+                "files": overlay_files_to_json(files),
+            }),
         };
         v.to_string()
     }
+}
+
+/// Serialise the `PushOverlay` `files` payload as a JSON array of
+/// `{"path":..,"content":..}` objects (Increment 2). Hand-rolled `Value`,
+/// no derive — same house style as `crate_verdicts_json`.
+fn overlay_files_to_json(files: &[(String, String)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        files
+            .iter()
+            .map(|(p, c)| serde_json::json!({"path": p, "content": c}))
+            .collect(),
+    )
+}
+
+/// Parse the `PushOverlay` `files` array (Increment 2). Best-effort,
+/// mirroring `crate_verdicts_from_json` exactly: a non-array (or `None`)
+/// ⇒ empty vec; an element with no `path` is skipped (not fatal); a
+/// missing `content` defaults to empty string. Never panics.
+fn overlay_files_from_json(v: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let Some(serde_json::Value::Array(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|f| {
+            let path = f.get("path")?.as_str()?.to_string();
+            let content = f
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some((path, content))
+        })
+        .collect()
+}
+
+/// Increment 2 (D-PUSHOVERLAY §2.3) — the cheap write-ingest ack for
+/// [`Request::PushOverlay`]. `PushOverlay` does NOT block on a verdict;
+/// the client obtains the verdict via the already-shipped
+/// `subscribe`/`get_status` read plane. `accepted` is the server's
+/// "stored it" signal; `applied_files` is the count it persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushOverlayAck {
+    pub worktree: String,
+    pub accepted: bool,
+    pub applied_files: u32,
+}
+
+/// Serialise a [`PushOverlayAck`] to wire JSON
+/// (`{"worktree":..,"accepted":..,"applied_files":..}`).
+pub fn pushoverlayack_to_json(a: &PushOverlayAck) -> String {
+    serde_json::json!({
+        "worktree": a.worktree,
+        "accepted": a.accepted,
+        "applied_files": a.applied_files,
+    })
+    .to_string()
+}
+
+/// Parse a [`PushOverlayAck`] from wire JSON (best-effort: a missing
+/// `worktree` ⇒ `None`; missing scalars default to `false`/`0`, never a
+/// panic — same posture as [`status_from_json`]).
+pub fn pushoverlayack_from_json(text: &str) -> Option<PushOverlayAck> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(PushOverlayAck {
+        worktree: v.get("worktree")?.as_str()?.to_string(),
+        accepted: v
+            .get("accepted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        applied_files: v
+            .get("applied_files")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+    })
 }
 
 fn crate_verdicts_json(crates: &[CrateVerdict]) -> serde_json::Value {
@@ -763,5 +909,102 @@ mod tests {
         // policy) is what #10 ships.
         assert!(AllowAll.authorize(None));
         assert!(AllowAll.authorize(Some("anything")));
+    }
+
+    // ───────── Increment 2 — PushOverlay verb + ack codec ─────────
+
+    #[test]
+    fn push_overlay_request_roundtrips_incl_empty_and_multi_files() {
+        for files in [
+            vec![],
+            vec![("src/lib.rs".to_string(), "fn main(){}".to_string())],
+            vec![
+                ("Cargo.toml".to_string(), "[package]".to_string()),
+                ("src/a.rs".to_string(), "// a".to_string()),
+                ("src/b.rs".to_string(), String::new()),
+            ],
+        ] {
+            let r = Request::PushOverlay {
+                worktree: "wt-x".into(),
+                base_ref: "origin/main".into(),
+                files,
+            };
+            assert_eq!(
+                Request::from_json(&r.to_json()),
+                Some(r.clone()),
+                "exact roundtrip: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_overlay_from_json_is_best_effort_never_panics() {
+        // Missing `files` ⇒ empty vec (not a panic); a malformed element
+        // (no `path`) is skipped; missing `base_ref` ⇒ empty string —
+        // same posture as `crate_verdicts_from_json`.
+        let no_files = Request::from_json(r#"{"op":"push_overlay","worktree":"w"}"#).unwrap();
+        assert_eq!(
+            no_files,
+            Request::PushOverlay {
+                worktree: "w".into(),
+                base_ref: String::new(),
+                files: vec![],
+            }
+        );
+        let bad_elem = Request::from_json(
+            r#"{"op":"push_overlay","worktree":"w","base_ref":"b",
+                "files":[{"no_path":"x"},{"path":"ok.rs","content":"c"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bad_elem,
+            Request::PushOverlay {
+                worktree: "w".into(),
+                base_ref: "b".into(),
+                files: vec![("ok.rs".into(), "c".into())], // bad element skipped
+            }
+        );
+        // `files` not an array ⇒ empty, no panic.
+        let not_array =
+            Request::from_json(r#"{"op":"push_overlay","worktree":"w","files":"nope"}"#).unwrap();
+        assert!(matches!(not_array, Request::PushOverlay { files, .. } if files.is_empty()));
+        // Unknown op still `None` (the frozen rule is unchanged).
+        assert_eq!(Request::from_json(r#"{"op":"frobnicate"}"#), None);
+    }
+
+    #[test]
+    fn pushoverlayack_roundtrips_and_is_best_effort() {
+        let a = PushOverlayAck {
+            worktree: "wt-y".into(),
+            accepted: true,
+            applied_files: 7,
+        };
+        assert_eq!(
+            pushoverlayack_from_json(&pushoverlayack_to_json(&a)),
+            Some(a)
+        );
+        // Best-effort: no worktree ⇒ None; missing scalars ⇒ false/0.
+        assert_eq!(pushoverlayack_from_json("{}"), None);
+        assert_eq!(pushoverlayack_from_json("garbage"), None);
+        let partial = pushoverlayack_from_json(r#"{"worktree":"w"}"#).unwrap();
+        assert!(!partial.accepted);
+        assert_eq!(partial.applied_files, 0);
+    }
+
+    #[test]
+    fn verdict_service_default_push_overlay_refuses_honestly() {
+        // The §2.4 contained seam-touch: the trait default reports it
+        // stored nothing (`accepted:false`) — a service that has not
+        // opted into push-ingest never falsely claims acceptance.
+        use super::inproc::testmock::MockService;
+        let ack = MockService::new().push_overlay("w", "base", &[]);
+        assert_eq!(
+            ack,
+            PushOverlayAck {
+                worktree: "w".into(),
+                accepted: false,
+                applied_files: 0,
+            }
+        );
     }
 }

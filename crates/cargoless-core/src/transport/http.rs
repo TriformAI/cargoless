@@ -36,33 +36,51 @@ use std::thread;
 use cargoless_proto::Diagnostic;
 
 use super::{
-    Authorizer, TransitionEvent, TransportClient, TransportError, VerdictService, WorktreeStatus,
-    WorktreeSummary, event_from_json, event_to_json, status_from_json, status_to_json,
+    Authorizer, PushOverlayAck, Request, TransitionEvent, TransportClient, TransportError,
+    VerdictService, WorktreeStatus, WorktreeSummary, event_from_json, event_to_json,
+    pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
     summaries_from_json, summaries_to_json,
 };
+
+/// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
+/// request body. The body-reading route is *bounded by construction*:
+/// the server `read_exact`s an EXACT, capped `Content-Length` and never
+/// more; a larger declared length is refused `413` before any read. 32
+/// MiB comfortably covers a whole-file overlay-set for a real workspace
+/// while fail-closed-bounding a hostile/runaway client.
+const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
 
 // ---- tiny request model -------------------------------------------------
 
 struct HttpReq {
+    method: String,
     path: String,
     query: String,
     bearer: Option<String>,
+    /// `Some(n)` iff a numeric `Content-Length` header was present.
+    /// Increment 2: only `POST /overlay` reads a body; an absent OR
+    /// non-numeric value both collapse to `None` ⇒ the POST handler
+    /// answers `400` (every GET route still reads no body).
+    content_length: Option<usize>,
 }
 
-/// Parse the request line + headers (we only need method/path/query +
-/// `Authorization: Bearer`). Body is never read — the API is all GET.
+/// Parse the request line + headers (method/path/query +
+/// `Authorization: Bearer` + `Content-Length`). The body is read ONLY by
+/// the `POST /overlay` route (Increment 2); every GET route stays
+/// body-less — the bounded-by-construction property is preserved.
 /// Returns `None` on a malformed head (server answers 400).
 fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
     let mut start = String::new();
     reader.read_line(&mut start).ok()?;
     let mut it = start.split_whitespace();
-    let _method = it.next()?; // GET (only verb served)
+    let method = it.next()?.to_string(); // GET (read routes) | POST (/overlay)
     let target = it.next()?.to_string();
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
     };
     let mut bearer = None;
+    let mut content_length = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -73,18 +91,24 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
             break; // end of headers
         }
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("authorization") {
-                let v = v.trim();
-                if let Some(tok) = v.strip_prefix("Bearer ") {
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("authorization") {
+                if let Some(tok) = v.trim().strip_prefix("Bearer ") {
                     bearer = Some(tok.to_string());
                 }
+            } else if k.eq_ignore_ascii_case("content-length") {
+                // Non-numeric ⇒ stays `None` ⇒ POST /overlay answers 400
+                // (absent and non-numeric are the same client error).
+                content_length = v.trim().parse::<usize>().ok();
             }
         }
     }
     Some(HttpReq {
+        method,
         path,
         query,
         bearer,
+        content_length,
     })
 }
 
@@ -233,6 +257,76 @@ fn handle(
         return;
     }
 
+    // ── POST /overlay — the server's FIRST body-reading route (Inc 2) ──
+    // Bearer-gated: the #14 auth gate above already ran, so POST /overlay
+    // inherits the SAME Authorizer as every non-/healthz route — no new
+    // auth surface. Bounded by construction: read EXACTLY a capped
+    // Content-Length and never more; every GET route stays body-less.
+    if req.method == "POST" && req.path == "/overlay" {
+        let body = match req.content_length {
+            // absent OR non-numeric Content-Length ⇒ 400 (same client error)
+            None => {
+                write_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    "POST /overlay requires a numeric Content-Length",
+                );
+                return;
+            }
+            // declared length over the cap ⇒ 413, refused BEFORE any read
+            Some(n) if n > MAX_OVERLAY_BYTES => {
+                write_response(
+                    &mut writer,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    "overlay payload exceeds the size cap",
+                );
+                return;
+            }
+            Some(n) => {
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() {
+                    write_response(
+                        &mut writer,
+                        400,
+                        "Bad Request",
+                        "text/plain",
+                        "overlay body shorter than its Content-Length",
+                    );
+                    return;
+                }
+                buf
+            }
+        };
+        match Request::from_json(&String::from_utf8_lossy(&body)) {
+            Some(Request::PushOverlay {
+                worktree,
+                base_ref,
+                files,
+            }) => {
+                let ack = svc.push_overlay(&worktree, &base_ref, &files);
+                write_response(
+                    &mut writer,
+                    200,
+                    "OK",
+                    "application/json",
+                    &pushoverlayack_to_json(&ack),
+                );
+            }
+            _ => write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "text/plain",
+                "body is not a valid push_overlay request",
+            ),
+        }
+        return;
+    }
+
     // SSE stream route.
     if req.path == "/events" {
         let _ = write!(
@@ -339,12 +433,18 @@ fn pct_decode(s: &str) -> String {
 pub struct HttpClient {
     host: String,
     port: u16,
+    /// Bearer token for the authed write path (`push_overlay` →
+    /// `POST /overlay`). `None` ⇒ no `Authorization` header is sent —
+    /// correct for the #10 loopback/`AllowAll` posture, and the GET read
+    /// methods are unchanged (token-less) either way. Increment 2.
+    token: Option<String>,
 }
 
 impl HttpClient {
     /// Parse `http://host:port` (the only scheme #10 serves; #14 may add
     /// TLS). Returns a protocol error on a malformed base rather than
-    /// panicking — discovery then falls through.
+    /// panicking — discovery then falls through. Token-less (the GET read
+    /// paths are unchanged); use [`Self::with_token`] for an authed push.
     pub fn new(base: &str) -> Result<Self, TransportError> {
         let rest = base
             .strip_prefix("http://")
@@ -358,7 +458,21 @@ impl HttpClient {
             ),
             None => (rest.to_string(), 80),
         };
-        Ok(Self { host, port })
+        Ok(Self {
+            host,
+            port,
+            token: None,
+        })
+    }
+
+    /// Increment 2 — like [`Self::new`] but carrying a bearer token the
+    /// `push_overlay` write path presents as `Authorization: Bearer` (a
+    /// `BearerToken`-protected daemon). Additive: `new`'s token-less GET
+    /// behaviour is unchanged.
+    pub fn with_token(base: &str, token: impl Into<String>) -> Result<Self, TransportError> {
+        let mut c = Self::new(base)?;
+        c.token = Some(token.into());
+        Ok(c)
     }
 
     fn get(&self, path_and_query: &str) -> Result<(u16, String), TransportError> {
@@ -448,6 +562,57 @@ impl TransportClient for HttpClient {
             }
         });
         Ok(rx)
+    }
+
+    fn push_overlay(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+    ) -> Result<PushOverlayAck, TransportError> {
+        // The server's one body-carrying route. Reuse the frozen
+        // `Request` codec for the body (no bespoke JSON); bearer header
+        // only when a token is configured (#10 loopback posture sends
+        // none — `AllowAll` accepts it).
+        let body = Request::PushOverlay {
+            worktree: worktree.to_string(),
+            base_ref: base_ref.to_string(),
+            files: files.to_vec(),
+        }
+        .to_json();
+        let mut stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        write!(
+            stream,
+            "POST /overlay HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            self.host,
+            body.len()
+        )?;
+        if let Some(tok) = &self.token {
+            write!(stream, "Authorization: Bearer {tok}\r\n")?;
+        }
+        write!(stream, "\r\n{body}")?;
+        stream.flush()?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw)?;
+        let (head, resp) = raw
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
+        match code {
+            200 => pushoverlayack_from_json(resp)
+                .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into())),
+            401 => Err(TransportError::Unauthorized),
+            413 => Err(TransportError::Protocol(
+                "overlay payload too large (413)".into(),
+            )),
+            c => Err(TransportError::Protocol(format!("push_overlay HTTP {c}"))),
+        }
     }
 }
 
@@ -677,5 +842,139 @@ mod tests {
         // Non-/healthz routes still work exactly as before.
         let c = client_for(&s);
         assert_eq!(c.get_verdict("green-wt").unwrap(), Some("green".into()));
+    }
+
+    // ───────── Increment 2 — POST /overlay body-reading route ─────────
+
+    /// Raw `POST` with a caller-chosen `Content-Length` header (or none)
+    /// — lets a test declare a deliberately-wrong length.
+    fn raw_post(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: &str,
+        content_length: Option<&str>,
+    ) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let mut head = format!("POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
+        if let Some(cl) = content_length {
+            head.push_str(&format!("Content-Length: {cl}\r\n"));
+        }
+        head.push_str("\r\n");
+        write!(s, "{head}{body}").unwrap();
+        s.flush().unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        let (h, b) = match raw.split_once("\r\n\r\n") {
+            Some(hb) => hb,
+            None => (raw.as_str(), ""),
+        };
+        let code = h
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .expect("status code");
+        (code, b.to_string())
+    }
+
+    fn overlay_body() -> String {
+        Request::PushOverlay {
+            worktree: "wt-push".into(),
+            base_ref: "origin/main".into(),
+            files: vec![("src/lib.rs".into(), "fn f(){}".into())],
+        }
+        .to_json()
+    }
+
+    #[test]
+    fn post_overlay_bounded_body_400_413_and_happy_path() {
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let body = overlay_body();
+
+        // Happy path: exact Content-Length ⇒ 200 + a parseable ack.
+        let (code, resp) = raw_post(s.addr(), "/overlay", &body, Some(&body.len().to_string()));
+        assert_eq!(code, 200, "exact-length POST /overlay ⇒ 200");
+        let ack = pushoverlayack_from_json(&resp).expect("ack parses");
+        assert_eq!(ack.worktree, "wt-push");
+
+        // Absent Content-Length ⇒ 400 (bounded-by-construction: a POST
+        // body is read ONLY against an exact declared length).
+        assert_eq!(raw_post(s.addr(), "/overlay", &body, None).0, 400);
+        // Non-numeric Content-Length ⇒ 400 (same client error as absent).
+        assert_eq!(
+            raw_post(s.addr(), "/overlay", &body, Some("not-a-number")).0,
+            400
+        );
+        // Declared length over the 32 MiB cap ⇒ 413, refused BEFORE any
+        // read (we send a tiny body but claim ~99 GB).
+        assert_eq!(
+            raw_post(s.addr(), "/overlay", &body, Some("99999999999")).0,
+            413
+        );
+        // A body that is not a valid push_overlay request ⇒ 400.
+        let junk = "{\"op\":\"nonsense\"}";
+        assert_eq!(
+            raw_post(s.addr(), "/overlay", junk, Some(&junk.len().to_string())).0,
+            400
+        );
+        drop(s);
+    }
+
+    #[test]
+    fn post_overlay_is_bearer_gated_deny_yields_401() {
+        // Unlike /healthz, POST /overlay is NOT auth-exempt — it flows
+        // through the #14 gate. A DenyAll authorizer ⇒ 401, no panic.
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(DenyAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let body = overlay_body();
+        let (code, _) = raw_post(s.addr(), "/overlay", &body, Some(&body.len().to_string()));
+        assert_eq!(
+            code, 401,
+            "POST /overlay is bearer-gated (not /healthz-exempt)"
+        );
+        drop(s);
+    }
+
+    #[test]
+    fn http_client_push_overlay_roundtrips_over_the_wire() {
+        // The HttpClient write path end-to-end: POST /overlay → ack.
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let c = client_for(&s);
+        let ack = c
+            .push_overlay(
+                "wt-z",
+                "origin/main",
+                &[("a.rs".to_string(), "// a".to_string())],
+            )
+            .expect("push_overlay ok");
+        // MockService uses the trait default ⇒ honest refusal (accepted
+        // false) — the WIRE is what this proves: request encoded, routed,
+        // ack decoded. Real acceptance is the serve loop's job (2b/§4).
+        assert_eq!(ack.worktree, "wt-z");
+        assert!(!ack.accepted);
+        drop(s);
     }
 }
