@@ -1,0 +1,19 @@
+# diffmatrix case `type-err` — a plain host type error (E0308).
+# Ground-truth = RED on host check (and therefore wasm + clippy moot,
+# since a type error stops the front-end before lints run).
+# cargoless MUST be RED here today — this is the #2 / #8-redo
+# verdict-honesty invariant; a FALSE-GREEN here is a launch-blocker.
+[workspace]
+
+[package]
+name = "diffcase-type-err"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

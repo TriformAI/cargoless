@@ -1,0 +1,19 @@
+# diffmatrix case `clean` — compiles green on host AND wasm32, and is
+# clippy(-D warnings)-clean. Ground-truth color = GREEN on every oracle.
+# ZERO dependencies on purpose (no crates.io egress; the differential
+# oracle must not import a fetch/lock surface — same ethos as
+# bench/harness/Cargo.toml).
+[workspace]
+
+[package]
+name = "diffcase-clean"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

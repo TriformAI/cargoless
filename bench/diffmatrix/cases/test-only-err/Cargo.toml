@@ -1,0 +1,21 @@
+# diffmatrix case `test-only-err` — the lib compiles green, but a
+# `#[cfg(test)]` module has a type error. `cargo check` (no flags)
+# is GREEN; `cargo check --all-targets` is RED (the test target fails).
+#
+# Probes whether cargoless's verdict authority covers the test target
+# (`--all-targets`). If cargoless is GREEN here it is a FALSE-GREEN that
+# Increment-3 (check authority parity) must close.
+[workspace]
+
+[package]
+name = "diffcase-test-only-err"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

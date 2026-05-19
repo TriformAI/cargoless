@@ -1,0 +1,26 @@
+# diffmatrix case `wasm-only-err` — THE LOAD-BEARING CASE.
+#
+# Compiles + clippy-clean on the host; FAILS only under
+# `cargo check --target wasm32-unknown-unknown`. Per dev-fixer's lane-B
+# gap analysis this host-vs-wasm divergence is the #1 currently-shipping
+# FALSE-GREEN risk: cargoless's authority is host `cargo check`, so a
+# wasm-only break ships GREEN today. The harness MUST fail loud here
+# until Increment-3 adds a wasm-target oracle to cargoless's authority.
+#
+# The harness BLOCKERs (does NOT silently skip) if the wasm32 target is
+# unavailable — silently skipping the load-bearing case would itself be
+# a harness-level false-GREEN.
+[workspace]
+
+[package]
+name = "diffcase-wasm-only-err"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

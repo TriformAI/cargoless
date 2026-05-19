@@ -1,0 +1,21 @@
+# diffmatrix case `clippy-warn` — compiles green on host AND wasm
+# (`cargo check` GREEN both targets), but `cargo clippy -- -D warnings`
+# is RED. Probes whether cargoless's authority includes a clippy tier.
+#
+# EXPECTED today (v0.2.0): cargoless = GREEN (no clippy authority) ⇒
+# FALSE-GREEN ⇒ gate fails loud. Turns bit-identical only when
+# Increment-3 adds the clippy oracle to cargoless's verdict authority.
+[workspace]
+
+[package]
+name = "diffcase-clippy-warn"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

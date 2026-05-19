@@ -1,0 +1,31 @@
+# Differential oracle table — the machine-readable contract diffharness.sh reads.
+# Tab-separated. Lines starting with '#' and blank lines are ignored.
+#
+# Columns:
+#   case              fixture id (dir under cases/ or the fixture-inject id)
+#   kind              crate           = standalone dep-free crate at cases/<case>/
+#                     fixture-inject  = copy bench/fixture/ + apply <inject>
+#   run_wasm          1 = the wasm32-unknown-unknown oracle is REQUIRED ground
+#                         truth for this case; target-missing => BLOCKER (never
+#                         a silent skip — that would be a harness false-GREEN)
+#                     0 = wasm not part of this case's ground truth
+#   run_clippy        1 = clippy -D warnings oracle is part of ground truth
+#   ground_truth      GREEN|RED — the canonical correct color (host[+wasm][+clippy])
+#   cargoless_base    GREEN|RED — HONEST documented v0.2.0 behavior. Where this
+#                     differs from ground_truth it records a CURRENTLY-SHIPPING
+#                     false-GREEN. This column is the "no we-already-win" ledger.
+#   inc3_required     GREEN|RED — required cargoless color when Increment-3 is
+#                     COMPLETE (always == ground_truth; explicit for clarity)
+#   klass             MATCH-NOW = must already bit-match; a mismatch is a
+#                                 REGRESSION (launch-class)
+#                     GAP-INC3  = documented false-GREEN an Increment-3 increment
+#                                 is responsible for closing
+#   inject            for kind=fixture-inject: anchor token | env (else "-")
+#
+#case	kind	run_wasm	run_clippy	ground_truth	cargoless_base	inc3_required	klass	inject
+clean	crate	1	1	GREEN	GREEN	GREEN	MATCH-NOW	-
+type-err	crate	0	0	RED	RED	RED	MATCH-NOW	-
+proc-macro	fixture-inject	0	0	RED	RED	RED	MATCH-NOW	BENCH_MACRO_ANCHOR|TF_RA_PROCMACRO_OFF=1
+test-only-err	crate	0	0	RED	GREEN	RED	GAP-INC3	-
+clippy-warn	crate	1	1	RED	GREEN	RED	GAP-INC3	-
+wasm-only-err	crate	1	1	RED	GREEN	RED	GAP-INC3	-
