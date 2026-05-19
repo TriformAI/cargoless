@@ -303,15 +303,16 @@ own-eyes-verified — exactly one `rust-analyzer` LSP + its one
    kill+wait+pgid/setsid), accumulating zombie/orphan RA under fleet
    restart-churn. **Fixed (#198, integrated):** a std-only
    `SIGTERM`/`SIGINT` handler routing **every** shutdown path through
-   the proven Supervisor reap (single-funnel). Verification:
-   **structurally proven** (independent scoped-confirm — single-funnel
-   no-bypass, proven cores byte-untouched) and integrated;
-   **live-fleet corroboration deferred to post-#199** (the shared
-   builder pod was in a degraded state — an unrelated infra issue,
-   #199, in-fix — that could not bring rust-analyzer up to run the
-   runtime probe; **no fabricated runtime number is claimed** — the
-   discipline refusing to manufacture a datum it couldn't honestly
-   obtain). It is **zombies (0 RSS), PID-hygiene under restart-churn —
+   the proven Supervisor reap (single-funnel). Verification —
+   **honest-closed-chain COMPLETE**: the fix's *correctness* is
+   established by the **structural fix** (independent scoped-confirm
+   — single-funnel no-bypass, proven cores byte-untouched —
+   source-verified) and integrated; that already-decided fix is now
+   **live-fleet-corroborated POSITIVE** on the #199-rolled infra (a
+   clean process table under real rust-analyzer load — corroboration
+   *confirmed*, not "FF-A proved by a fleet test"; the structural fix
+   is what decides correctness). It is **zombies (0 RSS), PID-hygiene
+   under restart-churn —
    NOT a RAM leak**; they reparent to init, structurally outside the
    descendant-scoped RSS measurement (an earlier "~10 GiB" inference
    was wrong and is **retracted**). A known-pattern regression caught
@@ -541,13 +542,15 @@ we deliberately did **not** do:
   accumulating zombie/orphan RA under fleet restart-churn. **Fixed
   (#198, integrated):** a std-only `SIGTERM`/`SIGINT` handler routing
   **every** shutdown path through the proven Supervisor reap
-  (single-funnel). Verification: **structurally proven** (independent
+  (single-funnel). Verification — **honest-closed-chain COMPLETE**:
+  correctness is established by the **structural fix** (independent
   scoped-confirm — single-funnel no-bypass, proven cores
-  byte-untouched) and integrated; **live-fleet corroboration deferred
-  to post-#199** (the shared builder pod was degraded — an unrelated
-  infra issue, #199, in-fix — and could not bring rust-analyzer up to
-  run the runtime probe; **no fabricated runtime number is claimed**).
-  It is **zombies (0 RSS), PID-hygiene under restart-churn — NOT a RAM
+  byte-untouched — source-verified) and integrated; that
+  already-decided fix is now **live-fleet-corroborated POSITIVE** on
+  the #199-rolled infra (a clean process table under real
+  rust-analyzer load — corroboration *confirmed*, not a
+  fleet-test-proof). It is **zombies (0 RSS), PID-hygiene under
+  restart-churn — NOT a RAM
   leak** (they reparent to init, outside the descendant-scoped RSS
   measurement; an earlier "~10 GiB" inference was wrong and is
   **retracted**). A known-pattern regression caught and structurally
@@ -673,16 +676,18 @@ the tool report when it breaks.
       tier ladder (≈−19 % / −53 % / −75 %) is framed as a **secondary
       constant-factor**, no "low RSS by default" claim anywhere.
 - [ ] FIELD FINDING A disclosed with the **accurate mechanism + the
-      honest verification shape**: serve-loop had no `SIGTERM` handler
-      → clean `kill -TERM` skipped the proven Supervisor reap (FF
-      #3b/#44/#61/#128); **Fixed (#198, integrated)** = std-only
-      single-funnel handler; verification **structurally proven +
-      integrated**, **live-fleet corroboration explicitly deferred to
-      post-#199** (degraded builder pod = unrelated infra #199;
-      **no fabricated runtime number** — stated as a strength, not
-      hidden); zombies/0-RSS/PID-hygiene, **NOT a RAM leak**. **No
-      `#183`/GracefulShutdown mis-attribution; the retracted "~10 GiB"
-      figure does not appear; #199 named as unrelated infra, not
+      honest verification shape (closed-chain COMPLETE)**: serve-loop
+      had no `SIGTERM` handler → clean `kill -TERM` skipped the proven
+      Supervisor reap (FF #3b/#44/#61/#128); **Fixed (#198,
+      integrated)** = std-only single-funnel handler; verification =
+      **structural fix decisive (source-verified) + integrated**, now
+      **live-fleet-corroborated POSITIVE** on the #199-rolled infra
+      (clean process table under real RA load — corroboration
+      *confirmed*, **NOT** "FF-A proved by a fleet test"; the
+      structural fix is what decides correctness); zombies/0-RSS/
+      PID-hygiene, **NOT a RAM leak**. **No `#183`/GracefulShutdown
+      mis-attribution; the retracted "~10 GiB" figure does not appear;
+      #199 named as the unrelated infra issue (now rolled), not
       conflated with FF-A.**
 - [ ] Latency presented as the **dual-tier split** (AC#2a hint ≤1s /
       AC#2b cargo-check-bound authoritative), not a single sub-1s

@@ -69,12 +69,14 @@ makes it turnkey.
 > "extrapolation"); the 589/617-worktree fleet must read as a stated
 > *projection*, never "validated"; the FF-A shutdown finding must be
 > disclosed with its accurate mechanism **and honest verification
-> shape** (proven Supervisor reap not invoked on the serve-loop
-> SIGTERM path; **Fixed #198, integrated**; verification structurally
-> proven + integrated, **live-fleet corroboration explicitly deferred
-> to post-#199** — degraded builder pod = unrelated infra #199, **no
-> fabricated runtime number**, stated as a strength; *not* a RAM
-> leak, *not* #183/GracefulShutdown, no "~10 GiB"). Any publish-time
+> shape (closed-chain COMPLETE)** (proven Supervisor reap not invoked
+> on the serve-loop SIGTERM path; **Fixed #198, integrated**;
+> verification = **structural fix decisive (source-verified) +
+> integrated**, now **live-fleet-corroborated POSITIVE** on the
+> #199-rolled infra — clean process table under real RA load,
+> corroboration *confirmed* **NOT** "fleet-test-proved" (the
+> structural fix decides correctness); *not* a RAM leak, *not*
+> #183/GracefulShutdown, no "~10 GiB"). Any publish-time
 > link-liveness
 > placeholder is filled by a separate small follow-up commit — review
 > the claims and structure, not those placeholders.
@@ -165,20 +167,21 @@ appendix block itself is removed at publish — it is scaffolding.)
      launch is Model R). The public version tag is resolved to
      **v0.2.0** (operator-decided 2026-05-19); copy asserts v0.2.0
      with no `v1.0`/fleet-ready overclaim.
-   - **(d) FF-A accurate-mechanism + honest verification shape.** The
-     shutdown finding is disclosed with the proven rust-analyzer
-     Supervisor reap discipline (FF #3b/#44/#61/#128) not invoked on
-     the serve-loop `SIGTERM` path; **Fixed (#198, integrated)** =
-     std-only single-funnel `SIGTERM`/`SIGINT` handler. Verification
-     reads as **structurally proven (independent scoped-confirm) +
-     integrated**, with **live-fleet corroboration explicitly deferred
-     to post-#199** (degraded shared builder pod = unrelated infra,
-     #199, in-fix; **no fabricated runtime number** — stated as a
-     strength of the discipline, not concealed). zombies/0-RSS, **NOT
-     a RAM leak**; does not impugn the measured ≈1 GiB headline. Zero
-     `#183`/GracefulShutdown mis-attribution; the retracted "~10 GiB"
-     figure must not appear; #199 named as unrelated infra, not
-     conflated with FF-A.
+   - **(d) FF-A accurate-mechanism + honest verification shape
+     (closed-chain COMPLETE).** The shutdown finding is disclosed with
+     the proven rust-analyzer Supervisor reap discipline (FF
+     #3b/#44/#61/#128) not invoked on the serve-loop `SIGTERM` path;
+     **Fixed (#198, integrated)** = std-only single-funnel
+     `SIGTERM`/`SIGINT` handler. Verification reads as **structural
+     fix decisive (independent scoped-confirm, source-verified) +
+     integrated**, and now **live-fleet-corroborated POSITIVE** on the
+     #199-rolled infra (clean process table under real RA load —
+     corroboration *confirmed*, **NOT** "FF-A proved by a fleet test";
+     the structural fix is what decides correctness). zombies/0-RSS,
+     **NOT a RAM leak**; does not impugn the measured ≈1 GiB headline.
+     Zero `#183`/GracefulShutdown mis-attribution; the retracted
+     "~10 GiB" figure must not appear; #199 named as the unrelated
+     infra issue (now rolled), not conflated with FF-A.
 10. **Sign-off record.** Outside reviewer name + sign-off recorded in
    the publish-time-edit **commit message** (AC#9 evidence trail).
 
