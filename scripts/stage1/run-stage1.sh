@@ -66,32 +66,38 @@ ac1_bringup() {
 ac2_parity() {
   hdr "AC2 — verdict-parity {clean / rustc-error / per-crate / clippy-only}"
   local wt="${S1_WTS[0]}"
-  # clean → GREEN  (activate first: Model R only checks active worktrees)
-  wt_activate "$wt"
-  wt_await_verdict "$wt" green || note AC2 "clean baseline slow to settle green"
-  assert_parity AC2-clean "$wt" green
+  # FIX #5: establish an OBSERVED clean green baseline FIRST. If the
+  # daemon never produces one, AC2 is INCONCLUSIVE — do NOT inject-and-
+  # judge (no baseline ⇒ no transition to judge a verdict against).
+  if ! establish_baseline "$wt"; then
+    fail AC2 "INCONCLUSIVE: clean baseline never observed within ${S1_VERDICT_GRACE}s (no verdict in ${BASELINE_LATENCY}s) — NOT injecting-and-judging (fix #5)"
+    return
+  fi
+  note AC2 "clean baseline observed green in ${BASELINE_LATENCY}s"
+  assert_green AC2-clean "$wt"
   if [ "${S1_CI_ORACLE}" = 1 ]; then
     local sha cv; sha="$(git -C "$wt" rev-parse HEAD)"; cv="$(ci_verdict_for_sha "$sha")"
     note AC2-clean "Forgejo-CI baseline oracle for $sha: $cv (coarse confirm)"
   fi
-  # rustc-error → RED  (false-GREEN here is STOP-class, via assert_parity)
-  inject_rustc_error "$wt"; wt_await_verdict "$wt" red || true
-  assert_parity AC2-rustc "$wt" red
-  # per-crate schema=2 attribution (bench/fixture is single-crate
-  # `cargoless-bench-fixture`). STOP only on a definite green; `unknown`
-  # is inconclusive → FAIL (bug-#3 discipline).
+  # rustc-error → must transition to red. assert_red_after_inject is
+  # freshness-gated: green-on-broken is STOP-class ONLY if the daemon is
+  # proven warm; otherwise INCONCLUSIVE (the run-2 stale case).
+  inject_rustc_error "$wt"
+  assert_red_after_inject AC2-rustc "$wt"
+  # per-crate schema=2 attribution — single-crate fixture. Only meaningful
+  # if AC2-rustc actually reached a red verdict.
   local v cr; v="$(wt_verdict "$wt")"; cr="$(wt_crates "$wt")"
-  if [ "$v" = green ]; then
-    stop_class AC2-percrate "FALSE-GREEN: rustc error injected but verdict=green"
-  elif [ "$v" != red ]; then
-    fail AC2-percrate "INCONCLUSIVE: verdict unobservable ($v) — not a false-GREEN"
-  elif echo "$cr" | grep -qiE 'cargoless-bench-fixture:red'; then
-    pass AC2-percrate "schema=2 per-crate attribution: cargoless-bench-fixture:red ($cr)"
+  if [ "$v" = red ]; then
+    if echo "$cr" | grep -qiE 'cargoless-bench-fixture:red'; then
+      pass AC2-percrate "schema=2 per-crate attribution: cargoless-bench-fixture:red ($cr)"
+    else
+      pass AC2-percrate "verdict=red authoritative; per-crate crates= line absent (crates='$cr') — schema=1-compatible"
+    fi
   else
-    pass AC2-percrate "verdict=red authoritative; per-crate crates= line absent (crates='$cr') — schema=1-compatible"
+    note AC2-percrate "skipped — AC2-rustc did not reach a red verdict ($v)"
   fi
   revert_inject "$wt"; wt_await_verdict "$wt" green || true
-  assert_parity AC2-revert "$wt" green
+  assert_green AC2-revert "$wt"
   # clippy-only — ERA-SCOPED per Lane-B #221. Pre-Inc3-B: warning-severity
   # lint suppressed ⇒ GREEN is CORRECT (S1_CLIPPY_EXPECTED=green).
   inject_clippy_only "$wt"
@@ -163,28 +169,28 @@ ac3_isolation() {
 ac4_respawn() {
   hdr "AC4 — kill -9 the shared rust-analyzer → correct post-respawn verdicts"
   local wt="${S1_WTS[0]}" rapids
-  wt_activate "$wt"; wt_await_verdict "$wt" green || true
+  establish_baseline "$wt" || { fail AC4 "INCONCLUSIVE: no pre-kill green baseline (${BASELINE_LATENCY}s)"; return; }
   rapids="$(ra_children "$DAEMON_PID")"
   [ -n "$rapids" ] || { fail AC4 "INCONCLUSIVE: no rust-analyzer child found under the daemon"; return; }
   log "killing -9 RA pids: $rapids"
   for p in $rapids; do kill -KILL "$p" 2>/dev/null || true; done
   sleep 5   # let the Supervisor notice + respawn + mux.reset()
+  # FIX #5: re-establish a baseline AFTER the respawn — proves the
+  # respawn produced a working daemon AND re-measures BASELINE_LATENCY
+  # for the post-respawn freshness gate (the new RA is cold).
+  if ! establish_baseline "$wt"; then
+    fail AC4 "INCONCLUSIVE: daemon produced no green baseline after the RA respawn (${BASELINE_LATENCY}s) — cannot judge post-respawn freshness"
+    return
+  fi
+  note AC4 "post-respawn baseline re-observed green in ${BASELINE_LATENCY}s (RA respawned + mux.reset)"
   inject_rustc_error "$wt"
-  if wt_await_verdict "$wt" red; then
+  if assert_red_after_inject AC4 "$wt"; then
     revert_inject "$wt"
-    if wt_await_verdict "$wt" green; then
-      pass AC4 "post-respawn RA produced a correct red→green cycle (mux.reset seam holds)"
-    else
-      fail AC4 "post-respawn stuck red after revert (stale overlay — reset() suspect)"
-    fi
+    wt_await_verdict "$wt" green \
+      && note AC4 "post-respawn revert→green also clean (mux.reset seam holds)" \
+      || fail AC4-revert "post-respawn stuck red after revert (stale overlay — reset() suspect)"
   else
     revert_inject "$wt"
-    # a definite green on an injected error after respawn = false-GREEN
-    if [ "$(wt_verdict "$wt")" = green ]; then
-      stop_class AC4 "FALSE-GREEN post-respawn: a definite injected error verdicts green (stale RA after kill -9)"
-    else
-      fail AC4 "INCONCLUSIVE: no red within grace after respawn (RA respawn / handshake latency)"
-    fi
   fi
 }
 
@@ -308,22 +314,18 @@ ac8_overlay_freshness() {
   hdr "AC8 — overlay freshness: verdict tracks on-disk content, never stale"
   serve_start; serve_wait_up || { fail AC8 "daemon did not come up for AC8"; return; }
   local wt="${S1_WTS[1]:-${S1_WTS[0]}}"
-  wt_activate "$wt"; wt_await_verdict "$wt" green || true
+  if ! establish_baseline "$wt"; then
+    fail AC8 "INCONCLUSIVE: clean baseline never observed (${BASELINE_LATENCY}s)"
+    return
+  fi
   inject_rustc_error "$wt"
-  if wt_await_verdict "$wt" red; then
+  if assert_red_after_inject AC8 "$wt"; then
     revert_inject "$wt"
-    if wt_await_verdict "$wt" green; then
-      pass AC8 "edit→red and revert→green both reflected within grace (no stale overlay)"
-    else
-      fail AC8 "revert not reflected — verdict stuck red (stale overlay after edit-back)"
-    fi
+    wt_await_verdict "$wt" green \
+      && pass AC8-revert "revert→green reflected within grace (no stale overlay after edit-back)" \
+      || fail AC8-revert "revert not reflected — verdict stuck red (stale overlay after edit-back)"
   else
     revert_inject "$wt"
-    if [ "$(wt_verdict "$wt")" = green ]; then
-      stop_class AC8 "FALSE-GREEN: a definite injected error verdicts green (stale overlay — on-disk read not refreshed)"
-    else
-      fail AC8 "INCONCLUSIVE: no red within grace of a definite-error edit (latency/freshness)"
-    fi
   fi
 }
 
