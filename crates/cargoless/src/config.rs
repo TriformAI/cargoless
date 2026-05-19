@@ -39,6 +39,13 @@ pub enum Detection {
     AutoCdylib,
     /// `leptos` dependency but no explicit `crate-type`.
     AutoLeptosDep,
+    /// #241 de-WASM-gate: a Cargo.toml with neither a `cdylib` crate-type
+    /// nor a `leptos` dependency — i.e. a plain native-Rust workspace.
+    /// cargoless `check`/`serve` are target-general, so this is a
+    /// first-class accepted project, NOT a refusal. (The `build --watch`
+    /// trunk→wasm artifact tier stays WASM-specific by nature — a native
+    /// repo has no WASM artifact — and errors gracefully, never panics.)
+    AutoNativeRust,
 }
 
 impl Detection {
@@ -48,6 +55,7 @@ impl Detection {
             Detection::AutoLeptosCdylib => "auto-detected: cdylib + leptos (Leptos CSR)",
             Detection::AutoCdylib => "auto-detected: cdylib crate-type (WASM library)",
             Detection::AutoLeptosDep => "auto-detected: leptos dependency",
+            Detection::AutoNativeRust => "auto-detected: native Rust workspace",
         }
     }
 }
@@ -58,9 +66,6 @@ impl Detection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     NoManifest {
-        root: PathBuf,
-    },
-    NotWasmProject {
         root: PathBuf,
     },
     BadTfToml {
@@ -78,16 +83,6 @@ impl fmt::Display for ConfigError {
                 "no Cargo.toml in {} (and no tf.toml).\n  \
                  run cargoless from your Rust + WASM project root, or pass \
                  --root <dir>.",
-                root.display()
-            ),
-            ConfigError::NotWasmProject { root } => write!(
-                f,
-                "{}/Cargo.toml is not a recognisable Rust + WASM project.\n  \
-                 looked for a `cdylib` crate-type or a `leptos` dependency \
-                 and found neither.\n  Fix one of:\n    \
-                 - add `crate-type = [\"cdylib\"]` under [lib], or\n    \
-                 - add a `leptos` dependency, or\n    \
-                 - create a tf.toml to configure the project explicitly.",
                 root.display()
             ),
             ConfigError::BadTfToml { line_no, line, why } => write!(
@@ -130,15 +125,26 @@ impl Config {
         let Ok(cargo) = std::fs::read_to_string(root.join("Cargo.toml")) else {
             return Err(ConfigError::NoManifest { root });
         };
-        match detect_from_cargo_toml(&cargo) {
-            Some(d) => Ok(Self::defaults(root, d)),
-            None => Err(ConfigError::NotWasmProject { root }),
-        }
+        // #241 de-WASM-gate: detection is now TOTAL — every Cargo.toml
+        // resolves to a `Detection` (a plain native-Rust workspace ⇒
+        // `AutoNativeRust`). cargoless no longer refuses a non-WASM Rust
+        // project: the old `None ⇒ ConfigError::NotWasmProject` refusal
+        // is retired. `unwrap_or` is the structural belt — resolve() can
+        // never re-introduce a refusal even if a future detection arm
+        // returned `None` (it would still resolve as native, not error).
+        let detection = detect_from_cargo_toml(&cargo).unwrap_or(Detection::AutoNativeRust);
+        Ok(Self::defaults(root, detection))
     }
 }
 
-/// Structural Rust + WASM detection from `Cargo.toml` text (D7). Pure over
+/// Structural project detection from `Cargo.toml` text (D7). Pure over
 /// the text so it is exhaustively unit-tested without a filesystem.
+///
+/// #241 de-WASM-gate: now **total** — every Cargo.toml yields a
+/// `Detection` (no `cdylib`/no `leptos` ⇒ `AutoNativeRust`), never
+/// `None`. The `Option` return is retained for signature stability;
+/// [`Config::resolve`] treats a (now-impossible) `None` as native via
+/// `unwrap_or`, so detection can never refuse a Rust project.
 pub fn detect_from_cargo_toml(text: &str) -> Option<Detection> {
     let mut section = String::new();
     let mut has_cdylib = false;
@@ -168,7 +174,9 @@ pub fn detect_from_cargo_toml(text: &str) -> Option<Detection> {
         (true, true) => Some(Detection::AutoLeptosCdylib),
         (true, false) => Some(Detection::AutoCdylib),
         (false, true) => Some(Detection::AutoLeptosDep),
-        (false, false) => None,
+        // #241: neither WASM signal ⇒ a plain native-Rust workspace —
+        // accepted as first-class, no longer a refusal.
+        (false, false) => Some(Detection::AutoNativeRust),
     }
 }
 
@@ -294,9 +302,38 @@ mod tests {
             detect_from_cargo_toml("[dependencies]\nleptos.workspace = true\n"),
             Some(Detection::AutoLeptosDep)
         );
+        // #241: a non-WASM dependency set ⇒ native Rust, no longer `None`.
         assert_eq!(
             detect_from_cargo_toml("[dependencies]\nserde = \"1\"\n"),
-            None
+            Some(Detection::AutoNativeRust)
+        );
+    }
+
+    #[test]
+    fn native_rust_workspace_is_auto_detected_not_refused() {
+        // #241 de-WASM-gate: a plain native-Rust Cargo.toml (no cdylib
+        // crate-type, no leptos dep) is now a FIRST-CLASS accepted
+        // project — `AutoNativeRust`, never the retired refusal.
+        let native = "[package]\nname = \"svc\"\n[dependencies]\ntokio = \"1\"\n";
+        assert_eq!(
+            detect_from_cargo_toml(native),
+            Some(Detection::AutoNativeRust)
+        );
+        // A bare bin package, likewise.
+        assert_eq!(
+            detect_from_cargo_toml("[package]\nname = \"x\"\n"),
+            Some(Detection::AutoNativeRust)
+        );
+        // Detection is total — EVERY Cargo.toml yields `Some`, never `None`.
+        assert!(detect_from_cargo_toml("").is_some());
+        // No regression: the WASM signals still detect correctly.
+        assert_eq!(
+            detect_from_cargo_toml("[lib]\ncrate-type=[\"cdylib\"]\n"),
+            Some(Detection::AutoCdylib)
+        );
+        assert_eq!(
+            Detection::AutoNativeRust.describe(),
+            "auto-detected: native Rust workspace"
         );
     }
 
@@ -330,12 +367,7 @@ mod tests {
             .to_string()
             .contains("--root")
         );
-        assert!(
-            ConfigError::NotWasmProject {
-                root: PathBuf::from("/x")
-            }
-            .to_string()
-            .contains("cdylib")
-        );
+        // #241: `NotWasmProject` is retired — a non-WASM Rust project is
+        // accepted, not refused, so there is no such error to assert.
     }
 }
