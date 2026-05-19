@@ -509,7 +509,7 @@ fn step(
     // restoring the proven core's exactly-once precondition AT THE WIRE
     // SEAM (the core is never weakened to accommodate a seam misuse).
     if let Some(followup) = cs.driver.take_followup() {
-        exec(cs, followup, pending_batch);
+        exec(cs, followup, pending_batch, api);
     }
 }
 
