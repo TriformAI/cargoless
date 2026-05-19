@@ -282,6 +282,77 @@ pub fn run_status(cfg: &Config) -> ExitCode {
     }
 }
 
+/// `status --remote <url>` — query a remote `serve --bind` fleet daemon
+/// over the **shipped** HTTP transport instead of the on-disk
+/// `cli-status`. Increment 0 (Model R #10): the client half of the
+/// read-plane wire (the server half is [`crate::serveapi`]).
+///
+/// Routes through the shipped `transport::discovery` precedence
+/// (`--remote` is §10.3 step 1 — explicit operator intent beats
+/// socket/file/spawn) + the shipped `HttpClient` / `TransportClient`; no
+/// bespoke HTTP. Exit codes mirror the local [`run_status`] contract so a
+/// script gates identically regardless of transport:
+/// * `0` — daemon reachable (the remote fleet is up);
+/// * `3` — no reachable daemon at `url` (the local "no/stale daemon"
+///   analogue — fall-through-safe, never a panic);
+/// * `2` — `url` is not a usable remote URL (setup error).
+pub fn run_status_remote(url: &str) -> ExitCode {
+    use cargoless_core::transport::TransportClient;
+    use cargoless_core::transport::discovery::{Resolution, resolve};
+    use cargoless_core::transport::http::HttpClient;
+
+    // Shipped discovery precedence: an explicit `--remote` resolves to the
+    // HTTP transport (beats socket/file/spawn — §10.3 step 1). Going
+    // through `resolve` (not bypassing it) is the point: this IS the
+    // shipped read path.
+    let Resolution::Remote(target) = resolve(Some(url), None, None) else {
+        ui::error(format!(
+            "--remote {url}: not a resolvable remote URL (expected http://host:port)"
+        ));
+        return ExitCode::from(2);
+    };
+    let client = match HttpClient::new(&target) {
+        Ok(c) => c,
+        Err(e) => {
+            ui::error(format!("--remote {target}: {e}"));
+            return ExitCode::from(2);
+        }
+    };
+    match client.list_worktrees() {
+        Ok(list) if !list.is_empty() => {
+            ui::ok(format!(
+                "remote daemon {target} live — {} worktree(s):",
+                list.len()
+            ));
+            for w in &list {
+                ui::step(format!(
+                    "{}  verdict {}  ({} red diagnostic{})",
+                    w.worktree,
+                    w.verdict,
+                    w.red_diagnostics,
+                    if w.red_diagnostics == 1 { "" } else { "s" }
+                ));
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            // Reachable but no verdict attributed yet (a cold daemon — no
+            // worktree has settled a flycheck pass). Still "live".
+            ui::ok(format!(
+                "remote daemon {target} reachable — no worktree verdicts yet"
+            ));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            ui::warn(format!(
+                "no reachable cargoless daemon at {target} ({e}) — is \
+                 `serve --repo <dir> --bind <host:port>` running there?"
+            ));
+            ExitCode::from(3)
+        }
+    }
+}
+
 /// FIELD FINDING #10 (#56): `kill(pid, 0)` liveness probe. Returns:
 /// * `Some(true)`  — pid exists and we may signal it (Unix);
 /// * `Some(false)` — pid does not exist (Unix);

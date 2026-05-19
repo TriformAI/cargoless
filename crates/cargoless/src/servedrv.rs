@@ -234,6 +234,51 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // The settled routed batch's file list, awaiting its SwitchOverlay.
     let mut pending_batch: BTreeMap<WtId, Vec<PathBuf>> = BTreeMap::new();
 
+    // ---- Increment 0: read-plane VerdictService + HTTP transport -----
+    // The serve-loop's live per-WT verdict state, presented as the
+    // shipped logical `VerdictService` (transport #10). Fed from the SOLE
+    // verdict site (`publish_verdict`) — a faithful MIRROR of the
+    // authoritative write-plane, never a second verdict-attribution path
+    // (Judgment B as composed; the #189/#198 story is intact). `serve.rs`
+    // already resolved `--bind`/`--auth-token` into the FleetConfig and
+    // ran `security_check`; THIS is #10's actual binding (the serve.rs
+    // module-doc "Stream E #10 binds it; #3 only resolves+carries" seam).
+    let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+    let http_server = match scope.fleet.bind {
+        Some(addr) => {
+            // #14 policy seam, fail-closed. Re-runs `security_check`:
+            // serve.rs already refused a non-loopback-no-token bind before
+            // discover, so this is defense-in-depth, not a new gate — and
+            // the contract is "surface the typed config error, never a
+            // silent AllowAll on a public socket".
+            let auth = match cargoless_core::transport::authorizer_for(&scope.fleet) {
+                Ok(a) => a,
+                Err(e) => {
+                    crate::ui::error(format!("refusing to bind transport: {e}"));
+                    return ExitCode::from(2);
+                }
+            };
+            match cargoless_core::transport::http::HttpServer::bind(
+                &addr.to_string(),
+                Arc::clone(&api) as Arc<dyn cargoless_core::transport::VerdictService>,
+                auth,
+            ) {
+                Ok(s) => {
+                    crate::ui::ok(format!("HTTP transport bound on http://{}", s.addr()));
+                    Some(s)
+                }
+                Err(e) => {
+                    crate::ui::error(format!("HTTP transport bind {addr}: {e}"));
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        // No `--bind` ⇒ the #10 default (loopback / in-proc / Unix): the
+        // HTTP adapter is simply inactive. `api` is still fed so an
+        // in-proc / Unix reader could consume the same live state.
+        None => None,
+    };
+
     // FIELD FINDING A / #198: arm SIGTERM/SIGINT → graceful loop-exit
     // BEFORE announcing "up", so a fleet `kill -TERM` during/just-after
     // bring-up still routes through the proven per-cluster RA reap.
@@ -267,7 +312,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // Drain forwarded RA events → the owning cluster's ClusterDriver.
         while let Ok((h, ev)) = lsp_rx.try_recv() {
             if clusters.contains_key(&h) {
-                step(&mut clusters, &h, DriverEvent::Lsp(ev), &pending_batch);
+                step(
+                    &mut clusters,
+                    &h,
+                    DriverEvent::Lsp(ev),
+                    &pending_batch,
+                    &api,
+                );
             }
         }
 
@@ -308,6 +359,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 &h,
                 DriverEvent::RoutedBatch { wt: wt.clone() },
                 &pending_batch,
+                &api,
             );
         }
 
@@ -320,6 +372,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                         &h,
                         DriverEvent::Deactivated { wt: wt.clone() },
                         &pending_batch,
+                        &api,
                     );
                 }
                 if let LifecycleAction::TeardownRa(_) = lifecycle.deactivate(path_key(&wt)) {
@@ -348,6 +401,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // silently skip the reap. Proven cores (analyzer/clusterdrv/…)
     // UNTOUCHED — this restores their precondition at the wire seam.
     clusters.clear();
+    // Increment 0: stop the HTTP accept loop at the SAME single exit
+    // funnel. `HttpServer::Drop` flips the listener stop-flag; in-flight
+    // one-shot/SSE connections drain when their peer disconnects. Done
+    // EXPLICITLY (not via invisible scope-end drop) — the same
+    // visible-teardown discipline as the per-cluster RA reap above, so no
+    // future exit path can silently leave the listener thread spinning.
+    drop(http_server);
     ExitCode::SUCCESS
 }
 
@@ -427,12 +487,13 @@ fn step(
     h: &WorkspaceConfigHash,
     ev: DriverEvent,
     pending_batch: &BTreeMap<WtId, Vec<PathBuf>>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     let Some(cs) = clusters.get_mut(h) else {
         return;
     };
     let action = cs.driver.on_event(ev);
-    exec(cs, action, pending_batch);
+    exec(cs, action, pending_batch, api);
     // EXACTLY ONCE — `clusterdrv::take_followup` is structurally
     // non-mutating (`self.current.as_ref().map(...)`, never clears
     // `current`) and its doc contract is "the adapter calls this exactly
@@ -457,6 +518,7 @@ fn exec(
     cs: &mut ClusterState,
     action: ClusterAction,
     pending_batch: &BTreeMap<WtId, Vec<PathBuf>>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     match action {
         ClusterAction::Idle => {}
@@ -503,14 +565,27 @@ fn exec(
             authoritative_error,
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
-            publish_verdict(&wt, authoritative_error);
+            publish_verdict(&wt, authoritative_error, api);
         }
     }
 }
 
-/// Write `wt`'s per-worktree statusfile verdict — the only place a
-/// verdict is attributed/published in the whole wire.
-fn publish_verdict(wt: &Path, authoritative_error: bool) {
+/// Write `wt`'s per-worktree verdict — the only place a verdict is
+/// attributed/published in the whole wire (Judgment B as composed).
+///
+/// Increment 0: this one site now feeds BOTH sinks — the durable
+/// `statusfile` (the v0 on-disk read path, unchanged) AND the in-memory
+/// [`crate::serveapi::ServeVerdictState`] that backs the shipped HTTP+SSE
+/// transport (`api.publish`, which also fans out the subscribe-emit
+/// transition, plan 0b). One real verdict ⇒ one statusfile write ⇒ one
+/// service update ⇒ one transition event. NO second verdict-attribution
+/// path is introduced: the read-plane is a faithful mirror of this single
+/// authoritative write-plane.
+fn publish_verdict(
+    wt: &Path,
+    authoritative_error: bool,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
+) {
     let verdict = if authoritative_error {
         Verdict::Red
     } else {
@@ -527,4 +602,8 @@ fn publish_verdict(wt: &Path, authoritative_error: bool) {
         red_diagnostics: 0,
     };
     statusfile::write(wt, &st);
+    // Same site, mirror sink: feed the read-plane VerdictService + emit
+    // the transition (subscribe-emit, 0b). Best-effort by construction —
+    // a poisoned lock recovers; a transport hiccup never wedges the loop.
+    api.publish(wt, authoritative_error);
 }

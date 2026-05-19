@@ -28,6 +28,7 @@ mod config;
 mod cratemap;
 mod orphan;
 mod serve;
+mod serveapi;
 mod servedrv;
 mod statusfile;
 mod ui;
@@ -85,6 +86,11 @@ struct Opts {
     /// `serve --auth-token <secret>` — bearer token (#14 enforces;
     /// prefer the `CARGOLESS_AUTH_TOKEN` env for secrets).
     auth_token: Option<String>,
+    /// `status --remote <url>` — query a remote `serve --bind` fleet
+    /// daemon over the shipped HTTP transport instead of the on-disk
+    /// `cli-status`. Resolved through `transport::discovery` (explicit
+    /// operator intent — `--remote` wins the §10.3 precedence).
+    remote: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -185,6 +191,13 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .clone(),
                 );
             }
+            "--remote" => {
+                opts.remote = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--remote"))?
+                        .clone(),
+                );
+            }
             "-h" | "--help" => {
                 return Ok(Parsed {
                     cmd: Cmd::Help,
@@ -238,6 +251,14 @@ fn usage() {
          default 'default';"
     );
     println!("                        also TF_FEATURES env)");
+    println!(
+        "  --remote <URL>        status: query a remote `serve --bind` daemon \
+         over HTTP"
+    );
+    println!(
+        "                        (e.g. http://host:8080) instead of the local \
+         cli-status file"
+    );
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
     println!();
@@ -304,6 +325,16 @@ fn main() -> ExitCode {
                 state_dir: parsed.opts.state_dir.clone(),
                 auth_token: parsed.opts.auth_token.clone(),
             });
+        }
+        // `status --remote <url>` queries a remote fleet `serve --bind`
+        // daemon over the shipped HTTP transport. Dispatch BEFORE the
+        // `config::Config::resolve` front-door (exactly like `serve`):
+        // that detector would wrongly reject a non-WASM cwd, and asking a
+        // *remote* daemon must not require a local cargoless project.
+        Cmd::Status => {
+            if let Some(url) = parsed.opts.remote.as_deref() {
+                return statusfile::run_status_remote(url);
+            }
         }
         _ => {}
     }
