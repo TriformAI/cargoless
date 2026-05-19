@@ -244,6 +244,16 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // ran `security_check`; THIS is #10's actual binding (the serve.rs
     // module-doc "Stream E #10 binds it; #3 only resolves+carries" seam).
     let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+    // /healthz readiness latch (#225 0d). `false` until the serve loop is
+    // live ⇒ unauthenticated `GET /healthz` answers `503
+    // {"status":"starting"}`; flipped `true` at loop-entry below ⇒ `200
+    // {"status":"ready"}`. Honest boundary: `RepoScope::discover` already
+    // completed in serve.rs *before* servedrv::run, so the meaningful
+    // daemon-ready boundary servedrv owns is "serve loop entered" (a bound
+    // listener alone only proves liveness — the k8s probe needs "actually
+    // serving"). One-way monotonic latch ⇒ `Relaxed` is sufficient and
+    // matches the adapter's `ready.load(Relaxed)`.
+    let ready = Arc::new(AtomicBool::new(false));
     let http_server = match scope.fleet.bind {
         Some(addr) => {
             // #14 policy seam, fail-closed. Re-runs `security_check`:
@@ -258,10 +268,11 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match cargoless_core::transport::http::HttpServer::bind(
+            match cargoless_core::transport::http::HttpServer::bind_with_health(
                 &addr.to_string(),
                 Arc::clone(&api) as Arc<dyn cargoless_core::transport::VerdictService>,
                 auth,
+                Arc::clone(&ready),
             ) {
                 Ok(s) => {
                     crate::ui::ok(format!("HTTP transport bound on http://{}", s.addr()));
@@ -284,6 +295,11 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // bring-up still routes through the proven per-cluster RA reap.
     install_signal_stops();
     crate::ui::wait("repo-scoped Model R daemon up. Ctrl-C / SIGTERM to stop.");
+    // #225 0d: the daemon's serve loop is now live → flip the /healthz
+    // readiness latch (503 {"status":"starting"} → 200 {"status":"ready"}).
+    // This is the ONE meaningful readiness transition the k8s probe needs;
+    // it is harmless (a no-op observer) when `--bind` is absent.
+    ready.store(true, Ordering::Relaxed);
 
     // ---- the serve loop (single owner ⇒ Judgment A holds composed) ---
     loop {

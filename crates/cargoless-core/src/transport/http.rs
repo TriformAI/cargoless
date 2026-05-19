@@ -118,10 +118,39 @@ impl HttpServer {
     /// serve `svc`, gating every request through `auth`. Pass
     /// `Arc::new(AllowAll)` for the #10 posture; #14 passes a token
     /// policy — this signature does not change.
+    ///
+    /// Delegates to [`Self::bind_with_health`] with an **always-ready**
+    /// flag: a caller that wires no readiness signal gets `GET /healthz`
+    /// ⇒ `200` (server-up ⇒ ready). Every other route + the #14 auth gate
+    /// is byte-identical to pre-`/healthz` — this constructor's
+    /// signature and behaviour are unchanged (the exhaustive existing
+    /// suite is untouched).
     pub fn bind(
         addr: &str,
         svc: Arc<dyn VerdictService>,
         auth: Arc<dyn Authorizer>,
+    ) -> Result<HttpServer, TransportError> {
+        Self::bind_with_health(addr, svc, auth, Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Like [`Self::bind`] but with a caller-owned `ready` flag the
+    /// unauthenticated `GET /healthz` route reflects: `false` ⇒
+    /// `503 {"status":"starting"}`, `true` ⇒ `200 {"status":"ready"}`.
+    /// The daemon flips it `true` once its serve loop is live — the
+    /// meaningful k8s readiness boundary (a bound listener alone only
+    /// proves liveness, not that the daemon is actually serving).
+    ///
+    /// **ADDITIVE, not a contract reshape:** this adds exactly one route
+    /// (`/healthz`) and one constructor; [`Self::bind`]'s
+    /// signature/behaviour, the [`VerdictService`] trait, the wire codec,
+    /// the discovery chain, and the #14 auth seam for **every other
+    /// route** are byte-frozen and their exhaustive unit suites untouched.
+    /// `/healthz` is the ONLY auth-exempt path (see [`handle`]).
+    pub fn bind_with_health(
+        addr: &str,
+        svc: Arc<dyn VerdictService>,
+        auth: Arc<dyn Authorizer>,
+        ready: Arc<AtomicBool>,
     ) -> Result<HttpServer, TransportError> {
         let listener = TcpListener::bind(addr)?;
         let bound = listener.local_addr()?;
@@ -132,8 +161,8 @@ impl HttpServer {
             while !stop_t.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((conn, _)) => {
-                        let (svc_c, auth_c) = (svc.clone(), auth.clone());
-                        thread::spawn(move || handle(conn, svc_c, auth_c));
+                        let (svc_c, auth_c, ready_c) = (svc.clone(), auth.clone(), ready.clone());
+                        thread::spawn(move || handle(conn, svc_c, auth_c, ready_c));
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(std::time::Duration::from_millis(20));
@@ -157,7 +186,12 @@ impl Drop for HttpServer {
     }
 }
 
-fn handle(conn: TcpStream, svc: Arc<dyn VerdictService>, auth: Arc<dyn Authorizer>) {
+fn handle(
+    conn: TcpStream,
+    svc: Arc<dyn VerdictService>,
+    auth: Arc<dyn Authorizer>,
+    ready: Arc<AtomicBool>,
+) {
     let mut writer = match conn.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -167,6 +201,25 @@ fn handle(conn: TcpStream, svc: Arc<dyn VerdictService>, auth: Arc<dyn Authorize
         write_response(&mut writer, 400, "Bad Request", "text/plain", "bad request");
         return;
     };
+    // ── GET /healthz — the ONLY unauthenticated route ───────────────────
+    // Structurally Authorizer-EXEMPT: we answer and `return` for EXACTLY
+    // this path BEFORE the #14 auth gate below, so the exemption cannot
+    // widen to any other route (every other path still flows into
+    // `auth.authorize`). The body is a FIXED constant — ZERO verdict,
+    // diagnostics, worktree names, paths, or counts — so an
+    // unauthenticated caller learns only a readiness boolean (a path or a
+    // count would leak repo structure off-host). k8s probe semantic: a
+    // bound listener proves liveness; this proves the daemon's serve loop
+    // is actually up. `503` until `ready`, `200` after.
+    if req.path == "/healthz" {
+        let (code, reason, body): (u16, &str, &str) = if ready.load(Ordering::Relaxed) {
+            (200, "OK", "{\"status\":\"ready\"}")
+        } else {
+            (503, "Service Unavailable", "{\"status\":\"starting\"}")
+        };
+        write_response(&mut writer, code, reason, "application/json", body);
+        return;
+    }
     // #14 seam — AllowAll under #10, so this never denies today; the
     // 401 path exists so #14 is pure policy, not a structural change.
     if !auth.authorize(req.bearer.as_deref()) {
@@ -494,5 +547,135 @@ mod tests {
         assert!(HttpClient::new("ftp://x").is_err());
         assert!(HttpClient::new("http://h:notaport").is_err());
         assert!(HttpClient::new("http://h:9").is_ok());
+    }
+
+    // ───────── /healthz — unauthenticated readiness probe ─────────
+    // (No `HttpClient` method by design: /healthz is a k8s/curl probe,
+    // NOT part of the TransportClient contract — proved over raw GET.)
+
+    fn raw_get(addr: std::net::SocketAddr, target: &str) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).expect("connect");
+        write!(
+            s,
+            "GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        s.flush().unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        let (head, body) = match raw.split_once("\r\n\r\n") {
+            Some(hb) => hb,
+            None => (raw.as_str(), ""),
+        };
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .expect("status code");
+        (code, body.to_string())
+    }
+
+    #[test]
+    fn healthz_is_unauth_503_until_ready_then_200_with_constant_body() {
+        // DenyAll authorizer: proves /healthz is STRUCTURALLY auth-exempt
+        // (a DenyAll daemon 401s every other route — see the surgical
+        // test below — yet still answers /healthz).
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        let ready = Arc::new(AtomicBool::new(false));
+        let s = HttpServer::bind_with_health(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(DenyAll),
+            ready.clone(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Not ready ⇒ 503 + the FIXED starting constant. Exact-equality
+        // is the strongest zero-leakage proof: byte-for-byte the
+        // constant, so it cannot carry a verdict/path/count.
+        let (code, body) = raw_get(s.addr(), "/healthz");
+        assert_eq!(
+            code, 503,
+            "unready ⇒ 503 (auth-exempt: DenyAll did not 401 it)"
+        );
+        assert_eq!(
+            body, "{\"status\":\"starting\"}",
+            "fixed constant, zero leakage"
+        );
+
+        // Flip ready ⇒ 200 + the FIXED ready constant.
+        ready.store(true, Ordering::Relaxed);
+        let (code, body) = raw_get(s.addr(), "/healthz");
+        assert_eq!(code, 200, "ready ⇒ 200");
+        assert_eq!(
+            body, "{\"status\":\"ready\"}",
+            "fixed constant, zero leakage"
+        );
+        // Belt-and-braces: the body names no worktree the service knows
+        // and carries no path/structure (a leak would mention these).
+        assert!(!body.contains("green-wt") && !body.contains("red-wt"));
+        assert!(!body.contains('/'), "no path leaks to an unauth caller");
+    }
+
+    #[test]
+    fn healthz_exemption_is_surgical_every_other_route_still_401() {
+        // The exemption must NOT widen: under DenyAll, every NON-/healthz
+        // route still hits the #14 gate and 401s.
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        let s = HttpServer::bind_with_health(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(DenyAll),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        for route in [
+            "/status?worktree=green-wt",
+            "/verdict?worktree=red-wt",
+            "/worktrees",
+            "/worktrees/red-wt/diagnostics",
+            "/events",
+        ] {
+            let (code, _) = raw_get(s.addr(), route);
+            assert_eq!(
+                code, 401,
+                "{route} must still be auth-gated (exemption is /healthz-only)"
+            );
+        }
+        // …and /healthz on the SAME deny server still answers (200, ready).
+        assert_eq!(raw_get(s.addr(), "/healthz").0, 200);
+    }
+
+    #[test]
+    fn old_bind_constructor_healthz_defaults_ready_200_no_regression() {
+        // The byte-frozen `bind` delegate ⇒ always-ready: an old caller
+        // (every existing test/consumer) sees /healthz ⇒ 200 and EVERY
+        // other route unchanged. Proves `bind` behaviour is unregressed.
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let (code, body) = raw_get(s.addr(), "/healthz");
+        assert_eq!(code, 200);
+        assert_eq!(body, "{\"status\":\"ready\"}");
+        // Non-/healthz routes still work exactly as before.
+        let c = client_for(&s);
+        assert_eq!(c.get_verdict("green-wt").unwrap(), Some("green".into()));
     }
 }
