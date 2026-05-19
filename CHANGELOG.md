@@ -54,7 +54,7 @@ Capabilities, honestly bounded:
 - Workspace-cluster manager, corun verdict-batching, activity-
   activation (idle worktrees deactivated by design), and crash/restart
   recovery (replay-queue + graceful-shutdown drain).
-- rust-analyzer weight-shedding: shipped default −19 % peak RSS
+- rust-analyzer weight-shedding: shipped default ≈−19 % peak RSS
   (behaviour-neutral); Tier-3 proc-macro-off shipped default-safe;
   idle-evict opt-in (`TF_RA_IDLE_EVICT=1`).
 
@@ -74,7 +74,8 @@ Capabilities, honestly bounded:
   corroborated positive on the #199-rolled infra — corroboration
   confirmed, **not** a fleet-test-proof. It is zombie/PID-hygiene
   under restart-churn, **not** a RAM leak.
-- Phase-2 dogfood field findings F1–F12
+- Phase-2 dogfood hardening: **11 of the 12** field findings fixed
+  before launch
   ([`docs/dogfood/PHASE-2-REPORT.md`](docs/dogfood/PHASE-2-REPORT.md)).
 
 ### Performance (measured; conditions stated inline, not headline scalars)
@@ -92,6 +93,13 @@ Capabilities, honestly bounded:
 - Save→verdict is the honest dual-tier split (RA-incremental hint
   ≤1 s / authoritative cargo-check-bound) — never a single sub-1s
   headline.
+
+### Notes
+
+- Of the 12 Phase-2 dogfood field findings, the one not fixed —
+  `cargoless clean` semantics — is **closed as a design question**
+  (non-breaking, safe-either-way), deliberately deferred (#30). It is
+  a design-closure, **not** a shipped bug-fix.
 
 ## [0.0.0] - 2026-05-17
 
