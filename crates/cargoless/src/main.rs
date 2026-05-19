@@ -31,6 +31,7 @@ mod serve;
 mod serveapi;
 mod servedrv;
 mod statusfile;
+mod telemetry; // #246 Wave-1 5a — OTEL+SigNoz init seam.
 mod ui;
 mod watch;
 

@@ -44,8 +44,22 @@ workspace = true
 # `ra-latency`, `cargoless-bench`, and `cargoless-bench-fixture` binaries that
 # cargo treats as install candidates. README install command reflects this.
 [features]
-default = ["integration"]
+# `telemetry` (default-on) gates the OTEL+SigNoz exporter stack (#246 Wave-1).
+# Off-by-feature builds skip the heavy OTel/tokio dep tree — binary-size
+# discipline per plan §5a (< 20MB delta budget, operator number not CI gate).
+# `tracing` + `tracing-subscriber` stay non-optional because the 5c keystone
+# spans in servedrv.rs use `tracing` macros unconditionally; they degrade to
+# no-ops when no global subscriber is installed (fail-soft contract).
+default = ["integration", "telemetry"]
 integration = []
+telemetry = [
+    "dep:tokio",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-semantic-conventions",
+]
 
 [[bin]]
 # D1 RESOLVED = `cargoless` (was placeholder `tftrunk`). Users type
@@ -56,6 +70,55 @@ path = "src/main.rs"
 
 [dependencies]
 cargoless-core = { path = "../cargoless-core", version = "0.2.0" }  # publish-ready
+
+# ──────────────────────────────────────────────────────────────────────────
+# #246 Wave-1 5a: OTEL + SigNoz telemetry stack.
+#
+# Versions + features mirror the canonical SigNoz Rust OTel guide (operator-
+# supplied at decision time, supersedes earlier sync-HTTP framing in this
+# branch's pre-rewrite f68447b). The async/tokio path is what SigNoz
+# documents + tf-physics uses, so the cargoless binary aligns with the
+# fleet's documented pattern at the transport level. Subcommands stay
+# synchronous from their own perspective; tokio is the substrate the OTel
+# exporter runs on (block-on-current-thread pattern in serve.rs).
+#
+# Always-on (no feature gate — these power the 5c keystone span macros):
+#   `tracing` — span/event API at every 5c call site in servedrv.rs
+#   `tracing-subscriber` (env-filter feature) — subscriber stack that
+#     bridges to OTEL when `telemetry` feature is on, plain stderr otherwise
+#
+# Feature-gated under `telemetry` (default-on):
+#   `tokio` — current-thread runtime substrate for the OTLP exporter.
+#     Feature scope intentionally MINIMAL: rt + rt-multi-thread + macros +
+#     time (NOT `full`). The daemon's existing sync code runs unchanged
+#     inside `runtime.block_on(async { ... })`; tokio provides the async
+#     substrate the OTel SDK needs, nothing more.
+#   `tracing-opentelemetry` — bridges `tracing::Span` → opentelemetry trace
+#   `opentelemetry` — SDK API surface (`trace` feature)
+#   `opentelemetry_sdk` — provider/processor/sampler impls (`trace` +
+#     `rt-tokio` features — the canonical pairing)
+#   `opentelemetry-otlp` — OTLP exporter. Features: `trace`, `http-proto`
+#     (binary protobuf — more efficient than JSON at scale), `reqwest-client`
+#     (async HTTP transport). NOT `grpc-tonic` (gRPC) — HTTP/protobuf
+#     matches the canonical SigNoz Rust guide + is wire-shape-equivalent
+#     at the collector. NOT `tls-roots` — cargoless-serve hits the
+#     in-cluster collector over plain HTTP; flip back to tls-roots only
+#     if we ever target SigNoz Cloud direct.
+#   `opentelemetry-semantic-conventions` — canonical attr-key constants
+#     (`service.name`, `error.message`, etc.) so we don't drift from
+#     fleet's resource-attr taxonomy
+#
+# Versions track the canonical doc (operator drop). `cargo update` resolves
+# the inter-crate version matrix; the major.minor pins below are what the
+# vendor guide recommends.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.31", optional = true, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", optional = true, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+opentelemetry-semantic-conventions = { version = "0.31", optional = true }
 
 # ──────────────────────────────────────────────────────────────────────────
 # cargo-binstall metadata (release 0.1.0+ — see docs/design/D-RELEASE.md §7)
