@@ -1,0 +1,397 @@
+# cargoless-serve — the CENTRAL in-cluster Model R daemon Service.
+#
+# WHAT THIS IS (and is NOT)
+#   This is the long-lived, networked `cargoless serve --repo` daemon
+#   exposed as a ClusterIP Service: one shared rust-analyzer multiplexed
+#   across a repo's worktrees, answering the §10 HTTP+SSE verdict API.
+#
+#   It is the OPPOSITE lifecycle to deploy/cargoless-builder.k8s.yaml —
+#   that is a PASSIVE `sleep infinity` kubectl-exec build target (ci-gate
+#   tar-streams a SHA in and runs cargo); this is an ACTIVE process that
+#   binds a socket and serves traffic. They are deliberately separate
+#   manifests, separate namespaces, separate images. Do NOT fold one into
+#   the other. Do NOT mutate cargoless-builder.k8s.yaml.
+#
+# ───────────────────────────────────────────────────────────────────────
+# VALIDATION STATUS — DESIGN-COMPLETE, NOT YET LIVE-VALIDATED
+# ───────────────────────────────────────────────────────────────────────
+#   The shipped v0.2.0 `serve --repo` driver (crates/cargoless/src/
+#   servedrv.rs) does NOT yet bind the HTTP transport — it publishes
+#   verdicts only to per-worktree statusfiles. transport/http.rs +
+#   BearerToken are a COMPLETE, unit-tested library seam that is NOT
+#   wired into the running daemon. This manifest is authored against the
+#   Increment-0 (#225, dev-fixer) wiring — servedrv implements
+#   VerdictService + spins HttpServer::bind on the resolved --bind addr +
+#   authorizer_for(cfg). Until #225 lands, the Deployment will start the
+#   process but the :8787 listener (hence the tcpSocket probe + Service)
+#   has nothing to bind to. APPLY ONLY AFTER #225 IS INTEGRATED.
+#
+# ───────────────────────────────────────────────────────────────────────
+# PRODUCT-RUNTIME-IMAGE GAP — THE BIGGEST DELTA vs THE PASSIVE BUILDER
+# ───────────────────────────────────────────────────────────────────────
+#   The builder pod runs `sleep infinity` on a pure toolchain image
+#   (triform-builder-v2:0.1) — it never needs the cargoless binary
+#   (ci-gate compiles per-SHA on demand). THIS pod must EXECUTE the
+#   product: it needs `cargoless` (built `--features integration` — the
+#   wired daemon is excluded from the default build) PLUS `rust-analyzer`
+#   + the 1.85.0 toolchain on PATH (servedrv spawns `rust-analyzer` via
+#   rust_analyzer_command() and RA shells `cargo check` for flycheck).
+#
+#   triform-builder-v2:0.1 supplies the toolchain + RA + rustfmt/clippy
+#   but NOT the cargoless binary. Closing that gap is a REAL NEW CD
+#   ARTIFACT, not a manifest tweak. Two options (recommendation: Opt-1):
+#
+#     OPT-1 (RECOMMENDED) — baked product-runtime image
+#       `registry.triform.cloud/cargoless/cargoless-serve:<ver>`:
+#       FROM registry.triform.cloud/mirror/triform-builder-v2:0.1
+#       COPY a `cargoless` binary built `--features integration --locked`
+#         (produced by a release step on the cargoless-builder pod —
+#         exactly the artifact ci-gate's integ-build already compiles)
+#       into /usr/local/bin, ENTRYPOINT ["cargoless"].
+#       Pros: immutable, fast cold-start (no in-pod compile), the image
+#       digest IS the deployed version (matches the release discipline).
+#       Cons: a new image build+push+retention surface in the release
+#       pipeline (a real, owned increment — flag to release/CD).
+#
+#     OPT-2 (fallback, no new registry artifact) — initContainer compiles
+#       onto the PVC: initContainer uses triform-builder-v2:0.1 to
+#       `cargo build -p cargoless --features integration --release
+#       --locked` into the state PVC; the main container (same toolchain
+#       image) execs the PVC-resident binary.
+#       Pros: zero new release artifact.
+#       Cons: a compile on every cold start (minutes), couples pod
+#       readiness to a build, PVC must hold a target dir. Strictly worse
+#       operationally; documented only as the no-new-artifact escape.
+#
+#   The `image:` below is the OPT-1 placeholder. It DOES NOT EXIST until
+#   the release pipeline produces it — surfaced explicitly, not silently
+#   assumed.
+#
+# Source/repo, RA-warm-state, and the tf-multiverse 589-worktree topology
+# are Lane B/C/D concerns; this file scopes ONLY the cargoless-self
+# single-workspace deployment shape (the cargoless-first rollout step).
+# ───────────────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cargoless-serve
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+---
+# Bearer-token Secret — MANDATORY by construction.
+#
+# The in-cluster bind is non-loopback (0.0.0.0:8787, so the Service +
+# consumers can reach it). cargoless-core `FleetConfig::security_check`
+# / `authorizer_for` FAIL CLOSED: a non-loopback bind with no (or a
+# blank/whitespace-only) token makes the daemon REFUSE TO START (exit 2).
+# That is the correct, deliberate posture — an unauthenticated socket
+# reachable off-pod must never come up. Therefore this Secret is not
+# optional: without it the Deployment never goes Ready.
+#
+# SECURITY: the value below is a NON-FUNCTIONAL PLACEHOLDER. Do NOT apply
+# this Secret as-is and do NOT commit a real token. The operator creates
+# the real one OUT OF BAND, e.g.:
+#   kubectl -n cargoless-serve create secret generic cargoless-serve-auth \
+#     --from-literal=token="$(openssl rand -hex 32)"
+# (or a sealed-secret / external-secret). The placeholder is whitespace-
+# only ON PURPOSE: if this stub is ever applied unmodified, the daemon
+# fail-closes (refuse-to-start) rather than coming up with a guessable
+# credential — a loud, safe failure instead of a silent weak one.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cargoless-serve-auth
+  namespace: cargoless-serve
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+type: Opaque
+stringData:
+  token: "   "   # PLACEHOLDER — replace out-of-band; whitespace ⇒ fail-closed
+---
+# State / cache PVC: state_dir (cli-status, tree.cache, diagnostics) +
+# the shared CAS dir + a warm cargo target/registry for RA's flycheck.
+# RWO + triform-replicated-fsn (the known-good fsn capacity class the
+# builder PVC and tf-multiverse fsn builders use). WaitForFirstConsumer
+# binds it where the single pod lands.
+#
+# SIZING: 20Gi covers cargoless-self (one small workspace, few
+# worktrees: .cargoless state + a warm check target). The operator's
+# tf-multiverse scale (base.cache + per-WT tree.cache + solo/combined
+# CAS across the active worktree subset) is a MEASURED sizing study, NOT
+# a number to guess here — out of scope for the cargoless-first shape.
+#
+# NOTE: rust-analyzer's resident workspace (the load-bearing RAM
+# consumer, ~0.97 GiB at Tier-3) lives in PROCESS MEMORY, not on this
+# PVC. A pod restart loses it ⇒ a cold re-analyze. The PVC only keeps
+# the disk-side warm (cargo target/registry + CAS), which still saves
+# the flycheck cargo cost across restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cargoless-serve-state
+  namespace: cargoless-serve
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: triform-replicated-fsn
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cargoless-serve
+  namespace: cargoless-serve
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+spec:
+  # Model R is ONE shared rust-analyzer multiplexed across the repo's
+  # worktrees — that sharing IS the architecture (D-FLEET-SHARED-DAEMON
+  # §3/§6). It does NOT scale horizontally: a 2nd replica would be a 2nd
+  # independent RA (the exact RAM duplication Model R exists to remove)
+  # AND a 2nd writer of the RWO state PVC. replicas is 1 BY DESIGN; there
+  # is no HA story and adding one here would be an architectural error.
+  replicas: 1
+  # RWO PVC: a rolling update would deadlock (new pod cannot mount the
+  # volume while the old pod still holds it). Recreate tears the old pod
+  # down first. Consequence (accepted, documented): every rollout is a
+  # cold-RA stall — the new pod re-analyzes from scratch. Minimise
+  # rollouts; this is inherent to single-RWO-single-RA, not a defect.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-serve
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cargoless-serve
+        app.kubernetes.io/part-of: cargoless
+    spec:
+      # FIELD FINDING A / #198 reap funnel: on SIGTERM the serve loop
+      # flips a flag, returns, and `clusters.clear()` drops every
+      # per-cluster Supervisor → kill()+wait() each rust-analyzer child
+      # + the setsid/pgid proc-macro-srv sweep. That funnel must be
+      # allowed to COMPLETE before SIGKILL. 30s (k8s default) can be
+      # tight once several clusters' RAs must each be reaped; 90s is
+      # generous headroom and costs nothing on the common (few-cluster)
+      # path — the pod exits as soon as the funnel finishes.
+      terminationGracePeriodSeconds: 90
+      imagePullSecrets:
+        - name: registry-pull
+      # ── repo source (cargoless-self scope) ──────────────────────────
+      # The daemon serves a repo it must see on disk at /repo. For the
+      # cargoless-FIRST rollout that is a shallow clone of cargoless
+      # itself. (tf-multiverse's 589-worktree topology — what "the repo"
+      # even IS in-cluster — is the explicit Lane B/C open question and
+      # is NOT solved here.) Egress 443 + a read credential are required
+      # for a private Forgejo clone; wired via the same registry-pull-
+      # class mechanism the operator uses (left as a clone URL the
+      # operator parameterises — NOT a committed credential).
+      initContainers:
+        - name: repo-clone
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.0
+          # OPT-1 image already has git; OPT-2 would use the builder image.
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ ! -d /repo/.git ]; then
+                git clone --depth 1 \
+                  "${CARGOLESS_REPO_URL:?set CARGOLESS_REPO_URL}" /repo
+              else
+                git -C /repo fetch --depth 1 origin && \
+                git -C /repo reset --hard origin/HEAD
+              fi
+          env:
+            - name: CARGOLESS_REPO_URL
+              value: "https://forgejo.triform.dev/triform/cargoless.git"
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+      containers:
+        - name: serve
+          # OPT-1 product-runtime image (see header). PLACEHOLDER — this
+          # artifact does not exist until the release pipeline bakes it.
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.0
+          args:
+            - "serve"
+            - "--repo"
+            - "/repo"
+            # Non-loopback bind so the ClusterIP Service + consumers can
+            # reach it ⇒ the auth token is MANDATORY (fail-closed above).
+            - "--bind"
+            - "0.0.0.0:8787"
+            - "--state-dir"
+            - "/state"
+            # Shared CAS dir → fleet dedup (a single workspace here, but
+            # the flag is the same seam tf-multiverse scale will use).
+            - "--cas-dir"
+            - "/state/cas"
+          env:
+            # Secret-as-env is the code's PREFERRED secret path (over the
+            # --auth-token flag). Required key: absence ⇒ no token ⇒
+            # security_check refuse-to-start (intended fail-closed).
+            - name: CARGOLESS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cargoless-serve-auth
+                  key: token
+            # Warm toolchain/target on the PVC so RA's flycheck `cargo
+            # check` is offline-fast and survives restarts (RA's RAM
+            # workspace does not — see PVC note).
+            - name: CARGO_HOME
+              value: /state/cargo
+            - name: RUSTUP_HOME
+              value: /state/rustup
+            - name: CARGO_TARGET_DIR
+              value: /state/target
+            - name: CARGO_INCREMENTAL
+              value: "0"
+          ports:
+            - name: http
+              containerPort: 8787
+          # PROBES — tcpSocket, NOT httpGet, BY CONSTRUCTION.
+          # Every HTTP route (incl. would-be /status, /worktrees) is
+          # gated by the Authorizer. A naive httpGet probe sends no
+          # bearer token ⇒ clean 401 ⇒ k8s marks the probe FAILED ⇒
+          # CrashLoop, even though the daemon is perfectly healthy. A
+          # tcpSocket probe proves the listener is bound (which is the
+          # Increment-0 wiring's job) without tripping auth.
+          #
+          # HONEST LIMIT: tcpSocket proves "listener up", NOT "fleet
+          # discovered + analyzed". A TRUE readiness signal needs a
+          # small UNAUTHENTICATED `GET /healthz` route — proposed as an
+          # Increment-0-adjacent code increment for dev-fixer (a 200
+          # liveness route exempt from the Authorizer, returning e.g.
+          # daemon up + worktrees discovered). When that lands, swap the
+          # readinessProbe to the commented httpGet block below.
+          startupProbe:
+            # Cold RA bring-up + AC#1 discovery budget can take a while
+            # on first start; give the listener generous time to appear
+            # before liveness starts counting.
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60   # ~5 min cold-start grace
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          # ── post-/healthz-increment readiness (dev-fixer follow-up) ──
+          # readinessProbe:
+          #   httpGet:
+          #     path: /healthz          # UNAUTHENTICATED by design
+          #     port: http
+          #   periodSeconds: 10
+          #   failureThreshold: 3
+          resources:
+            # One RA at Tier-3 default-safe ≈ 0.97 GiB resident + the
+            # daemon + flycheck cargo. 2Gi req / 6Gi limit fits the
+            # cargoless-self single-workspace shape with headroom. The
+            # tf-multiverse scale needs a MEASURED bump (Lane C) — do
+            # not extrapolate it from this number.
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: repo
+              mountPath: /repo
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: cargoless-serve-state
+        - name: repo
+          emptyDir: {}
+---
+# ClusterIP — in-cluster only. The stated topology is a central
+# in-cluster daemon with in-cluster consumers (ci-gate / check-remote /
+# evidence producers). NO Ingress is shipped: a ClusterIP is sufficient
+# and avoids the SSE hazard — `GET /events` is an unbounded long-lived
+# stream; an Ingress/proxy with any finite read-timeout in front would
+# silently sever it. If an off-cluster consumer is ever truly needed,
+# that is a separate, deliberate Ingress increment (TLS + bearer +
+# proxy read-timeout DISABLED) — not added here by default.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cargoless-serve
+  namespace: cargoless-serve
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cargoless-serve
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
+---
+# NetworkPolicy — INGRESS + EGRESS. This is a NEW shape vs the builder's
+# egress-only policy: the builder never serves traffic; this daemon
+# does, so its inbound surface must be explicitly fenced.
+#
+# Ingress: ONLY pods in namespaces the operator has labelled
+# `cargoless.triform/serve-consumer: "true"` may reach :8787. Default-
+# deny everything else (a NetworkPolicy that selects the pod with an
+# Ingress rule denies all non-matching ingress). The verdict API +
+# diagnostics are not a public surface.
+#
+# Egress: DNS + 80/443 to the public internet (the repo-clone init +
+# RA's first-analyze cargo/registry fetches), private ranges excluded —
+# the same shape as the builder's `cargoless-builder-egress`, scoped
+# entirely within this namespace and selecting only this pod. Touches
+# nothing in triform-builder or any global Flux/Calico resource.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cargoless-serve-netpol
+  namespace: cargoless-serve
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-serve
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              cargoless.triform/serve-consumer: "true"
+      ports:
+        - {port: 8787, protocol: TCP}
+  egress:
+    # DNS to in-cluster resolvers.
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+      to:
+        - namespaceSelector: {}
+    # HTTP/HTTPS to the public internet (repo clone + first-analyze
+    # cargo/registry). Private ranges excluded.
+    - ports:
+        - {port: 80, protocol: TCP}
+        - {port: 443, protocol: TCP}
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
