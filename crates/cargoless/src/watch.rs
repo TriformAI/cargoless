@@ -189,6 +189,11 @@ pub fn run(cfg: &Config) -> ExitCode {
                 verdict_str: verdict.as_str().to_string(),
                 crates,
                 red_diagnostics,
+                // #247: v0 watch path — settle ≈ write instant (the
+                // model fires BecameGreen/Red and we write immediately).
+                // analysed_at == updated honestly for v0; the distinction
+                // is preserved for the Model R serve --repo path.
+                analysed_at: statusfile::now_unix(),
             },
         );
         // Model R #11: retain the full diagnostic list for a red tree

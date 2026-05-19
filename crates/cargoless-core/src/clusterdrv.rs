@@ -279,6 +279,64 @@ impl ClusterDriver {
             .as_ref()
             .map(|a| ClusterAction::SwitchOverlay { wt: a.wt.clone() })
     }
+
+    /// #247 STOP-class — restore the [`ClusterDriver`] precondition after
+    /// a rust-analyzer **respawn**. The wire seam (`servedrv`'s
+    /// `Ctrl::Spawned` handler) calls this alongside
+    /// [`crate::multiplex::OverlayMultiplexer::reset`] (#190); the two
+    /// together restore BOTH proven cores' preconditions at the
+    /// integration seam — the
+    /// [[proven-core-precondition-violated-at-integration-seam]] pattern
+    /// recurring on a 2nd axis, mirroring #198's discipline (RESTORE the
+    /// precondition AT the wire seam, never weaken the proven core).
+    ///
+    /// ## What it does
+    ///
+    /// Drops the in-flight [`ActiveTxn`] (`current = None`) and clears
+    /// the `recheck_current` self-recheck flag tied to it. The in-flight
+    /// transaction's flycheck barrier was waiting on `FlycheckEnded` from
+    /// a rust-analyzer process that is no longer alive; the **new** RA's
+    /// `FlycheckEnded` events are causally unrelated to that barrier's
+    /// armed window (the new RA never received the overlays
+    /// `ClusterAction::SwitchOverlay` would have pushed for `current.wt`
+    /// — the wire only re-pushes overlays via a *new* `SwitchOverlay`
+    /// arm, which is produced from a *fresh* `RoutedBatch`, not from
+    /// respawn). Allowing the new RA's events to settle the old barrier
+    /// produces a verdict from a check that did NOT analyse `current.wt`
+    /// — the **AC4 false-GREEN**. Dropping `current` makes that path
+    /// unreachable by construction (`on_lsp`'s `None`-arm returns
+    /// [`ClusterAction::Idle`] before any barrier is observed).
+    ///
+    /// ## What it does NOT do (deliberate non-clear, defends Layer-3)
+    ///
+    /// `pending` is **not** cleared. The queue is RA-agnostic — it
+    /// carries "WT X had a routed batch waiting for the cluster RA,"
+    /// which is *still true* after a respawn. The next time the driver
+    /// settles a txn, [`start_next_after_settle`](Self::start_next_after_settle)
+    /// drains `pending` correctly through a *freshly-armed* barrier
+    /// under the NEW RA (`arm(false)`) — zero carry-over from the dead
+    /// process, no false-GREEN risk. Aggressively clearing `pending`
+    /// would be a strict superset and would silently drop legitimate
+    /// queued user-intent; this method opts for the minimum that
+    /// restores the no-false-GREEN invariant. (A future review can
+    /// trivially escalate to a full clear if richer semantics demand it.)
+    ///
+    /// ## No-false-GREEN invariant restored
+    ///
+    /// After this call, no [`LspEvent`] processed by [`on_event`](Self::on_event)
+    /// can produce a [`ClusterAction::EmitVerdict`] until a fresh
+    /// [`DriverEvent::RoutedBatch`] arrives (which opens a new
+    /// `ActiveTxn` with `arm(false)`). The settle path (`on_lsp`'s
+    /// `Settled` arm) requires `self.current.as_mut() → Some(active)` to
+    /// observe the barrier; with `current = None` the match returns
+    /// `Idle` *before* any barrier is touched — Judgment B preserved
+    /// structurally. **Honest fail-safe**: silent until the next
+    /// file-change re-routes through the watcher, never a false verdict.
+    pub fn reset_after_respawn(&mut self) {
+        self.current = None;
+        self.recheck_current = false;
+        // `pending` deliberately retained — see method-doc rationale.
+    }
 }
 
 #[cfg(test)]
@@ -484,5 +542,108 @@ mod tests {
             ClusterAction::Idle
         );
         assert!(!d.is_busy());
+    }
+
+    // ───────── #247 STOP-class AC4 fix: reset_after_respawn ─────────
+
+    #[test]
+    fn reset_after_respawn_drops_in_flight_txn_no_emit_without_fresh_routed_batch() {
+        // THE structural property the #247 AC4 fix establishes — the
+        // load-bearing layer-1 self-prove. After reset_after_respawn(),
+        // the in-flight ActiveTxn is gone; any LspEvent observed
+        // afterward returns Idle (no settle path reachable, Judgment B
+        // preserved structurally) until a fresh RoutedBatch arms a NEW
+        // barrier under the NEW RA's events.
+        let mut d = ClusterDriver::new();
+        // Pre-respawn: txn armed, RA chatter accumulating.
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") });
+        d.on_event(DriverEvent::Lsp(rustc_err("file:///r/a/x.rs")));
+        assert!(d.is_busy(), "txn in flight before respawn");
+
+        // Simulate kill-9 + respawn: the wire calls reset_after_respawn.
+        d.reset_after_respawn();
+        assert!(!d.is_busy(), "in-flight txn dropped on respawn");
+
+        // THE smoking gun assertion: a FlycheckEnded from the *new* RA
+        // MUST NOT settle anything (there's no current barrier to
+        // observe). Without the fix, this would emit a false verdict for
+        // /r/a — attributed to wt /r/a from a check whose
+        // PublishDiagnostics window does NOT contain analysis of /r/a's
+        // overlay (the new RA never received it). The AC4 false-GREEN.
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
+            ClusterAction::Idle,
+            "FlycheckEnded post-respawn MUST NOT settle anything (no current)"
+        );
+        // Multiple stray events — same.
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(rustc_err("file:///r/a/x.rs"))),
+            ClusterAction::Idle,
+        );
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
+            ClusterAction::Idle,
+        );
+
+        // A fresh RoutedBatch ⇒ new txn opens, barrier freshly armed.
+        // The next FlycheckEnded settles THIS (fresh) barrier with the
+        // new RA's diagnostics ⇒ a correct attributable verdict.
+        assert_eq!(
+            d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") }),
+            ClusterAction::SwitchOverlay { wt: wt("/r/a") }
+        );
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
+            ClusterAction::EmitVerdict {
+                wt: wt("/r/a"),
+                authoritative_error: false,
+            },
+            "after fresh RoutedBatch + fresh FlycheckEnded, the settle attributes correctly"
+        );
+    }
+
+    #[test]
+    fn reset_after_respawn_preserves_pending_queue_documented_choice() {
+        // #247 deliberate-non-clear of `pending` — defends the Layer-3
+        // "no flag-untouched residual" criterion by documenting WHY
+        // pending is intentionally preserved (RA-agnostic queued user
+        // intent; drains correctly via start_next_after_settle through a
+        // fresh-armed barrier under the new RA — no false-GREEN risk
+        // because the next-armed barrier is `arm(false)` over zero
+        // carry-over diagnostics).
+        let mut d = ClusterDriver::new();
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") }); // A in flight
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/b") }); // B queued
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/c") }); // C queued
+        assert_eq!(d.pending(), vec![wt("/r/b"), wt("/r/c")]);
+
+        d.reset_after_respawn();
+        assert!(!d.is_busy(), "current dropped");
+        assert_eq!(
+            d.pending(),
+            vec![wt("/r/b"), wt("/r/c")],
+            "pending PRESERVED across respawn (documented non-clear)"
+        );
+
+        // The pending queue drains through a FRESH settle's
+        // start_next_after_settle. Open + settle a fresh txn for /r/a:
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") });
+        // The fresh settle's verdict is correctly authored on the new
+        // RA's barrier window (NOT carry-over).
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
+            ClusterAction::EmitVerdict {
+                wt: wt("/r/a"),
+                authoritative_error: false,
+            }
+        );
+        // start_next_after_settle drained /r/b from pending ⇒ that's the
+        // follow-up switch the adapter dispatches.
+        assert_eq!(
+            d.take_followup(),
+            Some(ClusterAction::SwitchOverlay { wt: wt("/r/b") }),
+            "pending drains correctly post-fix: /r/b becomes the next switch \
+             (Layer-3: the deliberate non-clear DOES NOT silently lose work)"
+        );
     }
 }

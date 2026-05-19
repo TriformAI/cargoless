@@ -316,12 +316,41 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         }
 
         // (v) respawn-staleness closure: the SOLE site a cluster's
-        // LspClient is (re)set — reset() the multiplexer here, before any
-        // subsequent switch_to for that cluster.
+        // LspClient is (re)set — restore BOTH proven cores' preconditions
+        // here, before any subsequent switch_to / barrier observation for
+        // that cluster.
+        //
+        // #247 STOP-class AC4 fix: kill-mid-flycheck leaves
+        // `cs.driver: ClusterDriver` carrying an `ActiveTxn` whose
+        // flycheck barrier is `Waiting` for a `FlycheckEnded` from a
+        // rust-analyzer process that's no longer alive. Without
+        // `driver.reset_after_respawn()`, the new RA's initial cargo
+        // check (which never received `SwitchOverlay`-pushed overlays
+        // for the in-flight WT — those only re-fire from a *new*
+        // RoutedBatch) emits FlycheckEnded → settles the stale barrier →
+        // `EmitVerdict{wt, authoritative_error=false}` from a window
+        // that contains zero diagnostics about that WT's overlay ⇒
+        // **FALSE GREEN attributed to a WT whose source is broken.**
+        // dev-fixer source-traced (045d6dc) + clusterdrv test
+        // `reset_after_respawn_drops_in_flight_txn_no_emit_without_fresh_routed_batch`
+        // proves the structural restore.
+        //
+        // The [[proven-core-precondition-violated-at-integration-seam]]
+        // pattern recurring on a 2nd axis (mirrors #190's mux.reset and
+        // #198's RA reap — restore the precondition AT the wire seam,
+        // never weaken the proven core). ORDER: driver.reset_after_respawn
+        // BEFORE swapping in the new LspClient, so any LspEvents drained
+        // next iteration from the new RA cannot interleave with the dead
+        // state.
         while let Ok(Ctrl::Spawned(h, client)) = ctrl_rx.try_recv() {
             if let Some(cs) = clusters.get_mut(&h) {
+                cs.driver.reset_after_respawn();
                 cs.mux.reset();
                 cs.lsp = Some(client);
+                eprintln!(
+                    "[cargoless:obs] respawn cluster={} driver+mux reset (#247)",
+                    h.as_str()
+                );
             }
         }
 
@@ -509,6 +538,18 @@ fn step(
         return;
     };
     let action = cs.driver.on_event(ev);
+    // #247 obs: log the wire-side detection of barrier-settle (= the
+    // moment ClusterDriver emits an EmitVerdict — Judgment B's sole
+    // attribution boundary, observed BEFORE we dispatch the action to
+    // `exec`). The eprintln is dep-free; full OTEL `verdict.publish`
+    // span lands in #246.
+    if let ClusterAction::EmitVerdict { wt, .. } = &action {
+        eprintln!(
+            "[cargoless:obs] flycheck-end wt={} settled at={} (#247)",
+            wt.display(),
+            statusfile::now_unix()
+        );
+    }
     exec(cs, action, pending_batch, api);
     // EXACTLY ONCE — `clusterdrv::take_followup` is structurally
     // non-mutating (`self.current.as_ref().map(...)`, never clears
@@ -539,6 +580,16 @@ fn exec(
     match action {
         ClusterAction::Idle => {}
         ClusterAction::SwitchOverlay { wt } => {
+            // #247 obs: log the wire-side check-start (the SwitchOverlay
+            // arm dispatching mux.switch_to + did_save = the flycheck
+            // trigger). Pairs with `flycheck-end` (step's EmitVerdict
+            // detection) and `verdict-emit` (publish_verdict) to give a
+            // grep-able sequence per WT per generation. Dep-free.
+            eprintln!(
+                "[cargoless:obs] check-started wt={} at={} (#247)",
+                wt.display(),
+                statusfile::now_unix()
+            );
             let Some(lsp) = cs.lsp.clone() else {
                 return; // RA not handshaked yet; a later batch retries
             };
@@ -616,8 +667,21 @@ fn publish_verdict(
         verdict_str: verdict.as_str().to_string(),
         crates: Vec::new(),
         red_diagnostics: 0,
+        // #247 obs: analysed_at = settle-observed instant (Judgment B sole
+        // attribution site = the moment the wire reached this arm). For
+        // the current single-write path, analysed_at == updated; the
+        // distinction is preserved-design (a future heartbeat-refresh
+        // path would tick `updated` without re-checking, leaving
+        // `analysed_at` at the original settle time).
+        analysed_at: now,
     };
     statusfile::write(wt, &st);
+    eprintln!(
+        "[cargoless:obs] verdict-emit wt={} verdict={} analysed_at={} (#247)",
+        wt.display(),
+        verdict.as_str(),
+        now
+    );
     // Same site, mirror sink: feed the read-plane VerdictService + emit
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.

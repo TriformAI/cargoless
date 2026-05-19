@@ -97,6 +97,19 @@ pub struct Status {
     /// asymmetric-stream "how bad is red" scalar (`D-FLEET-SHARED-DAEMON`
     /// §9.2). Zero on green and on a schema=1 file.
     pub red_diagnostics: u32,
+    /// #247 in-scope obs fold: unix-seconds timestamp of the
+    /// AUTHORITATIVE analysis that produced this verdict (= the
+    /// barrier-settle instant observed at `publish_verdict`). Distinct
+    /// from `updated` (the statusfile-write instant): if a future
+    /// heartbeat-refresh path were to update `updated` without re-checking,
+    /// `analysed_at` would stay put at the original settle time — so a
+    /// diagnostician can answer "is this verdict from a real recent check
+    /// or just a heartbeat refresh?" by comparing `analysed_at` to
+    /// `updated`. Closes the AC4-class diagnosis gap that
+    /// `serve.out`-bring-up-banner-only could not resolve (partial #243
+    /// close; full OTEL+SigNoz spans land in #246). Zero on schema=1 or
+    /// pre-#247 files (forward-compatible default).
+    pub analysed_at: u64,
 }
 
 pub fn path(root: &Path) -> PathBuf {
@@ -153,6 +166,12 @@ impl Status {
             out.push_str(&format!("crates={joined}\n"));
         }
         out.push_str(&format!("red_diagnostics={}\n", self.red_diagnostics));
+        // #247: analysed_at emitted unconditionally (zero on green/never-
+        // checked is meaningful — distinguishes "no authoritative check
+        // yet" from a stale "recently re-heartbeated" state). Forward-
+        // compatible: a schema=2 reader pre-#247 will ignore the unknown
+        // `analysed_at` key (the parse-arm-driven discipline).
+        out.push_str(&format!("analysed_at={}\n", self.analysed_at));
         out
     }
 
@@ -174,6 +193,7 @@ impl Status {
                 "verdict" => s.verdict_str = v.trim().to_string(),
                 "crates" => s.crates = parse_crates(v.trim()),
                 "red_diagnostics" => s.red_diagnostics = v.trim().parse().unwrap_or(0),
+                "analysed_at" => s.analysed_at = v.trim().parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -645,6 +665,7 @@ mod tests {
             verdict_str: "green".into(),
             crates: vec![],
             red_diagnostics: 0,
+            analysed_at: 0,
         };
         assert_eq!(Status::parse(&st.serialize()), st);
         let forward = format!("{}future_key=42\n", st.serialize());
@@ -668,6 +689,7 @@ mod tests {
                 ("physics".into(), Verdict::Red),
             ],
             red_diagnostics: 2,
+            analysed_at: 0,
         };
         let wire = st.serialize();
         assert!(wire.starts_with("schema=2\n"), "schema bumped: {wire}");
@@ -705,6 +727,7 @@ mod tests {
             verdict_str: "red".into(),
             crates: vec![],
             red_diagnostics: 3,
+            analysed_at: 0,
         };
         let wire = st.serialize();
         assert!(!wire.contains("crates="), "no crates line: {wire}");
@@ -740,6 +763,7 @@ mod tests {
             verdict_str: "green".into(),
             crates: vec![("x".into(), Verdict::Green)],
             red_diagnostics: 0,
+            analysed_at: 0,
         };
         let wire = st.serialize();
         // The schema=1-era parser was exactly today's parser minus the
@@ -768,6 +792,50 @@ mod tests {
             assert_eq!(Verdict::parse(v.as_str()), v);
         }
         assert_eq!(Verdict::parse("garbage"), Verdict::Unknown);
+    }
+
+    // -----------------------------------------------------------------------
+    // #247 — analysed_at obs field (distinct-from-updated semantics)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn analysed_at_roundtrips_with_nonzero_value() {
+        // The #247 obs fold: analysed_at is the barrier-settle instant
+        // (publish_verdict's `now` at the EmitVerdict arm) — distinct
+        // from `updated` (statusfile-write instant). Test a non-zero
+        // value to prove ser/parse symmetry on the new field (the
+        // existing roundtrip tests all use 0 from the Default).
+        let st = Status {
+            pid: 42,
+            root: "/p".into(),
+            started: 100,
+            updated: 250,
+            verdict_str: "green".into(),
+            crates: vec![],
+            red_diagnostics: 0,
+            analysed_at: 200, // settled 50s before write (meaningful gap)
+        };
+        let wire = st.serialize();
+        assert!(wire.contains("analysed_at=200\n"), "emitted: {wire}");
+        assert_eq!(
+            Status::parse(&wire),
+            st,
+            "exact roundtrip incl. analysed_at"
+        );
+    }
+
+    #[test]
+    fn pre_247_file_without_analysed_at_defaults_to_zero() {
+        // Forward-compatibility: a pre-#247 statusfile (no `analysed_at=`
+        // line) parses with analysed_at=0 — meaning "no #247-aware
+        // authoritative-check-instant recorded." Mirrors the schema=1
+        // backward-compat discipline.
+        let pre247 = "schema=2\npid=1\nroot=/p\nstarted=0\nupdated=10\n\
+                      verdict=green\nred_diagnostics=0\n";
+        let s = Status::parse(pre247);
+        assert_eq!(s.analysed_at, 0, "absent ⇒ 0, not error");
+        assert_eq!(s.verdict_str, "green");
+        assert_eq!(s.updated, 10);
     }
 
     // -----------------------------------------------------------------------
@@ -830,6 +898,7 @@ mod tests {
             verdict_str: "red".into(),
             crates: vec![],
             red_diagnostics: 0,
+            analysed_at: 0,
         };
         write(&root, &st);
         let back = Status::parse(&std::fs::read_to_string(path(&root)).unwrap());
@@ -852,6 +921,7 @@ mod tests {
             verdict_str: verdict.into(),
             crates: vec![],
             red_diagnostics: 0,
+            analysed_at: 0,
         }
     }
 

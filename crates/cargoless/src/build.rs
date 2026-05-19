@@ -254,6 +254,13 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 verdict_str: verdict.as_str().to_string(),
                 crates,
                 red_diagnostics,
+                // #247: v0 single-WT path — settle ≈ write instant (the
+                // model fires BecameGreen/Red and we write immediately).
+                // `analysed_at == updated` is honest for v0; the
+                // distinction is preserved for the Model R serve --repo
+                // path (`servedrv::publish_verdict`) where they can
+                // diverge under heartbeat-refresh semantics.
+                analysed_at: statusfile::now_unix(),
             },
         );
     };
