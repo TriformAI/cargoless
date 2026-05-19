@@ -1,66 +1,66 @@
 # shellcheck shell=bash
 # scripts/stage1/lib.sh — shared machinery for the Stage-1 acceptance suite
-# (PLAN-LANE D / task #228). Sourced by run-stage1.sh; never executed alone.
+# (PLAN-LANE D / tasks #228, #239). Sourced by run-stage1.sh; never run alone.
 #
-# This file holds: config (env-overridable defaults), portable OS helpers
-# (macOS bash-3.2 + Linux), PASS/FAIL/STOP-class result accounting, the
-# never-publish-red pointer fingerprint, the parity-oracle helpers, daemon
-# lifecycle + rust-analyzer descendant discovery, ephemeral git-worktree
-# setup, and the structural no-cargo / no-accidental-execute guards.
+# SUBSTRATE (task #239): the Stage-1 suite validates the wired `cargoless
+# serve --repo` daemon against a REAL Rust+WASM project — the committed
+# Leptos reference fixture `bench/fixture/`. cargoless is a build tool FOR
+# Leptos/trunk WASM apps; its own native-CLI source is NOT a recognisable
+# Rust+WASM project (cargoless's D7 detection gates on cdylib-or-leptos),
+# so cargoless cannot dogfood its own repo — that was the substrate error
+# the first run surfaced. The suite builds a throwaway git repo whose
+# content IS the Leptos fixture and discovers nested worktrees of it.
 #
-# DESIGN NOTE — the suite is authored against the v0.2.0 contract
-# (`cargoless serve --repo`, GET-only HTTP+SSE, per-WT statusfile,
-# never-publish-red pointer). Anything the Increment-0+1 wiring may move
-# (pointer path, statusfile path, publish driver) is a NAMED env knob, so
-# the suite is "ready to run the instant Inc0+1 land" by setting knobs,
-# not by editing logic.
+# This file holds: config, portable OS helpers (macOS bash-3.2 + Linux),
+# PASS / FAIL / STOP-class accounting, the never-publish-red pointer
+# fingerprint, parity oracles, daemon lifecycle + rust-analyzer descendant
+# discovery, the Leptos-substrate builder, and the structural guards.
 
 set -u
 
 # ─────────────────────────────────────────────────────────────────────
 # Config — every value env-overridable; safe, hermetic defaults.
 # ─────────────────────────────────────────────────────────────────────
-: "${CARGOLESS_BIN:=cargoless}"        # PATH binary; suite NEVER builds it
+: "${CARGOLESS_BIN:=cargoless}"        # wired (#225) binary; suite NEVER builds it
 : "${S1_WORK:=/tmp/cl-stage1-run}"     # scratch root (must be under /tmp)
-: "${S1_STATE_DIR:=${S1_WORK}/state}"  # dogfood-isolated state dir
+: "${S1_STATE_DIR:=${S1_WORK}/state}"  # dogfood-isolated daemon state dir
 : "${S1_CAS_DIR:=${S1_WORK}/cas}"      # dogfood-isolated CAS dir
 : "${S1_BIND:=127.0.0.1:8717}"         # HTTP+SSE bind (AC6)
 : "${S1_TOKEN:=}"                      # bearer; preflight mints if empty
 : "${S1_BRINGUP_BUDGET:=30}"           # AC1 AC#1 budget seconds
-: "${S1_VERDICT_GRACE:=30}"            # debounce+verdict latency window s
-: "${S1_RESPAWN_GRACE:=40}"            # RA respawn settle window s (AC4)
-: "${S1_SIGTERM_GRACE:=10}"            # post-SIGTERM reap window s (AC7)
-: "${S1_NWT:=3}"                       # # ephemeral worktrees for AC3
-: "${S1_CI_ORACLE:=0}"                 # 1 ⇒ also confirm baseline vs CI
+: "${S1_VERDICT_GRACE:=180}"           # verdict-await window s (pod cold-leptos
+                                       # runs override higher, e.g. 480)
+: "${S1_RESPAWN_GRACE:=60}"            # RA respawn settle window s (AC4)
+: "${S1_SIGTERM_GRACE:=12}"            # post-SIGTERM reap window s (AC7)
+: "${S1_NWT:=3}"                       # # ephemeral nested worktrees (AC3)
+: "${S1_CI_ORACLE:=0}"                 # 1 ⇒ also confirm baseline vs Forgejo CI
 # AC2 clippy-only expectation — ERA-SCOPED (Lane-B #221 ruling, verified
-# from source by team-lead 2026-05-19). Stage-1 runs PRE-Increment-3, and
-# shipped v0.2.0 flycheck is hardcoded `command:"check"` (clippy is NOT a
-# flycheck): a clippy/rustc *warning* (e.g. the unused-import AC2 injects)
-# is advisory/suppressed ⇒ cargoless verdict GREEN — that is CORRECT
-# shipped behavior, NOT a bug; asserting RED here would be a false-alarm.
-# A clippy/rustc *error* (Severity::Error) ⇒ RED (honest, F8-redo).
-# ⇒ default = green for the Stage-1 era (AC2 deliberately injects a
-#   WARNING-severity lint). This FLIPS to red once Increment 3-B lands
-#   (clippy-as-flycheck + `-D warnings` promotes the lint to Error).
-#   dev-fixer owns final post-Inc3-B semantics. Override deliberately:
-#   red (post-Inc3-B, or if AC2 is changed to inject an error-level
-#   lint) | green (Stage-1 era, default) | fieldfinding (record-only).
+# from source). Stage-1 runs PRE-Increment-3-B; shipped v0.2.0 flycheck is
+# hardcoded `command:"check"` (clippy is NOT a flycheck): a warning-
+# severity lint (the unused-import AC2 injects) is advisory/suppressed ⇒
+# cargoless verdict GREEN — CORRECT shipped behaviour, NOT a bug; asserting
+# RED here would be a false-alarm. A clippy/rustc *error* (Severity::Error)
+# ⇒ RED. ⇒ default green for the Stage-1 era; FLIPS to red once Inc3-B
+# lands (clippy-as-flycheck + `-D warnings` promotes the lint to Error).
+# dev-fixer owns final post-Inc3-B semantics.
 : "${S1_CLIPPY_EXPECTED:=green}"       # red|green|fieldfinding — era-scoped
-# Source repo: the suite clones THIS (hermetic) — never the operator tree.
-: "${S1_SRC_REPO:=}"                   # auto-detected if empty
-# Knobs Inc0+1 may relocate (NAMED so logic never changes):
-: "${S1_POINTER_REL:=.cargoless/latest-green}"      # never-publish-red ptr
-: "${S1_STATUS_GLOB:=.cargoless/**/cli-status .cargoless/cli-status}"
-: "${S1_PUBLISH_ARGS:=build --watch --out}"          # publish driver (AC5)
-# Injection target inside the cloned repo (a stable .rs file):
-: "${S1_INJECT_FILE:=crates/cargoless/src/main.rs}"
-: "${S1_INJECT_CRATE_FILE:=crates/cargoless-core/src/lib.rs}" # AC2 multicrate
+# Substrate: the cargoless repo (to locate the fixture + the suite) and
+# the Leptos fixture inside it. The suite builds a throwaway repo FROM the
+# fixture — the operator tree / cargoless repo are never mutated.
+: "${S1_SRC_REPO:=}"                   # cargoless repo; auto-detected if empty
+: "${S1_FIXTURE:=}"                    # Leptos fixture; defaults to <repo>/bench/fixture
+# Named contract knobs (v0.2.0 verified-from-source):
+: "${S1_STATUS_REL:=.cargoless/cli-status}"     # per-WT verdict statusfile
+: "${S1_POINTER_REL:=.cargoless/latest-green}"  # never-publish-red pointer
+: "${S1_PUBLISH_ARGS:=build --watch --out}"      # AC5 publisher driver
+: "${S1_INJECT_FILE:=src/components/counter.rs}" # fixture file fault-injected
 : "${S1_EXECUTE_GO:=0}"                # STRUCTURAL gate — see require_go()
 
 SUITE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS=()        # "ACn|PASS|detail" / "ACn|FAIL|detail"
+RESULTS=()        # "ACn|PASS|detail" / "ACn|FAIL|detail" / "ACn|STOP|detail"
 FAILED=0
 DAEMON_PID=""     # current serve daemon (for cleanup traps)
+S1_REPO=""        # the throwaway Leptos substrate repo (set by setup_repo)
 
 # ─────────────────────────────────────────────────────────────────────
 # Output
@@ -72,11 +72,18 @@ pass(){ RESULTS+=("$1|PASS|${2:-}"); log "[$1] ✅ PASS — ${2:-}"; }
 fail(){ RESULTS+=("$1|FAIL|${2:-}"); FAILED=$((FAILED+1)); log "[$1] ❌ FAIL — ${2:-}"; }
 note(){ log "[$1] · ${2:-}"; }
 
-# STOP-class: an unrecoverable safety breach. Loud banner, sentinel file,
-# distinct exit 99 ⇒ orchestrator aborts the whole rollout and the
-# operator/team-lead route. The four triggers (false-GREEN /
-# cross-contamination / torn-pointer / RA-orphan) are the bright line —
-# never softened to a plain FAIL (STOP-guard structural-enforcement).
+# STOP-class: an unrecoverable PRODUCT safety breach. Loud banner, sentinel
+# file, distinct exit 99 ⇒ rollout HALTS and team-lead routes.
+#
+# BUG-#3 DISCIPLINE (the verdict-provenance principle — task #239): a
+# STOP-class HALT is ONLY ever raised on a *definite wrong verdict* — a
+# `green` verdict on a definitely-broken tree (false-GREEN), a definite
+# cross-worktree verdict flip, a torn pointer, an RA-orphan, an auth
+# bypass. It is NEVER raised on `unknown` (verdict unobservable). "Could
+# not observe a verdict" is INCONCLUSIVE → a plain FAIL, never a STOP.
+# Conflating `unknown` with `green` is exactly the harness false-positive
+# the first run produced; callers must gate STOP on `== green`, never on
+# `!= red`.
 stop_class() {
   local ac="$1" reason="$2"
   RESULTS+=("$ac|STOP|$reason")
@@ -132,11 +139,8 @@ ra_children() {
 # ─────────────────────────────────────────────────────────────────────
 # (1) No local cargo/rustc *invocation* anywhere in the suite (CI-only
 #     ethos lock). Matches command invocations — `cargo <subcmd>` /
-#     `rustc ` at a command position — NOT substrings/prose, so
-#     `rustc-error`, the identifier `AC2-rustc`, and `cargoless check`
-#     (the legit independent-instance oracle) never false-trip it. The
-#     guard's own pattern-definition lines carry the S1_GUARD sentinel
-#     and comment lines are excluded (self-reference safe).
+#     `rustc ` at a command position — NOT substrings/prose; the guard's
+#     own pattern lines carry the S1_GUARD sentinel (self-reference safe).
 guard_no_cargo() {                                                      # S1_GUARD
   local pat='(cargo (build|check|test|run|clippy|publish|fmt|metadata|install)|(^|[;&|]|\$\() *rustc )' # S1_GUARD
   if grep -nE "$pat" "$SUITE_DIR"/*.sh | grep -vE '^[^:]+:[0-9]+: *#| S1_GUARD'; then # S1_GUARD
@@ -144,20 +148,15 @@ guard_no_cargo() {                                                      # S1_GUA
     exit 2
   fi
 }
-# (2) Accidental-execution gate. The suite cannot run an AC unless the
-#     operator/team-lead explicitly sets S1_EXECUTE_GO=1 *and* Inc0+1 is
-#     declared landed. Default posture = self-check only. This is the
-#     structural enforcement of "design+prep only, gated on GO".
+# (2) Accidental-execution gate. No AC runs unless S1_EXECUTE_GO=1 is
+#     explicitly set (team-lead's GO). Default posture = self-check only.
 require_go() {
   if [ "${S1_EXECUTE_GO}" != "1" ]; then
     cat <<EOF
 
 GATED — Stage-1 execution is blocked by design.
-  Requires ALL of:
-    • Increment 0+1 landed (the central daemon + wiring)
-    • explicit team-lead GO
-    • S1_EXECUTE_GO=1 in the environment
-  Until then this suite only runs --self-check (validates readiness,
+  Requires explicit team-lead GO: S1_EXECUTE_GO=1 in the environment.
+  Without it this suite only runs --self-check (validates readiness,
   executes NO acceptance criterion, starts NO daemon, touches nothing).
 
   Re-run:   S1_EXECUTE_GO=1 $0 [--from ACn|--only ACn]
@@ -167,44 +166,64 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# Preflight (runs only under require_go — i.e. only when executing)
+# Preflight
 # ─────────────────────────────────────────────────────────────────────
 preflight() {
   guard_no_cargo
   case "$S1_WORK" in /tmp/*|/private/tmp/*) : ;; *)
     [ "${S1_FORCE:-0}" = 1 ] || { echo "REFUSE: S1_WORK ($S1_WORK) not under /tmp; set S1_FORCE=1 to override." >&2; exit 2; }
   esac
-  # State-dir isolation: must live under S1_WORK (never the operator's
-  # real .cargoless / .triform/cargoless) unless explicitly forced.
   case "$S1_STATE_DIR" in "$S1_WORK"/*) : ;; *)
     [ "${S1_FORCE:-0}" = 1 ] || { echo "REFUSE: S1_STATE_DIR not under S1_WORK — operator-state isolation breach; S1_FORCE=1 to override." >&2; exit 2; }
   esac
   command -v "$CARGOLESS_BIN" >/dev/null 2>&1 || { echo "FATAL: \$CARGOLESS_BIN ($CARGOLESS_BIN) not found — suite NEVER builds it." >&2; exit 2; }
   command -v curl >/dev/null 2>&1 || { echo "FATAL: curl required (AC6)." >&2; exit 2; }
-  command -v git  >/dev/null 2>&1 || { echo "FATAL: git required (AC3 worktrees)." >&2; exit 2; }
+  command -v git  >/dev/null 2>&1 || { echo "FATAL: git required (worktrees)." >&2; exit 2; }
   rm -rf "$S1_WORK"; mkdir -p "$S1_WORK" "$S1_STATE_DIR" "$S1_CAS_DIR"
   [ -n "$S1_TOKEN" ] || S1_TOKEN="s1-$(date +%s)-$RANDOM"
   if [ -z "$S1_SRC_REPO" ]; then
     S1_SRC_REPO="$(cd "$SUITE_DIR/../.." && git rev-parse --show-toplevel 2>/dev/null || true)"
   fi
-  [ -n "$S1_SRC_REPO" ] && [ -d "$S1_SRC_REPO/.git" ] || { echo "FATAL: cannot resolve S1_SRC_REPO (the cargoless repo to clone hermetically)." >&2; exit 2; }
-  log "preflight OK — bin=$($CARGOLESS_BIN --version 2>/dev/null || echo '?') src_repo=$S1_SRC_REPO work=$S1_WORK"
+  [ -n "$S1_SRC_REPO" ] && [ -d "$S1_SRC_REPO/.git" ] || { echo "FATAL: cannot resolve S1_SRC_REPO (the cargoless repo)." >&2; exit 2; }
+  [ -n "$S1_FIXTURE" ] || S1_FIXTURE="$S1_SRC_REPO/bench/fixture"
+  # The substrate MUST be a recognisable Rust+WASM project, else cargoless
+  # refuses it (D7 detection) — the exact failure the first run hit.
+  [ -f "$S1_FIXTURE/Cargo.toml" ] || { echo "FATAL: S1_FIXTURE ($S1_FIXTURE) has no Cargo.toml." >&2; exit 2; }
+  grep -q 'leptos' "$S1_FIXTURE/Cargo.toml" 2>/dev/null \
+    || { echo "FATAL: S1_FIXTURE is not a Leptos project (no leptos dep) — cargoless would D7-refuse it." >&2; exit 2; }
+  [ -f "$S1_FIXTURE/$S1_INJECT_FILE" ] || { echo "FATAL: inject target $S1_FIXTURE/$S1_INJECT_FILE missing." >&2; exit 2; }
+  log "preflight OK — bin=$($CARGOLESS_BIN --version 2>/dev/null || echo '?') fixture=$S1_FIXTURE work=$S1_WORK"
 }
 
-# Hermetic clone + N ephemeral worktrees of the cargoless repo itself.
-# Local clone (no network, near-zero blast radius); the operator's
-# checkout is never touched.
+# Build the Leptos substrate: a throwaway git repo whose content IS the
+# `bench/fixture/` Leptos app, plus N worktrees NESTED under repo_root.
+#
+# BUG-#4 FIX (task #239): the v0.2.0 wired daemon installs ONE file-watcher
+# rooted at repo_root (servedrv `raw_repo_watch(&repo_root)`); a sibling
+# worktree's edits are never observed. The first run placed worktrees as
+# siblings ⇒ zero activity ⇒ zero verdicts. Worktrees here are NESTED
+# under `$S1_REPO/.s1-wt/` so the single raw watcher sees their edits —
+# matching D-FLEET-SHARED-DAEMON §4's dominant `.claude/worktrees/`
+# topology. `.s1-wt/` is gitignored so the base RA workspace skips it
+# (the raw watcher is unfiltered ⇒ still sees the nested edits — the §4
+# gitignore-inversion).
 setup_repo() {
   S1_REPO="$S1_WORK/repo"
-  git clone --local --no-hardlinks --quiet "$S1_SRC_REPO" "$S1_REPO"
+  mkdir -p "$S1_REPO"
+  cp -R "$S1_FIXTURE"/. "$S1_REPO"/
+  printf '/.s1-wt/\n/.cargoless/\n/target/\n/dist/\n' > "$S1_REPO/.gitignore"
+  local G=(-c user.email=stage1@cargoless.local -c user.name=stage1)
+  git -C "$S1_REPO" init -q
+  git -C "$S1_REPO" "${G[@]}" add -A
+  git -C "$S1_REPO" "${G[@]}" commit -q -m "stage1 leptos substrate"
   S1_WTS=()
-  local i
+  local i wt
   for i in $(seq 1 "$S1_NWT"); do
-    local wt="$S1_WORK/wt$i"
-    git -C "$S1_REPO" worktree add --quiet -b "s1-wt$i" "$wt" HEAD
+    wt="$S1_REPO/.s1-wt/wt$i"     # NESTED under repo_root (bug-#4 fix)
+    git -C "$S1_REPO" "${G[@]}" worktree add -q -b "s1-wt$i" "$wt" HEAD
     S1_WTS+=("$wt")
   done
-  log "repo set up: $S1_REPO + ${#S1_WTS[@]} ephemeral worktrees"
+  log "leptos substrate: $S1_REPO (from $S1_FIXTURE) + ${#S1_WTS[@]} NESTED worktrees"
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -218,7 +237,7 @@ serve_start() {  # extra args... → exports DAEMON_PID, writes $S1_WORK/serve.o
   DAEMON_PID=$!
   log "serve --repo started pid=$DAEMON_PID bind=$S1_BIND"
 }
-serve_wait_up() {  # wait for the §3.3 banner (no verdict yet) up to budget
+serve_wait_up() {  # wait for the §3.3 bring-up banner up to budget
   local lim=$(( $(date +%s) + S1_BRINGUP_BUDGET ))
   while [ "$(date +%s)" -lt "$lim" ]; do
     grep -qiE 'repo-scoped (Model R )?daemon' "$S1_WORK/serve.out" 2>/dev/null && return 0
@@ -237,27 +256,28 @@ serve_stop() {
 }
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill -KILL "$DAEMON_PID" 2>/dev/null || true
-  pkill -KILL -f "serve --repo $S1_REPO" 2>/dev/null || true
+  [ -n "$S1_REPO" ] && pkill -KILL -f "serve --repo $S1_REPO" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 # ─────────────────────────────────────────────────────────────────────
 # Per-worktree verdict + never-publish-red pointer
 # ─────────────────────────────────────────────────────────────────────
-# Resolve the per-WT statusfile then read its `verdict=` (schema=2).
+# Per-WT statusfile = `<wt>/.cargoless/cli-status` — the EXACT v0.2.0 path
+# (`statusfile::path()` verified from source). BUG-#1 FIX (task #239): the
+# prior `**`-glob resolver silently relied on `globstar` (off by default)
+# ⇒ never recursed. The path is exact — no glob needed.
 wt_statusfile() {
-  local wt="$1" g f
-  for g in $S1_STATUS_GLOB; do
-    for f in "$wt"/$g; do [ -f "$f" ] && { echo "$f"; return 0; }; done
-  done
+  local f="${1%/}/$S1_STATUS_REL"
+  [ -f "$f" ] && { echo "$f"; return 0; }
   return 1
 }
-wt_verdict() {  # wt → green|red|unknown
+wt_verdict() {  # wt → green|red|unknown  (`unknown` = unobservable, NOT green)
   local sf; sf="$(wt_statusfile "$1")" || { echo unknown; return; }
-  awk -F= '/^verdict=/{print $2;exit}' "$sf" 2>/dev/null | tr -d '[:space:]' \
-    | grep -qiE '^(green|red)$' && awk -F= '/^verdict=/{print tolower($2);exit}' "$sf" | tr -d '[:space:]' || echo unknown
+  local v; v="$(awk -F= '/^verdict=/{print tolower($2);exit}' "$sf" 2>/dev/null | tr -d '[:space:]')"
+  case "$v" in green|red) echo "$v" ;; *) echo unknown ;; esac
 }
-wt_crates() {  # wt → the schema=2 `crates=` line (per-crate verdicts) or ""
+wt_crates() {  # wt → the schema=2 `crates=` value or ""
   local sf; sf="$(wt_statusfile "$1")" || { echo ""; return; }
   awk -F= '/^crates=/{print $2;exit}' "$sf" 2>/dev/null
 }
@@ -266,13 +286,17 @@ wt_await_verdict() {
   local wt="$1" want="$2" lim=$(( $(date +%s) + S1_VERDICT_GRACE ))
   while [ "$(date +%s)" -lt "$lim" ]; do
     [ "$(wt_verdict "$wt")" = "$want" ] && return 0
-    sleep 1
+    sleep 2
   done
   return 1
 }
-# Never-publish-red 4-tuple fingerprint (the proven AC#4/#5 invariant:
-# sha256 + inode + mtime + size — a byte-unmoved pointer is identical on
-# all four). Echoes "MISSING" if the pointer is absent.
+# Activity trigger: Model R is activity-driven — an idle worktree is never
+# checked. Append a trailing newline (content-neutral for Rust: stays
+# green) to produce a watcher event so the daemon activates + checks it.
+wt_activate() { printf '\n' >> "$1/$S1_INJECT_FILE"; }
+
+# Never-publish-red 4-tuple fingerprint (the AC#4/#5 invariant: sha256 +
+# inode + mtime + size — a byte-unmoved pointer is identical on all four).
 ptr_path() { echo "${1%/}/$S1_POINTER_REL"; }
 ptr_fp() {
   local p; p="$(ptr_path "$1")"
@@ -281,45 +305,23 @@ ptr_fp() {
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# Fault injection (operates ONLY inside the hermetic clone/worktrees)
+# Fault injection (operates ONLY inside the throwaway substrate worktrees)
 # ─────────────────────────────────────────────────────────────────────
-INJ_MARK_RUSTC='// S1-INJECT-RUSTC'
-INJ_MARK_CLIPPY='// S1-INJECT-CLIPPY'
-inject_rustc_error() {  # wt → appends a definite syntax/type error
-  printf '\n%s\nlet __s1_bad =\n' "$INJ_MARK_RUSTC" >> "$1/$S1_INJECT_FILE"
+# BUG-#2 FIX (task #239): revert is `git checkout --` (the worktree is a
+# git checkout) — deterministic, exact. The prior sed-by-marker revert
+# embedded `//`-prefixed markers that collided with sed's `/` delimiter
+# (`sed: char 3: unknown command /`) ⇒ reverts silently failed.
+inject_rustc_error() {  # wt → a definite module-scope syntax error ⇒ RED
+  printf '\n// S1-INJECT-RUSTC\nlet __s1_bad =\n' >> "$1/$S1_INJECT_FILE"
 }
-revert_rustc_error() {  # precise revert by marker (no git needed)
-  local f="$1/$S1_INJECT_FILE"
-  sed -i.bak "/$INJ_MARK_RUSTC/,\$d" "$f" 2>/dev/null \
-    || { sed "/$INJ_MARK_RUSTC/,\$d" "$f" > "$f.t" && mv "$f.t" "$f"; }
-  rm -f "$f.bak"
-}
-inject_rustc_error_in_crate() {  # AC2 multicrate: error in cargoless-core
-  printf '\n%s\nfn __s1_bad() -> u32 { "no" }\n' "$INJ_MARK_RUSTC" >> "$1/$S1_INJECT_CRATE_FILE"
-}
-revert_rustc_error_in_crate() {
-  local f="$1/$S1_INJECT_CRATE_FILE"
-  sed -i.bak "/$INJ_MARK_RUSTC/,\$d" "$f" 2>/dev/null \
-    || { sed "/$INJ_MARK_RUSTC/,\$d" "$f" > "$f.t" && mv "$f.t" "$f"; }
-  rm -f "$f.bak"
-}
-# Clippy-only: rustc-clean but `clippy -D warnings` red. DELIBERATELY a
-# WARNING-severity lint (unused import) — under shipped v0.2.0 flycheck
-# (plain `check`, gates on Severity::Error only) this is suppressed ⇒
-# cargoless GREEN, which is the CORRECT pre-Increment-3-B verdict (Lane-B
-# #221). It is exactly the canonical "clippy-only" case that must NOT
-# false-alarm RED in the Stage-1 era. Post-Inc3-B (clippy-as-flycheck +
-# `-D warnings`) the SAME lint promotes to Severity::Error ⇒ RED, and
-# S1_CLIPPY_EXPECTED flips to red. AC2 asserts per the era-scoped knob,
-# never auto-STOP (a clippy verdict is contract, not a safety breach).
+# Clippy-only: a DELIBERATELY warning-severity lint (unused import). Under
+# shipped v0.2.0 flycheck (plain `check`, Severity::Error-only) it is
+# suppressed ⇒ cargoless GREEN — the correct pre-Inc3-B verdict (#221).
 inject_clippy_only() {
-  printf '\n%s\nuse std::collections::HashMap as _S1Unused;\n' "$INJ_MARK_CLIPPY" >> "$1/$S1_INJECT_FILE"
+  printf '\n// S1-INJECT-CLIPPY\nuse std::collections::HashMap as _S1Unused;\n' >> "$1/$S1_INJECT_FILE"
 }
-revert_clippy_only() {
-  local f="$1/$S1_INJECT_FILE"
-  sed -i.bak "/$INJ_MARK_CLIPPY/,\$d" "$f" 2>/dev/null \
-    || { sed "/$INJ_MARK_CLIPPY/,\$d" "$f" > "$f.t" && mv "$f.t" "$f"; }
-  rm -f "$f.bak"
+revert_inject() {  # wt → restore the inject target exactly (git checkout)
+  git -C "$1" checkout -- "$S1_INJECT_FILE" 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -327,10 +329,11 @@ revert_clippy_only() {
 # ─────────────────────────────────────────────────────────────────────
 # (b) Fast per-edit oracle: an INDEPENDENT cargoless instance (single-tree
 #     `check`, NOT serve) on a *copy* of the worktree's exact tree state.
-#     Returns green|red|unknown. This is a 2nd witness, never local cargo.
+#     Returns green|red. A 2nd witness — never local cargo.
 oracle_check_copy() {  # wt → verdict of an independent cargoless check
   local wt="$1" cp="$S1_WORK/oracle.$$"
-  rm -rf "$cp"; cp -R "$wt" "$cp" 2>/dev/null || return 1
+  rm -rf "$cp"; cp -R "$wt" "$cp" 2>/dev/null || { echo unknown; return; }
+  rm -rf "$cp/.git" "$cp/.cargoless" "$cp/target"   # clean slate for the check
   ( cd "$cp" && "$CARGOLESS_BIN" check >/dev/null 2>&1 ); local rc=$?
   rm -rf "$cp"
   [ $rc -eq 0 ] && echo green || echo red
@@ -347,9 +350,12 @@ ci_verdict_for_sha() {  # sha → success|failure|unknown
     | tr ',' '\n' | grep -A4 "\"head_sha\":\"$sha\"" \
     | grep -oE '"status":"[a-z]+"' | head -1 | cut -d'"' -f4 || echo unknown
 }
-# Compare daemon per-WT verdict to the by-construction ground truth AND
-# the independent-instance oracle. false-GREEN (daemon green where truth
-# is red) is STOP-class; false-RED is a hard FAIL (not STOP).
+# Compare the daemon's per-WT verdict to the by-construction ground truth
+# AND the independent-instance oracle.
+#   • false-GREEN (daemon == green, truth == red)  → STOP-class.
+#   • false-RED   (daemon == red,   truth == green) → hard FAIL (not STOP).
+#   • unknown (verdict unobservable)                → hard FAIL (not STOP).
+# BUG-#3 DISCIPLINE: STOP fires ONLY on an exact `green`, never on `!= red`.
 assert_parity() {  # ac wt expected(green|red)
   local ac="$1" wt="$2" want="$3" got ora
   got="$(wt_verdict "$wt")"
@@ -359,8 +365,12 @@ assert_parity() {  # ac wt expected(green|red)
     return 0
   fi
   if [ "$want" = "red" ] && [ "$got" = "green" ]; then
-    stop_class "$ac" "FALSE-GREEN: daemon=green but tree is definitively RED (oracle=$ora)"
+    stop_class "$ac" "FALSE-GREEN: daemon=green but the tree is definitively RED (oracle=$ora)"
   fi
-  fail "$ac" "parity miss: daemon=$got oracle=$ora expected=$want"
+  if [ "$got" = "unknown" ]; then
+    fail "$ac" "INCONCLUSIVE: daemon verdict unobservable (oracle=$ora expected=$want) — not a false-GREEN"
+  else
+    fail "$ac" "parity miss: daemon=$got oracle=$ora expected=$want"
+  fi
   return 1
 }
