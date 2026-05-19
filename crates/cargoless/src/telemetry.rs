@@ -81,7 +81,10 @@ impl ShutdownHandle {
     }
 
     /// `true` if init actually installed a provider (vs no-endpoint
-    /// no-op). Useful for diagnostics; not load-bearing.
+    /// no-op). Useful for diagnostics; not load-bearing in the
+    /// shutdown path so allowed-dead until a diagnostics consumer
+    /// wires it up.
+    #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         self.inner.is_some()
     }
@@ -194,7 +197,7 @@ pub fn shutdown_telemetry(mut handle: ShutdownHandle) {
 /// `hasError=true` filter — without it, failed spans are
 /// indistinguishable from succeeded ones (real incident pattern in
 /// physics file).
-#[allow(unused_variables)]
+#[allow(dead_code, unused_variables)] // Wave-2 — first error-attaching span site lands then.
 pub fn record_exception(span: &tracing::Span, err: &dyn std::error::Error) {
     let kind = std::any::type_name_of_val(err);
     let msg = err.to_string();

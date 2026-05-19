@@ -347,6 +347,19 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 cs.driver.reset_after_respawn();
                 cs.mux.reset();
                 cs.lsp = Some(client);
+                // #246 5c KEYSTONE: the `overlay.reset` event — load-bearing
+                // for AC4 diagnostics. Its PRESENCE between an `ra.respawn`
+                // span (emitted inside on_spawn) and the next
+                // `verdict.publish` proves the #190 + #247 structural-
+                // precondition-restore ran; ABSENCE is the smoking gun for
+                // the proven-core-precondition-violated-at-integration-seam
+                // false-GREEN path. Pairs with the always-on `[cargoless:obs]`
+                // eprintln (kept as ops-without-collector fallback).
+                tracing::info!(
+                    cluster_id = %h.as_str(),
+                    reset_actually_called = true,
+                    "overlay.reset",
+                );
                 eprintln!(
                     "[cargoless:obs] respawn cluster={} driver+mux reset (#247)",
                     h.as_str()
@@ -493,6 +506,20 @@ fn spawn_cluster(
             return; // RA broke mid-handshake; Supervisor retries
         };
         let client = Arc::new(client);
+        // #246 5c KEYSTONE: `ra.spawn` event — load-bearing AC4 oracle
+        // input. The plan's Wave-1 spec calls for both `ra.spawn` (initial)
+        // and `ra.respawn` (post-restart) spans; Wave-1 simplifies to a
+        // single `ra.spawn` event at every supervisor handshake (initial
+        // OR restart — Supervisor's caller doesn't distinguish at this
+        // seam). The `overlay.reset` event that fires from the Ctrl::Spawned
+        // handler on every spawn IS the distinguishing signal — its
+        // presence after the FIRST `ra.spawn` proves the multiplex+driver
+        // reset ran, and its absence is the AC4 false-GREEN smoking gun.
+        tracing::info!(
+            cluster_id = %hook_h.as_str(),
+            ra_pid = ?child.id(),
+            "ra.spawn",
+        );
         let _ = ctrl_tx.send(Ctrl::Spawned(hook_h.clone(), Arc::clone(&client)));
         let fwd_h = hook_h.clone();
         let fwd_tx = lsp_tx.clone();
@@ -544,6 +571,17 @@ fn step(
     // `exec`). The eprintln is dep-free; full OTEL `verdict.publish`
     // span lands in #246.
     if let ClusterAction::EmitVerdict { wt, .. } = &action {
+        // #246 5c: `flycheck.end` event (event form, not span — the spanning
+        // check.cycle is Wave-2 5d scope). Captures the WT + settle instant
+        // at the same site the eprintln does, so the structured trace has
+        // the barrier-settlement boundary explicitly marked. Paired with
+        // the always-on `[cargoless:obs]` eprintln as ops-without-collector
+        // fallback.
+        tracing::info!(
+            worktree = %wt.display(),
+            settled_at_unix = statusfile::now_unix(),
+            "flycheck.end",
+        );
         eprintln!(
             "[cargoless:obs] flycheck-end wt={} settled at={} (#247)",
             wt.display(),
@@ -580,6 +618,17 @@ fn exec(
     match action {
         ClusterAction::Idle => {}
         ClusterAction::SwitchOverlay { wt } => {
+            // #246 5c KEYSTONE: `overlay.switch` span wraps the body —
+            // captures wt, file_count (set at end), overlay_size_bytes
+            // (set at end). Bound via `.entered()` to the SwitchOverlay
+            // arm scope so the span closes when the arm exits.
+            let _span = tracing::info_span!(
+                "overlay.switch",
+                worktree = %wt.display(),
+                file_count = tracing::field::Empty,
+                overlay_size_bytes = tracing::field::Empty,
+            )
+            .entered();
             // #247 obs: log the wire-side check-start (the SwitchOverlay
             // arm dispatching mux.switch_to + did_save = the flycheck
             // trigger). Pairs with `flycheck-end` (step's EmitVerdict
@@ -659,6 +708,23 @@ fn publish_verdict(
         Verdict::Green
     };
     let now = statusfile::now_unix();
+    // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
+    // This span MUST be the only emission of `verdict.publish`, mirroring
+    // the structural invariant that publish_verdict is called from exactly
+    // one site (the ClusterAction::EmitVerdict arm in `exec()`). A future
+    // emission seam introducing a non-EmitVerdict path would by-pass this
+    // span site → loud telemetry signal at the type-system level (Layer-2
+    // keystone criterion at the OTEL surface).
+    let _span = tracing::info_span!(
+        "verdict.publish",
+        worktree = %wt.display(),
+        verdict_color = verdict.as_str(),
+        pid = std::process::id(),
+        trigger_source = "EmitVerdict",
+        analysed_at = now,
+        otel.status_code = if authoritative_error { "ERROR" } else { "OK" },
+    )
+    .entered();
     let st = Status {
         pid: std::process::id(),
         root: wt.to_string_lossy().into_owned(),

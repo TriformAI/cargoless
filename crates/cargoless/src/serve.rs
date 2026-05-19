@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use cargoless_core::repo::RepoScope;
 use cargoless_core::repo::topology::WtClass;
-use cargoless_core::{FleetConfig, FleetOverrides};
+use cargoless_core::{FleetConfig, FleetOverrides, TelemetryConfig, TelemetryOverrides};
 
 use crate::ui;
 
@@ -159,18 +159,79 @@ pub fn run(opts: &ServeOpts) -> ExitCode {
     // worse than the v0 single-watch case, so the proven `orphan` guard
     // the v0 loop trusts is wired in from #3.
     let parent = crate::orphan::ParentWatch::capture();
-    // capstone-wire: the live repo-scoped Model R driver supersedes the
-    // #3 park-skeleton. It faithfully composes the proven cores
-    // (clusterdrv A+B, barrier, multiplex incl. reset(),
-    // cluster/clustermgr, activitymgr, repo::watch) into the live
-    // multiplexed verdict pipeline, holds the process, and orphan-guards
-    // internally. Honest verification boundary
-    // (cores-structurally-proven + integration-validated-downstream via
-    // #15/Track-1, NOT pure-unit-end-to-end) is documented in
-    // `crate::servedrv`. NOTE (flag-at-land, doc-only follow-up): this
-    // module's header doc still describes the pre-capstone park-skeleton
-    // and wants a refresh — tracked, non-correctness.
-    crate::servedrv::run(scope, &parent)
+
+    // #246 Wave-1 5a — telemetry init + ordered shutdown around the serve
+    // loop. Resolved from env (OTEL_EXPORTER_OTLP_ENDPOINT etc.) + repo's
+    // tf.toml `[telemetry]` overlay. The tokio runtime substrate is owned
+    // here (NOT created inside init_telemetry) so the runtime's lifetime
+    // brackets the serve loop — exporter batch tasks live as long as the
+    // daemon does. When `enabled() == false` (no endpoint), the runtime
+    // is still created but the telemetry init returns inert; cost is one
+    // idle tokio thread for the daemon's lifetime, negligible.
+    let tcfg = match TelemetryConfig::resolve(&repo_root, TelemetryOverrides::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            // Telemetry config errors are non-fatal — log + continue with
+            // disabled defaults. The fail-soft contract: telemetry MUST
+            // NOT wedge the daemon, not even at config-resolution time.
+            eprintln!(
+                "[cargoless:telemetry] config error ({e}); continuing \
+                 with telemetry disabled."
+            );
+            TelemetryConfig::defaults()
+        }
+    };
+    run_with_telemetry(scope, &parent, &tcfg)
+}
+
+/// Wrap `servedrv::run` in a tokio runtime + telemetry init/shutdown.
+/// Extracted so the runtime lifetime is explicit + telemetry shutdown
+/// fires BEFORE any orphan-reap path (5f ordered-flush requirement).
+#[cfg(feature = "telemetry")]
+fn run_with_telemetry(
+    scope: RepoScope,
+    parent: &crate::orphan::ParentWatch,
+    tcfg: &TelemetryConfig,
+) -> ExitCode {
+    // Multi-thread runtime so the OTel SDK's batch exporter tasks can
+    // run independently of the daemon's main thread (which blocks on
+    // std::sync::mpsc::recv_timeout — a tokio current-thread runtime
+    // would be starved by that). Default worker count = std::thread
+    // count, which is fine for a daemon binary.
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!(
+                "[cargoless:telemetry] tokio runtime init failed ({e}); \
+                 continuing without OTEL export."
+            );
+            return crate::servedrv::run(scope, parent);
+        }
+    };
+    let _guard = runtime.enter();
+    // capstone-wire: live Model R driver. See servedrv.rs header for the
+    // honest verification-boundary statement (cores-structurally-proven
+    // + integration-validated-downstream via #15/Track-1).
+    let telemetry = crate::telemetry::init_telemetry(tcfg);
+    let code = crate::servedrv::run(scope, parent);
+    // Ordered flush BEFORE any orphan-reap path (5f). Telemetry shutdown
+    // is best-effort — it must never block return on a slow collector.
+    crate::telemetry::shutdown_telemetry(telemetry);
+    drop(_guard);
+    drop(runtime); // tokio runtime drops + batch tasks finalize.
+    code
+}
+
+#[cfg(not(feature = "telemetry"))]
+fn run_with_telemetry(
+    scope: RepoScope,
+    parent: &crate::orphan::ParentWatch,
+    _tcfg: &TelemetryConfig,
+) -> ExitCode {
+    // Feature compiled out — no runtime, no telemetry, just the serve
+    // loop. Path exists so the binary still ships under
+    // `--no-default-features` builds.
+    crate::servedrv::run(scope, parent)
 }
 
 /// §3.3 bring-up banner: one process, the discovered+classified topology,
