@@ -61,6 +61,8 @@ RESULTS=()        # "ACn|PASS|detail" / "ACn|FAIL|detail" / "ACn|STOP|detail"
 FAILED=0
 DAEMON_PID=""     # current serve daemon (for cleanup traps)
 S1_REPO=""        # the throwaway Leptos substrate repo (set by setup_repo)
+BASELINE_LATENCY=0  # seconds the daemon took to produce the last observed
+                    # clean baseline verdict — the warmth measure for fix #5
 
 # ─────────────────────────────────────────────────────────────────────
 # Output
@@ -295,6 +297,28 @@ wt_await_verdict() {
 # green) to produce a watcher event so the daemon activates + checks it.
 wt_activate() { printf '\n' >> "$1/$S1_INJECT_FILE"; }
 
+# FIX #5 — the freshness gate (verdict-provenance, deeper instance of
+# bug #3). Establish + TIME an OBSERVED clean green baseline for `wt`:
+# activate it, await a green verdict, record how long the daemon took in
+# BASELINE_LATENCY. Return 0 iff a green baseline was actually observed.
+#
+# A transition (inject→red) can only be judged relative to an observed
+# baseline; and BASELINE_LATENCY is the daemon's measured check latency —
+# the warmth evidence `assert_red_after_inject` needs to tell a genuine
+# false-GREEN (warm daemon, fresh post-injection check, still green) from
+# a stale verdict (slow daemon never re-checked).
+establish_baseline() {  # wt → 0 if a green baseline was observed, else 1
+  local wt="$1" t0
+  wt_activate "$wt"
+  t0=$(date +%s)
+  if wt_await_verdict "$wt" green; then
+    BASELINE_LATENCY=$(( $(date +%s) - t0 ))
+    return 0
+  fi
+  BASELINE_LATENCY=$(( $(date +%s) - t0 ))
+  return 1
+}
+
 # Never-publish-red 4-tuple fingerprint (the AC#4/#5 invariant: sha256 +
 # inode + mtime + size — a byte-unmoved pointer is identical on all four).
 ptr_path() { echo "${1%/}/$S1_POINTER_REL"; }
@@ -350,27 +374,60 @@ ci_verdict_for_sha() {  # sha → success|failure|unknown
     | tr ',' '\n' | grep -A4 "\"head_sha\":\"$sha\"" \
     | grep -oE '"status":"[a-z]+"' | head -1 | cut -d'"' -f4 || echo unknown
 }
-# Compare the daemon's per-WT verdict to the by-construction ground truth
-# AND the independent-instance oracle.
-#   • false-GREEN (daemon == green, truth == red)  → STOP-class.
-#   • false-RED   (daemon == red,   truth == green) → hard FAIL (not STOP).
-#   • unknown (verdict unobservable)                → hard FAIL (not STOP).
-# BUG-#3 DISCIPLINE: STOP fires ONLY on an exact `green`, never on `!= red`.
-assert_parity() {  # ac wt expected(green|red)
-  local ac="$1" wt="$2" want="$3" got ora
-  got="$(wt_verdict "$wt")"
-  ora="$(oracle_check_copy "$wt")"
-  if [ "$got" = "$want" ] && [ "$ora" = "$want" ]; then
-    pass "$ac" "verdict=$got == truth=$want (independent oracle concurs)"
+# FIX #5 — freshness-gated judgement of an injected rustc error.
+# Precondition: the caller has established an OBSERVED green baseline
+# (establish_baseline returned 0) and has just injected a definite
+# module-scope rustc error into `wt`.
+#
+#   • verdict transitions green→red within grace
+#       → PASS. A transition the daemon itself produced IS a confirmed,
+#         completed post-injection check — conclusive + correct.
+#   • verdict stays green for the FULL grace, AND the daemon is proven
+#     warm — BASELINE_LATENCY small enough that ≥3 of its check cycles
+#     fit the post-injection grace (3·BASELINE_LATENCY ≤ grace)
+#       → STOP-class FALSE-GREEN. A fresh post-mutation check is
+#         confirmed-completed (many cycles fit) and chose green.
+#   • verdict stays green but the daemon is NOT proven warm (slow)
+#       → INCONCLUSIVE FAIL — cannot confirm a fresh post-mutation
+#         check; this is the run-2 stale-verdict case, NEVER a STOP.
+#   • verdict unobservable (`unknown`)
+#       → INCONCLUSIVE FAIL.
+# The independent `cargoless check` oracle corroborates the ground truth
+# (the injected error really is red) without gating the STOP decision.
+assert_red_after_inject() {  # ac wt
+  local ac="$1" wt="$2"
+  if wt_await_verdict "$wt" red; then
+    pass "$ac" "verdict transitioned green→red after injection (confirmed completed post-injection check; oracle=$(oracle_check_copy "$wt"))"
     return 0
   fi
-  if [ "$want" = "red" ] && [ "$got" = "green" ]; then
-    stop_class "$ac" "FALSE-GREEN: daemon=green but the tree is definitively RED (oracle=$ora)"
-  fi
-  if [ "$got" = "unknown" ]; then
-    fail "$ac" "INCONCLUSIVE: daemon verdict unobservable (oracle=$ora expected=$want) — not a false-GREEN"
+  local got; got="$(wt_verdict "$wt")"
+  if [ "$got" = green ]; then
+    if [ "$BASELINE_LATENCY" -ge 0 ] && [ $(( BASELINE_LATENCY * 3 )) -le "$S1_VERDICT_GRACE" ]; then
+      stop_class "$ac" "FALSE-GREEN: a definite rustc error verdicts GREEN after ${S1_VERDICT_GRACE}s on a daemon proven WARM (baseline check ${BASELINE_LATENCY}s ⇒ ≥3 post-injection check cycles fit the grace) — a fresh post-mutation check is confirmed-completed and chose green (oracle=$(oracle_check_copy "$wt"))"
+    fi
+    fail "$ac" "INCONCLUSIVE: verdict green-on-broken but the daemon is NOT proven warm (baseline ${BASELINE_LATENCY}s vs grace ${S1_VERDICT_GRACE}s) — cannot confirm a fresh post-mutation check completed; NOT a false-GREEN (the run-2 stale-verdict case)"
   else
-    fail "$ac" "parity miss: daemon=$got oracle=$ora expected=$want"
+    fail "$ac" "INCONCLUSIVE: verdict unobservable ($got) after injection"
+  fi
+  return 1
+}
+
+# Judge an expected-GREEN state (clean baseline / post-revert). A wrong
+# verdict here is a false-RED — a hard FAIL, never STOP-class (only a
+# false-GREEN halts the rollout). The independent oracle corroborates.
+assert_green() {  # ac wt
+  local ac="$1" wt="$2" got ora
+  got="$(wt_verdict "$wt")"; ora="$(oracle_check_copy "$wt")"
+  if [ "$got" = green ]; then
+    [ "$ora" = green ] \
+      && pass "$ac" "verdict green (independent oracle concurs)" \
+      || fail "$ac" "daemon=green but independent oracle=$ora — oracle disagreement"
+    return 0
+  fi
+  if [ "$got" = unknown ]; then
+    fail "$ac" "INCONCLUSIVE: verdict unobservable (oracle=$ora)"
+  else
+    fail "$ac" "false-RED: daemon=$got on a clean tree (oracle=$ora)"
   fi
   return 1
 }
