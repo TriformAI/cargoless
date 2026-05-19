@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # scripts/stage1/run-stage1.sh — Stage-1 acceptance suite (PLAN-LANE D /
-# task #228). The falsifiable, all-must-PASS-to-advance gate for the
-# cargoless-first rollout, run co-located against cargoless's OWN repo
-# (near-zero blast radius — a hermetic local clone; the operator's
-# checkout is never touched).
+# tasks #228, #239). The falsifiable, all-must-PASS-to-advance gate for
+# the cargoless-first rollout — it validates the wired `cargoless serve
+# --repo` daemon (#225) against the committed Leptos reference fixture
+# `bench/fixture/` (a real Rust+WASM project — cargoless's actual
+# workload). The suite builds a throwaway git repo from the fixture with
+# nested worktrees; the operator tree is never touched.
 #
 # USAGE
 #   scripts/stage1/run-stage1.sh --self-check     # readiness ONLY; runs no AC
@@ -12,17 +14,21 @@
 #   S1_EXECUTE_GO=1 scripts/stage1/run-stage1.sh --only AC3 # one AC
 #   S1_EXECUTE_GO=1 scripts/stage1/run-stage1.sh --from AC5 # AC5..AC8
 #
-# GATING (structural — see lib.sh require_go): without S1_EXECUTE_GO=1
-# the suite refuses to execute ANY criterion. This enforces "design+prep
-# only, gated on Increment 0+1 + explicit team-lead GO" — accidental
-# execution is impossible by construction, not by convention.
+# GATING (structural — lib.sh require_go): without S1_EXECUTE_GO=1 the
+# suite refuses to execute ANY criterion — accidental execution is
+# impossible by construction.
 #
 # EXIT CODES
-#   0  all selected ACs PASS  (or --self-check / --list / gated stub)
-#   1  ≥1 non-STOP FAIL — Stage-1 does NOT advance; investigate+route
-#   2  harness/preflight error (bad config, missing bin/curl/git)
-#  99  STOP-CLASS HALT (false-GREEN / cross-contamination / torn-pointer
-#      / RA-orphan) — rollout HALTED, route to team-lead → dev-fixer
+#   0  all selected ACs PASS
+#   1  ≥1 non-STOP FAIL (incl. INCONCLUSIVE) — Stage-1 does NOT advance
+#   2  harness/preflight error (bad config, missing bin/curl/git/fixture)
+#  99  STOP-CLASS HALT — a definite PRODUCT wrong-verdict: false-GREEN /
+#      cross-contamination / torn-pointer / RA-orphan / auth-bypass.
+#      Rollout HALTS → route to team-lead → dev-fixer.
+#
+# STOP vs FAIL (the verdict-provenance discipline — task #239): a
+# STOP-class HALT is raised ONLY on a definite wrong verdict. `unknown`
+# (verdict unobservable) is INCONCLUSIVE → a plain FAIL, NEVER a STOP.
 #
 # ORACLE (cargoless has no local cargo, by design): parity is judged
 # against (i) the by-construction ground truth (we control the
@@ -42,7 +48,6 @@ ac1_bringup() {
   if serve_wait_up; then
     t1=$(date +%s)
     local d=$(( t1 - t0 ))
-    # discovery+classification must cover every git-worktree-list entry.
     local want got
     want=$(git -C "$S1_REPO" worktree list | wc -l | tr -d ' ')
     got=$(grep -oE '[0-9]+ worktrees' "$S1_WORK/serve.out" | head -1 | grep -oE '[0-9]+' || echo 0)
@@ -56,159 +61,175 @@ ac1_bringup() {
   fi
 }
 
-# ─── AC2 — verdict-parity vs oracle, 4-state matrix ──────────────────
+# ─── AC2 — verdict-parity vs oracle {clean / rustc-error / per-crate /
+#           clippy-only} ────────────────────────────────────────────────
 ac2_parity() {
-  hdr "AC2 — verdict-parity {clean / rustc-error / clippy-only / multi-crate}"
+  hdr "AC2 — verdict-parity {clean / rustc-error / per-crate / clippy-only}"
   local wt="${S1_WTS[0]}"
-  # clean → GREEN
+  # clean → GREEN  (activate first: Model R only checks active worktrees)
+  wt_activate "$wt"
   wt_await_verdict "$wt" green || note AC2 "clean baseline slow to settle green"
   assert_parity AC2-clean "$wt" green
   if [ "${S1_CI_ORACLE}" = 1 ]; then
     local sha cv; sha="$(git -C "$wt" rev-parse HEAD)"; cv="$(ci_verdict_for_sha "$sha")"
-    note AC2-clean "CI baseline oracle for $sha: $cv (coarse confirm)"
+    note AC2-clean "Forgejo-CI baseline oracle for $sha: $cv (coarse confirm)"
   fi
   # rustc-error → RED  (false-GREEN here is STOP-class, via assert_parity)
   inject_rustc_error "$wt"; wt_await_verdict "$wt" red || true
   assert_parity AC2-rustc "$wt" red
-  revert_rustc_error "$wt"; wt_await_verdict "$wt" green || true
-  assert_parity AC2-revert "$wt" green
-  # multi-crate: error in cargoless-core only → that crate red, others green
-  inject_rustc_error_in_crate "$wt"; wt_await_verdict "$wt" red || true
-  local cr; cr="$(wt_crates "$wt")"
-  if echo "$cr" | grep -qiE 'cargoless-core:red'; then
-    if echo "$cr" | grep -qiE '(cargoless|cargoless-cli)?:?green'; then
-      pass AC2-multicrate "per-crate schema=2: cargoless-core:red, others green ($cr)"
-    else
-      fail AC2-multicrate "core red but other crates not green ($cr)"
-    fi
+  # per-crate schema=2 attribution (bench/fixture is single-crate
+  # `cargoless-bench-fixture`). STOP only on a definite green; `unknown`
+  # is inconclusive → FAIL (bug-#3 discipline).
+  local v cr; v="$(wt_verdict "$wt")"; cr="$(wt_crates "$wt")"
+  if [ "$v" = green ]; then
+    stop_class AC2-percrate "FALSE-GREEN: rustc error injected but verdict=green"
+  elif [ "$v" != red ]; then
+    fail AC2-percrate "INCONCLUSIVE: verdict unobservable ($v) — not a false-GREEN"
+  elif echo "$cr" | grep -qiE 'cargoless-bench-fixture:red'; then
+    pass AC2-percrate "schema=2 per-crate attribution: cargoless-bench-fixture:red ($cr)"
   else
-    # workspace-level red is acceptable iff verdict==red (no false-green)
-    [ "$(wt_verdict "$wt")" = red ] \
-      && note AC2-multicrate "no per-crate line; workspace verdict=red (schema=1-compatible)" \
-      || stop_class AC2-multicrate "FALSE-GREEN: crate error present but verdict not red ($cr)"
+    pass AC2-percrate "verdict=red authoritative; per-crate crates= line absent (crates='$cr') — schema=1-compatible"
   fi
-  revert_rustc_error_in_crate "$wt"; wt_await_verdict "$wt" green || true
-  # clippy-only: ERA-SCOPED per Lane-B #221 (resolved). Stage-1 runs
-  # PRE-Inc3-B; shipped v0.2.0 flycheck = plain `check` (no clippy), so
-  # the warning-severity lint AC2 injects is suppressed ⇒ GREEN is the
-  # CORRECT verdict (default S1_CLIPPY_EXPECTED=green). Flips to red once
-  # Inc3-B (clippy-as-flycheck + -D warnings) promotes it to Error.
-  inject_clippy_only "$wt"; sleep "$S1_VERDICT_GRACE"
+  revert_inject "$wt"; wt_await_verdict "$wt" green || true
+  assert_parity AC2-revert "$wt" green
+  # clippy-only — ERA-SCOPED per Lane-B #221. Pre-Inc3-B: warning-severity
+  # lint suppressed ⇒ GREEN is CORRECT (S1_CLIPPY_EXPECTED=green).
+  inject_clippy_only "$wt"
+  local want_c; [ "$S1_CLIPPY_EXPECTED" = red ] && want_c=red || want_c=green
+  wt_await_verdict "$wt" "$want_c" || true
   local cg; cg="$(wt_verdict "$wt")"
   case "$S1_CLIPPY_EXPECTED" in
-    green) [ "$cg" = green ] && pass AC2-clippy "warning-level clippy/rustc lint ⇒ green — CORRECT shipped v0.2.0 behavior pre-Inc3-B (#221; not a bug)" \
-                              || fail AC2-clippy "expected green (pre-Inc3-B contract), got $cg — false-RED on correct shipped behavior, OR flycheck changed" ;;
-    red)   [ "$cg" = red ]   && pass AC2-clippy "clippy/rustc lint ⇒ red — post-Inc3-B (clippy-as-flycheck + -D warnings) OR error-level lint" \
-                              || fail AC2-clippy "expected red (post-Inc3-B / error-level), got $cg — clippy-as-flycheck not gating" ;;
-    *)     note AC2-clippy "clippy-only ⇒ $cg — record-only (S1_CLIPPY_EXPECTED=fieldfinding); set green (pre-Inc3-B) / red (post) to gate" ;;
+    green) [ "$cg" = green ] && pass AC2-clippy "warning-level lint ⇒ green — CORRECT shipped v0.2.0 behaviour pre-Inc3-B (#221; not a bug)" \
+            || { [ "$cg" = unknown ] && fail AC2-clippy "INCONCLUSIVE: verdict unobservable" \
+                 || fail AC2-clippy "expected green (pre-Inc3-B contract), got $cg"; } ;;
+    red)   [ "$cg" = red ] && pass AC2-clippy "lint ⇒ red — post-Inc3-B / error-level" \
+            || fail AC2-clippy "expected red, got $cg" ;;
+    *)     note AC2-clippy "clippy-only ⇒ $cg — record-only (S1_CLIPPY_EXPECTED=fieldfinding)" ;;
   esac
-  revert_clippy_only "$wt"; wt_await_verdict "$wt" green || true
+  revert_inject "$wt"; wt_await_verdict "$wt" green || true
 }
 
 # ─── AC3 — no-wrong-verdict: spatial isolation, ≥2 WTs / one shared RA ─
 # The load-bearing Model-R risk. Editing WT_k must flip ONLY WT_k; every
-# other WT's verdict AND diagnostics must stay byte-identical. Any
-# bleed-through = cross-contamination = STOP-class.
+# sibling must STAY green. A sibling green→RED = cross-contamination =
+# STOP-class. A sibling green→unknown = inconclusive = FAIL (bug-#3).
 ac3_isolation() {
   hdr "AC3 — spatial isolation across ${#S1_WTS[@]} worktrees / ONE shared RA"
   local k="${S1_WTS[0]}" j
-  # settle all green
+  for j in "${S1_WTS[@]}"; do wt_activate "$j"; done
   for j in "${S1_WTS[@]}"; do wt_await_verdict "$j" green || true; done
-  # snapshot every non-k WT (verdict + diagnostics fingerprint)
+  # baseline: every non-k sibling must be observably green
+  local i=0 baseline_ok=1
   declare -a SNAP=()
   for j in "${S1_WTS[@]}"; do
-    [ "$j" = "$k" ] && { SNAP+=("-"); continue; }
-    local sf fp; sf="$(wt_statusfile "$j" || true)"
-    fp="$(wt_verdict "$j")|$( [ -n "$sf" ] && sha256_of "$sf" || echo nofile )"
-    SNAP+=("$fp")
-  done
-  # induce red in WT_k only
-  inject_rustc_error "$k"; wt_await_verdict "$k" red \
-    || { revert_rustc_error "$k"; fail AC3 "WT_k never went red — inconclusive"; return; }
-  # WT_k must be red; every other WT must be byte-identical to snapshot
-  local i=0 bled=0
-  for j in "${S1_WTS[@]}"; do
-    if [ "$j" = "$k" ]; then i=$((i+1)); continue; fi
-    local sf now; sf="$(wt_statusfile "$j" || true)"
-    now="$(wt_verdict "$j")|$( [ -n "$sf" ] && sha256_of "$sf" || echo nofile )"
-    [ "$now" != "${SNAP[$i]}" ] && { bled=1; note AC3 "WT $j changed: ${SNAP[$i]} → $now"; }
+    if [ "$j" = "$k" ]; then SNAP+=("-"); i=$((i+1)); continue; fi
+    local bv; bv="$(wt_verdict "$j")"; SNAP+=("$bv")
+    [ "$bv" = green ] || { baseline_ok=0; note AC3 "sibling $j not green at baseline ($bv)"; }
     i=$((i+1))
   done
-  revert_rustc_error "$k"; wt_await_verdict "$k" green || true
-  if [ "$bled" -eq 1 ]; then
-    stop_class AC3 "CROSS-CONTAMINATION: a non-edited worktree's verdict/diagnostics moved when only WT_k was edited"
+  if [ "$baseline_ok" != 1 ]; then
+    fail AC3 "INCONCLUSIVE: not all siblings reached a green baseline — cannot judge isolation"
+    return
   fi
-  pass AC3 "WT_k isolated red; ${#S1_WTS[@]}-1 sibling WTs byte-identical (no bleed through the shared RA)"
+  # induce RED in WT_k only
+  inject_rustc_error "$k"
+  wt_await_verdict "$k" red \
+    || { revert_inject "$k"; fail AC3 "INCONCLUSIVE: WT_k never went red"; return; }
+  # every non-k sibling must STILL be green
+  local contam=0 flaky=0
+  i=0
+  for j in "${S1_WTS[@]}"; do
+    if [ "$j" = "$k" ]; then i=$((i+1)); continue; fi
+    local now; now="$(wt_verdict "$j")"
+    if [ "$now" = red ]; then
+      contam=1; note AC3 "WT $j flipped green→RED while ONLY WT_k was edited"
+    elif [ "$now" != green ]; then
+      flaky=1; note AC3 "WT $j green→$now (verdict became unobservable — inconclusive, not a clean contamination)"
+    fi
+    i=$((i+1))
+  done
+  revert_inject "$k"; wt_await_verdict "$k" green || true
+  if [ "$contam" = 1 ]; then
+    stop_class AC3 "CROSS-CONTAMINATION: a non-edited worktree flipped green→RED when only WT_k was edited — the shared RA bled a verdict across worktrees"
+  fi
+  if [ "$flaky" = 1 ]; then
+    fail AC3 "INCONCLUSIVE: a sibling verdict became unobservable during WT_k's edit"
+    return
+  fi
+  pass AC3 "WT_k isolated RED; all $(( ${#S1_WTS[@]} - 1 )) siblings stayed GREEN (no bleed through the one shared RA)"
 }
 
-# ─── AC4 — respawn-staleness (kill -9 cluster RA) ────────────────────
+# ─── AC4 — respawn-staleness (kill -9 the shared rust-analyzer) ───────
 ac4_respawn() {
   hdr "AC4 — kill -9 the shared rust-analyzer → correct post-respawn verdicts"
   local wt="${S1_WTS[0]}" rapids
-  wt_await_verdict "$wt" green || true
+  wt_activate "$wt"; wt_await_verdict "$wt" green || true
   rapids="$(ra_children "$DAEMON_PID")"
-  [ -n "$rapids" ] || { fail AC4 "no rust-analyzer child found under daemon — inconclusive"; return; }
+  [ -n "$rapids" ] || { fail AC4 "INCONCLUSIVE: no rust-analyzer child found under the daemon"; return; }
   log "killing -9 RA pids: $rapids"
   for p in $rapids; do kill -KILL "$p" 2>/dev/null || true; done
-  # Supervisor must respawn + mux.reset(); then verdicts must be CORRECT
-  # for EVERY active WT (not stale). Prove with a fresh red→green cycle.
-  sleep 3
+  sleep 5   # let the Supervisor notice + respawn + mux.reset()
   inject_rustc_error "$wt"
   if wt_await_verdict "$wt" red; then
-    revert_rustc_error "$wt"
+    revert_inject "$wt"
     if wt_await_verdict "$wt" green; then
-      pass AC4 "post-respawn RA produced correct red→green for active WT (mux.reset seam holds)"
+      pass AC4 "post-respawn RA produced a correct red→green cycle (mux.reset seam holds)"
     else
       fail AC4 "post-respawn stuck red after revert (stale overlay — reset() suspect)"
     fi
   else
-    revert_rustc_error "$wt"
-    # stale-GREEN on a definite error after respawn = false-green = STOP
-    [ "$(wt_verdict "$wt")" = green ] \
-      && stop_class AC4 "FALSE-GREEN post-respawn: injected error not seen (stale RA after kill -9)" \
-      || fail AC4 "no verdict within respawn grace (RA respawn / handshake failure)"
+    revert_inject "$wt"
+    # a definite green on an injected error after respawn = false-GREEN
+    if [ "$(wt_verdict "$wt")" = green ]; then
+      stop_class AC4 "FALSE-GREEN post-respawn: a definite injected error verdicts green (stale RA after kill -9)"
+    else
+      fail AC4 "INCONCLUSIVE: no red within grace after respawn (RA respawn / handshake latency)"
+    fi
   fi
 }
 
-# ─── AC5 — never-publish-red under multiplex (pointer byte-unmoved) ───
-# Reuses the proven AC#4/#5 invariant: a red transition leaves the
-# latest-green pointer identical on all four of sha256+inode+mtime+size;
-# green recovery advances it; a zero/partial pointer is a torn write.
+# ─── AC5 — never-publish-red (latest-green pointer byte-unmoved) ──────
+# The never-publish-red pointer is a `build --watch` publisher artifact;
+# the serve daemon does not emit one in v0.2.0. AC5 runs the publisher on
+# a DEDICATED standalone fixture checkout (not a serve worktree — avoids
+# the dual-watch cli-status guard). A red transition must leave the
+# pointer identical on all four of sha256+inode+mtime+size; a zero/partial
+# pointer is a torn write.
 ac5_never_publish_red() {
   hdr "AC5 — never-publish-red: pointer byte-unmoved on red, atomic"
-  local wt="${S1_WTS[0]}"
-  wt_await_verdict "$wt" green || true
-  local fp0; fp0="$(ptr_fp "$wt")"
+  local pub="$S1_WORK/ac5-pub"
+  rm -rf "$pub"; mkdir -p "$pub"
+  cp -R "$S1_FIXTURE"/. "$pub"/
+  local G=(-c user.email=stage1@cargoless.local -c user.name=stage1)
+  git -C "$pub" init -q
+  git -C "$pub" "${G[@]}" add -A
+  git -C "$pub" "${G[@]}" commit -q -m "ac5 publisher fixture"
+  # start the publisher
+  ( cd "$pub" && "$CARGOLESS_BIN" $S1_PUBLISH_ARGS "$S1_WORK/ac5-dist" \
+      > "$S1_WORK/ac5-pub.out" 2>&1 & echo $! > "$S1_WORK/ac5-pub.pid" )
+  local lim=$(( $(date +%s) + S1_VERDICT_GRACE * 4 ))
+  while [ "$(date +%s)" -lt "$lim" ]; do [ -f "$(ptr_path "$pub")" ] && break; sleep 3; done
+  local fp0; fp0="$(ptr_fp "$pub")"
   if [ "$fp0" = MISSING ]; then
-    # serve-path may not drive the publisher; try the explicit publish
-    # driver against this WT (S1_PUBLISH_ARGS is the named Inc0+1 knob).
-    ( cd "$wt" && timeout 180 "$CARGOLESS_BIN" $S1_PUBLISH_ARGS "$S1_WORK/dist.$$" \
-        > "$S1_WORK/pub.out" 2>&1 & echo $! > "$S1_WORK/pub.pid" )
-    local lim=$(( $(date +%s) + S1_VERDICT_GRACE*3 ))
-    while [ "$(date +%s)" -lt "$lim" ]; do [ -f "$(ptr_path "$wt")" ] && break; sleep 2; done
-    fp0="$(ptr_fp "$wt")"
-  fi
-  if [ "$fp0" = MISSING ]; then
-    fail AC5 "no never-publish-red pointer produced (publisher not wired for serve / wrong S1_POINTER_REL) — verify Inc0+1 wiring"
-    [ -f "$S1_WORK/pub.pid" ] && kill -KILL "$(cat "$S1_WORK/pub.pid")" 2>/dev/null || true
+    fail AC5 "no latest-green pointer produced — publisher never reached first green (see ac5-pub.out)"
+    [ -f "$S1_WORK/ac5-pub.pid" ] && kill -KILL "$(cat "$S1_WORK/ac5-pub.pid")" 2>/dev/null || true
     return
   fi
-  # induce red — pointer MUST stay byte-identical (all 4 fields)
-  inject_rustc_error "$wt"; wt_await_verdict "$wt" red || true
-  sleep 5
-  local fpR; fpR="$(ptr_fp "$wt")"
+  # induce RED — pointer MUST stay byte-identical
+  inject_rustc_error "$pub"
+  sleep "$S1_VERDICT_GRACE"
+  local fpR pp; fpR="$(ptr_fp "$pub")"; pp="$(ptr_path "$pub")"
   if [ "$fpR" != "$fp0" ]; then
-    stop_class AC5 "TORN/MOVED POINTER: latest-green changed during RED ($fp0 → $fpR) — never-publish-red VIOLATED"
+    stop_class AC5 "MOVED POINTER: latest-green changed during RED ($fp0 → $fpR) — never-publish-red VIOLATED"
   fi
-  local pp; pp="$(ptr_path "$wt")"
   if [ ! -s "$pp" ]; then
     stop_class AC5 "TORN POINTER: latest-green is zero-byte/partial during red"
   fi
-  # recover — pointer must advance (different fp) and stay non-empty
-  revert_rustc_error "$wt"; wt_await_verdict "$wt" green || true
-  sleep 8
-  local fp2; fp2="$(ptr_fp "$wt")"
-  [ -f "$S1_WORK/pub.pid" ] && kill -KILL "$(cat "$S1_WORK/pub.pid")" 2>/dev/null || true
+  # recover — pointer must advance atomically and stay non-empty
+  revert_inject "$pub"
+  sleep "$S1_VERDICT_GRACE"
+  local fp2; fp2="$(ptr_fp "$pub")"
+  [ -f "$S1_WORK/ac5-pub.pid" ] && kill -KILL "$(cat "$S1_WORK/ac5-pub.pid")" 2>/dev/null || true
   if [ "$fp2" != "$fp0" ] && [ "$fp2" != MISSING ] && [ -s "$pp" ]; then
     pass AC5 "pointer byte-unmoved through red, atomically advanced on green recovery"
   else
@@ -221,7 +242,6 @@ ac6_transport_auth() {
   hdr "AC6 — HTTP+SSE transport + bearer auth over --bind $S1_BIND"
   local base="http://$S1_BIND" wt="${S1_WTS[0]}" ok=1
   local AUTH=(-H "Authorization: Bearer $S1_TOKEN")
-  # auth: missing & wrong ⇒ 401 ; correct ⇒ 200
   local c_no c_bad c_ok
   c_no=$(curl -s -o /dev/null -w '%{http_code}' "$base/worktrees")
   c_bad=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer WRONG" "$base/worktrees")
@@ -229,29 +249,30 @@ ac6_transport_auth() {
   if [ "$c_no" = 401 ] && [ "$c_bad" = 401 ] && [ "$c_ok" = 200 ]; then
     pass AC6-auth "no-token=401 wrong=401 correct=200 (#14 bearer seam enforced)"
   else
-    # auth bypass (a protected route served without/with-wrong token) is
-    # a security STOP-class breach, not a soft fail.
-    { [ "$c_no" = 200 ] || [ "$c_bad" = 200 ]; } \
-      && stop_class AC6 "AUTH BYPASS: protected route served without a valid bearer (no=$c_no wrong=$c_bad)" \
-      || { fail AC6-auth "auth codes off (no=$c_no wrong=$c_bad ok=$c_ok)"; ok=0; }
+    # a protected route served WITHOUT a valid bearer is an auth bypass
+    if [ "$c_no" = 200 ] || [ "$c_bad" = 200 ]; then
+      stop_class AC6 "AUTH BYPASS: a protected route served without a valid bearer (no=$c_no wrong=$c_bad)"
+    fi
+    fail AC6-auth "auth codes off (no=$c_no wrong=$c_bad ok=$c_ok)"; ok=0
   fi
-  # GET routes return well-formed payloads
   local enc; enc=$(printf '%s' "$wt" | sed 's:/:%2F:g')
-  curl -s "${AUTH[@]}" "$base/worktrees" | grep -q '\[' \
-    && curl -s "${AUTH[@]}" "$base/status?worktree=$enc" | grep -qiE 'verdict|green|red' \
-    && curl -s "${AUTH[@]}" "$base/verdict?worktree=$enc" | grep -qiE 'green|red' \
-    && pass AC6-routes "GET /worktrees /status /verdict /…/diagnostics well-formed" \
-    || { fail AC6-routes "a GET route returned malformed/empty payload"; ok=0; }
-  # SSE: exactly one frame per transition (induce 2: green→red→green)
+  if curl -s "${AUTH[@]}" "$base/worktrees" | grep -q '\[' \
+     && curl -s "${AUTH[@]}" "$base/status?worktree=$enc" | grep -qiE 'verdict|green|red' \
+     && curl -s "${AUTH[@]}" "$base/verdict?worktree=$enc" | grep -qiE 'green|red'; then
+    pass AC6-routes "GET /worktrees /status /verdict well-formed payloads"
+  else
+    fail AC6-routes "a GET route returned malformed/empty payload"; ok=0
+  fi
+  # SSE: ≥1 frame per transition (induce 2: green→red→green)
   ( curl -sN "${AUTH[@]}" "$base/events" > "$S1_WORK/sse.out" 2>&1 & echo $! > "$S1_WORK/sse.pid" )
   sleep 2
   inject_rustc_error "$wt"; wt_await_verdict "$wt" red || true
-  revert_rustc_error "$wt"; wt_await_verdict "$wt" green || true
+  revert_inject "$wt"; wt_await_verdict "$wt" green || true
   sleep 3
   kill -KILL "$(cat "$S1_WORK/sse.pid")" 2>/dev/null || true
   local frames; frames=$(grep -c '^data:' "$S1_WORK/sse.out" 2>/dev/null || echo 0)
   if [ "$frames" -ge 2 ]; then
-    pass AC6-sse "SSE emitted $frames data frames across ≥2 transitions (one frame per transition)"
+    pass AC6-sse "SSE emitted $frames data frames across ≥2 transitions"
   else
     fail AC6-sse "SSE frame count $frames < expected ≥2 (missed transitions)"; ok=0
   fi
@@ -262,7 +283,7 @@ ac6_transport_auth() {
 ac7_sigterm_reap() {
   hdr "AC7 — SIGTERM reaps every per-cluster rust-analyzer child (#198)"
   local before; before="$(ra_children "$DAEMON_PID")"
-  [ -n "$before" ] || { fail AC7 "no RA children to reap — inconclusive (activate a WT first)"; return; }
+  [ -n "$before" ] || { fail AC7 "INCONCLUSIVE: no RA children to reap"; return; }
   log "RA children before SIGTERM: $before"
   kill -TERM "$DAEMON_PID" 2>/dev/null || true
   local lim=$(( $(date +%s) + S1_SIGTERM_GRACE ))
@@ -270,39 +291,39 @@ ac7_sigterm_reap() {
   sleep 2
   local survivors=""
   for p in $before; do kill -0 "$p" 2>/dev/null && survivors="$survivors $p"; done
-  # also catch any stray RA / proc-macro-srv parented away from the daemon
   local stray; stray="$(ps -axo pid,ppid,command 2>/dev/null \
-      | awk -v D="$DAEMON_PID" '($2==1)&&(/rust-analyzer/||/proc-macro-srv/){print $1}')"
+      | awk '($2==1)&&(/rust-analyzer/||/proc-macro-srv/){print $1}')"
   DAEMON_PID=""
   if [ -n "${survivors// /}" ]; then
-    stop_class AC7 "RA-ORPHAN: rust-analyzer survived daemon SIGTERM ($survivors) — #198 ReapOnDrop regressed at the serve seam"
+    stop_class AC7 "RA-ORPHAN: rust-analyzer survived the daemon SIGTERM ($survivors) — #198 ReapOnDrop regressed at the serve seam"
   fi
   if [ -n "$stray" ]; then
-    note AC7 "reparented RA/proc-macro-srv present (pid $stray) — investigate provenance"
-    stop_class AC7 "RA-ORPHAN: reparented rust-analyzer/proc-macro-srv after daemon SIGTERM"
+    stop_class AC7 "RA-ORPHAN: a reparented rust-analyzer/proc-macro-srv (pid$stray) outlived the daemon SIGTERM"
   fi
   pass AC7 "every per-cluster RA child reaped on SIGTERM (no zombie/orphan; #198 holds)"
 }
 
-# ─── AC8 — overlay freshness (Shape-1 local-FS read) ─────────────────
+# ─── AC8 — overlay freshness (verdict tracks on-disk content) ────────
 ac8_overlay_freshness() {
   hdr "AC8 — overlay freshness: verdict tracks on-disk content, never stale"
   serve_start; serve_wait_up || { fail AC8 "daemon did not come up for AC8"; return; }
   local wt="${S1_WTS[1]:-${S1_WTS[0]}}"
-  wt_await_verdict "$wt" green || true
+  wt_activate "$wt"; wt_await_verdict "$wt" green || true
   inject_rustc_error "$wt"
   if wt_await_verdict "$wt" red; then
-    revert_rustc_error "$wt"
+    revert_inject "$wt"
     if wt_await_verdict "$wt" green; then
-      pass AC8 "edit→red and revert→green both reflected within ${S1_VERDICT_GRACE}s (no stale overlay)"
+      pass AC8 "edit→red and revert→green both reflected within grace (no stale overlay)"
     else
       fail AC8 "revert not reflected — verdict stuck red (stale overlay after edit-back)"
     fi
   else
-    revert_rustc_error "$wt"
-    [ "$(wt_verdict "$wt")" = green ] \
-      && stop_class AC8 "FALSE-GREEN: edited a definite error but verdict stayed green (stale overlay — Shape-1 read not refreshed)" \
-      || fail AC8 "no red within ${S1_VERDICT_GRACE}s of a definite-error edit (latency/freshness)"
+    revert_inject "$wt"
+    if [ "$(wt_verdict "$wt")" = green ]; then
+      stop_class AC8 "FALSE-GREEN: a definite injected error verdicts green (stale overlay — on-disk read not refreshed)"
+    else
+      fail AC8 "INCONCLUSIVE: no red within grace of a definite-error edit (latency/freshness)"
+    fi
   fi
 }
 
@@ -336,19 +357,18 @@ self_check() {
   for f in "$SUITE_DIR"/lib.sh "$SUITE_DIR"/run-stage1.sh; do
     if bash -n "$f"; then echo "  syntax OK: $f"; else echo "  SYNTAX ERROR: $f"; rc=1; fi
   done
-  guard_no_cargo && echo "  guard: no local cargo/rustc in suite — OK"
-  if command -v "$CARGOLESS_BIN" >/dev/null 2>&1; then
-    echo "  cargoless bin: present ($CARGOLESS_BIN)"
-  else
-    echo "  cargoless bin: ABSENT — suite will preflight-fail until Inc0+1 ships the binary (expected pre-GO)"
-  fi
-  command -v curl >/dev/null 2>&1 && echo "  curl: present" || { echo "  curl: ABSENT (AC6 needs it)"; rc=1; }
-  command -v git  >/dev/null 2>&1 && echo "  git: present"  || { echo "  git: ABSENT (AC3 needs it)";  rc=1; }
+  guard_no_cargo && echo "  guard: no local cargo/rustc invocation in suite — OK"
+  command -v "$CARGOLESS_BIN" >/dev/null 2>&1 \
+    && echo "  cargoless bin: present ($CARGOLESS_BIN)" \
+    || echo "  cargoless bin: ABSENT ($CARGOLESS_BIN) — preflight will fail until a wired binary is on PATH"
+  command -v curl >/dev/null 2>&1 && echo "  curl: present" || { echo "  curl: ABSENT (AC6)"; rc=1; }
+  command -v git  >/dev/null 2>&1 && echo "  git: present"  || { echo "  git: ABSENT";        rc=1; }
   echo "  ACs: $ACS"
-  echo "  named Inc0+1 knobs: S1_POINTER_REL='$S1_POINTER_REL' S1_STATUS_GLOB='$S1_STATUS_GLOB' S1_PUBLISH_ARGS='$S1_PUBLISH_ARGS'"
+  echo "  substrate: Leptos fixture (S1_FIXTURE='${S1_FIXTURE:-<repo>/bench/fixture}')"
+  echo "  contract knobs: S1_STATUS_REL='$S1_STATUS_REL' S1_POINTER_REL='$S1_POINTER_REL' S1_INJECT_FILE='$S1_INJECT_FILE'"
   echo
-  [ "$rc" = 0 ] && echo "  READY — suite is runnable the instant Inc0+1 land + GO (S1_EXECUTE_GO=1)." \
-                || echo "  NOT READY — fix the above before GO."
+  [ "$rc" = 0 ] && echo "  READY — runnable with S1_EXECUTE_GO=1 against the Leptos fixture." \
+                || echo "  NOT READY — fix the above."
   exit "$rc"
 }
 
