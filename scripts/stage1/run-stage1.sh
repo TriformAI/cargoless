@@ -88,15 +88,19 @@ ac2_parity() {
       || stop_class AC2-multicrate "FALSE-GREEN: crate error present but verdict not red ($cr)"
   fi
   revert_rustc_error_in_crate "$wt"; wt_await_verdict "$wt" green || true
-  # clippy-only: contract question (only Severity::Error flips red).
+  # clippy-only: ERA-SCOPED per Lane-B #221 (resolved). Stage-1 runs
+  # PRE-Inc3-B; shipped v0.2.0 flycheck = plain `check` (no clippy), so
+  # the warning-severity lint AC2 injects is suppressed ⇒ GREEN is the
+  # CORRECT verdict (default S1_CLIPPY_EXPECTED=green). Flips to red once
+  # Inc3-B (clippy-as-flycheck + -D warnings) promotes it to Error.
   inject_clippy_only "$wt"; sleep "$S1_VERDICT_GRACE"
   local cg; cg="$(wt_verdict "$wt")"
   case "$S1_CLIPPY_EXPECTED" in
-    red)   [ "$cg" = red ]   && pass AC2-clippy "clippy-only ⇒ red (cargoless gates clippy-class)" \
-                              || fail AC2-clippy "clippy-only expected red, got $cg" ;;
-    green) [ "$cg" = green ] && pass AC2-clippy "clippy-only ⇒ green (rustc-error-only contract, by design)" \
-                              || fail AC2-clippy "clippy-only expected green, got $cg" ;;
-    *)     note AC2-clippy "clippy-only ⇒ $cg — FIELD FINDING input for Lane-B (#221: does cargoless replace clippy?). Not a Stage-1 gate." ;;
+    green) [ "$cg" = green ] && pass AC2-clippy "warning-level clippy/rustc lint ⇒ green — CORRECT shipped v0.2.0 behavior pre-Inc3-B (#221; not a bug)" \
+                              || fail AC2-clippy "expected green (pre-Inc3-B contract), got $cg — false-RED on correct shipped behavior, OR flycheck changed" ;;
+    red)   [ "$cg" = red ]   && pass AC2-clippy "clippy/rustc lint ⇒ red — post-Inc3-B (clippy-as-flycheck + -D warnings) OR error-level lint" \
+                              || fail AC2-clippy "expected red (post-Inc3-B / error-level), got $cg — clippy-as-flycheck not gating" ;;
+    *)     note AC2-clippy "clippy-only ⇒ $cg — record-only (S1_CLIPPY_EXPECTED=fieldfinding); set green (pre-Inc3-B) / red (post) to gate" ;;
   esac
   revert_clippy_only "$wt"; wt_await_verdict "$wt" green || true
 }

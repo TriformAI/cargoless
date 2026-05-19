@@ -32,7 +32,20 @@ set -u
 : "${S1_SIGTERM_GRACE:=10}"            # post-SIGTERM reap window s (AC7)
 : "${S1_NWT:=3}"                       # # ephemeral worktrees for AC3
 : "${S1_CI_ORACLE:=0}"                 # 1 ⇒ also confirm baseline vs CI
-: "${S1_CLIPPY_EXPECTED:=fieldfinding}" # red|green|fieldfinding (see AC2)
+# AC2 clippy-only expectation — ERA-SCOPED (Lane-B #221 ruling, verified
+# from source by team-lead 2026-05-19). Stage-1 runs PRE-Increment-3, and
+# shipped v0.2.0 flycheck is hardcoded `command:"check"` (clippy is NOT a
+# flycheck): a clippy/rustc *warning* (e.g. the unused-import AC2 injects)
+# is advisory/suppressed ⇒ cargoless verdict GREEN — that is CORRECT
+# shipped behavior, NOT a bug; asserting RED here would be a false-alarm.
+# A clippy/rustc *error* (Severity::Error) ⇒ RED (honest, F8-redo).
+# ⇒ default = green for the Stage-1 era (AC2 deliberately injects a
+#   WARNING-severity lint). This FLIPS to red once Increment 3-B lands
+#   (clippy-as-flycheck + `-D warnings` promotes the lint to Error).
+#   dev-fixer owns final post-Inc3-B semantics. Override deliberately:
+#   red (post-Inc3-B, or if AC2 is changed to inject an error-level
+#   lint) | green (Stage-1 era, default) | fieldfinding (record-only).
+: "${S1_CLIPPY_EXPECTED:=green}"       # red|green|fieldfinding — era-scoped
 # Source repo: the suite clones THIS (hermetic) — never the operator tree.
 : "${S1_SRC_REPO:=}"                   # auto-detected if empty
 # Knobs Inc0+1 may relocate (NAMED so logic never changes):
@@ -290,10 +303,15 @@ revert_rustc_error_in_crate() {
     || { sed "/$INJ_MARK_RUSTC/,\$d" "$f" > "$f.t" && mv "$f.t" "$f"; }
   rm -f "$f.bak"
 }
-# Clippy-only: rustc-clean but `clippy -D warnings` red (unused import —
-# CLAUDE.md heuristic). Whether cargoless's RA-flycheck verdict reflects
-# this is the v0.2.0 contract question (only Severity::Error flips red);
-# AC2 treats divergence per S1_CLIPPY_EXPECTED, NOT auto-STOP.
+# Clippy-only: rustc-clean but `clippy -D warnings` red. DELIBERATELY a
+# WARNING-severity lint (unused import) — under shipped v0.2.0 flycheck
+# (plain `check`, gates on Severity::Error only) this is suppressed ⇒
+# cargoless GREEN, which is the CORRECT pre-Increment-3-B verdict (Lane-B
+# #221). It is exactly the canonical "clippy-only" case that must NOT
+# false-alarm RED in the Stage-1 era. Post-Inc3-B (clippy-as-flycheck +
+# `-D warnings`) the SAME lint promotes to Severity::Error ⇒ RED, and
+# S1_CLIPPY_EXPECTED flips to red. AC2 asserts per the era-scoped knob,
+# never auto-STOP (a clippy verdict is contract, not a safety breach).
 inject_clippy_only() {
   printf '\n%s\nuse std::collections::HashMap as _S1Unused;\n' "$INJ_MARK_CLIPPY" >> "$1/$S1_INJECT_FILE"
 }
