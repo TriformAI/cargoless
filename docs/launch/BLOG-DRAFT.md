@@ -29,9 +29,10 @@
 > honestly-bounded latency); the human single-tree reading still
 > works, but the design center is the agent fleet loop.
 >
-> **Version & launch GO:** the public-launch decision and the version
-> tag (`v1.0` vs `v0.2`) are the **operator's call** — this draft
-> describes capabilities, not a chosen tag or ship date.
+> **Version & launch GO:** the version tag is **v0.2.0**
+> (operator-decided 2026-05-19); the public-launch decision remains
+> the **operator's call** — this draft describes capabilities, not a
+> ship date.
 
 ---
 
@@ -386,7 +387,7 @@ and `ac7-verdict` keys on the release SHA.
 ## Install and try it
 
 > **Pre-release.** The release-tagged install commands below will work
-> once `v0.1.0` is cut. Today, only the from-source GitHub install is
+> once `v0.2.0` is cut. Today, only the from-source GitHub install is
 > supported — and it's been smoke-tested end-to-end on a clean Linux
 > environment.
 
@@ -395,7 +396,7 @@ cargo install --git https://github.com/TriformAI/cargoless.git \
               cargoless --branch main --locked
 ```
 
-Once `v0.1.0` ships, the install path becomes:
+Once `v0.2.0` ships, the install path becomes:
 
 ```bash
 # Source build (universal)
@@ -451,8 +452,8 @@ demo.
 ## Roadmap
 
 cargoless is phased **launch → next → parking lot**. The public
-version tag (`v1.0` vs `v0.2`) is the operator's call; this post
-describes capability, not a chosen tag.
+version tag is **v0.2.0** (operator-decided 2026-05-19); this post
+describes capability, not a ship date.
 
 **The launch (today):** the headless continuous checker +
 latest-green publisher, delivered as **one repo-scoped daemon**
@@ -693,8 +694,9 @@ the tool report when it breaks.
 - [ ] **No "ship v0" / "v0 launch" residual** — Model A
       (per-worktree-`watch` daemon) is a superseded internal
       intermediate, never publicly launched; the launch is Model R.
-      Public version tag (`v1.0` vs `v0.2`) left as the operator's
-      call (no tag asserted in copy).
+      Public version tag resolved to **v0.2.0** (operator-decided
+      2026-05-19); copy asserts v0.2.0, no `v1.0`/fleet-ready
+      overclaim.
 - [x] D1 product name resolved = `cargoless` (operator, 2026-05-17);
       `tftrunk`/`tf-cli` drift renamed to `cargoless` in the #87
       surgical rename-commit; internal crates renamed to

@@ -10,9 +10,9 @@
 > "~19.4 GiB BORDERLINE" extrapolation. The ≈2.05× per-edit CPU win vs
 > `trunk serve` is **unchanged under Model R** (two-source-confirmed,
 > §8.5). The browser/HTTP adapter remains deferred (orthogonal to the
-> daemon). **The public-launch GO and the version tag (`v1.0` vs
-> `v0.2`) are the operator's decision** — this roadmap describes
-> capabilities, not a chosen tag.
+> daemon). **The version tag is `v0.2.0` (operator-decided
+> 2026-05-19); the public-launch GO remains the operator's
+> decision** — this roadmap describes capabilities, not a ship date.
 
 cargoless's earlier per-worktree single-tree checker (the `watch`-per-WT
 shape) was a **superseded internal intermediate**; the repo-scoped

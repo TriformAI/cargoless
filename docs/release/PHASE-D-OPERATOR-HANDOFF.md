@@ -20,8 +20,8 @@ Once the pre-tag checklist (§3) is fully green, the entire public release
 is **one command**:
 
 ```bash
-git tag -a v0.1.0 <ratified-sha> -m "cargoless 0.1.0 — first public release"
-git push origin v0.1.0          # → Forgejo
+git tag -a v0.2.0 <ratified-sha> -m "cargoless 0.2.0 — first public release"
+git push origin v0.2.0          # → Forgejo
 # Forgejo→GitHub push-mirror (sync_on_commit, §8 #9) auto-replicates the
 # tag to github.com/TriformAI/cargoless within ~3–15s.
 ```
@@ -51,11 +51,11 @@ On `v[0-9]+.*` tag arrival at GitHub, `.github/workflows/release.yml`:
    `fail-fast: false` — one target regressing doesn't kill the others.
 3. **`attach-release-assets`** — `gh release upload` posts all three
    tarballs + their `.sha256` sums to the GitHub release page.
-4. **`publish-*`** — DECLARATIVE ONLY for 0.1.0 (`if: false`). See §2.
+4. **`publish-*`** — DECLARATIVE ONLY for 0.2.0 (`if: false`). See §2.
 
-**Result**: a GitHub release at `v0.1.0` with three prebuilt tarballs.
+**Result**: a GitHub release at `v0.2.0` with three prebuilt tarballs.
 End users immediately get:
-- `cargo install --git https://github.com/TriformAI/cargoless.git cargoless --tag v0.1.0 --locked` (source, any rustc platform)
+- `cargo install --git https://github.com/TriformAI/cargoless.git cargoless --tag v0.2.0 --locked` (source, any rustc platform)
 - `cargo binstall cargoless` (prebuilt: linux-x86_64 + macOS aarch64/x86_64; falls back to `cargo install` on other targets)
 
 ---
@@ -130,18 +130,19 @@ No code change needed (`release.yml` already consumes
 `secrets.FORGEJO_READONLY_TOKEN`). Never committed; GH masks it in logs.
 **Option 2** (also publish the verdict as a GitHub commit status /
 release asset so GH Actions never crosses to Forgejo — D-CI-RESILIENCE
-F-C) is a **0.2.0+** hardening — parked, deliberately not
-launch-blocking.
+F-C) is a **post-0.2.0 (0.3.0+)** hardening — parked, deliberately
+not launch-blocking (it was a "post-first-release" item; the first
+release is now 0.2.0).
 
 ### 2.2 crates.io publish — the LATER operator-credential stage (§8 #5)
 
-For `0.1.0`, crates.io publish is **operator-run from their laptop**, NOT
+For `0.2.0`, crates.io publish is **operator-run from their laptop**, NOT
 automated (the `publish-*` jobs in release.yml are `if: false`). Sequence,
 from the tagged SHA, in topological order (each waits ~30s for crates.io
 propagation before the next):
 
 ```bash
-git checkout v0.1.0     # work from the tag, never HEAD
+git checkout v0.2.0     # work from the tag, never HEAD
 
 # MANDATORY pre-publish gate (D-CI-RESILIENCE F-J). crates.io is
 # append-only — a packaging/manifest/order error is UNRECOVERABLE once
@@ -173,10 +174,12 @@ now moot — do NOT publish any `tf-*` package, none exist post-#97):
   match — they now do.)
 - crates.io token: operator configures `~/.cargo/credentials.toml` or
   `CARGO_REGISTRY_TOKEN` env once, before the first `cargo publish`.
-  Never committed; never in CI for 0.1.0.
+  Never committed; never in CI for 0.2.0.
 
-Automating this (Forgejo/GitHub-Actions-secret) is a **0.2.0+** concern —
-token-rotation strategy needs design first. Tracked, not launch-blocking.
+Automating this (Forgejo/GitHub-Actions-secret) is a **post-0.2.0
+(0.3.0+)** concern — token-rotation strategy needs design first
+(post-first-release; the first release is now 0.2.0). Tracked, not
+launch-blocking.
 
 ---
 
@@ -211,16 +214,16 @@ State as of skeleton-draft 2026-05-17 (✅ done / ⏳ pending / TBD = fill at fi
 [✅] FORGEJO_READONLY_TOKEN secret — minted+set+verified in Phase C #100
      (`cargoless-ci-readonly` id=45, scope `read:repository`); operator
      re-confirms presence at launch via `gh secret list` (§2.1)
-[ ] §8 #7 GPG signing — v1+ parking-lot (intentionally NOT a 0.1.0 gate)
+[ ] §8 #7 GPG signing — v1+ parking-lot (intentionally NOT a 0.2.0 gate)
 [OPERATOR PRE-FLIGHT — D-CI-RESILIENCE F-C/F-D, do immediately before §0]
      ( ) authed probe returns `s1-ac2-verdict` for the launch SHA
          (`curl -H "Authorization: token <FORGEJO_READONLY_TOKEN>"
          .../commits/<sha>/statuses` → context present) AND
          forgejo.triform.dev reachable — else tag-validate hard-fails
-     ( ) after `git push origin v0.1.0`: within 60s the tag is on
+     ( ) after `git push origin v0.2.0`: within 60s the tag is on
          github.com/TriformAI/cargoless AND a `release.yml` run started
          — else mirror health (Forgejo→Settings→Mirroring) + the
-         break-glass `git push github v0.1.0` fallback
+         break-glass `git push github v0.2.0` fallback
 KNOWN LIMITATION (documented, NOT a gate): x86_64-apple-darwin (Intel
      Mac) prebuilt is best-effort — free-tier macos-13 runner
      availability is systemic-flaky (Phase-C: queued/never-assigned
@@ -231,7 +234,7 @@ KNOWN LIMITATION (documented, NOT a gate): x86_64-apple-darwin (Intel
       save→verdict claim wording in README/blog
 [✅] Phase 2 dogfood — DOGFOOD-REPORT.md on main (12 findings; F1–F12 fixed)
 [TBD] AC#9 launch blog — reviewed by ≥2 incl. outside (human-gated)
-[TBD] `[workspace.package].version` bumped 0.0.0 → 0.1.0 (one focused
+[TBD] `[workspace.package].version` bumped 0.0.0 → 0.2.0 (one focused
       commit at launch-prep time; tag-validate enforces tag==version)
 ```
 
@@ -243,23 +246,23 @@ an omission).
 
 ## 4. Rollback procedure (if a tagged release is bad)
 
-If `v0.1.0` ships and a launch-blocker is discovered post-tag:
+If `v0.2.0` ships and a launch-blocker is discovered post-tag:
 
 1. **Delete the GitHub release + tag**:
    ```bash
-   gh release delete v0.1.0 --repo TriformAI/cargoless --yes --cleanup-tag
-   git push origin --delete v0.1.0     # also remove from Forgejo
+   gh release delete v0.2.0 --repo TriformAI/cargoless --yes --cleanup-tag
+   git push origin --delete v0.2.0     # also remove from Forgejo
    ```
 2. **crates.io yank** (if any crate was already `cargo publish`'d — yank
    does NOT delete, it prevents NEW dependents; existing lockfiles keep
    working, which is correct):
    ```bash
-   cargo yank --version 0.1.0 cargoless
-   cargo yank --version 0.1.0 cargoless-core   # + cargoless-cas, cargoless-proto if published
+   cargo yank --version 0.2.0 cargoless
+   cargo yank --version 0.2.0 cargoless-core   # + cargoless-cas, cargoless-proto if published
    # (internals renamed by #97; pre-#97 these were tf-{core,cas,proto})
    ```
 3. **Fix forward** — the bug fix lands on main via the normal
-   ci-gate→ff flow; cut `v0.1.1` when green. Never re-cut `v0.1.0`
+   ci-gate→ff flow; cut `v0.2.1` when green. Never re-cut `v0.2.0`
    (immutable-tag discipline; a re-pointed tag is a supply-chain
    anti-pattern — consumers cache by tag).
 4. **Communicate** — if the bad release was announced (blog/social),
@@ -312,7 +315,7 @@ GitHub-release artifacts have been smoke-tested.
       name-and-mechanism ready, date is a business call)
 - [ ] AC#9 launch blog ≥2-reviewer sign-off (human-gated; will NOT close
       in an agent session)
-- [ ] **(D-CI-RESILIENCE F-E, HARDEN-NOW recommended pre-real-v0.1.0):**
+- [ ] **(D-CI-RESILIENCE F-E, HARDEN-NOW recommended pre-real-v0.2.0):**
       make the Forgejo `bench` verdict-POST assert HTTP 2xx (fail the
       step on non-2xx) so a silently-broken s1-ac2 producer reds `main`
       at commit time instead of surprising the operator at tag time —

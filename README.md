@@ -110,8 +110,9 @@ makes the agent-fleet case work.
    does not impugn the measured ≈1 GiB steady-state headline;
    launch-relevant only for restart-churn process hygiene.
 
-Version (`v1.0` vs `v0.2`) and public-launch GO are the **operator's
-call** — this document describes capabilities, not a chosen tag.
+The version is **v0.2.0** (operator-decided 2026-05-19). The
+public-launch GO remains the operator's call — this document
+describes capabilities, not a ship date.
 
 v0.1 browser/HTTP adapter remains deferred (orthogonal to Model R).
 Fleet-scale methodology + the measured per-N curve + the v1→v3 honest
@@ -174,7 +175,7 @@ deferred browser adapter, and the parking lot.
 ## Install
 
 > **Pre-release.** The release-tagged install commands below will work
-> once `v0.1.0` is cut. Today, only the from-source install against the
+> once `v0.2.0` is cut. Today, only the from-source install against the
 > GitHub development tip is supported and proven end-to-end in a clean
 > environment.
 
@@ -204,7 +205,7 @@ green. See [D-RELEASE Appendix B](docs/design/D-RELEASE.md#appendix-b--why---loc
 > is on by default on `cargoless`. Users who want only the standalone
 > checker semantics can opt out via `--no-default-features`.
 
-**Once `v0.1.0` releases:**
+**Once `v0.2.0` releases:**
 
 ```bash
 # Source build via crates.io (universal: any platform with rustc)
@@ -584,9 +585,10 @@ acknowledgement is itself a GitHub-issue-worthy event.
 
 Repo-scoped Model-R daemon feature-complete on `main`; fleet-RAM
 flatness measured (`AC7-THROUGHPUT-REPORT §11.4` Leg-C v4); launch
-hardening in progress. The public-launch GO and the version tag
-(`v1.0` vs `v0.2`) are the **operator's decision** — this document
-states capabilities, not a chosen tag or a ship date. Tracked
+hardening in progress. The version tag is **v0.2.0**
+(operator-decided 2026-05-19); the public-launch GO remains the
+**operator's decision** — this document states capabilities, not a
+ship date. Tracked
 publicly via [GitHub Issues](https://github.com/TriformAI/cargoless/issues);
 the internal agent-team backlog lives in Plane (project "CWDL"). See
 [`ROADMAP.md`](ROADMAP.md) for the acceptance criteria and the

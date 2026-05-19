@@ -162,8 +162,9 @@ appendix block itself is removed at publish — it is scaffolding.)
    - **(c) No-v0-launch-residual.** Sweep for "ship v0" / "v0 launch"
      / "launching v0" copy — **zero survives** (Model A is a
      superseded internal intermediate, never publicly launched; the
-     launch is Model R). The public version tag (`v1.0` vs `v0.2`)
-     is left as the operator's call — no tag asserted in copy.
+     launch is Model R). The public version tag is resolved to
+     **v0.2.0** (operator-decided 2026-05-19); copy asserts v0.2.0
+     with no `v1.0`/fleet-ready overclaim.
    - **(d) FF-A accurate-mechanism + honest verification shape.** The
      shutdown finding is disclosed with the proven rust-analyzer
      Supervisor reap discipline (FF #3b/#44/#61/#128) not invoked on
