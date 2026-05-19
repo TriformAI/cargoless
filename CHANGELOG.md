@@ -6,11 +6,11 @@ open decision D1 / Plane CWDL-12) are documented here. Format follows
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 from `0.2.0` (the first public release) onward.
 
-`.github/workflows/release.yml` (currently `.draft` per D-RELEASE
-§10 path-to-real-fire checklist) asserts at tag-validate time that this file
-contains a `## <version>` (or `## [<version>]`) heading matching the cut
-tag's semver. Drift between the tag and this file is a hard release-pipeline
-fail — keep entries here in lockstep with version bumps.
+`.github/workflows/release.yml` (active — CWDL-71 Phase A) asserts at
+tag-validate time that this file contains a `## <version>` (or `##
+[<version>]`) heading matching the cut tag's semver. Drift between the
+tag and this file is a hard release-pipeline fail — keep entries here
+in lockstep with version bumps.
 
 Entries within a version follow these section names (keepachangelog
 canonical, in this order):
