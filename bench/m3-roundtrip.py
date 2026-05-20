@@ -153,6 +153,16 @@ class SseListener(threading.Thread):
                 wt = ev.get("worktree")
                 if not wt:
                     continue
+                # Diagnostic visibility: log every received event to stderr
+                # so a wedge of the form "SSE listener got no events" is
+                # immediately distinguishable from "events arrived but
+                # didn't satisfy a wait predicate". Cheap; the steady-state
+                # rate is one event per push-cycle (≤ a few per second).
+                print(
+                    f"[m3-sse] recv wt={wt[-32:]} verdict={ev.get('verdict','?')} "
+                    f"published_at={ev.get('published_at','?')}",
+                    file=sys.stderr,
+                )
                 with self.queues_lock:
                     q = self.queues.get(wt)
                 if q is not None:
@@ -270,50 +280,66 @@ def main():
     # Subscribe to all worktrees we'll touch.
     queues = {wt: sse.subscribe(wt) for wt in worktrees}
 
-    # Warm-up: prime each worktree to a known GREEN state by pushing an
-    # empty overlay (server overlay clears ⇒ tree == base ⇒ green once
-    # cold cargo check completes). Wait for the green SSE event per WT.
-    # The FIRST worktree on a cold Leptos cluster pays the cold-cargo-
-    # check cost (minutes); subsequent worktrees in the same cluster
-    # share the warm RA and are fast.
-    print("[m3] warm-up: pushing empty overlay per worktree + waiting for GREEN")
+    # Warm-up: prime each worktree to a known GREEN state by pushing the
+    # ORIGINAL-content overlay (a semantic no-op — overlay matches disk —
+    # but a REAL overlay-set payload that triggers the daemon's activity
+    # routing → RA spawn → initial cargo check → first GREEN verdict).
+    # Run-2 used files=[] (empty overlay); the daemon parsed it but
+    # apparently does not treat empty-overlay as activity-routing input,
+    # so RA never spawned and no SSE frame ever arrived — wedge mode.
+    # The `cargoless push` real-world client always sends a non-empty
+    # overlay (`git diff --name-only HEAD` → file content list); empty
+    # was a harness artifact, not a real client posture.
+    warmup_files = [(TRAIT_REL, orig_content)]
+    print("[m3] warm-up: pushing real overlay (orig content; no-op vs base) per worktree + waiting for GREEN")
     for i, wt in enumerate(worktrees):
         t_warm0 = time.monotonic()
         try:
-            ack, _, _ = post_overlay(base_url, token, wt, "HEAD", [])
+            ack, _, _ = post_overlay(base_url, token, wt, "HEAD", warmup_files)
         except Exception as e:
             print(f"FAIL: warm-up push {wt}: {e}", file=sys.stderr)
-            try: sse.stop()
-            except Exception: pass
-            # os._exit bypasses cleanup — the SSE listener thread's blocked
-            # socket.readline() doesn't always release on sse._resp.close(),
-            # which left the prior FAIL run hung. Force-exit is the right
-            # discipline here: the FAIL message has been flushed already.
+            sys.stderr.flush()
+            # os._exit bypasses Python cleanup INCLUDING sse.stop(). In
+            # run-2 the prior `try: sse.stop(); except: pass; os._exit(2)`
+            # pattern hung because sse.stop() calls self._resp.close() on
+            # a streaming chunked-no-length SSE response — urllib's close()
+            # tries to drain unread bytes, which never end on a long-lived
+            # event stream, so main thread blocked IN sse.stop() and the
+            # os._exit line below never executed (1h55m wedge). The SSE
+            # listener is daemon=True; the OS reaps the thread + socket
+            # on process exit without a graceful close.
             os._exit(2)
         if not ack.get("accepted"):
             print(f"FAIL: warm-up push {wt} rejected: {ack}", file=sys.stderr)
-            try: sse.stop()
-            except Exception: pass
+            sys.stderr.flush()
             os._exit(2)
-        # Drain SSE for this WT until green (or timeout)
+        # Drain SSE for this WT until green (or timeout). Log every event
+        # received so a wedge of the form "no SSE frames at all" is
+        # distinguishable from "frames received but never green".
         timeout = args.warmup_timeout if i == 0 else args.verdict_timeout
         deadline = time.monotonic() + timeout
         got_green = False
+        seen_verdicts: list[str] = []
         while time.monotonic() < deadline:
             try:
                 recv_ns, ev = queues[wt].get(timeout=0.5)
             except Empty:
                 continue
-            if ev.get("verdict") == "green":
+            v = ev.get("verdict", "?")
+            if not seen_verdicts or seen_verdicts[-1] != v:
+                seen_verdicts.append(v)
+                print(f"  warmup {wt}: verdict→{v} at t+{time.monotonic() - t_warm0:.1f}s")
+            if v == "green":
                 got_green = True
-                print(
-                    f"  warmup {wt}: green in {time.monotonic() - t_warm0:.1f}s"
-                )
+                print(f"  warmup {wt}: GREEN in {time.monotonic() - t_warm0:.1f}s (sequence: {' → '.join(seen_verdicts)})")
                 break
         if not got_green:
-            print(f"FAIL: worktree {wt} did not reach GREEN within {timeout}s", file=sys.stderr)
-            try: sse.stop()
-            except Exception: pass
+            print(
+                f"FAIL: worktree {wt} did not reach GREEN within {timeout}s "
+                f"(seen sequence: {' → '.join(seen_verdicts) or '(no events received)'})",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
             os._exit(2)
 
     # Drain any residual events (the warmup pushes may have produced
@@ -372,9 +398,13 @@ def main():
             print(
                 f"  rep {rep:3d} {wt[-32:]}: transport={t_ms:6.1f}ms ra={r_ms:7.1f}ms total={tot_ms:7.1f}ms"
             )
-        # Revert: push empty overlay → daemon clears WT overlay → verdict back to green.
+        # Revert: push the ORIGINAL-content overlay (matches base) so the
+        # daemon's overlay-set is non-empty real-content → it routes
+        # activity → cargo check → green. Same reasoning as the warm-up:
+        # empty-overlay pushes appear not to trigger activity routing in
+        # the current daemon, so use real-content no-op pushes.
         try:
-            post_overlay(base_url, token, wt, "HEAD", [])
+            post_overlay(base_url, token, wt, "HEAD", warmup_files)
         except Exception as e:
             print(f"  rep {rep} {wt}: revert-push failed: {e}")
         # Wait for green back (or timeout) to keep state clean.
