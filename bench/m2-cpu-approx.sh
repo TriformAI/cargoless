@@ -82,7 +82,7 @@ REFTAG="$(cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || echo "$(date +%
 CL_TGT="/tmp/m2-cl-tgt-${REFTAG}"
 say "building cargoless (release) @ streamed tree ..."
 BUILD_START=$(date +%s)
-( cd "$SRC" && CARGO_TARGET_DIR="$CL_TGT" $APPROVE cargo build -p cargoless --release --locked ) \
+( cd "$SRC" && CARGO_TARGET_DIR="$CL_TGT" TRIFORM_OPERATOR_APPROVED_BUILD=1 cargo build -p cargoless --release --locked ) \
   > /tmp/m2-cl-build.log 2>&1 \
   || { tail -30 /tmp/m2-cl-build.log; die "cargoless build failed"; }
 CL_BIN="$CL_TGT/release/cargoless"
@@ -93,7 +93,7 @@ BIN_MTIME=$(stat -c %Y "$CL_BIN" 2>/dev/null || echo 0)
 say "cargoless = $CL_BIN  mtime=$BIN_MTIME ($("$CL_BIN" --version 2>/dev/null | head -1))"
 
 # locked fetch on the fixture (Leptos deps) — honest BLOCKER if egress is absent
-( cd "$FIX" && $APPROVE cargo fetch --locked ) > /tmp/m2-fetch.log 2>&1 \
+( cd "$FIX" && TRIFORM_OPERATOR_APPROVED_BUILD=1 cargo fetch --locked ) > /tmp/m2-fetch.log 2>&1 \
   || die "cargo fetch --locked on bench/fixture failed (no crates.io egress?)"
 
 # ── helpers (descendant-tree walk, not pgid — the §11-v1 setsid lesson) ─
@@ -214,7 +214,7 @@ say "ARM-B: cold cargo-check per edit, shared warm /target (status-quo synthetic
 B_TGT="/tmp/m2-arm-b-tgt-${REFTAG}"
 rm -rf "$B_TGT"
 # warm /target ONCE — NOT measured (this is the operator's persistent-volume warmth)
-( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" $APPROVE cargo check --locked --all-targets ) \
+( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" TRIFORM_OPERATOR_APPROVED_BUILD=1 cargo check --locked --all-targets ) \
   > /tmp/m2-armb-warm.log 2>&1 \
   || { tail -15 /tmp/m2-armb-warm.log; die "ARM-B initial cold cargo-check failed (substrate broken)"; }
 say "  /target warmed; ARM-B per-edit measurements begin"
@@ -231,7 +231,7 @@ for i in $(seq 1 "$REPS"); do
   tf=/tmp/m2-armb-time-$i.log
   # { time SUBSHELL ; } 2> $tf  — outer { } captures the builtin's stderr;
   # inner ( ... > cargo.log 2>&1 ) keeps cargo's noise out of $tf.
-  { time ( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" $APPROVE \
+  { time ( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" TRIFORM_OPERATOR_APPROVED_BUILD=1 \
       cargo check --locked --all-targets > /tmp/m2-armb-cargo-$i.log 2>&1 ) ; } 2> "$tf"
   # parse "real user sys" (last non-empty line; bash may emit a leading blank)
   read -r realT userT sysT < <(awk 'NF>=3{l=$0} END{print l}' "$tf")
@@ -240,7 +240,7 @@ for i in $(seq 1 "$REPS"); do
   B_SAMPLES="${B_SAMPLES}${ms}"$'\n'; B_OK=$((B_OK+1))
   # revert + settle (NOT measured)
   do_edit "$FIX/$TRAIT_FILE" "$TRAIT_REPL" "$TRAIT_FIND" || true
-  ( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" $APPROVE cargo check --locked --all-targets ) \
+  ( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" TRIFORM_OPERATOR_APPROVED_BUILD=1 cargo check --locked --all-targets ) \
     > /tmp/m2-armb-settle-$i.log 2>&1 || true
   sleep "$INTER_EDIT_GAP"
 done
@@ -251,13 +251,13 @@ C_SAMPLES=""; C_OK=0
 if [ "$RUN_ARM_C" = "1" ]; then
   say "ARM-C: cold one-shot 'cargoless check' per edit (synthetic option-2)"
   rm -rf "$FIX/.cargoless"
-  ( cd "$FIX" && $APPROVE "$CL_BIN" check ) > /tmp/m2-armc-warm.log 2>&1 || true
+  ( cd "$FIX" && TRIFORM_OPERATOR_APPROVED_BUILD=1 "$CL_BIN" check ) > /tmp/m2-armc-warm.log 2>&1 || true
   export TIMEFORMAT='%R %U %S'
   for i in $(seq 1 "$REPS"); do
     do_edit "$FIX/$TRAIT_FILE" "$TRAIT_FIND" "$TRAIT_REPL" \
       || { say "  ARM-C rep $i: anchor-not-found — aborting arm"; break; }
     tf=/tmp/m2-armc-time-$i.log
-    { time ( cd "$FIX" && $APPROVE "$CL_BIN" check > /tmp/m2-armc-out-$i.log 2>&1 ) ; } 2> "$tf"
+    { time ( cd "$FIX" && TRIFORM_OPERATOR_APPROVED_BUILD=1 "$CL_BIN" check > /tmp/m2-armc-out-$i.log 2>&1 ) ; } 2> "$tf"
     read -r realT userT sysT < <(awk 'NF>=3{l=$0} END{print l}' "$tf")
     ms=$(awk -v u="${userT:-0}" -v s="${sysT:-0}" 'BEGIN{printf "%d", (u+s)*1000}')
     say "  ARM-C rep $i: real=${realT}s user=${userT}s sys=${sysT}s per-edit_cpu_ms=$ms"
