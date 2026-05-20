@@ -29,7 +29,12 @@ REPS="${REPS:-50}"
 PORT="${PORT:-8080}"
 INTER_REP_GAP="${INTER_REP_GAP:-1.0}"
 VERDICT_TIMEOUT="${VERDICT_TIMEOUT:-60}"
-WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-300}"
+# 900s budget: run-3 hit FAIL at the 300s default with `(no events received)` —
+# cold Leptos cargo check on a fresh per-WT /target plus RA workspace-load
+# + flycheck-barrier-settle takes longer than 5min from cold. Bumped to 15min
+# to give H1 (genuine cold-compile time) room; run-4's per-30s heartbeat will
+# reveal in real-time whether the daemon is making progress or SSE is silent.
+WARMUP_TIMEOUT="${WARMUP_TIMEOUT:-900}"
 WORK="${WORK:-/tmp/m3fleet}"
 MAXN="$(printf '%s\n' $NLIST | sort -n | tail -1)"
 

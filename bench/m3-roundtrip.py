@@ -207,6 +207,29 @@ def read_anchor_file(repo_root: Path) -> str:
     return p.read_text()
 
 
+def read_cli_status_file(wt_path: str) -> dict | None:
+    """Read `<wt>/.cargoless/cli-status` into a dict. None if absent or empty.
+
+    Schema (statusfile.rs): `schema=2`, `pid=...`, `root=...`, `started=...`,
+    `updated=...`, `verdict=green|red|unknown`, optional `crates=`, etc.
+    Used as a DAEMON-OWNED secondary signal independent of the SSE channel
+    — if SSE is silent but the on-disk cli-status shows the daemon converged,
+    that confirms H2 (SSE delivery broken) vs H1 (daemon hasn't converged yet).
+    """
+    p = Path(wt_path) / ".cargoless" / "cli-status"
+    if not p.is_file():
+        return None
+    try:
+        d: dict[str, str] = {}
+        for line in p.read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                d[k] = v
+        return d or None
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", required=True, help="e.g. http://127.0.0.1:8080")
@@ -315,12 +338,45 @@ def main():
             os._exit(2)
         # Drain SSE for this WT until green (or timeout). Log every event
         # received so a wedge of the form "no SSE frames at all" is
-        # distinguishable from "frames received but never green".
+        # distinguishable from "frames received but never green". 30s
+        # heartbeat surfaces cli-status (independent daemon-owned signal)
+        # so a silent-SSE state vs. genuine-still-compiling state are
+        # immediately diagnosable in real time — run-3's wedge was opaque
+        # until the 5min timeout fired; this surfaces progress live.
+        # Cli-status GREEN is also accepted as a fallback warmup signal:
+        # if the daemon has converged (per its own on-disk truth) but SSE
+        # hasn't delivered, the warmup is structurally done and we can
+        # proceed (rep loop's SSE-vs-cli-status fallback is a later
+        # iteration if H2 turns out true).
         timeout = args.warmup_timeout if i == 0 else args.verdict_timeout
         deadline = time.monotonic() + timeout
         got_green = False
         seen_verdicts: list[str] = []
+        last_heartbeat = time.monotonic()
+        HEARTBEAT_INTERVAL = 30.0
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                cs = read_cli_status_file(wt)
+                cs_v = cs.get("verdict", "?") if cs else "(no cli-status file)"
+                cs_u = cs.get("updated", "?") if cs else "?"
+                last_sse = seen_verdicts[-1] if seen_verdicts else "(none — SSE silent)"
+                print(
+                    f"  warmup {wt}: t+{now - t_warm0:.0f}s  "
+                    f"SSE-last='{last_sse}'  cli-status verdict='{cs_v}' updated={cs_u}"
+                )
+                last_heartbeat = now
+                # Fallback acceptance: if cli-status confirms GREEN but SSE
+                # is silent (or hasn't delivered yet), accept it. Daemon has
+                # converged per its own on-disk truth.
+                if cs and cs.get("verdict") == "green":
+                    print(
+                        f"  warmup {wt}: GREEN via cli-status FALLBACK at "
+                        f"t+{now - t_warm0:.0f}s "
+                        f"(SSE sequence: {' → '.join(seen_verdicts) or '(silent)'})"
+                    )
+                    got_green = True
+                    break
             try:
                 recv_ns, ev = queues[wt].get(timeout=0.5)
             except Empty:
@@ -328,15 +384,18 @@ def main():
             v = ev.get("verdict", "?")
             if not seen_verdicts or seen_verdicts[-1] != v:
                 seen_verdicts.append(v)
-                print(f"  warmup {wt}: verdict→{v} at t+{time.monotonic() - t_warm0:.1f}s")
+                print(f"  warmup {wt}: verdict→{v} at t+{time.monotonic() - t_warm0:.1f}s (via SSE)")
             if v == "green":
                 got_green = True
-                print(f"  warmup {wt}: GREEN in {time.monotonic() - t_warm0:.1f}s (sequence: {' → '.join(seen_verdicts)})")
+                print(f"  warmup {wt}: GREEN in {time.monotonic() - t_warm0:.1f}s via SSE (sequence: {' → '.join(seen_verdicts)})")
                 break
         if not got_green:
+            cs = read_cli_status_file(wt)
+            cs_v = cs.get("verdict", "?") if cs else "(no cli-status file)"
             print(
                 f"FAIL: worktree {wt} did not reach GREEN within {timeout}s "
-                f"(seen sequence: {' → '.join(seen_verdicts) or '(no events received)'})",
+                f"(SSE sequence: {' → '.join(seen_verdicts) or '(no events received)'}; "
+                f"final cli-status verdict: '{cs_v}')",
                 file=sys.stderr,
             )
             sys.stderr.flush()
