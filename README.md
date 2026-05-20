@@ -4,18 +4,22 @@
 > agent driving the loop — the moment it doesn't — without burning
 > your CPU to do so.**
 
-cargoless is a **repo-scoped** headless dev-loop daemon for Rust+WASM
-projects — one `serve --repo` multiplexes every git worktree through a
-single shared analyzer — built on one premise: most of the work
-`trunk serve` and `bacon` do on every save is **redundant work** —
-rebuilding state the previous cycle already proved correct. cargoless
-keeps a warm `rust-analyzer`,
-content-addresses every build's input set, and skips the rebuild
-entirely when the source state hasn't changed. When the tree does go
-green, it publishes the latest green WASM artifact to a pointer file
-via an atomic temp+fsync+rename; when the tree goes red, the pointer
-**does not move** — so anything consuming that pointer (a static
-server, a CI step, an agent) can rely on never seeing a broken build.
+cargoless is a **repo-scoped** headless dev-loop daemon for **any
+Cargo workspace** (native Rust or Rust+WASM) — one `serve --repo`
+multiplexes every git worktree through a single shared analyzer —
+built on one premise: most of the work `cargo check`, `trunk serve`,
+and `bacon` do on every save is **redundant work** — rebuilding state
+the previous cycle already proved correct. cargoless keeps a warm
+`rust-analyzer`, content-addresses every build's input set, and skips
+the rebuild entirely when the source state hasn't changed. When a
+WASM workspace's tree goes green, it publishes the latest green WASM
+artifact to a pointer file via an atomic temp+fsync+rename; when the
+tree goes red, the pointer **does not move** — so anything consuming
+that pointer (a static server, a CI step, an agent) can rely on never
+seeing a broken build. (The WASM-artifact publisher tier engages only
+on `cdylib + wasm32` / `leptos` workspaces — by nature, there is no
+WASM artifact to publish on a native target. The check / serve / watch
+tiers are target-general.)
 
 The net effect is **≈half the per-edit CPU of `trunk serve`**
 (two-source verified) — and therefore more dev cycles per battery —
@@ -129,8 +133,10 @@ audit trail:
 is per agent-edit-batch, never per-keystroke. Humans run it too, but
 the design center is the agent fleet loop.
 
-**cargoless IS** — a *repo-scoped headless checker + latest-green
-publisher* that collapses the fleet onto one shared analyzer:
+**cargoless IS** — a *repo-scoped headless checker* for any Cargo
+workspace, with an opt-in *latest-green WASM-artifact publisher* for
+Rust+WASM workspaces, that collapses the fleet onto one shared
+analyzer:
 
 - `cargoless serve --repo <path>` — **the fleet entrypoint.** Auto-
   discovers every git worktree (`git worktree list`), routes file
@@ -139,18 +145,36 @@ publisher* that collapses the fleet onto one shared analyzer:
   this is the architecture that makes the agent-fleet RAM story flat
   (see "At a glance"). Pinned-base + per-tree cache are decoupled;
   corun batching folds non-overlapping worktrees into one check.
+  Target-general — works on any Cargo workspace.
 - `cargoless check` — one-shot verdict + diagnostics, formatted
   file:line:col + severity + code + message; per-crate verdicts so an
-  agent can gate one crate independently of another.
+  agent can gate one crate independently of another. Target-general.
 - `cargoless watch` — continuous timestamped verdict stream
   (single-worktree mode; subsumed by `serve --repo` at fleet scale,
-  not removed).
+  not removed). Target-general.
 - `cargoless build --watch --out <dir>` — wraps `trunk build` and
   publishes the latest green WASM artifact via an atomic
   `.cargoless/latest-green` pointer that **only advances on green**.
-- Zero-config — auto-detects `cdylib` + `wasm32` / `leptos` projects.
+  **WASM-specific by nature** — requires `cdylib + wasm32` /
+  `leptos`; no WASM artifact exists to publish on a native target.
+- Zero-config — auto-detects any Cargo workspace; native Rust and
+  `cdylib + wasm32` / `leptos` workspaces all work without flags.
+  The WASM-artifact publisher tier engages only when the workspace is
+  `cdylib + wasm32` (per the line above).
 - Survives `kill -9` of the underlying rust-analyzer; the supervisor
   restarts it transparently.
+
+> **Honest scope note (post-#241 de-WASM-gate).** For native-Rust
+> workspaces, cargoless's check tier is rust-analyzer flycheck
+> wrapping host-triple `cargo check` — *the same checker `bacon`
+> runs*. cargoless's differentiator for the native-Rust case is
+> **not** a novel checker; it is the shared-RA fleet-RAM property
+> (one multiplexed RA across N worktrees — see Leg C), the
+> verdict-provenance discipline (per-crate + diagnostics retention),
+> and the soon-shipping central in-cluster topology (parked
+> design-ahead spec, ships bundled with Increment-2 overlay-push
+> implementation). The WASM-artifact publisher and the Rust+WASM
+> inner-loop story remain the launch wedge.
 
 **cargoless is NOT** — a `trunk serve` drop-in replacement (yet). It
 does not include a browser/HTTP/WebSocket layer; that adapter is
@@ -236,7 +260,9 @@ cargoless surfaces an actionable error if `trunk` is missing from PATH.
 ## Quick start
 
 ```bash
-# In a Rust + WASM project root (auto-detected: cdylib + wasm32 / leptos)
+# Any Cargo workspace root — auto-detected. (This example: Rust + WASM,
+# cdylib + wasm32 / leptos; native-Rust workspaces work the same way at
+# the check / serve / watch tier.)
 $ cargoless check
 >> checking /work/my-app (auto-detected: cdylib + leptos (Leptos CSR))
 ok green — every tracked file compiles
