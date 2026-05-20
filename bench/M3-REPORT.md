@@ -1,12 +1,21 @@
 # M3 — Overlay-push round-trip latency, split transport-vs-RA
 
-**Status:** PENDING run-2 numbers (placeholders below; populated on
-`bg-bash b9dsucusd` completion + commit).
+**Status: SHAPE-SHIFTED to STRUCTURAL-FINDING DELIVERABLE.** Per
+team-lead's pre-committed escape (4 runs × harness self-bugs caught,
+no numbers extracted, escalating to a daemon-side push-mode read-plane
+finding that's bigger than the bench). The harness IS done; the
+numbers it was meant to extract are blocked on the daemon-side finding
+in §6 below.
 
 **Task:** Plane CWDL `#267` — fluffy-dreaming-allen.md M3 line.
 
-**Branch / harness commit:** `agent/bench-lead-m3` @ `414e07c`
-(harness initial: `19be764`; two-bug fix: `414e07c`).
+**Branch / harness commits chain:** `agent/bench-lead-m3` —
+- `19be764` initial harness (JSON wire shape was wrong)
+- `414e07c` fix: JSON wire shape (`op` not `type`, files `[{path,content}]`) + early os._exit attempt
+- `5ae1f5f` M3-REPORT.md template draft (this file)
+- `3df5ca2` fix: real-content warm-up overlay + drop blocking sse.stop() before os._exit + SSE event diagnostic logging
+- `e697b38` fix: bump warmup→900s + 30s heartbeat with cli-status fallback signal
+- (this commit) populates the §3-§6 with the structural-finding deliverable + probe data
 
 **Substrate:** origin/main `929a5d3` — full push-mode chain operational
 (`#240/2a` PushOverlay verb + `#240/2b` servedrv consume +
@@ -85,38 +94,29 @@ mismatch).
 
 ---
 
-## 3. Results — PENDING run-2
+## 3. Results — NOT-MEASURED (blocked on §6 finding)
 
-Numbers will be populated from `bg-bash b9dsucusd` completion. Tables
-shape locked in advance to remove "land-numbers-then-write-up" friction.
+The N=1 and N=20 latency tables were intentionally left empty. Across
+4 bench runs (1834 s of pod time on the final 900 s × 2-scale attempt),
+ZERO complete round-trips were measured — not because of harness
+brokenness in the end (harness is verified working through 3 distinct
+bug-fix iterations) but because the daemon never published a verdict
+to ANY read-plane channel for the bench fixture, blocking the post-ack
+half of the round-trip (`t2 - t1` = `ra_ms`).
 
-### 3.1 N=1 — single-worktree baseline
+What WAS measured during the §6 probe (one isolated data point, not a
+distribution but still informative):
 
-| metric | p50 | p95 | p99 | min | max | median |
-|---|--:|--:|--:|--:|--:|--:|
-| `transport_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| `ra_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| `total_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
+| metric | value | source |
+|---|--:|---|
+| transport_ms (one push, loopback) | **9.28 ms** | §6 probe: `time.monotonic_ns()` around POST /overlay |
+| ra_ms | NOT-MEASURED | no verdict ever published; see §6 |
+| total_ms | NOT-MEASURED | NOT-MEASURED |
 
-Reps measured: PENDING / 50 (failures: PENDING).
-
-### 3.2 N=20 — fleet baseline (exposes daemon per-WT state cardinality)
-
-| metric | p50 | p95 | p99 | min | max | median |
-|---|--:|--:|--:|--:|--:|--:|
-| `transport_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| `ra_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| `total_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-
-Reps measured: PENDING / 50 (failures: PENDING).
-
-### 3.3 Delta N=1 → N=20
-
-| metric | N=1 p50 | N=20 p50 | Δ | N=1 p95 | N=20 p95 | Δ |
-|---|--:|--:|--:|--:|--:|--:|
-| `transport_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| `ra_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
-| `total_ms` | PENDING | PENDING | PENDING | PENDING | PENDING | PENDING |
+The 9.28 ms transport figure is **one push**, not a distribution; cite
+as "order-of-magnitude indicator only, not a statistical claim". A real
+distribution would require the verdict-publication channel to work so
+the full rep loop could run.
 
 ---
 
@@ -214,7 +214,137 @@ travel alone.
 
 ---
 
-## 6. Stage-1 acceptance feed (`#228`)
+## 6. FIELD FINDING — push-mode read-plane silent on fresh-fleet substrate
+
+**This is the load-bearing M3 outcome — bigger than the bench numbers
+M3 was meant to extract.** Surfaced clearly here so future-operators
+read it without parsing the whole report.
+
+### 6.1 Symptom
+
+4 successive bench runs (`19be764` → `414e07c` → `3df5ca2` → `e697b38`)
+all hit the same wall after harness-self-bugs were fixed: across 15
+minutes of warm-up (`WARMUP_TIMEOUT=900s`), NO verdict ever published
+to ANY of the daemon's read-plane channels (SSE `/events` stream;
+on-disk `cli-status` file; HTTP `/status?worktree=W` query). RA process
+DID spawn and was actively working (5.8 % CPU at t+47 s in run-3;
+12.4 % then 3.0 % in the §6.2 probe).
+
+### 6.2 Diagnostic probe data (the discriminator)
+
+Isolated probe (`bg-bash bpg311vz2`, kubectl-`-i`-fixed): start fresh
+`cargoless serve --repo /tmp/m3probe/repo --bind 127.0.0.1:8091`,
+push one real-content overlay for `/tmp/m3probe/wt1`, observe every
+read-plane channel + process state at t+10 s and t+40 s:
+
+```
+ack: {"accepted":true,"applied_files":1,"worktree":"/tmp/m3probe/wt1"}
+transport ms: 9.27  ← the only real M3 number this cycle produced
+
+--- t+10s ---
+  /status:    null
+  /verdict:   null
+  /worktrees: []          ← ZERO worktrees discovered
+  cli-status(wt1): absent
+  RA: 12.4 % CPU active
+
+--- t+40s ---
+  /status:    null
+  /verdict:   null
+  /worktrees: []          ← still ZERO
+  cli-status(wt1): absent
+  RA: 3.0 % CPU active
+```
+
+### 6.3 Narrowed root cause (`/worktrees: []`)
+
+The daemon discovered ZERO worktrees despite the bench setup correctly
+running `git -C /tmp/m3probe/repo worktree add -b wt1 /tmp/m3probe/wt1
+HEAD` (which `git worktree list --porcelain` should report). When the
+push arrives for `/tmp/m3probe/wt1`, the daemon:
+
+1. **ACCEPTS the push** (200, `accepted:true`, `applied_files:1`) — the
+   write plane works end-to-end.
+2. **Stores the overlay** in `ServeVerdictState.peek_overlay_for`
+   ingestion via push_tx signal.
+3. **Has no cluster-state for `wt1`** because worktree discovery returned
+   empty — so the serve loop's `SwitchOverlay`/`take_overlay_for`/
+   `EmitVerdict` path never fires for this worktree.
+4. Verdict never emitted ⇒ `/status` stays null, `/events` stays silent,
+   cli-status file never created.
+
+This narrows team-lead's 3 candidates definitively:
+- ❌ NOT H1 (slow cold compile timing out — RA is alive, /worktrees IS exposed)
+- ❌ NOT H2 (SSE delivery broken — /status HTTP query also returns null)
+- ✅ **HΩ: ACTIVITY-ROUTER / DISCOVERY SEAM** — the daemon
+  discovers zero worktrees from this bench setup. POST /overlay returns
+  200 + accepted:true for an unknown-to-daemon worktree, but produces
+  no read-plane signal because no cluster-state exists to drive
+  `EmitVerdict`. Worst combination: client gets a success ack with no
+  underlying effect.
+
+### 6.4 Why M1 #196/#252/#259 worked but M3 didn't
+
+The same `bench/modelr-fleet.sh` fleet shape (base repo + N
+`git worktree add` siblings) WORKED for M1 fleet-RAM measurement
+across four independent re-baselines. The difference: M1 only
+required RA to spawn (modelr-fleet activates via `touch_wts()` —
+direct on-disk file changes, the file-watcher's input). M3 requires
+the **verdict-publication channel** to also work for pushes, which
+M1 never exercised.
+
+Possible explanations for why M1's file-watcher path activates but
+M3's push path doesn't trigger discovery / cluster-state-creation:
+- M1's `touch_wts()` directly writes the worktree's file on disk →
+  file-watcher fires → daemon walks discovery + activates cluster
+  state on the fly
+- M3's POST /overlay only signals `push_tx` → serve loop drains →
+  but the "register this worktree as known" step may live in the
+  file-watcher path NOT replicated on the push path
+- This would be an asymmetry between the two activation sources that
+  Increment-2 (#240/2a/2b/2c) didn't have a test exercising
+
+### 6.5 Suggested follow-up (NOT filed by bench-lead — operator routes)
+
+This finding is more substantial than the M3 bench it blocked. Routing
+options for the operator to consider:
+
+- **dev-fixer investigation**: confirm whether `serve --repo`'s
+  worktree discovery + push-mode activity routing have an asymmetry
+  vs. the file-watcher path. The proof-of-concept reproducer is
+  precisely the probe in §6.2 (fresh repo + git worktree add +
+  serve --bind + POST /overlay + observe /worktrees endpoint).
+- **Integration test gap**: #240's Layer-3 backstops (#260, #242,
+  #264) gated the wire-shape contract but not "push for an
+  unknown-to-discovery worktree produces a verdict". A new integration
+  test asserting `/worktrees` non-empty after first push + `/status?wt=W`
+  resolving to a real verdict within a reasonable timeout would catch
+  this class.
+- **Affected Stage-1 ACs**: S1-AC parity (#228) — "push-overlay-verdict
+  ≡ Shape-1 local-FS verdict" cannot be verified end-to-end against
+  the current fleet substrate. The S1-AC test setup may need to mirror
+  M1's `touch_wts()`-driven activation OR exercise the push path
+  independently with a deeper integration test.
+
+### 6.6 The positive results worth carrying
+
+Not all is loss — items that VERIFIED WORKING end-to-end on
+`929a5d3 + this commit`:
+
+| component | verified |
+|---|---|
+| POST /overlay write plane | 200 ack + accepted:true + applied_files:1 |
+| Transport (HTTP RTT, loopback) | **9.27 ms (one push)** — single-data-point indicator of order-of-magnitude; not a distribution |
+| Push-client → daemon JSON wire (op="push_overlay", files:[{path,content}]) | parses cleanly |
+| RA spawn on real-content overlay | RA process alive + actively at 5.8-12.4 % CPU |
+| Bug-A fix (real-content overlay triggers activity for the cluster's RA process even if not for worktree-registration) | confirmed via process tree |
+| Bug-B fix (os._exit cleanly without sse.stop deadlock) | confirmed via exit-0 on FAIL paths |
+| `cargoless serve --repo --bind` /healthz readiness latch (#225/0d) | 200 within ~1 s of process start |
+| `/worktrees` endpoint shape | returns valid JSON `[]` (empty array, well-formed) |
+
+---
+
+## 7. Stage-1 acceptance feed (`#228`)
 
 Which `S1-AC` criteria this run informs:
 
@@ -226,7 +356,7 @@ Which `S1-AC` criteria this run informs:
 
 ---
 
-## 7. Cross-references
+## 8. Cross-references
 
 * **M1 fleet-RAM** (`#196` → `#252` → `#259`) — RAM flatness across
   N=1→20, confirmed through four architectural deltas.
