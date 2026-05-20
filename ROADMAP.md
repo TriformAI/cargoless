@@ -140,18 +140,28 @@ that protect the launch surface. Each is on the v0.1 or v1 list.
 
 ---
 
-## Post-v0.2.0 (in-flight on `main`) — central in-cluster topology
+## Post-v0.2.0 — central in-cluster topology (substantively on `main`)
 
-The Increment-5 umbrella (Plane #245) — a workstream that emerged
-**after** v0.2.0 tagged, distinct from the v0.1 browser-reload
-adapter (see below). Where v0.1 targets the local human-developer
-browser-reload loop, this workstream targets the **in-cluster
-agent-fleet / CI** consumer: a long-lived `cargoless serve` deployed
-as a Kubernetes Service that other in-cluster consumers query via
-HTTP+SSE+bearer for verdicts and ingest via `POST /overlay` for
-overlay-pushed (no-shared-FS) workloads. The two workstreams are
-parallel and orthogonal — both layer on top of the v0 cores, neither
-blocks the other.
+A workstream that emerged **after** v0.2.0 tagged, distinct from the
+v0.1 browser-reload adapter (see below). Where v0.1 targets the local
+human-developer browser-reload loop, this workstream targets the
+**in-cluster agent-fleet / CI** consumer: a long-lived `cargoless
+serve` deployed as a Kubernetes Service that other in-cluster
+consumers query via HTTP+SSE+bearer for verdicts and ingest via
+`POST /overlay` for overlay-pushed (no-shared-FS) workloads. The two
+workstreams are parallel and orthogonal — both layer on top of the
+v0 cores, neither blocks the other.
+
+**The central-daemon write-plane is END-TO-END ON `main`** — client
+push (`cargoless push --remote <url>`) → daemon HTTP ingest (`POST
+/overlay`, bearer-gated) → overlay-set apply (proven `overlay::diff`
+byte-unchanged) → verdict publish → SSE transition stream — this is
+the substantive post-launch landing. The Increment-5 OTEL umbrella
+(Wave-1 traces shipped, Wave-2 metrics parked — see below) is the
+observability companion to that landed surface. The deploy-milestone
+(image bake → manifest apply → in-cluster service) is designed-and-
+parked pending the operator pre-stage authorisation (#235) — see
+"What's PARKED or PENDING" below.
 
 ### What's LANDED on `main` (substantively shipped)
 
@@ -199,25 +209,42 @@ blocks the other.
   `cargoless-otel-headers` Secret + verification + activation
   sequence. Makes the deploy-milestone executable, not just designed.
 
-### What's IN FLIGHT (not yet on `main`)
+### What's PARKED or PENDING (not yet on `main`)
+
+> **Honest framing distinction:** "parked" = designed-and-paused (no
+> active implementation capacity engaged; ready to resume); "pending"
+> = waiting on an operator/external gate to fire. Neither means
+> canceled. The known-future-want umbrellas stay tracked (Plane #245
+> is the canonical anchor for the Increment-5 umbrella).
 
 - **Increment-5 Wave-2 — metrics layer (5d)** + broader 5c spans +
-  AC4 keystone-invariant test. Off `agent/dev-fixer-w2`. Adds
-  counters (`cargoless_overlay_reset_total` /
-  `cargoless_ra_restart_total` / `cargoless_initial_spawn_total` /
-  `cargoless_verdict_total` / ...), histograms
-  (`cargoless_save_to_verdict_seconds`), gauges
+  AC4 keystone-invariant test. **PARKED** (was off
+  `agent/dev-fixer-w2`; implementation capacity disengaged — Wave-2
+  is deferred until capacity re-engages, NOT canceled). Plane #245
+  umbrella stays pending in the backlog as the honest anchor. When
+  Wave-2 eventually lands it adds counters
+  (`cargoless_overlay_reset_total` / `cargoless_ra_restart_total` /
+  `cargoless_initial_spawn_total` / `cargoless_verdict_total` / ...),
+  histograms (`cargoless_save_to_verdict_seconds`), gauges
   (`cargoless_ra_resident_bytes` — the headline "fleet-RAM flat
-  across N" claim made VISIBLE). When Wave-2 lands, the AC4 metric
-  divergence sentry becomes live-fireable (operator runbook for
-  that alert ships alongside this ROADMAP refresh as
-  `docs/observability/AC4-DIVERGENCE-RUNBOOK.md`).
-- **Image-bake pipeline**: a release-pipeline workflow producing
-  `registry.triform.cloud/cargoless/cargoless-serve:<version>` from
-  the integ-build artifact. The pre-stage runbook's
-  `REGISTRY_TRIFORM_*` secrets feed this.
-- **#235 operator pre-stage activation**: the operator authorising
-  the deploy milestone — pre-stage runbook is the bridge.
+  across N" claim made VISIBLE). The AC4 metric divergence sentry
+  becomes live-fireable then (operator runbook for that alert ships
+  alongside this ROADMAP refresh as
+  `docs/observability/AC4-DIVERGENCE-RUNBOOK.md`); until then the
+  AC4 invariant is verified by the source-structural #247 fix +
+  the keystone-event presence in Wave-1 traces (manual SigNoz trace
+  query) — see [AC4 three-layer defense]
+  (the runbook explains the pre-Wave-2 verification status).
+- **Deploy-milestone — designed + manifests parked, NOT yet
+  deployed.** The cargoless-serve k8s manifest (Increment-1, #226) is
+  parked on `agent/builder-infra-serve-k8s @ 7bd82a4` (off `cc206da`,
+  rebase-pending). The image-bake release-pipeline workflow (#234)
+  producing `registry.triform.cloud/cargoless/cargoless-serve:<version>`
+  is parked alongside. **PENDING** on #235 operator pre-stage
+  activation — the operator's authorising decision is the gate;
+  the pre-stage runbook
+  (`docs/operator/DEPLOY-MILESTONE-PRESTAGE.md`, lands alongside
+  this ROADMAP refresh) is the bridge from "designed" to "executable".
 
 ### Design anchors
 
