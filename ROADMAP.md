@@ -1,7 +1,15 @@
 # Roadmap
 
-> **Status snapshot (2026-05-18):** the **repo-scoped Model-R daemon**
-> is feature-complete; launch hardening in progress. Fleet RAM is
+> **Status snapshot (2026-05-20):** the **repo-scoped Model-R daemon**
+> is feature-complete and **v0.2.0 is tagged** (operator-decided
+> 2026-05-19; ratified on `main`). Since the tag, the **central
+> in-cluster topology** workstream has landed substantively on `main`
+> (Increment-0 read-plane wiring + Increment-1 deploy manifest design
+> + Increment-2 overlay-push ingest 2a/2b/2c + Increment-4
+> de-WASM-gate + Wave-1 OTEL traces + #247 STOP-class fix + operator
+> pre-stage runbook) — that workstream is documented below in the new
+> "Post-v0.2.0 (in-flight)" section, parallel to (NOT before) the
+> still-deferred v0.1 browser-reload adapter. Fleet RAM remains
 > **measured flat** — ≈1 GiB across N ∈ {1,2,4,8,16,20} active
 > worktrees, ≈19–30× collapse vs the per-worktree-daemon model, one
 > multiplexed rust-analyzer mechanism-verified
@@ -10,18 +18,22 @@
 > "~19.4 GiB BORDERLINE" extrapolation. The ≈2.05× per-edit CPU win vs
 > `trunk serve` is **unchanged under Model R** (two-source-confirmed,
 > §8.5). The browser/HTTP adapter remains deferred (orthogonal to the
-> daemon). **The version tag is `v0.2.0` (operator-decided
-> 2026-05-19); the public-launch GO remains the operator's
-> decision** — this roadmap describes capabilities, not a ship date.
+> daemon and to the central in-cluster topology). **The
+> public-launch GO remains the operator's decision** — this roadmap
+> describes capabilities, not a ship date.
 
 cargoless's earlier per-worktree single-tree checker (the `watch`-per-WT
 shape) was a **superseded internal intermediate**; the repo-scoped
-daemon (`serve --repo`, one multiplexed RA) is the architecture. The
-browser/reload adapter is the obvious next adapter (deferred,
-orthogonal); the parking lot is the rest of the ambitious-but-not-now
-ideas. Anything that doesn't sharpen the codebase's self-knowledge or
-reduce the latency from brokenness to signal is **not** in the launch
-surface — it goes to the deferred adapter or the parking lot.
+daemon (`serve --repo`, one multiplexed RA) is the architecture.
+Post-v0.2.0, **two parallel workstreams** exist beyond v0: the
+**central in-cluster topology** (Increment-5 umbrella — already
+substantively landed on `main`, see "Post-v0.2.0" below) and the
+**v0.1 browser-reload adapter** (still deferred, orthogonal to both
+the daemon and the central topology). The parking lot is the rest of
+the ambitious-but-not-now ideas. Anything that doesn't sharpen the
+codebase's self-knowledge or reduce the latency from brokenness to
+signal is **not** in the launch surface — it goes to one of those
+parallel workstreams or to the parking lot.
 
 > **Name:** the product, the published crate, and the binary are all
 > **`cargoless`** (operator decision D1, 2026-05-17). Internal library
@@ -120,20 +132,134 @@ that protect the launch surface. Each is on the v0.1 or v1 list.
   the shared-RA fleet-RAM property (one multiplexed RA across N
   worktrees — flat in N, see the status snapshot), the
   verdict-provenance discipline (per-crate + diagnostics retention),
-  and the soon-shipping central in-cluster topology (parked
-  design-ahead spec, ships bundled with Increment-2 overlay-push
-  implementation).
+  and the **central in-cluster topology** (Increment-5 umbrella —
+  substantively landed on `main`; see "Post-v0.2.0" below for what's
+  shipped vs in-flight).
 - **No hot-swap, no symbol-level granularity, no editor LSP plugin.**
   Per the v1 parking list.
+
+---
+
+## Post-v0.2.0 (in-flight on `main`) — central in-cluster topology
+
+The Increment-5 umbrella (Plane #245) — a workstream that emerged
+**after** v0.2.0 tagged, distinct from the v0.1 browser-reload
+adapter (see below). Where v0.1 targets the local human-developer
+browser-reload loop, this workstream targets the **in-cluster
+agent-fleet / CI** consumer: a long-lived `cargoless serve` deployed
+as a Kubernetes Service that other in-cluster consumers query via
+HTTP+SSE+bearer for verdicts and ingest via `POST /overlay` for
+overlay-pushed (no-shared-FS) workloads. The two workstreams are
+parallel and orthogonal — both layer on top of the v0 cores, neither
+blocks the other.
+
+### What's LANDED on `main` (substantively shipped)
+
+- **Increment-0 — read-plane wiring** (#225): `servedrv` constructs
+  a `VerdictService` over its per-WT state, binds `HttpServer::bind`
+  with `authorizer_for(&cfg)`, emits `TransitionEvent` from the sole
+  `EmitVerdict` site, exposes the unauthenticated `/healthz`
+  readiness route (#236).
+- **Increment-1 — deploy manifest design** (#226): the long-lived
+  cargoless-serve Service shape (Namespace + bearer-auth Secret +
+  RWO state PVC + Deployment with `terminationGracePeriodSeconds=90`
+  + ClusterIP Service + Ingress/Egress NetworkPolicy). Parked on
+  `agent/builder-infra-serve-k8s` for the rebase + image-bake
+  pipeline activation; the design is durable.
+- **Increment-2 — overlay-push ingest** (#240): additive
+  `Request::PushOverlay { worktree, base_ref, files }` proto verb +
+  the HTTP server's first body-reading bearer-gated `POST /overlay`
+  route + `ServeVerdictState::push_overlay` override + serve-loop
+  drain consuming pushed overlays into the existing `SwitchOverlay`
+  arm + thin push-client (`cargoless push --remote <url>`). The pure
+  `overlay::diff()` core is **byte-unchanged** — only the OverlaySet
+  *source* swaps from disk-read to pushed payload.
+- **Increment-4 — de-WASM-gate** (#241): `cargoless check`/`serve`
+  accepts ANY Cargo workspace (native Rust or Rust+WASM). The check
+  / serve / watch tiers are target-general; the `build --watch
+  --out` WASM-artifact publisher remains WASM-specific by nature.
+- **Increment-5 Wave-1 — OTEL telemetry foundation + keystone spans**
+  (#246): `crates/cargoless/src/telemetry.rs` OTEL+SigNoz init via
+  OTLP HTTP/protobuf + 5 keystone spans/events (`ra.spawn`,
+  `ra.respawn`, `overlay.reset`, `overlay.switch`, `verdict.publish`)
+  in `servedrv.rs`. Fail-soft contract (no endpoint ⇒ inert handle,
+  zero overhead). 5s shutdown timeout. Resource attrs:
+  `service.name` / `service.version` / `cargoless.build_id`.
+- **#247 STOP-class structural fix**: `ClusterDriver::reset_after_respawn`
+  + `Ctrl::Spawned` wire fix — guarantees every RA-(re)spawn is
+  followed by `OverlayMultiplexer::reset()` before any subsequent
+  `switch_to` for that cluster. This is the source-structural layer
+  of the AC4 three-layer defense (see [`D-INC2-OBSERVABILITY.md`](docs/design/D-INC2-OBSERVABILITY.md) §1.5).
+- **Operator pre-stage runbook** (lands alongside this ROADMAP
+  refresh as `docs/operator/DEPLOY-MILESTONE-PRESTAGE.md` — currently
+  parked on `agent/docs-launch-lead-prestage`, pending integration):
+  the operator-actionable checklist for `REGISTRY_TRIFORM_USER`/
+  `REGISTRY_TRIFORM_TOKEN` Forgejo repo secrets + the
+  `cargoless-otel-config` ConfigMap shape + the optional
+  `cargoless-otel-headers` Secret + verification + activation
+  sequence. Makes the deploy-milestone executable, not just designed.
+
+### What's IN FLIGHT (not yet on `main`)
+
+- **Increment-5 Wave-2 — metrics layer (5d)** + broader 5c spans +
+  AC4 keystone-invariant test. Off `agent/dev-fixer-w2`. Adds
+  counters (`cargoless_overlay_reset_total` /
+  `cargoless_ra_restart_total` / `cargoless_initial_spawn_total` /
+  `cargoless_verdict_total` / ...), histograms
+  (`cargoless_save_to_verdict_seconds`), gauges
+  (`cargoless_ra_resident_bytes` — the headline "fleet-RAM flat
+  across N" claim made VISIBLE). When Wave-2 lands, the AC4 metric
+  divergence sentry becomes live-fireable (operator runbook for
+  that alert ships alongside this ROADMAP refresh as
+  `docs/observability/AC4-DIVERGENCE-RUNBOOK.md`).
+- **Image-bake pipeline**: a release-pipeline workflow producing
+  `registry.triform.cloud/cargoless/cargoless-serve:<version>` from
+  the integ-build artifact. The pre-stage runbook's
+  `REGISTRY_TRIFORM_*` secrets feed this.
+- **#235 operator pre-stage activation**: the operator authorising
+  the deploy milestone — pre-stage runbook is the bridge.
+
+### Design anchors
+
+- [`docs/design/D-FLEET-SHARED-DAEMON.md`](docs/design/D-FLEET-SHARED-DAEMON.md)
+  — the central-service architecture this workstream realises.
+- [`docs/design/D-INC2-2B.md`](docs/design/D-INC2-2B.md) — the
+  Increment-2 2b servedrv-consume implementation anchor (the
+  overlay-push contract that 2a/2b/2c implement; promoted from
+  spike with the Inc-2 land, so it covers the same scope the
+  original `D-PUSHOVERLAY.md` design-ahead spec did).
+- `docs/design/D-INC2-OBSERVABILITY.md` (lands alongside this
+  ROADMAP refresh — currently parked on `agent/docs-launch-lead-w2-docs`,
+  pending integration) — the Increment-5 implementation-anchor; the
+  Wave-1 vs Wave-2 distinction; the 5 design invariants
+  (cores-stay-log-free, fail-soft, default-no-op, 5s shutdown
+  budget, AC4 regression-sentry).
+- `docs/observability/cargoless-dashboard.json` (same parked branch
+  as above) — the 23-panel SigNoz/Grafana-import dashboard sketch;
+  each panel marks WAVE-1-LIVE vs WAVE-2-PENDING.
+
+### Honest scope
+
+This workstream is **post-v0.2.0 and pre-launch-GO**. It does NOT
+change the v0 capabilities described above; it ADDS the in-cluster
+deployment shape on top of the same v0 cores. The launch GO remains
+the operator's decision and is orthogonal to this workstream's
+completion — operators can choose to ship v0.2.0 (local-only) and
+activate the central in-cluster topology independently when
+business needs justify it.
 
 ---
 
 ## v0.1 — optional live server / browser-reload adapter (deferred)
 
 A thin adapter on top of the v0 latest-green publisher. It consumes the
-published `.cargoless/latest-green` output and adds the browser. **None of
-this is required for the v0 launch — it is the next obvious step, not a
-shipping promise with a date.**
+published `.cargoless/latest-green` output and adds the browser.
+**Distinct from the central in-cluster topology above** — v0.1 targets
+the local human-developer browser-reload loop; the central topology
+targets the in-cluster agent-fleet / CI consumer. The two are
+parallel, neither blocks the other. **None of this is required for
+the v0 launch — it is the next obvious step for the
+local-developer-browser case, not a shipping promise with a date.**
 
 - HTTP static server over the latest-green directory.
 - WebSocket channel to the browser; Trunk-compatible reload protocol,
@@ -155,7 +281,14 @@ surface area for a feature that is strictly additive on top of the
 publisher contract. Better to ship v0 honest and small than v0 + v0.1
 half-done.
 
-### v0.1 perf follow-up — the RAM ladder (full design in `D-RAM-TIERS.md`)
+### Single-RA RAM follow-up — the tiered ladder (full design in `D-RAM-TIERS.md`)
+
+> Applies to BOTH the post-v0.2.0 central in-cluster topology AND
+> the still-deferred v0.1 browser-reload adapter — both ride on the
+> same single multiplexed rust-analyzer, so any ladder reduction
+> applies once across all consumer shapes. The section title used to
+> read "v0.1 perf follow-up"; the ladder is in fact orthogonal to
+> which post-v0 workstream is shipping.
 
 **The launch fleet-RAM story is Model R's measured architectural
 collapse** (one multiplexed rust-analyzer, total RSS flat in worktree
@@ -189,7 +322,7 @@ that one process (numbers from
   workload-shape-dependent (function of `gap / RA-busy-time` —
   ≈5 % on the bench's tight-gap Leptos regime, larger at real
   minute-scale agent-think-gaps).
-- **`--features csr`** (project-narrowable only) — ≈**−75 %** RSS
+- **`--features csr`** (project-narrowable only) — ≈**−75 %** RSS  
   (`AC7-THROUGHPUT-REPORT §5/A4` vs same A2 baseline) + CPU collapse.
   The v0.1 auto-narrow change makes the narrowed
   configuration the **auto-detected default** rather than an opt-in
@@ -214,26 +347,37 @@ single-RA-ladder design tracked in
 
 ---
 
-## v1 — parking lot (not v0, not v0.1)
+## v1 — parking lot (not v0, not v0.1, not the central in-cluster topology)
 
 The long-horizon list. These are deliberately **not** on a roadmap with
 dates; they're the ideas that would justify their own design pass and
-their own sprint if and when v0 / v0.1 prove the foundation:
+their own sprint if and when the v0 + post-v0.2.0 + v0.1 surfaces
+prove the foundation:
 
 - salsa / rust-analyzer-as-library deep integration
 - remote / shared CAS backend
-- team features + remote auth
-- multi-agent build coordination
+- **team features + remote auth** — PARTIALLY ADDRESSED by the
+  bearer-auth `Authorizer` shipped in Wave-1 (the network seam exists
+  + is fail-closed; multi-tenant team primitives still parking-lot).
+- **multi-agent build coordination** — PARTIALLY ADDRESSED by the
+  central in-cluster topology (one shared service many agents
+  consume); deeper cross-agent coordination still parking-lot.
 - editor LSP-style interface (cargoless-as-LSP)
 - symbol-level green/red granularity
 - replacing `trunk build` internals
 - hot-swap WASM
-- CI integration (cargoless-as-CI-driver)
+- **CI integration (cargoless-as-CI-driver)** — PARTIALLY ADDRESSED
+  by the Increment-2 thin push-client (`cargoless push --remote
+  <url>`) which is the natural CI-stage shape; deeper integration
+  (cargoless-as-the-CI-platform) still parking-lot.
 - Windows support
 
 If you find yourself wanting one of these, open an issue — community
 demand is the strongest signal we have for what graduates from v1 to a
-later v0.x or v1.0.
+later v0.x or v1.0. (For the three "PARTIALLY ADDRESSED" items above:
+the partial-coverage is the post-v0.2.0 central-topology landed work;
+the parking-lot entry remains for the deeper feature beyond what's
+shipped.)
 
 ---
 
