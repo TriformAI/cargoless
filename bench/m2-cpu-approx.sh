@@ -65,7 +65,8 @@ die() { echo "RATIO_RESULT FAIL :: $*"; echo "DONE_SENTINEL"; exit 1; }
 [ -d "$SRC/bench/fixture/src" ] || die "no bench/fixture under SRC=$SRC"
 command -v cargo   >/dev/null 2>&1 || die "cargo not on PATH"
 command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (edit driver)"
-command -v /usr/bin/time >/dev/null 2>&1 || die "/usr/bin/time -v required for arm-B"
+# Bash builtin `time` is universal; we set TIMEFORMAT for parseable output.
+# (/usr/bin/time is NOT in the cargoless-builder image — first run hit this.)
 
 CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 say "CLK_TCK=$CLK_TCK reps=$REPS inter-edit-gap=${INTER_EDIT_GAP}s"
@@ -220,17 +221,22 @@ say "  /target warmed; ARM-B per-edit measurements begin"
 
 B_SAMPLES=""
 B_OK=0
+# bash builtin `time`: %R=real %U=user %S=sys, all seconds.fraction; %U/%S
+# INCLUDE waited children, per bash(1) — sufficient for the arm-B per-edit
+# CPU we want (the cargo + rustc subtree).
+export TIMEFORMAT='%R %U %S'
 for i in $(seq 1 "$REPS"); do
   do_edit "$FIX/$TRAIT_FILE" "$TRAIT_FIND" "$TRAIT_REPL" \
     || { say "  ARM-B rep $i: anchor-not-found — aborting arm"; break; }
   tf=/tmp/m2-armb-time-$i.log
-  ( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" /usr/bin/time -v -o "$tf" \
-      $APPROVE cargo check --locked --all-targets ) > /tmp/m2-armb-cargo-$i.log 2>&1
-  # /usr/bin/time -v "User time (seconds)" + "System time (seconds)" (incl children — GNU time does this)
-  u=$(awk -F': ' '/User time \(seconds\)/{print $2}' "$tf")
-  s=$(awk -F': ' '/System time \(seconds\)/{print $2}' "$tf")
-  ms=$(awk -v u="${u:-0}" -v s="${s:-0}" 'BEGIN{printf "%d", (u+s)*1000}')
-  say "  ARM-B rep $i: user=${u}s  sys=${s}s  per-edit_cpu_ms=$ms"
+  # { time SUBSHELL ; } 2> $tf  — outer { } captures the builtin's stderr;
+  # inner ( ... > cargo.log 2>&1 ) keeps cargo's noise out of $tf.
+  { time ( cd "$FIX" && CARGO_TARGET_DIR="$B_TGT" $APPROVE \
+      cargo check --locked --all-targets > /tmp/m2-armb-cargo-$i.log 2>&1 ) ; } 2> "$tf"
+  # parse "real user sys" (last non-empty line; bash may emit a leading blank)
+  read -r realT userT sysT < <(awk 'NF>=3{l=$0} END{print l}' "$tf")
+  ms=$(awk -v u="${userT:-0}" -v s="${sysT:-0}" 'BEGIN{printf "%d", (u+s)*1000}')
+  say "  ARM-B rep $i: real=${realT}s user=${userT}s sys=${sysT}s  per-edit_cpu_ms=$ms"
   B_SAMPLES="${B_SAMPLES}${ms}"$'\n'; B_OK=$((B_OK+1))
   # revert + settle (NOT measured)
   do_edit "$FIX/$TRAIT_FILE" "$TRAIT_REPL" "$TRAIT_FIND" || true
@@ -246,16 +252,15 @@ if [ "$RUN_ARM_C" = "1" ]; then
   say "ARM-C: cold one-shot 'cargoless check' per edit (synthetic option-2)"
   rm -rf "$FIX/.cargoless"
   ( cd "$FIX" && $APPROVE "$CL_BIN" check ) > /tmp/m2-armc-warm.log 2>&1 || true
+  export TIMEFORMAT='%R %U %S'
   for i in $(seq 1 "$REPS"); do
     do_edit "$FIX/$TRAIT_FILE" "$TRAIT_FIND" "$TRAIT_REPL" \
       || { say "  ARM-C rep $i: anchor-not-found — aborting arm"; break; }
     tf=/tmp/m2-armc-time-$i.log
-    ( cd "$FIX" && /usr/bin/time -v -o "$tf" $APPROVE "$CL_BIN" check ) \
-      > /tmp/m2-armc-out-$i.log 2>&1
-    u=$(awk -F': ' '/User time \(seconds\)/{print $2}' "$tf")
-    s=$(awk -F': ' '/System time \(seconds\)/{print $2}' "$tf")
-    ms=$(awk -v u="${u:-0}" -v s="${s:-0}" 'BEGIN{printf "%d", (u+s)*1000}')
-    say "  ARM-C rep $i: user=${u}s sys=${s}s per-edit_cpu_ms=$ms"
+    { time ( cd "$FIX" && $APPROVE "$CL_BIN" check > /tmp/m2-armc-out-$i.log 2>&1 ) ; } 2> "$tf"
+    read -r realT userT sysT < <(awk 'NF>=3{l=$0} END{print l}' "$tf")
+    ms=$(awk -v u="${userT:-0}" -v s="${sysT:-0}" 'BEGIN{printf "%d", (u+s)*1000}')
+    say "  ARM-C rep $i: real=${realT}s user=${userT}s sys=${sysT}s per-edit_cpu_ms=$ms"
     C_SAMPLES="${C_SAMPLES}${ms}"$'\n'; C_OK=$((C_OK+1))
     do_edit "$FIX/$TRAIT_FILE" "$TRAIT_REPL" "$TRAIT_FIND" || true
     sleep "$INTER_EDIT_GAP"
