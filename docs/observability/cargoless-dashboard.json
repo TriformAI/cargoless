@@ -1,0 +1,513 @@
+{
+  "_comment_top": "cargoless SigNoz/Grafana-import dashboard sketch. Authored 2026-05-20 against origin/main=929a5d3. PURPOSE: importable+readable starting point for the operator-facing dashboard once Wave-2 (Increment-5 5d) metrics land. Some panels query Wave-1-landed surfaces (traces/keystone-spans/events) and will render today; others query Wave-2-future metrics and will render once those metrics emit. EACH PANEL'S '_status' FIELD indicates which. Companion design doc: docs/design/D-INC2-OBSERVABILITY.md. Companion runbook: docs/observability/AC4-DIVERGENCE-RUNBOOK.md.",
+  "_comment_format": "Grafana-format JSON (schemaVersion 39) for SigNoz import — matches the tf-multiverse/deployment/monitoring/dashboards/ convention. SigNoz's UI can import this directly; per-panel queries use Prometheus-compatible PromQL syntax that SigNoz's metric backend understands.",
+  "_comment_status_legend": "WAVE-1-LIVE = queries Wave-1 keystone span/event data, renders today; WAVE-2-PENDING = queries Wave-2 metric, renders once Wave-2 lands.",
+
+  "id": null,
+  "uid": "cargoless-overview",
+  "title": "cargoless — Observability Overview",
+  "tags": ["cargoless", "observability", "otel", "signoz"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_SIGNOZ",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false
+      },
+      {
+        "name": "service",
+        "type": "constant",
+        "current": { "value": "cargoless", "text": "cargoless" },
+        "hide": 0,
+        "label": "Service",
+        "query": "cargoless"
+      },
+      {
+        "name": "cluster_hash",
+        "type": "query",
+        "query": "label_values(cargoless_ra_resident_bytes{service=\"$service\"}, cluster_hash)",
+        "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+        "includeAll": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "multi": true,
+        "refresh": 2,
+        "sort": 1,
+        "_comment": "Populates from Wave-2 cargoless_ra_resident_bytes gauge labels. Pre-Wave-2: shows no values; All-selector still selects every series."
+      },
+      {
+        "name": "worktree",
+        "type": "query",
+        "query": "label_values(cargoless_verdict_total{service=\"$service\"}, worktree)",
+        "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+        "includeAll": true,
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "multi": true,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+        "enable": true,
+        "expr": "changes(cargoless_initial_spawn_total{service=\"$service\"}[2m]) > 0",
+        "iconColor": "blue",
+        "name": "Daemon Restart Events",
+        "step": "30s",
+        "tagKeys": "cluster_hash",
+        "titleFormat": "Daemon spawn: cluster={{cluster_hash}}",
+        "_comment": "WAVE-2-PENDING — annotates daemon restarts on every panel once cargoless_initial_spawn_total emits."
+      }
+    ]
+  },
+
+  "panels": [
+    {
+      "id": 1,
+      "title": "Daemon Health at a Glance",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+
+    {
+      "id": 10,
+      "title": "Service status — daemon up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-1-LIVE (uses /healthz scrape if Prometheus configured, OR up{} metric from service-discovery)",
+      "_comment": "Status indicator — green if at least one cargoless instance has reported in the last minute. Use SigNoz service health if your collector exposes it; alternatively wire to the /healthz endpoint shipped via #236.",
+      "targets": [
+        {
+          "expr": "up{service=\"$service\"}",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" },
+        "textMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      }
+    },
+
+    {
+      "id": 11,
+      "title": "RA processes alive",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_ra_resident_bytes is Wave-2)",
+      "_comment": "Count of distinct RA processes currently reporting RSS. Model-R thesis says this stays at ≈1 per cluster across N worktrees; if it grows linearly with worktrees, the fleet-RAM multiplication regression has re-emerged.",
+      "targets": [
+        {
+          "expr": "count(cargoless_ra_resident_bytes{service=\"$service\"})",
+          "legendFormat": "RA count",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value"
+      }
+    },
+
+    {
+      "id": 12,
+      "title": "Active worktrees",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_active_worktrees_gauge is Wave-2)",
+      "targets": [
+        {
+          "expr": "cargoless_active_worktrees_gauge{service=\"$service\"}",
+          "legendFormat": "active WTs",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "id": 13,
+      "title": "Verdict rate (5m, green/red)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_verdict_total is Wave-2). Pre-Wave-2: a degraded version queries SigNoz trace search for count of verdict.publish span emissions.",
+      "targets": [
+        {
+          "expr": "sum by (color) (rate(cargoless_verdict_total{service=\"$service\"}[5m]))",
+          "legendFormat": "{{color}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "title": "AC4 Regression Sentry (LOAD-BEARING)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+
+    {
+      "id": 20,
+      "title": "AC4 Divergence — overlay.reset − (ra.restart + initial.spawn)",
+      "description": "**LOAD-BEARING INVARIANT.** This timeseries MUST stay flat at 0 forever. Any non-zero value persisting beyond 5 minutes is a regression of the proven-core-precondition-violated-at-integration-seam class — see docs/observability/AC4-DIVERGENCE-RUNBOOK.md. Do NOT silence the alert; do NOT restart the daemon; page dev-fixer for source-fix at the violating seam.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (all three metrics in expression are Wave-2)",
+      "_comment": "The headline AC4 panel. Per-cluster_hash slicing is the diagnostic drill-down (Panel 21 below). Aggregated view here = fleet-wide divergence. Signed view chosen deliberately per D-INC2-OBSERVABILITY §9 q3 — negative indicates transient ordering effect (resolves within one scrape cycle); persistent non-zero = real regression.",
+      "targets": [
+        {
+          "expr": "sum(cargoless_overlay_reset_total{service=\"$service\"}) - (sum(cargoless_ra_restart_total{service=\"$service\"}) + sum(cargoless_initial_spawn_total{service=\"$service\"}))",
+          "legendFormat": "divergence (must be 0)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 },
+              { "color": "red", "value": -1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+
+    {
+      "id": 21,
+      "title": "AC4 Divergence — per cluster_hash drill-down",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING",
+      "_comment": "Per-cluster_hash divergence. Identifies the specific cluster the AC4 alert is firing on. See runbook §3.2.",
+      "targets": [
+        {
+          "expr": "sum by (cluster_hash) (cargoless_overlay_reset_total{service=\"$service\"}) - (sum by (cluster_hash) (cargoless_ra_restart_total{service=\"$service\"}) + sum by (cluster_hash) (cargoless_initial_spawn_total{service=\"$service\"}))",
+          "legendFormat": "cluster={{cluster_hash}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "title": "Latency KPIs (AC#2)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+
+    {
+      "id": 30,
+      "title": "Save → verdict latency — p50/p95/p99",
+      "description": "The AC#2 KPI. Wave-1-tier: RA-incremental hint (median ≤1s); Wave-1-tier: authoritative cargo-check verdict (seconds, no sub-1s promise). Tracked by tier label.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_save_to_verdict_seconds is Wave-2 histogram)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (tier, le) (rate(cargoless_save_to_verdict_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "p50 — {{tier}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (tier, le) (rate(cargoless_save_to_verdict_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "p95 — {{tier}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (tier, le) (rate(cargoless_save_to_verdict_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "p99 — {{tier}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 31,
+      "title": "Verdict counter by color (5m rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_verdict_total is Wave-2)",
+      "_comment": "Green/red transition ratio. A sustained shift toward red indicates either real defect surge or false-RED noise (e.g. flycheck timing).",
+      "targets": [
+        {
+          "expr": "sum by (color) (rate(cargoless_verdict_total{service=\"$service\", worktree=~\"$worktree\"}[5m]))",
+          "legendFormat": "{{color}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "title": "Fleet RAM — Model-R structural claim made VISIBLE",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+
+    {
+      "id": 40,
+      "title": "RA process resident bytes — per cluster_hash",
+      "description": "Visualizes the Model-R fleet-RAM claim: one multiplexed RA across N worktrees; total RSS stays ≈1 GiB regardless of worktree count. Each line = one cluster's RA RSS; the SUM across all lines is the fleet's total. Mechanism check: line count == cluster count, NEVER worktree count.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_ra_resident_bytes gauge is Wave-2)",
+      "targets": [
+        {
+          "expr": "cargoless_ra_resident_bytes{service=\"$service\", cluster_hash=~\"$cluster_hash\"}",
+          "legendFormat": "cluster={{cluster_hash}} pid={{pid}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+
+    {
+      "id": 41,
+      "title": "Fleet total RA RSS (sum across clusters)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING",
+      "targets": [
+        {
+          "expr": "sum(cargoless_ra_resident_bytes{service=\"$service\"})",
+          "legendFormat": "total",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    {
+      "id": 42,
+      "title": "Active RA count (= cluster count)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING",
+      "_comment": "Should equal cluster count (Model-R: one RA per cluster_hash). If this number grows with worktree count, the multiplexing regression has re-emerged.",
+      "targets": [
+        {
+          "expr": "count(cargoless_ra_resident_bytes{service=\"$service\"})",
+          "legendFormat": "RA processes",
+          "refId": "A"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    {
+      "id": 43,
+      "title": "Pushed-mode worktrees (post-Inc-2)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_pushed_worktrees_gauge is Wave-2)",
+      "_comment": "Worktrees being served via POST /overlay ingest (no shared FS). Post-#240 Inc-2 surface.",
+      "targets": [
+        {
+          "expr": "cargoless_pushed_worktrees_gauge{service=\"$service\"}",
+          "legendFormat": "pushed WTs",
+          "refId": "A"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    {
+      "id": 5,
+      "title": "Infra-shape KPIs (transport + cluster lifecycle)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 }
+    },
+
+    {
+      "id": 50,
+      "title": "HTTP server request p95 by route",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_http_request_seconds histogram is Wave-2)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (route, le) (rate(cargoless_http_request_seconds_bucket{service=\"$service\"}[5m])))",
+          "legendFormat": "{{route}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 51,
+      "title": "Overlay-push p95 + accept/reject rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(cargoless_http_request_seconds_bucket{service=\"$service\", route=\"/overlay\"}[5m])))",
+          "legendFormat": "p95 latency",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (accepted) (rate(cargoless_overlay_push_total{service=\"$service\"}[5m]))",
+          "legendFormat": "rate accepted={{accepted}}",
+          "refId": "B"
+        }
+      ]
+    },
+
+    {
+      "id": 52,
+      "title": "Cluster transition rate (spawn / reap / swap)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING",
+      "_comment": "Cluster lifecycle activity. Compare with the RA-count gauge (Panel 42) — a healthy fleet shows spawn/reap pairs balanced over the long run.",
+      "targets": [
+        {
+          "expr": "sum by (transition) (rate(cargoless_cluster_transition_seconds_count{service=\"$service\"}[5m]))",
+          "legendFormat": "{{transition}}",
+          "refId": "A"
+        }
+      ]
+    },
+
+    {
+      "id": 53,
+      "title": "Overlay.switch p95 by worktree (Top 10)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-2-PENDING (cargoless_overlay_switch_seconds histogram is Wave-2)",
+      "_comment": "Per-worktree overlay-switch latency. Slow worktrees here = candidate for cluster-isolation analysis (a noisy WT can contend with siblings sharing the same RA).",
+      "targets": [
+        {
+          "expr": "topk(10, histogram_quantile(0.95, sum by (worktree, le) (rate(cargoless_overlay_switch_seconds_bucket{service=\"$service\", worktree=~\"$worktree\"}[5m]))))",
+          "legendFormat": "{{worktree}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "id": 6,
+      "title": "Wave-1 keystone span surface (traces, available today)",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 }
+    },
+
+    {
+      "id": 60,
+      "title": "Wave-1 keystone span emission counts (5m)",
+      "description": "**WAVE-1-LIVE** — these panels query SigNoz trace search rather than Wave-2 metrics, so they render today. Useful as the pre-Wave-2 substitute for the metric counter panels and as a long-running cross-check after Wave-2 lands (metric_total should == event_count over the same window, modulo sampling).",
+      "type": "table",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "${DS_SIGNOZ}" },
+      "_status": "WAVE-1-LIVE",
+      "_comment": "In SigNoz, replace the Prometheus query with a SigNoz Query Builder query against trace data: name IN ('ra.spawn', 'ra.respawn', 'overlay.reset', 'overlay.switch', 'verdict.publish') AND service.name = $service, group by name, count(). The Grafana-format below is the closest representation; operators editing this in SigNoz UI should switch to the native trace-query view.",
+      "targets": [
+        {
+          "expr": "label_replace(vector(0), \"name\", \"see SigNoz trace query\", \"\", \"\")",
+          "legendFormat": "see comment",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+
+  "_comment_post_wave2_actions": "Once Wave-2 lands and metrics emit, every panel marked WAVE-2-PENDING transitions to live data without dashboard edits. The annotations panel (Daemon Restart Events) starts firing at restart-time. The AC4 Divergence panel (20/21) begins enforcing the invariant; pair it with the alert defined in docs/observability/AC4-DIVERGENCE-RUNBOOK.md §1.1.",
+
+  "_comment_alert_export": "This dashboard does NOT contain SigNoz alert rules — those are configured in SigNoz's alerts UI per docs/observability/AC4-DIVERGENCE-RUNBOOK.md. Define the alert there pointing at the AC4 divergence expression with FOR=5m and labels severity=critical, signal=stop-class-regression. A future revision of this dashboard JSON could include alert-rule blocks once the SigNoz import format stabilizes for them.",
+
+  "_comment_per_panel_status_index": {
+    "10": "WAVE-1-LIVE",
+    "11": "WAVE-2-PENDING",
+    "12": "WAVE-2-PENDING",
+    "13": "WAVE-2-PENDING (degradable to trace-count pre-Wave-2)",
+    "20": "WAVE-2-PENDING (load-bearing AC4 sentry)",
+    "21": "WAVE-2-PENDING",
+    "30": "WAVE-2-PENDING",
+    "31": "WAVE-2-PENDING",
+    "40": "WAVE-2-PENDING",
+    "41": "WAVE-2-PENDING",
+    "42": "WAVE-2-PENDING",
+    "43": "WAVE-2-PENDING",
+    "50": "WAVE-2-PENDING",
+    "51": "WAVE-2-PENDING",
+    "52": "WAVE-2-PENDING",
+    "53": "WAVE-2-PENDING",
+    "60": "WAVE-1-LIVE (queries SigNoz trace search)"
+  }
+}
