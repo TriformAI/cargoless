@@ -229,7 +229,7 @@ the proven core".
   divergence is the sentry; silencing it without source-fix
   re-introduces the false-GREEN class.
 
-### 4.3 Source pointers (for the on-call dev-fixer)
+### 4.3 Source pointers (for the on-call implementer-of-record / current code-owner)
 
 - Seam owner: `crates/cargoless/src/servedrv.rs`'s `Ctrl::Spawned`
   ingestion handler. The 929a5d3 line numbers are in the
@@ -292,8 +292,9 @@ In the interim, the AC4 invariant is verified by:
    emits at the seam (servedrv.rs:360 region) per #246/5c; an
    operator inspecting SigNoz trace search can manually verify the
    `ra.respawn → overlay.reset` pairing today.
-3. **The Wave-2 keystone-invariant TEST** (in flight on
-   `agent/dev-fixer-w2`) — when it lands, it asserts the divergence ≡ 0
+3. **The Wave-2 keystone-invariant TEST** (parked on
+   `agent/dev-fixer-w2` — implementation capacity disengaged;
+   re-engagement TBD) — when it lands, it asserts the divergence ≡ 0
    property at unit-test time, before any metric emits.
 
 Once Wave-2 lands, the three-layer defense is complete:
@@ -320,7 +321,7 @@ test) + metric-sentry (this alert).
 │    overlay.switch                                              │
 │  • Note the trace_id + respawn_generation for the fix ticket   │
 │                                                                │
-│ Hand-off to dev-fixer:                                         │
+│ Hand-off to implementer-of-record / current code-owner:        │
 │  • Offending cluster_hash                                      │
 │  • Trace_id with the missing overlay.reset                     │
 │  • Source pointer: the new code path that bypassed the         │

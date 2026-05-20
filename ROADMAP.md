@@ -200,9 +200,9 @@ parked pending the operator pre-stage authorisation (#235) — see
   followed by `OverlayMultiplexer::reset()` before any subsequent
   `switch_to` for that cluster. This is the source-structural layer
   of the AC4 three-layer defense (see [`D-INC2-OBSERVABILITY.md`](docs/design/D-INC2-OBSERVABILITY.md) §1.5).
-- **Operator pre-stage runbook** (lands alongside this ROADMAP
-  refresh as `docs/operator/DEPLOY-MILESTONE-PRESTAGE.md` — currently
-  parked on `agent/docs-launch-lead-prestage`, pending integration):
+- **Operator pre-stage runbook**
+  ([`docs/operator/DEPLOY-MILESTONE-PRESTAGE.md`](docs/operator/DEPLOY-MILESTONE-PRESTAGE.md),
+  #270, live on `main` @ 286d755):
   the operator-actionable checklist for `REGISTRY_TRIFORM_USER`/
   `REGISTRY_TRIFORM_TOKEN` Forgejo repo secrets + the
   `cargoless-otel-config` ConfigMap shape + the optional
@@ -228,9 +228,10 @@ parked pending the operator pre-stage authorisation (#235) — see
   histograms (`cargoless_save_to_verdict_seconds`), gauges
   (`cargoless_ra_resident_bytes` — the headline "fleet-RAM flat
   across N" claim made VISIBLE). The AC4 metric divergence sentry
-  becomes live-fireable then (operator runbook for that alert ships
-  alongside this ROADMAP refresh as
-  `docs/observability/AC4-DIVERGENCE-RUNBOOK.md`); until then the
+  becomes live-fireable then (operator runbook for that alert lives
+  at
+  [`docs/observability/AC4-DIVERGENCE-RUNBOOK.md`](docs/observability/AC4-DIVERGENCE-RUNBOOK.md),
+  #268, live on `main` @ 286d755); until then the
   AC4 invariant is verified by the source-structural #247 fix +
   the keystone-event presence in Wave-1 traces (manual SigNoz trace
   query) — see [AC4 three-layer defense]
@@ -243,8 +244,8 @@ parked pending the operator pre-stage authorisation (#235) — see
   is parked alongside. **PENDING** on #235 operator pre-stage
   activation — the operator's authorising decision is the gate;
   the pre-stage runbook
-  (`docs/operator/DEPLOY-MILESTONE-PRESTAGE.md`, lands alongside
-  this ROADMAP refresh) is the bridge from "designed" to "executable".
+  ([`docs/operator/DEPLOY-MILESTONE-PRESTAGE.md`](docs/operator/DEPLOY-MILESTONE-PRESTAGE.md),
+  #270, live on `main` @ 286d755) is the bridge from "designed" to "executable".
 
 ### Design anchors
 
@@ -255,15 +256,14 @@ parked pending the operator pre-stage authorisation (#235) — see
   overlay-push contract that 2a/2b/2c implement; promoted from
   spike with the Inc-2 land, so it covers the same scope the
   original `D-PUSHOVERLAY.md` design-ahead spec did).
-- `docs/design/D-INC2-OBSERVABILITY.md` (lands alongside this
-  ROADMAP refresh — currently parked on `agent/docs-launch-lead-w2-docs`,
-  pending integration) — the Increment-5 implementation-anchor; the
-  Wave-1 vs Wave-2 distinction; the 5 design invariants
-  (cores-stay-log-free, fail-soft, default-no-op, 5s shutdown
-  budget, AC4 regression-sentry).
-- `docs/observability/cargoless-dashboard.json` (same parked branch
-  as above) — the 23-panel SigNoz/Grafana-import dashboard sketch;
-  each panel marks WAVE-1-LIVE vs WAVE-2-PENDING.
+- [`docs/design/D-INC2-OBSERVABILITY.md`](docs/design/D-INC2-OBSERVABILITY.md)
+  (#268, live on `main` @ 286d755) — the Increment-5
+  implementation-anchor; the Wave-1 vs Wave-2 distinction; the 5
+  design invariants (cores-stay-log-free, fail-soft, default-no-op,
+  5s shutdown budget, AC4 regression-sentry).
+- [`docs/observability/cargoless-dashboard.json`](docs/observability/cargoless-dashboard.json)
+  (#268, live on `main` @ 286d755) — the 23-panel SigNoz/Grafana-import
+  dashboard sketch; each panel marks WAVE-1-LIVE vs WAVE-2-PENDING.
 
 ### Honest scope
 

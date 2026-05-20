@@ -7,8 +7,9 @@ future waves (Wave-3, metrics-expansion, etc.).
 **Plane umbrella:** CWDL-245 (Increment 5 — OTEL+SigNoz observability).
 **Authored:** 2026-05-20.
 **Source anchor:** `origin/main` = `929a5d3` (Wave-1 fully landed).
-Wave-2 reference branch: `agent/dev-fixer-w2 off feb3fac` (IN FLIGHT —
-metrics + AC4 keystone-invariant test not yet on `main`).
+Wave-2 reference branch: `agent/dev-fixer-w2 off feb3fac` (PARKED —
+implementation capacity disengaged; metrics + AC4 keystone-invariant
+test not yet on `main`; re-engagement TBD when capacity restores).
 
 ---
 
@@ -37,14 +38,16 @@ SigNoz collector configured see the full keystone-span surface today;
 operators without one see the stderr `[cargoless:obs]` fallback. Both
 paths are honest and tested.
 
-**Wave-2 is IN FLIGHT** (`agent/dev-fixer-w2 off feb3fac`, NOT on
-`main`):
+**Wave-2 is PARKED** (`agent/dev-fixer-w2 off feb3fac` — implementation
+capacity disengaged; NOT on `main`; re-engagement TBD when capacity
+restores. NOT canceled — the umbrella tracking stays under Plane #245
+as the honest anchor):
 
 | Surface | Wave-2 status |
 |---|---|
-| Broader 5c spans (e.g. `cluster.transition`, `overlay.push_ingest`, `http.request`) | in flight |
-| 5d metrics layer — `cargoless_*_total` counters / `*_resident_bytes` gauges / `*_seconds` histograms | in flight |
-| **AC4 keystone-invariant TEST** (the regression sentry for the §247 STOP-class) | in flight |
+| Broader 5c spans (e.g. `cluster.transition`, `overlay.push_ingest`, `http.request`) | parked |
+| 5d metrics layer — `cargoless_*_total` counters / `*_resident_bytes` gauges / `*_seconds` histograms | parked |
+| **AC4 keystone-invariant TEST** (the regression sentry for the §247 STOP-class) | parked |
 | Wave-2 Layer-3 backstop on `30dc7d6` (Wave-1) | ✓ COMPLETE (#250) |
 
 When Wave-2 lands, the metric divergence sentry (§3 below) becomes
@@ -189,10 +192,12 @@ the regression sentry for this pattern.
 
 ---
 
-## 3. Wave-2 metrics — the contracted emission surface (NOT yet on main)
+## 3. Wave-2 metrics — the contracted emission surface (PARKED, NOT yet on main)
 
-Wave-2 (`agent/dev-fixer-w2 off feb3fac`) introduces the `metrics`
-crate (or `opentelemetry::metrics`) layer. The contracted set:
+Wave-2 (`agent/dev-fixer-w2 off feb3fac` — currently parked,
+implementation capacity disengaged; design-of-record remains durable)
+will introduce the `metrics` crate (or `opentelemetry::metrics`) layer
+when capacity re-engages. The contracted set:
 
 ### 3.1 Counters
 
@@ -305,7 +310,9 @@ NOT adopted (deliberately):
    │                      │   • HTTP / overlay.push / cluster.transition
    └──────────────────────┘  Alerts per docs/observability/
                               AC4-DIVERGENCE-RUNBOOK.md:
-                              • AC4 invariant violation → page dev-fixer
+                              • AC4 invariant violation → page
+                                implementer-of-record / current
+                                code-owner on-call
 ```
 
 ---

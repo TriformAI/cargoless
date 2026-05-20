@@ -5,10 +5,14 @@ cargoless-serve deploy-milestone (Plane #235).
 **Goal:** when #235 fires, the deploy is one command away — every
 credential and configuration this runbook lists is in place, so
 activation is a kubectl-apply, not a concept-to-commands translation.
-**Authored:** 2026-05-20 against `origin/main = 929a5d3`.
+**Authored:** 2026-05-20 against `origin/main = 929a5d3`. **Refreshed
+post-#273 ROADMAP fold to `origin/main = 9807534`** (the SHA anchor
+below now points at the post-#266/#268/#270/#273 state; no content
+shift to source-anchored claims, all line refs verified byte-identical
+because the intervening commits touched docs + scripts/ci-gate only).
 **Source anchor for the manifest:** parked branch
 `agent/builder-infra-serve-k8s` @ `7bd82a4cd757399381ad24b4854aaaf72d3271de`
-(off `cc206da`). **The manifest needs a rebase** (`cc206da → 929a5d3`)
+(off `cc206da`). **The manifest needs a rebase** (`cc206da → 9807534`)
 before integration — flagged in §6.
 
 ---
@@ -16,7 +20,7 @@ before integration — flagged in §6.
 ## 0. Status / honest scope (read this first)
 
 This runbook documents pre-stage steps the operator can complete
-**today** (against current `main` 929a5d3) so #235's activation is
+**today** (against current `main` 9807534) so #235's activation is
 mechanical. It does **NOT** mean the deploy is ready to fire:
 
 1. **#226 manifest is parked, not on `main`.** See §6 — the
@@ -130,7 +134,7 @@ edited to `envFrom: configMapRef` this ConfigMap during the
 integration rebase — pre-staging the ConfigMap means that integration
 step is a one-line manifest tweak.
 
-### 2.2 Env vars cargoless reads (anchored to `crates/cargoless-core/src/config.rs` @ 929a5d3)
+### 2.2 Env vars cargoless reads (anchored to `crates/cargoless-core/src/config.rs` @ 9807534, lines 622-639; byte-identical to 929a5d3 authoring base — verified via post-#266 backstop)
 
 | Var | Required? | Default | What it does |
 |---|---|---|---|
@@ -453,18 +457,29 @@ sequence is:
 - File: `deploy/cargoless-serve.k8s.yaml`
 - Branch: `agent/builder-infra-serve-k8s` @ `7bd82a4`
 - Branch base: `cc206da` (the v0.2.0 SHA)
-- **Rebase gap:** `cc206da..929a5d3` includes:
+- **Rebase gap:** `cc206da..9807534` includes (complete enumeration
+  verified via `git log --oneline cc206da..9807534`):
+  - Stage-1 acceptance suite (#228 — `test(stage1): Stage-1 acceptance suite`)
+  - Increment-0 /healthz route (#236 — `feat(#225): 0d`)
+  - Increment-2/2a PushOverlay transport contract delta (#240/2a)
+  - #247 STOP-class structural fix (`fix(#247): ClusterDriver::reset_after_respawn + Ctrl::Spawned wire fix`, 6290333)
+  - Stage-1 harness rework + bug fixes (#239 — `test(stage1):` multi-commit)
+  - Increment-4 de-WASM-gate source change (#241, 4d56021 — `feat(#241): de-WASM-gate`)
+  - Wave-1 OTEL telemetry foundation + 5b TelemetryConfig + 5c keystone spans + Layer-3 CATCH fixes (#246, multiple commits)
+  - Increment-2/2b servedrv-consume (#240/2b)
+  - Increment-2/2c thin push-client (#240/2c)
   - de-WASM-gate docs sweep (#255)
   - brand-coherence sweep (#258)
-  - Wave-1 OTEL telemetry foundation + keystone spans (#246, multiple commits)
-  - Increment-0 read-plane wiring (#225, ServeVerdictState + HttpServer::bind)
-  - Increment-2 overlay-push ingest (#240, 2a + 2b + 2c)
-  - 2b servedrv-consume design spike (#254 → D-INC2-2B.md)
-  - ci-gate housekeeping (#263)
+  - 2b servedrv-consume design spike → D-INC2-2B.md (#254)
+  - ci-gate housekeeping (#263) + ci-gate --update-lock opt-in mode (#266)
+  - Wave-2 OTEL docs (D-INC2-OBSERVABILITY + AC4-DIVERGENCE-RUNBOOK + cargoless-dashboard.json, #268)
+  - Operator pre-stage runbook (this doc, #270)
+  - ROADMAP refresh (#273)
 - The rebase is the responsibility of **builder-infra** at integration
-  time; it's mechanical (pure cherry-pick onto current main) unless
-  one of the intervening changes has touched `deploy/` (which from
-  inspection none has — all the integrating work was orthogonal).
+  time; it's mechanical (pure cherry-pick onto current main).
+  **Verified**: 0 commits in `cc206da..9807534` touched `deploy/`
+  (per `git log --oneline cc206da..9807534 -- deploy/` returning empty);
+  all the integrating work was orthogonal.
 
 ### 6.2 Manifest edits needed during integration
 
@@ -545,6 +560,8 @@ This is small enough to land in the same rebase commit.
 ---
 
 **End of pre-stage runbook. Authored against
-`origin/main = 929a5d3`. Update this doc if any of the OTEL env vars
-in §2.2/§2.3 change, if the registry-secret names in §1 change, or
-if the parked manifest in §6 lands on `main`.**
+`origin/main = 929a5d3`; freshness-refreshed to `9807534` (post-#266
+ci-gate, post-#268+#270 Wave-2 docs, post-#273 ROADMAP refresh). Update
+this doc if any of the OTEL env vars in §2.2/§2.3 change, if the
+registry-secret names in §1 change, or if the parked manifest in §6
+lands on `main`.**
