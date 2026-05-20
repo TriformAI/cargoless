@@ -39,6 +39,7 @@
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import threading
@@ -63,9 +64,16 @@ def _request(url: str, token: str | None, *, data=None, method="GET", timeout=30
 
 def post_overlay(base_url, token, worktree, base_ref, files):
     """POST /overlay; return (ack_dict, t0_ns, t1_ns).
-    t0 = monotonic just before send; t1 = monotonic at 200 receipt."""
+    t0 = monotonic just before send; t1 = monotonic at 200 receipt.
+
+    Wire shape is the daemon's Request::from_json contract
+    (crates/cargoless-core/src/transport/mod.rs §363+): the discriminant
+    key is `op` (NOT `type`), and files are objects with `path` + `content`
+    fields (NOT tuple-pairs). Mis-shaped requests answer HTTP 400 silently
+    — first M3 launch caught this loudly via the warm-up FAIL."""
+    files_wire = [{"path": p, "content": c} for (p, c) in files]
     body = json.dumps(
-        {"type": "PushOverlay", "worktree": worktree, "base_ref": base_ref, "files": files}
+        {"op": "push_overlay", "worktree": worktree, "base_ref": base_ref, "files": files_wire}
     ).encode()
     t0 = time.monotonic_ns()
     with _request(f"{base_url}/overlay", token, data=body, method="POST") as resp:
@@ -275,12 +283,18 @@ def main():
             ack, _, _ = post_overlay(base_url, token, wt, "HEAD", [])
         except Exception as e:
             print(f"FAIL: warm-up push {wt}: {e}", file=sys.stderr)
-            sse.stop()
-            sys.exit(2)
+            try: sse.stop()
+            except Exception: pass
+            # os._exit bypasses cleanup — the SSE listener thread's blocked
+            # socket.readline() doesn't always release on sse._resp.close(),
+            # which left the prior FAIL run hung. Force-exit is the right
+            # discipline here: the FAIL message has been flushed already.
+            os._exit(2)
         if not ack.get("accepted"):
             print(f"FAIL: warm-up push {wt} rejected: {ack}", file=sys.stderr)
-            sse.stop()
-            sys.exit(2)
+            try: sse.stop()
+            except Exception: pass
+            os._exit(2)
         # Drain SSE for this WT until green (or timeout)
         timeout = args.warmup_timeout if i == 0 else args.verdict_timeout
         deadline = time.monotonic() + timeout
@@ -298,8 +312,9 @@ def main():
                 break
         if not got_green:
             print(f"FAIL: worktree {wt} did not reach GREEN within {timeout}s", file=sys.stderr)
-            sse.stop()
-            sys.exit(2)
+            try: sse.stop()
+            except Exception: pass
+            os._exit(2)
 
     # Drain any residual events (the warmup pushes may have produced
     # transient `red`→`green` sequences for each WT). After this point
