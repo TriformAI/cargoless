@@ -96,7 +96,7 @@ The project's design discipline is "additive-alongside" — when adding a
 new shape, prefer adding new types/functions next to the existing ones
 over reshaping them. This keeps cross-crate contracts stable. See
 [`docs/DESIGN.md`](docs/DESIGN.md) §4 and §6 for the contract / change
-protocol if you're touching `tf-proto`.
+protocol if you're touching `cargoless-proto`.
 
 ## How code changes flow into the project
 
@@ -128,9 +128,12 @@ mirror: commit, push, and CI (`.forgejo/workflows/ci.yml`) runs
 `cargoless-builder` Kubernetes pod for fast pre-integration merge
 gating.
 
-The crate ownership is disjoint (`tf-proto`, `tf-cas`, `tf-core`,
-`cargoless` — the published binary crate, dir `crates/tf-cli/` — and
-`bench/`) — see the crate table in [`README.md`](README.md).
+The crate ownership is disjoint (`cargoless-proto`, `cargoless-cas`,
+`cargoless-core`, `cargoless` — the published binary crate, dir
+`crates/cargoless/` — and `bench/`) — see the crate table in
+[`README.md`](README.md). (Internal crate names completed the
+`tf-{proto,cas,core}` → `cargoless-*` rename in #97 / #131; the
+binary's directory moved `crates/tf-cli/` → `crates/cargoless/` in #87.)
 
 **Workflow for internal agent-team contributors** (not required for
 outside contributors):
@@ -138,7 +141,7 @@ outside contributors):
 1. Work on a branch (`agent/<role>-<topic>` or `feat/<topic>`) on the
    Forgejo mirror.
 2. Keep crate ownership disjoint per the table above; cross-cutting
-   changes go via `tf-proto`.
+   changes go via `cargoless-proto`.
 3. Commit small and push often. **Uncommitted/unpushed work is invisible
    to CI and to teammates.**
 4. Self-gate via `scripts/ci-gate <branch>` (the dedicated k8s builder)
@@ -161,15 +164,15 @@ outside contributors):
   everywhere (CI, ci-gate, future release pipeline). New deps are
   evaluated against the cold-build budget AC#1/#2 measure against.
 - **Cross-crate contract:** all data crossing crate boundaries goes
-  through `tf-proto` types — never element-style hardcoding. See
+  through `cargoless-proto` types — never element-style hardcoding. See
   [`docs/DESIGN.md`](docs/DESIGN.md) §3.
-- **Unsafe:** `#![forbid(unsafe_code)]` is set on `tf-proto`; other
+- **Unsafe:** `#![forbid(unsafe_code)]` is set on `cargoless-proto`; other
   crates use `unsafe` only with a written justification.
 
 ## Governance (v0)
 
 Benevolent-maintainer model during v0: the technical lead owns
-cross-cutting decisions and the `tf-proto` contract; crate owners own
+cross-cutting decisions and the `cargoless-proto` contract; crate owners own
 their crate. Decisions of record live in Plane (internal project
 "CWDL"); they are mirrored to public GitHub issues when they affect
 contributor-visible behaviour.
