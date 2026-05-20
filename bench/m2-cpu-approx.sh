@@ -128,7 +128,13 @@ read_verdict() {
 }
 
 wait_verdict() {   # $1=expected $2=timeout $3=cli-status $4=updated-after-min
-  local exp=$1 to=$2 f=$3 min=$4 dl=$(( $(date +%s) + to )) rv u v
+  # NB: in `local var1=$1 var2=$2 ... dl=$((... + var2))` bash evaluates
+  # the RHS arithmetic against the OUTER scope (the locals don't bind
+  # until the statement completes) — and with `set -u` that fires on the
+  # unbound outer name. Split into two `local` statements to bind first,
+  # then read.
+  local exp=$1 to=$2 f=$3 min=$4 rv u v
+  local dl=$(( $(date +%s) + to ))
   while [ $(date +%s) -lt $dl ]; do
     if [ -f "$f" ]; then
       rv=$(read_verdict "$f")
@@ -161,23 +167,33 @@ rm -rf "$FIX/.cargoless"
 ( cd "$FIX" && "$CL_BIN" watch ) > /tmp/m2-watch.log 2>&1 &
 WPID=$!
 CLI="$FIX/.cargoless/cli-status"
-say "  daemon pid=$WPID; waiting for first verdict (cap ${WARM_TIMEOUT}s)"
+say "  daemon pid=$WPID; waiting for first GREEN verdict (cap ${WARM_TIMEOUT}s)"
+# NB on warm-up semantics: cargoless watch may publish verdict=red as
+# the conservative AC#4-never-publish-red default WHILE the first cold
+# Leptos cargo check is still in flight (a transient unproven-red, NOT
+# a real compile error). Wait specifically for verdict=green so the rep
+# loop has a known clean starting state.
 deadline=$(( $(date +%s) + WARM_TIMEOUT ))
 warm=0
+last_seen=""
 while [ $(date +%s) -lt $deadline ]; do
   kill -0 "$WPID" 2>/dev/null || { tail -25 /tmp/m2-watch.log; die "cargoless watch died during warm-up"; }
   if [ -f "$CLI" ]; then
     rv=$(read_verdict "$CLI")
-    if [ "$rv" != "NONE" ] && [ "${rv##*:}" != "unknown" ]; then warm=1; break; fi
+    if [ "$rv" != "NONE" ]; then
+      v_now="${rv##*:}"
+      [ "$v_now" != "$last_seen" ] && { say "    warm-up: verdict transitioned to '$v_now' at $rv"; last_seen="$v_now"; }
+      [ "$v_now" = "green" ] && { warm=1; break; }
+    fi
   fi
   sleep 1
 done
 if [ "$warm" -ne 1 ]; then
   tail -25 /tmp/m2-watch.log
   kill "$WPID" 2>/dev/null; sleep 1; kill -9 "$WPID" 2>/dev/null
-  die "cargoless never warmed within ${WARM_TIMEOUT}s (cold Leptos cargo-check; bump WARM_TIMEOUT?)"
+  die "cargoless never warmed to GREEN within ${WARM_TIMEOUT}s (last verdict seen: '${last_seen:-NONE}'; cold Leptos cargo-check may need longer — bump WARM_TIMEOUT)"
 fi
-say "  daemon warm; initial verdict $(read_verdict "$CLI")"
+say "  daemon warm-GREEN; initial verdict $(read_verdict "$CLI")"
 
 A_SAMPLES=""
 A_OK=0
