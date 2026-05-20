@@ -619,9 +619,13 @@ fn exec(
         ClusterAction::Idle => {}
         ClusterAction::SwitchOverlay { wt } => {
             // #246 5c KEYSTONE: `overlay.switch` span wraps the body —
-            // captures wt, file_count (set at end), overlay_size_bytes
-            // (set at end). Bound via `.entered()` to the SwitchOverlay
-            // arm scope so the span closes when the arm exits.
+            // captures wt, file_count, overlay_size_bytes. Bound via
+            // `.entered()` to the arm scope so the span closes when the
+            // arm exits. Field values are computed eagerly from
+            // `pending_batch` and recorded **on every exit path** below
+            // (both the early-return AND the normal end-of-arm) so the
+            // span never emits with Empty fields — the
+            // `tracing::field::record_at_close` discipline made explicit.
             let _span = tracing::info_span!(
                 "overlay.switch",
                 worktree = %wt.display(),
@@ -639,11 +643,11 @@ fn exec(
                 wt.display(),
                 statusfile::now_unix()
             );
-            let Some(lsp) = cs.lsp.clone() else {
-                return; // RA not handshaked yet; a later batch retries
-            };
-            // Build the WT's overlay from its changed files' on-disk
-            // content (v0: empty ⇒ base/on-disk, still correct).
+            // Build the WT's overlay BEFORE the lsp-present guard so the
+            // span's load-bearing fields (file_count, overlay_size_bytes)
+            // can be recorded on BOTH exit paths — the early-return case
+            // STILL carries valid attrs, distinguishing "0-file early
+            // return" from "0-file no-overlay-found".
             let mut pairs: Vec<(String, String)> = Vec::new();
             if let Some(files) = pending_batch.get(&wt) {
                 for f in files {
@@ -652,6 +656,17 @@ fn exec(
                     }
                 }
             }
+            let file_count = pairs.len() as u64;
+            let overlay_size_bytes: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
+            _span.record("file_count", file_count);
+            _span.record("overlay_size_bytes", overlay_size_bytes);
+
+            let Some(lsp) = cs.lsp.clone() else {
+                // Early-return: RA not handshaked yet; a later batch
+                // retries. Fields are recorded above so the span still
+                // carries valid attrs at drop.
+                return;
+            };
             let target = OverlaySet::from_pairs(pairs.iter().map(|(p, c)| (p.clone(), c.clone())));
             for verb in cs.mux.switch_to(&target) {
                 match verb {

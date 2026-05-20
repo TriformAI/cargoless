@@ -159,11 +159,27 @@ pub fn init_telemetry(cfg: &TelemetryConfig) -> ShutdownHandle {
     }
 }
 
-/// Ordered flush + shutdown. Hook into the existing #198 SIGTERM funnel
-/// in servedrv.rs's main loop: telemetry shutdown BEFORE orphan reap so
-/// pending spans egress before daemon termination.
+/// Ordered flush + shutdown with explicit **5s timeout**. Hook into the
+/// existing #198 SIGTERM funnel in servedrv.rs's main loop: telemetry
+/// shutdown BEFORE orphan reap so pending spans egress before daemon
+/// termination.
+///
+/// The 5s timeout is plan §5f's load-bearing flush budget — a slow /
+/// wedged collector MUST NOT block the daemon from terminating. The
+/// explicit `tokio::time::timeout` makes the budget visible-in-source
+/// rather than implicit in SDK-default behavior (which varies across
+/// `opentelemetry_sdk` versions). If the timeout elapses, a one-line
+/// stderr warning surfaces the observability-discipline event so a
+/// degraded collector path is loud not silent.
 ///
 /// Idempotent: calling on an inert handle (or twice) is a no-op.
+///
+/// **Caller contract:** invoked from inside the same tokio runtime
+/// context as `init_telemetry` (typically via `serve.rs`'s
+/// `runtime.enter()` guard). Calling outside a runtime when telemetry
+/// is active panics in `tokio::time::timeout` — but that path is
+/// unreachable because the runtime guard brackets both init+shutdown
+/// by construction in serve.rs.
 pub fn shutdown_telemetry(mut handle: ShutdownHandle) {
     let Some(inner) = handle.inner.take() else {
         return; // inert
@@ -171,15 +187,38 @@ pub fn shutdown_telemetry(mut handle: ShutdownHandle) {
 
     #[cfg(feature = "telemetry")]
     {
-        // SDK 0.31+: shutdown() returns Result<(), OTelSdkError>.
-        // Drives synchronous flush of all batch processors + closes the
-        // exporter. Errors here are diagnostic-only; the daemon
-        // continues to termination either way.
-        if let Err(e) = inner.tracer_provider.shutdown() {
-            eprintln!(
-                "[cargoless:telemetry] shutdown error for service={}: {e:?}",
-                inner.service_name
-            );
+        use std::time::Duration;
+        // Wrap the SDK shutdown in a 5s budget. The shutdown body is
+        // synchronous from the SDK's perspective; we run it inside
+        // `spawn_blocking` so `timeout` has an async future to gate.
+        // The whole shutdown call is best-effort — diagnostic on
+        // either failure mode (timeout elapsed OR SDK error).
+        let provider = inner.tracer_provider;
+        let service = inner.service_name.clone();
+        let handle = tokio::runtime::Handle::current();
+        let outcome = handle.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || provider.shutdown()),
+            )
+            .await
+        });
+        match outcome {
+            Ok(Ok(Ok(()))) => { /* clean flush */ }
+            Ok(Ok(Err(e))) => {
+                eprintln!("[cargoless:telemetry] shutdown error for service={service}: {e:?}");
+            }
+            Ok(Err(join_err)) => {
+                eprintln!(
+                    "[cargoless:telemetry] shutdown task panic for service={service}: {join_err}"
+                );
+            }
+            Err(_elapsed) => {
+                eprintln!(
+                    "[cargoless:telemetry] shutdown TIMEOUT (>5s) for service={service}; \
+                     pending spans may be lost — investigate collector reachability."
+                );
+            }
         }
     }
 
@@ -342,5 +381,103 @@ mod tests {
         let err: Box<dyn std::error::Error> =
             std::io::Error::new(std::io::ErrorKind::Other, "test").into();
         record_exception(&span, err.as_ref());
+    }
+
+    // ───────── #246 Wave-1 5c CATCH-1 regression sentry ─────────
+    //
+    // Layer-3 caught: `overlay.switch` declared `file_count` +
+    // `overlay_size_bytes` as `tracing::field::Empty` but the arm body
+    // never called `_span.record(...)` before exit on either path
+    // (early-return on missing LSP client AND normal end-of-arm). The
+    // span emitted with Empty fields under every code path. The
+    // fix-forward records the fields BEFORE the lsp-present guard so
+    // both exit paths carry valid attrs.
+    //
+    // This test enforces the structural property: declaring a span field
+    // as `Empty` and then calling `span.record(name, value)` surfaces
+    // that value to subscriber layers via `on_record`. The arm body's
+    // correctness (that it CALLS .record before exit) is verified by
+    // careful review + grep against `_span.record("file_count"` —
+    // belt-and-braces with this shape test documenting the API contract.
+    #[test]
+    fn span_with_empty_fields_surfaces_via_on_record() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        // Local layer struct (orphan-rule compliance: Layer is foreign,
+        // so the impl-type must be local). Shared state is the
+        // Arc<Mutex<_>> field inside, NOT wrapping the struct.
+        struct CaptureLayer {
+            state: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for CaptureLayer {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+                let buf = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut v = Vis { buf };
+                attrs.record(&mut v);
+            }
+            fn on_record(&self, _id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+                let buf = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut v = Vis { buf };
+                values.record(&mut v);
+            }
+        }
+        struct Vis<'a> {
+            buf: std::sync::MutexGuard<'a, Vec<(String, String)>>,
+        }
+        impl tracing::field::Visit for Vis<'_> {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.buf.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                self.buf.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.buf.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.buf.push((field.name().to_string(), value.to_string()));
+            }
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+                // intentionally unhandled — the test asserts on the
+                // numeric u64 fields the CATCH-1 fix records.
+            }
+        }
+
+        let state: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            state: state.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "overlay.switch",
+                worktree = "/test/wt",
+                file_count = tracing::field::Empty,
+                overlay_size_bytes = tracing::field::Empty,
+            );
+            // Mirror the arm's recording pattern exactly.
+            span.record("file_count", 7u64);
+            span.record("overlay_size_bytes", 4096u64);
+        });
+
+        let buf = state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            buf.iter().any(|(k, v)| k == "file_count" && v == "7"),
+            "file_count not surfaced (CATCH-1 regression): captured={buf:?}"
+        );
+        assert!(
+            buf.iter()
+                .any(|(k, v)| k == "overlay_size_bytes" && v == "4096"),
+            "overlay_size_bytes not surfaced (CATCH-1 regression): captured={buf:?}"
+        );
     }
 }
