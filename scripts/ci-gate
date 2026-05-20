@@ -188,6 +188,37 @@ POD="$(kubectl -n "$BUILDER_NS" get pod -l "$BUILDER_SEL" \
 kexec()  { kubectl exec      -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- "$@"; }
 kexec_i() { kubectl exec -i   -n "$BUILDER_NS" "$POD" -c "$BUILDER_CONTAINER" -- "$@"; }
 
+# ── #263 (3): pre-flight /cache PVC space check ──────────────────────────────
+# An exhausted /cache PVC fails cargo mid-build with confusing exit codes
+# (often 137-class OOM-looking — actually ENOSPC from a write deep inside a
+# linker invocation) instead of a clear "out of space" message. Pre-flight
+# queries available KB on /cache + aborts LOUDLY with the exact reclaim
+# command an operator can copy-paste — the diagnostic IS the fix.
+#
+# Threshold default 5GiB (configurable via CI_GATE_PREFLIGHT_MIN_KB) is
+# empirical for the cargoless ci-gate's 7-phase cycle: a cold cargo build's
+# deps + final-link peaks around 2-3GB; integ-* roughly doubles target-dir
+# size; warm-cache hits + active /work/src.d add ~5GB pre-existing. 5GiB
+# headroom safely covers a full cycle on a typical pod-state.
+#
+# Fail-soft on df-query failure: if the df invocation itself errors (e.g.,
+# busybox image without `--output=avail` support), AVAIL_KB is empty + the
+# bounds-check short-circuits without aborting. The pre-flight is a safety
+# NET, not a gatekeeper — false-negative (let through) is safer than
+# false-positive (block valid gate). Motivated by dev-fixer's autonomous
+# +12G /cache reclaim event (post-#240/2c integration cycle).
+PREFLIGHT_THRESHOLD_KB="${CI_GATE_PREFLIGHT_MIN_KB:-$((5 * 1024 * 1024))}"
+AVAIL_KB="$(kexec df --output=avail /cache 2>/dev/null | tail -1 | tr -d ' ')"
+if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt "$PREFLIGHT_THRESHOLD_KB" ] 2>/dev/null; then
+  AVAIL_GB=$((AVAIL_KB / 1024 / 1024))
+  THRESHOLD_GB=$((PREFLIGHT_THRESHOLD_KB / 1024 / 1024))
+  echo "[ci-gate] ERROR: /cache PVC has only ${AVAIL_GB}GiB free; gate needs >=${THRESHOLD_GB}GiB" >&2
+  echo "[ci-gate] reclaim: kubectl exec -n $BUILDER_NS $POD -c $BUILDER_CONTAINER -- \\" >&2
+  echo "[ci-gate]   bash -c 'find $CI_TARGET_ROOT $REMOTE_SRC_ROOT -mindepth 1 -maxdepth 1 -type d -mmin +60 -exec rm -rf {} +'" >&2
+  echo "[ci-gate] (the same housekeeping stream_tree runs at every gate; this just applies it NOW outside the gate flow)" >&2
+  exit 2
+fi
+
 # Fresh source dir per run; the per-ref CARGO_TARGET_DIR
 # ($CI_TARGET_ROOT/$SHA) lives OUTSIDE this dir on the PVC so a same-SHA
 # re-gate reuses that ref's own warm cache (relink, not from-scratch) while
@@ -201,11 +232,18 @@ stream_tree() {
   kexec bash -c "rm -rf $REMOTE_SRC && mkdir -p $REMOTE_SRC && mkdir -p $CI_TARGET_ROOT/$SHA" \
     || die "could not reset $REMOTE_SRC / create per-ref target dir in pod"
   # Bound PVC growth: best-effort prune sibling per-ref SOURCE + TARGET dirs
-  # untouched for >24h (a gate runs in minutes; >24h ⇒ provably not an
-  # in-flight concurrent gate's dir, so removing it cannot false-red a live
-  # run). Never touches THIS $SHA's dirs. Failure here never fails the gate
-  # (|| true) — a housekeeping miss must not block a verdict.
-  kexec bash -c "find $CI_TARGET_ROOT $REMOTE_SRC_ROOT -mindepth 1 -maxdepth 1 -type d ! -name $SHA -mtime +1 -exec rm -rf {} + 2>/dev/null || true" || true
+  # untouched for >60min (#263 tighten from the original 24h threshold).
+  # Rationale: a gate runs in minutes; >60min ⇒ provably not an in-flight
+  # concurrent gate's dir, so removing it cannot false-red a live run. The
+  # 24h threshold let stale per-ref dirs accumulate faster than they aged
+  # out at fleet cadence (motivated by dev-fixer's autonomous +12G /cache
+  # reclaim post-#240/2c). Tightening to 60min keeps same-cycle re-gates
+  # warm-cache-eligible while aggressively reclaiming yesterday's dirs that
+  # the 24h threshold would have kept. Never touches THIS $SHA's dirs.
+  # Failure here never fails the gate (|| true) — a housekeeping miss must
+  # not block a verdict. Pairs with the gate-entry pre-flight space-check
+  # above as defense-in-depth (preflight catches what housekeeping missed).
+  kexec bash -c "find $CI_TARGET_ROOT $REMOTE_SRC_ROOT -mindepth 1 -maxdepth 1 -type d ! -name $SHA -mmin +60 -exec rm -rf {} + 2>/dev/null || true" || true
   git -C "$REPO_ROOT" archive --format=tar "$SHA" \
     | kexec_i tar -x -C "$REMOTE_SRC" \
     || die "source transfer failed"
