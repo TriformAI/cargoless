@@ -22,6 +22,16 @@
 #
 # USAGE
 #   scripts/ci-gate [<git-ref>]      # 4-check merge gate (default ref origin/main)
+#   scripts/ci-gate <ref> --update-lock
+#                                    # OPT-IN: run `cargo update --workspace`
+#                                    #   IN-POD on the freshly-streamed source,
+#                                    #   capture regenerated Cargo.lock back to
+#                                    #   the host gated-tree root, THEN run the
+#                                    #   7-phase gate (which proves the new
+#                                    #   lock builds/tests/lints green BEFORE
+#                                    #   you commit it). Default invocations
+#                                    #   are byte-identical to pre-#266.
+#                                    #   Alt env form: CI_GATE_UPDATE_LOCK=1
 #   scripts/ci-gate --bench <ref>    # run the S1/AC#2 bench harness for <ref>
 #                                    #   and publish the `s1-ac2-verdict`
 #                                    #   Forgejo commit status for that sha
@@ -53,11 +63,17 @@
 #   BUILDER_SEL   default app.kubernetes.io/name=cargoless-builder
 #   CI_GATE_KEEP_GOING=1  run all four checks even after one fails (default:
 #                         keep going — a gate should report every failure)
+#   CI_GATE_UPDATE_LOCK=1 opt-in: regenerate Cargo.lock in-pod before the
+#                         7-phase gate (equivalent to --update-lock flag)
 #   FJ_API        default https://forgejo.triform.dev/api/v1
 #   FJ_REPO       default triform/cargoless
 #
 # EXIT: gate mode  → 0 iff all four checks pass; 1 if any red; 2 on setup err.
 #       --bench    → 0 if the verdict was captured + status POSTed; 2 on error.
+#       --update-lock additionally → 2 if `cargo update` itself fails (the
+#                    gate ABORTS BEFORE the 7 phases run — no silent
+#                    fall-through to "gating with old lock while claiming
+#                    fresh"; §9a-trap defense; host Cargo.lock UNCHANGED).
 
 set -euo pipefail
 
@@ -119,6 +135,27 @@ usage() { sed -n '2,/^set -euo pipefail/p' "$0" | sed -e 's/^# \?//' -e '$d'; }
 die() { echo "[ci-gate] ERROR: $*" >&2; exit 2; }
 
 MODE="gate"
+
+# ── #266: strip the composable --update-lock flag from positional args ──────
+# The mode case below (`--provision`, `--bench`) is mutually exclusive — those
+# are operational shapes, not modifiers. `--update-lock` is a MODIFIER on
+# default gate mode (opt-in pre-gate lockfile regen), so it must be
+# composable with the positional <ref> form and not collide with the case.
+# Strip it FIRST (any position), then let the case + REF resolution run as
+# before with byte-identical semantics on a non-update-lock invocation. The
+# env-var alternative CI_GATE_UPDATE_LOCK=1 is the default initializer.
+UPDATE_LOCK="${CI_GATE_UPDATE_LOCK:-0}"
+__nargs=()
+for __a in "$@"; do
+  case "$__a" in
+    --update-lock) UPDATE_LOCK=1 ;;
+    *) __nargs+=("$__a") ;;
+  esac
+done
+# Safe under `set -u` for empty arrays via the +alt-value idiom:
+set -- ${__nargs[@]+"${__nargs[@]}"}
+unset __nargs __a
+
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   --provision)
@@ -131,6 +168,13 @@ case "${1:-}" in
     exit 0 ;;
   --bench) MODE="bench"; shift ;;
 esac
+
+# --update-lock is a modifier on default gate mode only. Combining it with
+# --bench would be silently ignored (the bench path exits before the gate
+# block runs), so refuse LOUD instead — honesty > silent-discard.
+if [ "$UPDATE_LOCK" = "1" ] && [ "$MODE" = "bench" ]; then
+  die "--update-lock is for default gate mode only (cannot combine with --bench)"
+fi
 
 REF="${1:-origin/main}"
 command -v kubectl >/dev/null || die "kubectl not found"
@@ -306,6 +350,84 @@ fi
 
 # ───────────────────────── default: 4-check merge gate ──────────────────────
 stream_tree
+
+# ── #266: opt-in pre-gate lockfile regen ────────────────────────────────────
+# The gate pins `--locked` on every cargo invocation (matches .forgejo/ci.yml
+# post-#25): drift between Cargo.toml and Cargo.lock fails LOUD as gate-red.
+# That's the right discipline for integration runs but leaves agents with no
+# in-band way to refresh the lockfile — the cargo-safety hook blocks local
+# `cargo update` and there's no committed escape for it. This opt-in mode
+# fills that gap:
+#
+#   1) Run `cargo update --workspace` IN THE POD on the freshly-streamed
+#      per-ref source tree (the same $REMOTE_SRC the 7 phases will use).
+#   2) If regen FAILS — abort the gate LOUD. Do NOT fall through into the
+#      7 phases (that would gate the OLD lock while the operator believes
+#      they're gating the new one — silent-stale-green class, §9a-trap).
+#      The host Cargo.lock is left UNCHANGED.
+#   3) If regen SUCCEEDS — capture the regenerated $REMOTE_SRC/Cargo.lock
+#      back to $REPO_ROOT/Cargo.lock on the host (the gated-tree root, so
+#      a follow-up `git add Cargo.lock && git commit` applies it). Surface
+#      the diff up to the first 200 lines so the operator can eyeball what
+#      moved before committing. The 7 phases below run on the in-pod tree
+#      which has the new lock — their --locked greens ARE the proof that
+#      the refreshed lockfile builds/tests/lints cleanly.
+#
+# §9a-trap defense surface: cargo update failure ⇒ exit "$URC" BEFORE the
+# 4-check loop. The original host Cargo.lock is mutated only AFTER
+# verifying the in-pod capture is non-empty (truncated transport ≠ valid
+# lock). Default invocations (no --update-lock + no CI_GATE_UPDATE_LOCK=1)
+# skip this block entirely — UPDATE_LOCK=0 short-circuits the `if`.
+if [ "$UPDATE_LOCK" = "1" ]; then
+  echo
+  echo "======================================================================"
+  echo "=== update-lock :: cargo update --workspace  sha=$SHORT  [in-pod regen]"
+  echo "======================================================================"
+  set +e
+  UPDATE_OUT="$(kexec_i bash -c \
+    "cd $REMOTE_SRC && $APPROVE $CTARGET cargo update --workspace 2>&1")"
+  URC=$?
+  set -e
+  printf '%s\n' "$UPDATE_OUT"
+  if [ "$URC" -ne 0 ]; then
+    echo "--- update-lock: FAIL (exit $URC)"
+    echo
+    echo "======================================================================"
+    echo "=== ci-gate verdict   ref=$REF  sha=$SHORT  (update-lock FAILED — gate ABORTED)"
+    echo "======================================================================"
+    echo "  cargo update --workspace failed; refusing to run 7-phase gate on"
+    echo "  the unmodified lock while claiming a fresh regen happened."
+    echo "  host Cargo.lock UNCHANGED; fix the regen failure + retry."
+    echo "=== RESULT: ABORTED — $SHORT not gated (update-lock pre-step red)"
+    exit "$URC"
+  fi
+  echo "--- update-lock: regen complete (exit 0); capturing Cargo.lock to host"
+  # Atomic capture: cat to tempfile, verify non-empty, diff vs host, then
+  # cp into place. A truncated kubectl-exec pipe must not partial-replace
+  # the host lock (mid-write corruption would defeat the §9a-trap defense).
+  TMP_LOCK="$(mktemp)"
+  # Best-effort tempfile cleanup; do NOT clobber an existing EXIT trap if
+  # one is set later in the script's lifetime — currently none, so direct
+  # assignment is safe.
+  trap 'rm -f "$TMP_LOCK"' EXIT
+  if ! kexec cat "$REMOTE_SRC/Cargo.lock" > "$TMP_LOCK"; then
+    die "could not capture regenerated Cargo.lock from $REMOTE_SRC/Cargo.lock (transport failed)"
+  fi
+  if [ ! -s "$TMP_LOCK" ]; then
+    die "captured Cargo.lock is empty — transport truncated; host Cargo.lock UNCHANGED"
+  fi
+  if cmp -s "$TMP_LOCK" "$REPO_ROOT/Cargo.lock" 2>/dev/null; then
+    echo "[update-lock] host Cargo.lock is byte-identical to regenerated copy (no-op write skipped)"
+  else
+    echo "[update-lock] diff (host → regenerated, first 200 lines of unified diff):"
+    diff -u "$REPO_ROOT/Cargo.lock" "$TMP_LOCK" 2>/dev/null | head -200 || true
+    echo "[update-lock] (full regenerated lock follows the gate; capturing now)"
+    cp "$TMP_LOCK" "$REPO_ROOT/Cargo.lock"
+    echo "[update-lock] host Cargo.lock REPLACED ($REPO_ROOT/Cargo.lock)"
+    echo "[update-lock] follow-up: review the diff, then 'git add Cargo.lock && git commit' on top of $SHORT"
+  fi
+  echo "[update-lock] proceeding to 7-phase gate on in-pod tree (now carries the regenerated lock)"
+fi
 
 # Each check: prefixed with the operator-approved build escape, run in the
 # streamed tree, full output captured and echoed. rust-toolchain.toml pins
