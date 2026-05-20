@@ -244,6 +244,16 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // ran `security_check`; THIS is #10's actual binding (the serve.rs
     // module-doc "Stream E #10 binds it; #3 only resolves+carries" seam).
     let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+
+    // #240/2b — overlay-push ingest signal channel. Wired BEFORE
+    // `HttpServer::bind` so no `POST /overlay` from a client can race
+    // the channel-not-yet-attached window (api.push_overlay would store
+    // the overlay but the wakeup would be silently dropped, leaving the
+    // push unservicable until activity tick). Pre-binding eliminates
+    // that race by construction.
+    let (push_tx, push_rx) = channel::<String>();
+    api.attach_push_signal(push_tx);
+
     // /healthz readiness latch (#225 0d). `false` until the serve loop is
     // live ⇒ unauthenticated `GET /healthz` answers `503
     // {"status":"starting"}`; flipped `true` at loop-entry below ⇒ `200
@@ -367,6 +377,60 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             }
         }
 
+        // #240/2b — overlay-push ingest drain. The PushOverlay write-plane
+        // wakeup signal: every `api.push_overlay(...)` call sends the
+        // worktree key here. We synthesize a `DriverEvent::RoutedBatch`
+        // for the WT — IDENTICAL event shape to the watcher path — so
+        // `clusterdrv` / `multiplex` see no difference (pushed-vs-FS is
+        // a SOURCE mode, not a wire mode; the proven cores stay
+        // byte-untouched). On first push for a never-seen WT, we
+        // register it: derive the cluster hash from the pushed
+        // workspace-config files (Cargo.toml / Cargo.lock / rust-toolchain
+        // / .cargo/config — present in the pushed `files` per
+        // D-PUSHOVERLAY §4.3 tap-2 substitute). Best-effort: a missing
+        // workspace-config in the push still routes (split-safe — that
+        // WT gets its own cluster, same v0-bias-to-split discipline as
+        // the FS path's `read_workspace_config(_).is_err() => skip`).
+        while let Ok(wt_key) = push_rx.try_recv() {
+            let wt: WtId = PathBuf::from(&wt_key);
+            // Register on first push (tap 1 substitute) + derive cluster
+            // hash from pushed content (tap 2 substitute). On subsequent
+            // pushes for the same WT, this is a no-op (entry::or_insert).
+            if !wt_hash.contains_key(&wt) {
+                let h = cluster_hash_from_pushed(&api, &wt_key);
+                cluster_root.entry(h.clone()).or_insert_with(|| wt.clone());
+                wt_hash.insert(wt.clone(), h);
+            }
+            // The cluster hash for this WT (always present after the
+            // registration above).
+            let Some(h) = wt_hash.get(&wt).cloned() else {
+                continue; // unreachable; defensive
+            };
+            activity.touch(wt.clone(), Instant::now());
+            // Ensure the cluster's RA exists (proven 0→1 SpawnRa) — same
+            // as the FS path's gate.
+            if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
+                spawn_cluster(
+                    &mut clusters,
+                    &h,
+                    cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
+                    lsp_tx.clone(),
+                    ctrl_tx.clone(),
+                );
+            }
+            // Feed the SAME DriverEvent::RoutedBatch the watcher path
+            // feeds — clusterdrv sees no difference. The SwitchOverlay
+            // arm's source pick (FS-read vs api.take_overlay_for) is
+            // where the pushed/FS divergence actually lives (one line).
+            step(
+                &mut clusters,
+                &h,
+                DriverEvent::RoutedBatch { wt: wt.clone() },
+                &pending_batch,
+                &api,
+            );
+        }
+
         // Drain forwarded RA events → the owning cluster's ClusterDriver.
         while let Ok((h, ev)) = lsp_rx.try_recv() {
             if clusters.contains_key(&h) {
@@ -472,6 +536,50 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
 /// WtId (PathBuf) → the `String` key `ClusterLifecycle` uses.
 fn path_key(wt: &WtId) -> String {
     wt.to_string_lossy().into_owned()
+}
+
+/// #240/2b — derive a WorkspaceConfigHash from a pushed overlay's
+/// `files` (path,content pairs) without disk-reading the worktree.
+/// Substitutes the FS path's `read_workspace_config` for pushed-mode
+/// WTs (D-PUSHOVERLAY §4.3 tap-2). PEEKS at the api's pushed store
+/// (does NOT consume — `take_overlay_for` does that later in the
+/// SwitchOverlay arm). Best-effort: a push with no Cargo.toml etc.
+/// hashes to the all-absent (default) WorkspaceConfig — split-safe
+/// since identical empty pushes group together, distinct from any
+/// real workspace.
+///
+/// Path-matching is suffix-based: `path.ends_with("Cargo.toml")` so
+/// both absolute (`/abs/wt/Cargo.toml`) and relative (`Cargo.toml`)
+/// push paths resolve. The 4 workspace-defining files mirror
+/// `clustermgr::read_workspace_config`'s set.
+fn cluster_hash_from_pushed(
+    api: &Arc<crate::serveapi::ServeVerdictState>,
+    wt_key: &str,
+) -> WorkspaceConfigHash {
+    // PEEK (non-consuming) — the consume happens later in the
+    // SwitchOverlay arm via `take_overlay_for`.
+    let Some(pushed) = api.peek_overlay_for(wt_key) else {
+        return cargoless_core::cluster::WorkspaceConfig::default().hash();
+    };
+    fn find(files: &[(String, String)], suffix: &str) -> Option<String> {
+        files
+            .iter()
+            .find(|(p, _)| p.ends_with(suffix))
+            .map(|(_, c)| c.clone())
+    }
+    let cargo_toml = find(&pushed.files, "Cargo.toml");
+    let cargo_lock = find(&pushed.files, "Cargo.lock");
+    let rust_toolchain = find(&pushed.files, "rust-toolchain.toml")
+        .or_else(|| find(&pushed.files, "rust-toolchain"));
+    let cargo_config =
+        find(&pushed.files, ".cargo/config.toml").or_else(|| find(&pushed.files, ".cargo/config"));
+    cargoless_core::cluster::WorkspaceConfig::new(
+        cargo_toml,
+        cargo_lock,
+        rust_toolchain,
+        cargo_config,
+    )
+    .hash()
 }
 
 /// Construct a cluster's RA Supervisor (sole `ClusterState` creation
@@ -643,19 +751,38 @@ fn exec(
                 wt.display(),
                 statusfile::now_unix()
             );
-            // Build the WT's overlay BEFORE the lsp-present guard so the
-            // span's load-bearing fields (file_count, overlay_size_bytes)
-            // can be recorded on BOTH exit paths — the early-return case
-            // STILL carries valid attrs, distinguishing "0-file early
-            // return" from "0-file no-overlay-found".
-            let mut pairs: Vec<(String, String)> = Vec::new();
-            if let Some(files) = pending_batch.get(&wt) {
-                for f in files {
-                    if let Ok(text) = std::fs::read_to_string(f) {
-                        pairs.push((f.to_string_lossy().into_owned(), text));
+            // #240/2b — overlay source pick (D-PUSHOVERLAY §4.1 pivot).
+            // PUSHED-mode: if a fresh push is pending for this WT, source
+            // the overlay from the in-memory store (consumed — the
+            // pop-on-consume semantic). The FS-mode path below is the
+            // unchanged v0.2.0 wire. The proven core (`overlay::diff`,
+            // `multiplex::switch_to`, LSP verbs, barrier, EmitVerdict,
+            // publish_verdict) is BYTE-UNTOUCHED — only the SOURCE of the
+            // pairs changes. THIS is the composing-equivalence assertion
+            // that 2b's load-bearing test pins: for the same `(prev,
+            // pairs)`, `overlay::diff` produces a byte-identical
+            // `Vec<OverlayOp>` whether `pairs` came from the FS or from
+            // the pushed store. Per-WT mode arbitration (one WT can be
+            // pushed while another is FS-watched).
+            // Build BEFORE the lsp-present guard so the span's
+            // load-bearing fields (file_count, overlay_size_bytes) can be
+            // recorded on BOTH exit paths — the early-return case STILL
+            // carries valid attrs, distinguishing "0-file early return"
+            // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
+            let pairs: Vec<(String, String)> =
+                if let Some(pushed) = api.take_overlay_for(&wt.to_string_lossy()) {
+                    pushed.files
+                } else {
+                    let mut pairs = Vec::new();
+                    if let Some(files) = pending_batch.get(&wt) {
+                        for f in files {
+                            if let Ok(text) = std::fs::read_to_string(f) {
+                                pairs.push((f.to_string_lossy().into_owned(), text));
+                            }
+                        }
                     }
-                }
-            }
+                    pairs
+                };
             let file_count = pairs.len() as u64;
             let overlay_size_bytes: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
             _span.record("file_count", file_count);
