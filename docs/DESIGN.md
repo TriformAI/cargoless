@@ -15,18 +15,33 @@ and this doc disagree, that is a bug in one of them — raise it, do not fork.
 
 ## 1. Scope in one paragraph
 
-cargoless **v0** is a single-developer, single-machine, **headless** inner-loop
-tool for Rust+WASM. A daemon watches the source tree, an analyzer assigns each
-file a green/red verdict, and the **moment** the tree is green the build/CAS
-layer produces (or dedupe-skips) a WASM artifact and **publishes** it: the
-`.cargoless/latest-green` pointer/dir advances only on a servable green build —
-a red tree or failed build never moves it (AC#4, "never publish red"). v0 has
-**no browser and no HTTP**. The live HTTP/WebSocket dev-server that serves the
-published artifact to a browser and full-reloads it is the **v0.1** adapter
-(decisions D3/D5 below) layered on top of this published output; it is
-deferred, not deleted (preserved on `agent/devserver*`). v0 is explicitly
-*not* browser-serving, *not* distributed, *not* multi-agent, *not* hot-swap,
+cargoless **v0** is a single-developer, single-machine, **headless**
+inner-loop tool for **any Cargo workspace** — native Rust or Rust+WASM
+(#241 de-WASM-gate, landed on `main`). A daemon watches the source
+tree, an analyzer assigns each file a green/red verdict, and — for
+Rust+WASM workspaces — the **moment** the tree is green the build/CAS
+layer produces (or dedupe-skips) a WASM artifact and **publishes** it:
+the `.cargoless/latest-green` pointer/dir advances only on a servable
+green build — a red tree or failed build never moves it (AC#4, "never
+publish red"). The **check / serve / watch** tiers are target-general
+(any Cargo workspace); the **latest-green WASM-artifact publisher**
+(§3.4) is WASM-specific by nature — no WASM artifact exists to publish
+on a native target. v0 has **no browser and no HTTP**. The live
+HTTP/WebSocket dev-server that serves the published artifact to a
+browser and full-reloads it is the **v0.1** adapter (decisions D3/D5
+below) layered on top of this published output; it is deferred, not
+deleted (preserved on `agent/devserver*`). v0 is explicitly *not*
+browser-serving, *not* distributed, *not* multi-agent, *not* hot-swap,
 *not* symbol-level — those are v0.1/v1 by construction (ROADMAP).
+**Honest scope note (post-#241):** for native-Rust workspaces, the
+check tier is rust-analyzer flycheck wrapping host-triple `cargo
+check` — *the same checker `bacon` runs*. cargoless's differentiator
+for the native case is **not** a novel checker; it is the shared-RA
+fleet-RAM property (one multiplexed RA across N worktrees — flat in
+N), the verdict-provenance discipline (per-crate + diagnostics
+retention), and the soon-shipping central in-cluster topology
+([`docs/design/D-PUSHOVERLAY.md`](design/D-PUSHOVERLAY.md),
+increment-2 design-ahead).
 
 ## 2. Decisions of record (D1–D7)
 
@@ -45,12 +60,18 @@ name *is* the chosen brand, not a placeholder. D1-completeness is
 CI-enforced forward by `scripts/d1-drift-guard` (#96, with allowlist
 spec in [`docs/design/D-DRIFT-GUARD.md`](design/D-DRIFT-GUARD.md)).
 
-### D2 — Audience wedge: Leptos-first vs broad Rust+WASM *(owner: Lead; OPEN)*
+### D2 — Audience wedge: Leptos-first vs broad Cargo-workspace *(owner: Lead; OPEN — post-#241 broadening of scope beyond Rust+WASM)*
 Documented stance: **Leptos-first for zero-config defaults, mechanism stays
 framework-agnostic.** Rationale: deep adoption in a focused community beats
 diffuse reach for a launch; but the contract must not bake Leptos in. **Contract
 impact:** none — `BuildIdentity`/`TargetTriple`/`Profile` are framework-neutral;
 "Leptos-first" lives in auto-detection defaults (D7), not the seam.
+**Post-#241 update:** the de-WASM-gate (#241, on `main` @4d56021)
+accepts any Cargo workspace at the check / serve / watch tier, so the
+broader-audience axis is no longer purely a future ambition — it is the
+landed reality. The Leptos-first wedge for zero-config auto-detection
+defaults stands; the WASM-artifact publisher remains a launch-wedge for
+the Rust+WASM use case; the broader scope claim is now empirical.
 
 ### D3 — Reload protocol: Trunk-compatible vs clean *(**v0.1**; documented
 stance: **Trunk-compatible**)*
@@ -85,12 +106,20 @@ A separate file keeps `Cargo.toml` unpolluted and is unambiguous to detect.
 config changes the build, so it is part of the cache identity. The *path/name*
 `tf.toml` is a config-parser concern (Epic 5), not frozen in the seam.
 
-### D7 — Zero-config auto-detection *(owner: Engineer A; SPEC)*
-Detect a `Cargo.toml` whose crate is `cdylib` + a `wasm32` target; infer the
-rest; fail loudly with a specific message if it cannot. Feeds AC#1 and Epic 5.
-**Contract impact:** the *output* of detection populates `TargetTriple` and the
-hashed config/toolchain inputs of `BuildIdentity`; detection logic itself is
-Epic 5, not the seam.
+### D7 — Zero-config auto-detection *(owner: Engineer A; SPEC — post-#241 broadened)*
+Detect any Cargo workspace; `cdylib` + a `wasm32` target (Leptos-class)
+is the auto-detected fast-path and engages the WASM-artifact publisher
+tier; native Rust workspaces are accepted at the check / serve / watch
+tier (the WASM-artifact publisher remains gated on `cdylib` +
+`wasm32`). Fail loudly with a specific message if no usable
+`Cargo.toml` is found. Feeds AC#1 and Epic 5. **Contract impact:** the
+*output* of detection populates `TargetTriple` and the hashed
+config/toolchain inputs of `BuildIdentity`; detection logic itself is
+Epic 5, not the seam. **Post-#241 update:** the prior "cdylib + wasm32
+required at the front door" stance was relaxed — the de-WASM-gate
+moved the WASM-specific gate from the front door to the publisher
+tier (where it belongs by nature), so check / serve / watch accept any
+Cargo workspace.
 
 ## 3. The contract (`cargoless-proto`)
 

@@ -33,10 +33,15 @@ surface — it goes to the deferred adapter or the parking lot.
 
 ## v0 — what just shipped (headless continuous checker + latest-green publisher)
 
-v0 is **single-developer, single-machine, headless**. It always knows
-what's green and **publishes** the latest green build to a pointer file.
-It does **not** serve a browser — the live HTTP/WebSocket dev-server is
-v0.1.
+v0 is **single-developer, single-machine, headless** — for **any Cargo
+workspace** (native Rust or Rust+WASM). It always knows what's green;
+for Rust+WASM workspaces (`cdylib + wasm32` / `leptos`) it also
+**publishes** the latest green WASM artifact to a pointer file. The
+check / serve / watch tiers are target-general (any Cargo workspace);
+the `build --watch --out` WASM-artifact publisher tier engages only on
+WASM workspaces — by nature there is no WASM artifact to publish on a
+native target. v0 does **not** serve a browser — the live
+HTTP/WebSocket dev-server is v0.1.
 
 ### v0 capabilities (available today on `main`)
 
@@ -57,8 +62,12 @@ v0.1.
   build (cargoless wraps it; see the install note in the README).
 - **`cargoless status`** — daemon liveness + last verdict + latest-green hash.
 - **`cargoless clean`** — clear the content-addressed cache.
-- **Zero-config auto-detection** — a `cdylib` + `wasm32` / `leptos` project
-  needs no flags; auto-detected on first run.
+- **Zero-config auto-detection** — any Cargo workspace is auto-detected
+  on first run; native Rust and `cdylib` + `wasm32` / `leptos` projects
+  all work without flags (#241 de-WASM-gate, landed on `main`). The
+  WASM-artifact publisher tier (`build --watch --out`) engages only
+  when the workspace is `cdylib` + `wasm32` — by nature, native targets
+  have no WASM artifact to publish.
 - **Agent-edit-batch as the cost unit.** The primary consumer is an AI
   agent writing whole files atomically (`Write`/`Edit` of a complete
   file). cargoless optimizes for the per-batch verdict, not
@@ -91,16 +100,29 @@ production-hardening sweep that closed 11 of 12 dogfood findings, see
 These are not bugs or oversights — they are **intentional v0 scope cuts**
 that protect the launch surface. Each is on the v0.1 or v1 list.
 
-- **No browser, no HTTP, no WebSocket.** cargoless does not serve your
-  WASM bundle. If you need that today, run `trunk serve` (or a static
-  server like `miniserve`) against the directory cargoless publishes via
-  `cargoless build --watch --out <dir>`. The integrated dev-server is v0.1.
-- **Not a `trunk serve` drop-in replacement in v0.** cargoless replaces
-  the *verdict* and *latest-green-publisher* surfaces, not the
-  browser-facing serve loop. v0.1 closes that gap.
+- **No browser, no HTTP, no WebSocket.** For the Rust+WASM case
+  cargoless does not serve your WASM bundle. If you need that today,
+  run `trunk serve` (or a static server like `miniserve`) against the
+  directory cargoless publishes via `cargoless build --watch --out
+  <dir>`. The integrated dev-server is v0.1.
+- **Not a `trunk serve` drop-in replacement in v0** (for the Rust+WASM
+  case). cargoless replaces the *verdict* and *latest-green-publisher*
+  surfaces, not the browser-facing serve loop. v0.1 closes that gap.
+  (For native-Rust workspaces there is no `trunk serve` analog; the
+  relevant comparison is `cargo check` / `bacon` — see below.)
 - **Not a `trunk build` replacement.** `cargoless build --watch --out`
   wraps `trunk build` (which calls cargo + wasm-bindgen + post-processing).
   cargoless drives it and adds the watch/publish loop on top.
+- **Not a novel native-Rust checker.** For native-Rust workspaces the
+  check tier is rust-analyzer flycheck wrapping host-triple
+  `cargo check` — *the same checker `bacon` runs*. cargoless's
+  differentiator for the native case is **not** a new checker; it is
+  the shared-RA fleet-RAM property (one multiplexed RA across N
+  worktrees — flat in N, see the status snapshot), the
+  verdict-provenance discipline (per-crate + diagnostics retention),
+  and the soon-shipping central in-cluster topology (parked
+  design-ahead spec, ships bundled with Increment-2 overlay-push
+  implementation).
 - **No hot-swap, no symbol-level granularity, no editor LSP plugin.**
   Per the v1 parking list.
 
