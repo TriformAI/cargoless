@@ -44,7 +44,9 @@ use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use cargoless_core::Diagnostic;
-use cargoless_core::transport::{TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary};
+use cargoless_core::transport::{
+    PushOverlayAck, TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
+};
 
 /// Poison-tolerant lock (same discipline as `model::poisoned` /
 /// `inproc::testmock`): a panicked verdict path must not wedge the read
@@ -53,10 +55,30 @@ fn poisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// A pushed overlay set carried in `ServeVerdictState::pushed`. Stored
+/// pair-shape (`Vec<(String, String)>`) instead of [`OverlaySet`] so the
+/// consumer in servedrv.rs's `SwitchOverlay` arm can re-build with
+/// `OverlaySet::from_pairs(pushed.files)` — byte-identical to the FS
+/// path's construction (the composing-equivalence assertion 2b's
+/// load-bearing test pins).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushedOverlay {
+    /// Client-supplied base_ref (typically e.g. `origin/main`). v0.2.x:
+    /// stored for diagnostics + future "diff vs base_ref" features;
+    /// server does NOT act on it in 2b (spike open-question #2 default).
+    pub base_ref: String,
+    /// Whole-file `(path, content)` pairs — the same shape the FS path
+    /// builds via `std::fs::read_to_string` per file.
+    pub files: Vec<(String, String)>,
+    /// Unix timestamp of the push receipt. Diagnostics-only for 2b;
+    /// future idle-evict policy (Wave-2) reads this.
+    pub last_push_unix: u64,
+}
+
 /// The serve-loop's live verdict state, presented as the shipped logical
 /// [`VerdictService`]. `Send + Sync` (the trait demands it so the
 /// HTTP/Unix adapters can share one service across connection threads):
-/// the two `Mutex`-guarded maps satisfy that by construction.
+/// the four `Mutex`-guarded fields satisfy that by construction.
 #[derive(Default)]
 pub struct ServeVerdictState {
     /// worktree-key → last published status. Keyed by the SAME string
@@ -68,6 +90,24 @@ pub struct ServeVerdictState {
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
     subs: Mutex<Vec<Sender<TransitionEvent>>>,
+    /// #240/2b — pushed-overlay store. worktree-key →
+    /// [`PushedOverlay`]. Populated by `push_overlay` (the
+    /// [`VerdictService`] write-plane ingest), consumed once by
+    /// `take_overlay_for` (the serve loop's SwitchOverlay arm). The
+    /// `take` is **pop-on-consume semantic** (spike open-question #3
+    /// default): once consumed, the WT falls back to the FS path until
+    /// a fresh push arrives. Per-WT serialization (a new push for the
+    /// same WT REPLACES the prior overlay before consumption) is the
+    /// natural BTreeMap semantic.
+    pushed: Mutex<BTreeMap<String, PushedOverlay>>,
+    /// #240/2b — push-arrival signal channel. The serve loop drains
+    /// this alongside ctrl_rx; each received worktree-key is the
+    /// wakeup signal that a push needs servicing. `Option<Sender>`
+    /// because `new()` constructs without a channel; the loop wires
+    /// one in via [`Self::attach_push_signal`] at startup, BEFORE
+    /// `HttpServer::bind` exposes `push_overlay` to clients (so no
+    /// push can race the channel-not-yet-attached window).
+    push_signal: Mutex<Option<Sender<String>>>,
 }
 
 impl ServeVerdictState {
@@ -110,6 +150,42 @@ impl ServeVerdictState {
             published_at,
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
+    }
+
+    /// #240/2b — wire the push-arrival signal channel. Called ONCE by
+    /// the serve loop at startup, BEFORE `HttpServer::bind` exposes the
+    /// `push_overlay` ingest route. After this, every `push_overlay`
+    /// call sends the WT key on `tx`; the serve loop's drain wakes up
+    /// and synthesizes a `DriverEvent::RoutedBatch` for that WT.
+    ///
+    /// **Best-effort by construction:** a wedged `tx` (closed receiver)
+    /// produces a silent send-error; the push is still STORED in
+    /// `pushed`, only the wakeup is lost. The next push or activity
+    /// tick will eventually surface the stored overlay — the
+    /// fail-soft transport ethos applied to the write-plane wakeup.
+    pub fn attach_push_signal(&self, tx: Sender<String>) {
+        *poisoned(&self.push_signal) = Some(tx);
+    }
+
+    /// #240/2b — consume-semantic reader for the SwitchOverlay arm.
+    /// Returns the pushed overlay for `wt_key` (matching
+    /// `wt.to_string_lossy()` from servedrv) AND removes it from the
+    /// store. If no push is pending, returns `None` and the SwitchOverlay
+    /// arm falls through to the FS-read path. The pop-on-consume
+    /// semantic (spike open-question #3 default) means each push
+    /// services exactly one SwitchOverlay cycle; FS path resumes if no
+    /// fresh push arrives.
+    pub fn take_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
+        poisoned(&self.pushed).remove(wt_key)
+    }
+
+    /// #240/2b — non-consuming peek. Used by the serve loop's first-push
+    /// cluster-hash derivation (`cluster_hash_from_pushed`) which needs
+    /// to read the pushed workspace-config files WITHOUT consuming the
+    /// overlay (the consume happens later in the SwitchOverlay arm via
+    /// `take_overlay_for`). Returns a clone; the store is unchanged.
+    pub fn peek_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
+        poisoned(&self.pushed).get(wt_key).cloned()
     }
 }
 
@@ -155,6 +231,46 @@ impl VerdictService for ServeVerdictState {
         let (tx, rx) = channel();
         poisoned(&self.subs).push(tx);
         rx
+    }
+
+    /// #240/2b — overlay-push ingest. The WRITE-PLANE entry for the
+    /// pushed-mode central-daemon topology (D-PUSHOVERLAY §2.4 / §4).
+    ///
+    /// 1. Record the `(base_ref, files)` pair in the per-WT pushed
+    ///    store. A subsequent push for the same WT REPLACES (latest
+    ///    wins; per-WT serialization is the natural BTreeMap semantic).
+    /// 2. Signal the serve loop via the attached `push_signal` channel
+    ///    (best-effort: a wedged send leaves the overlay stored, only
+    ///    the wakeup is lost). The loop synthesizes a
+    ///    `DriverEvent::RoutedBatch` for this WT, which feeds the
+    ///    proven core EXACTLY as if it came from the FS watcher path
+    ///    — same event shape, no new emission seam.
+    /// 3. Return an ack: `accepted=true` + `applied_files` count. The
+    ///    ack does NOT block on the verdict; the client uses the
+    ///    already-shipped subscribe (SSE) or `get_status` for the
+    ///    verdict (D-PUSHOVERLAY §2.3 — no new verdict-egress surface).
+    fn push_overlay(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+    ) -> PushOverlayAck {
+        let applied_files = files.len() as u32;
+        let pushed = PushedOverlay {
+            base_ref: base_ref.to_string(),
+            files: files.to_vec(),
+            last_push_unix: crate::statusfile::now_unix(),
+        };
+        poisoned(&self.pushed).insert(worktree.to_string(), pushed);
+        // Wake the serve loop (best-effort — see attach_push_signal doc).
+        if let Some(tx) = poisoned(&self.push_signal).as_ref() {
+            let _ = tx.send(worktree.to_string());
+        }
+        PushOverlayAck {
+            worktree: worktree.to_string(),
+            accepted: true,
+            applied_files,
+        }
     }
 }
 
@@ -266,6 +382,197 @@ mod tests {
         assert!(
             api.get_diagnostics("/r/wt").is_empty(),
             "Inc-0: diagnostics-retention wiring is a later increment"
+        );
+    }
+
+    // ──────────── #240/2b — overlay-push ingest tests ────────────
+
+    #[test]
+    fn push_overlay_stores_files_signals_and_acks() {
+        let api = ServeVerdictState::new();
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+
+        let files = vec![
+            ("/wt-a/src/lib.rs".to_string(), "pub fn x() {}".to_string()),
+            (
+                "/wt-a/Cargo.toml".to_string(),
+                "[package]\nname=\"x\"\n".to_string(),
+            ),
+        ];
+        let ack = api.push_overlay("/wt-a", "origin/main", &files);
+
+        // Ack: accepted=true + applied_files=N.
+        assert_eq!(ack.worktree, "/wt-a");
+        assert!(
+            ack.accepted,
+            "VerdictService override returns accepted=true"
+        );
+        assert_eq!(ack.applied_files, 2);
+
+        // Store contains the overlay (peek doesn't consume).
+        let peeked = api.peek_overlay_for("/wt-a").expect("stored");
+        assert_eq!(peeked.base_ref, "origin/main");
+        assert_eq!(peeked.files.len(), 2);
+        assert_eq!(peeked.files, files);
+
+        // Signal fired with the WT key.
+        let signal = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .expect("push_signal wakeup");
+        assert_eq!(signal, "/wt-a");
+    }
+
+    #[test]
+    fn take_overlay_for_is_pop_on_consume() {
+        let api = ServeVerdictState::new();
+        let files = vec![("/wt/x".to_string(), "y".to_string())];
+        api.push_overlay("/wt", "main", &files);
+
+        // First take: consumes.
+        let first = api.take_overlay_for("/wt");
+        assert!(first.is_some(), "first take returns the stored overlay");
+        assert_eq!(first.unwrap().files, files);
+
+        // Second take: None (consumed). FS-mode resumes for this WT
+        // until a fresh push arrives.
+        assert!(
+            api.take_overlay_for("/wt").is_none(),
+            "second take returns None — pop-on-consume semantic"
+        );
+        // peek also None.
+        assert!(api.peek_overlay_for("/wt").is_none());
+    }
+
+    /// **THE load-bearing composing-equivalence assertion (2b spec §5.3).**
+    ///
+    /// For the SAME `(path, content)` set, the `Vec<OverlayOp>` produced
+    /// by `overlay::diff(prev, next)` is byte-identical whether `next`
+    /// was built from FS-read pairs OR from pushed pairs. This proves
+    /// that `overlay::diff` is source-agnostic — the proven isolation
+    /// core (multiplex/clusterdrv/barrier) sees no difference between
+    /// pushed-mode and FS-mode, and the §190/#247
+    /// precondition-restore story stays intact through the 2b ingest seam.
+    ///
+    /// This is the structural-correctness guarantee 2b ships. A future
+    /// regression that introduces source-asymmetry (e.g. trimming pushed
+    /// content) would flip exactly this assertion.
+    #[test]
+    fn composing_equivalence_pushed_vs_fs_pairs_yield_identical_overlay_ops() {
+        use cargoless_core::overlay::{OverlaySet, diff};
+
+        let prev = OverlaySet::from_pairs(vec![(
+            "/wt-a/src/old.rs".to_string(),
+            "fn old() {}".to_string(),
+        )]);
+
+        // Same content, two construction paths:
+        //   - FS-mode: the SwitchOverlay arm reads (path, content) from
+        //     disk and builds OverlaySet::from_pairs.
+        //   - Pushed-mode: the SwitchOverlay arm reads (path, content)
+        //     from api.take_overlay_for(wt) and builds OverlaySet::from_pairs.
+        // Both produce IDENTICAL OverlaySet → IDENTICAL diff output.
+        let pairs = vec![
+            (
+                "/wt-a/src/lib.rs".to_string(),
+                "pub fn new() {}".to_string(),
+            ),
+            (
+                "/wt-a/src/util.rs".to_string(),
+                "pub fn util() {}".to_string(),
+            ),
+        ];
+
+        let fs_next = OverlaySet::from_pairs(pairs.iter().cloned());
+        let fs_ops = diff(&prev, &fs_next);
+
+        // Pushed-mode: store + take + reconstruct OverlaySet exactly as
+        // the SwitchOverlay arm does.
+        let api = ServeVerdictState::new();
+        api.push_overlay("/wt-a", "origin/main", &pairs);
+        let pushed = api.take_overlay_for("/wt-a").expect("pushed");
+        let pushed_next = OverlaySet::from_pairs(pushed.files.iter().cloned());
+        let pushed_ops = diff(&prev, &pushed_next);
+
+        assert_eq!(
+            fs_ops, pushed_ops,
+            "overlay::diff output MUST be byte-identical regardless of \
+             source (FS vs pushed) — the load-bearing composing-equivalence \
+             assertion (D-PUSHOVERLAY §5.3). A regression here breaks the \
+             pushed-mode no-wrong-verdict guarantee."
+        );
+    }
+
+    #[test]
+    fn push_overlay_no_signal_attached_is_safe() {
+        // Fail-soft: a push that arrives BEFORE the loop wires its
+        // push_signal (or AFTER the receiver was dropped) must store
+        // the overlay AND not panic. The loop can still service the
+        // push on its next activity tick or next push.
+        let api = ServeVerdictState::new();
+        // No attach_push_signal called.
+        let files = vec![("/wt/f".to_string(), "x".to_string())];
+        let ack = api.push_overlay("/wt", "main", &files);
+        assert!(
+            ack.accepted,
+            "no-signal-attached ⇒ push is still accepted + stored"
+        );
+        assert!(
+            api.peek_overlay_for("/wt").is_some(),
+            "overlay still in store despite no signal"
+        );
+
+        // Dropped-receiver case: attach, drop rx, push again — still safe.
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+        drop(rx);
+        let ack2 = api.push_overlay("/wt-b", "main", &files);
+        assert!(
+            ack2.accepted,
+            "dropped-receiver ⇒ push still accepted + stored (best-effort signal)"
+        );
+        assert!(api.peek_overlay_for("/wt-b").is_some());
+    }
+
+    #[test]
+    fn multiple_pushes_same_wt_latest_wins() {
+        // Per-WT serialization: a fresh push for the same WT REPLACES the
+        // prior stored overlay (BTreeMap::insert semantic). N rapid
+        // pushes coalesce — the SwitchOverlay arm services exactly the
+        // latest state. The push_signal still fires per push (each wakeup
+        // services whatever the CURRENT stored state is — natural coalesce
+        // on the consume side via pop-on-consume).
+        let api = ServeVerdictState::new();
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+
+        let v1 = vec![("/wt/x".to_string(), "version-1".to_string())];
+        let v2 = vec![("/wt/x".to_string(), "version-2".to_string())];
+        let v3 = vec![("/wt/x".to_string(), "version-3".to_string())];
+        api.push_overlay("/wt", "main", &v1);
+        api.push_overlay("/wt", "main", &v2);
+        api.push_overlay("/wt", "main", &v3);
+
+        // Store has the LATEST content (v3), not v1/v2.
+        let consumed = api.take_overlay_for("/wt").expect("stored");
+        assert_eq!(
+            consumed.files, v3,
+            "latest push wins (BTreeMap::insert replace semantic)"
+        );
+        // Subsequent take: None (consumed once; v1/v2/v3 collapsed).
+        assert!(api.take_overlay_for("/wt").is_none());
+
+        // All 3 signals fired (the wakeup channel is per-push, not
+        // coalesced). The serve loop's drain sees 3 wakeups, but each
+        // take_overlay_for after the first returns None — natural
+        // idempotency.
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, 3,
+            "3 signals (one per push) — consume-side coalesces"
         );
     }
 }
