@@ -3,15 +3,19 @@
 Thanks for considering a contribution. cargoless is small, the surface area
 is well-defined, and the project genuinely benefits from outside eyes —
 especially around UX rough edges, install-path corner cases, and
-real-world Leptos/WASM project shapes the maintainers haven't tried.
+real-world Cargo workspace shapes the maintainers haven't tried (native
+Rust or Rust+WASM — both are in scope post-#241 de-WASM-gate).
 
 ## Quick start for new contributors
 
 1. **Install the development tip** (see [`README.md`](README.md) for the
    exact command — single `cargo install` against the GitHub repo).
 2. **Try it on your own project.** Run `cargoless check` and `cargoless
-   watch` against a real Rust+WASM tree you care about; report anything
-   that surprises you.
+   watch` against a real Cargo workspace you care about — native Rust
+   or Rust+WASM both work at the check / serve / watch tier (#241
+   de-WASM-gate on `main`); the latest-green WASM-artifact publisher
+   tier (`build --watch --out`) engages only on `cdylib + wasm32` /
+   `leptos` workspaces, by nature. Report anything that surprises you.
 3. **Open an issue** at
    [github.com/TriformAI/cargoless/issues](https://github.com/TriformAI/cargoless/issues)
    describing what you saw. Bug, feature request, doc gap, "this command
@@ -45,17 +49,34 @@ ground truth. So when you find something that breaks that trust, the
 maintainers want to fix it fast, and a precise repro shortens that loop:
 
 - **Your environment**: OS + arch, `cargoless --version`, `rustc --version`.
-- **The project shape**: framework (Leptos, Yew, Sycamore, none), is it
-  `cdylib`-only or `cdylib+rlib`, anything unusual about the workspace?
+- **The project shape**: framework / kind (Leptos, Yew, Sycamore,
+  native-Rust binary, native-Rust library, workspace with mixed
+  crates...); for WASM workspaces — is it `cdylib`-only or
+  `cdylib+rlib`? Anything unusual about the workspace?
 - **The exact commands you ran**, with their output.
 - **What you expected vs what you got.**
 - **Whether `cargo check` agrees or disagrees with cargoless's verdict.**
   (This is the most useful single piece of information for diagnosing a
-  verdict bug.)
+  verdict bug — at the check tier, cargoless wraps rust-analyzer
+  flycheck wrapping host-triple `cargo check`, so a `cargo check` vs
+  cargoless mismatch is the highest-signal verdict-bug indicator on
+  both native Rust and Rust+WASM.)
 
 A 4-line repro on a shape we've never tried is more valuable than a
 "cargoless is broken on my big private project" message — the second
 one we can't act on.
+
+> **Honest scope note (post-#241 de-WASM-gate).** For native-Rust
+> workspaces, cargoless's check tier is rust-analyzer flycheck
+> wrapping host-triple `cargo check` — *the same checker `bacon`
+> runs*. cargoless's differentiator for the native-Rust case is
+> **not** a novel checker; it is the shared-RA fleet-RAM property
+> (one multiplexed RA across N worktrees), the verdict-provenance
+> discipline (per-crate verdicts + diagnostics retention), and the
+> soon-shipping central in-cluster topology (design-ahead spec parked
+> with the Increment-2 overlay-push bundle). The WASM-artifact
+> publisher and the Rust+WASM inner-loop story remain the launch
+> wedge.
 
 ## What makes a good pull request
 
