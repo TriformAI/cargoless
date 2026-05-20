@@ -27,6 +27,7 @@ mod clean;
 mod config;
 mod cratemap;
 mod orphan;
+mod push; // #240/2c — thin push-client (POST /overlay).
 mod serve;
 mod serveapi;
 mod servedrv;
@@ -44,6 +45,9 @@ enum Cmd {
     Clean,
     /// Model R Stream B #3: repo-scoped daemon (`serve --repo <path>`).
     Serve,
+    /// #240/2c: thin push-client — push a local overlay-set to a remote
+    /// `serve --repo --bind` daemon via `POST /overlay`.
+    Push,
     Help,
     Version,
 }
@@ -92,6 +96,14 @@ struct Opts {
     /// `cli-status`. Resolved through `transport::discovery` (explicit
     /// operator intent — `--remote` wins the §10.3 precedence).
     remote: Option<String>,
+    /// `push --worktree <key>` — explicit server-side worktree key. If
+    /// absent, defaults to the canonical absolute `--repo` path
+    /// (path-keyed identity, D-INC2-2B §11 open-Q1 default).
+    push_worktree: Option<String>,
+    /// `push --base <ref>` — git base ref for `git diff --name-only`.
+    /// Default `HEAD`. Carried in the push payload; server stores +
+    /// ignores in v0.2.x (D-INC2-2B §11 open-Q2 default).
+    push_base: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -124,6 +136,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "status" => Cmd::Status,
         "clean" => Cmd::Clean,
         "serve" => Cmd::Serve,
+        "push" => Cmd::Push,
         "help" | "-h" | "--help" => Cmd::Help,
         "version" | "-V" | "--version" => Cmd::Version,
         other => return Err(ParseError::UnknownCommand(other.to_string())),
@@ -198,6 +211,17 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .ok_or(ParseError::MissingValue("--remote"))?
                         .clone(),
                 );
+            }
+            // ── Model R / #240 2c `push` flags ──────────────────────
+            "--worktree" => {
+                opts.push_worktree = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--worktree"))?
+                        .clone(),
+                );
+            }
+            "--base" => {
+                opts.push_base = Some(it.next().ok_or(ParseError::MissingValue("--base"))?.clone());
             }
             "-h" | "--help" => {
                 return Ok(Parsed {
@@ -337,6 +361,45 @@ fn main() -> ExitCode {
                 return statusfile::run_status_remote(url);
             }
         }
+        // #240/2c — `push --remote <url>` pushes a local overlay-set to
+        // a remote daemon. Dispatch BEFORE the `config::Config::resolve`
+        // front-door (same rationale as serve/status --remote): push is
+        // a server-protocol command, not a local-WASM-project command.
+        // --remote is REQUIRED for push (no local fallback).
+        Cmd::Push => {
+            let Some(remote) = parsed.opts.remote.clone() else {
+                ui::error("push: --remote <url> is required");
+                return ExitCode::from(2);
+            };
+            let repo = parsed
+                .opts
+                .repo
+                .clone()
+                .or_else(|| parsed.opts.root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            // Default worktree-key = canonical absolute repo path
+            // (D-INC2-2B path-keyed identity). std::fs::canonicalize
+            // resolves symlinks + relative components; fall back to the
+            // raw path if canonicalize fails (e.g. ephemeral test dirs).
+            let worktree = parsed.opts.push_worktree.clone().unwrap_or_else(|| {
+                std::fs::canonicalize(&repo)
+                    .unwrap_or_else(|_| repo.clone())
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let base = parsed
+                .opts
+                .push_base
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string());
+            return push::run(&push::PushOpts {
+                remote,
+                repo,
+                worktree,
+                base,
+            });
+        }
         _ => {}
     }
 
@@ -389,7 +452,7 @@ fn main() -> ExitCode {
         Cmd::Build => build::run(&cfg, parsed.opts.out.as_deref()),
         Cmd::Status => statusfile::run_status(&cfg),
         Cmd::Clean => clean::run(&cfg),
-        Cmd::Help | Cmd::Version | Cmd::Serve => unreachable!("handled above"),
+        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push => unreachable!("handled above"),
     }
 }
 
