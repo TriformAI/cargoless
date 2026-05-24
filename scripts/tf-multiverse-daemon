@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+#
+# Local-host daemon control for making cargoless the default tf-multiverse
+# check path. This intentionally runs beside the agent worktrees so the
+# daemon can see the same filesystem paths that scripts/check-remote pushes.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TF_MULTIVERSE_REPO="${TF_MULTIVERSE_REPO:-/Users/iggy/Documents/GitHub/tf-multiverse}"
+CARGOLESS_BIND="${CARGOLESS_BIND:-127.0.0.1:8787}"
+CARGOLESS_REMOTE="${CARGOLESS_REMOTE:-http://$CARGOLESS_BIND}"
+CARGOLESS_AWAIT_TIMEOUT_SECS="${CARGOLESS_AWAIT_TIMEOUT_SECS:-45}"
+
+case "$(uname -s 2>/dev/null || true)" in
+  Darwin)
+    DEFAULT_CACHE_ROOT="${HOME}/Library/Caches/cargoless/tf-multiverse"
+    ;;
+  *)
+    DEFAULT_CACHE_ROOT="${XDG_CACHE_HOME:-${HOME}/.cache}/cargoless/tf-multiverse"
+    ;;
+esac
+
+CARGOLESS_TFM_DAEMON_ROOT="${CARGOLESS_TFM_DAEMON_ROOT:-$DEFAULT_CACHE_ROOT}"
+CARGOLESS_TFM_STATE_DIR="${CARGOLESS_TFM_STATE_DIR:-$CARGOLESS_TFM_DAEMON_ROOT/state}"
+CARGOLESS_TFM_CAS_DIR="${CARGOLESS_TFM_CAS_DIR:-$CARGOLESS_TFM_STATE_DIR/cas}"
+CARGOLESS_TFM_TARGET_DIR="${CARGOLESS_TFM_TARGET_DIR:-$CARGOLESS_TFM_DAEMON_ROOT/target}"
+CARGOLESS_TFM_LOG_DIR="${CARGOLESS_TFM_LOG_DIR:-$CARGOLESS_TFM_DAEMON_ROOT/logs}"
+CARGOLESS_TFM_PIDFILE="${CARGOLESS_TFM_PIDFILE:-$CARGOLESS_TFM_DAEMON_ROOT/cargoless.pid}"
+CARGOLESS_TFM_LOG="${CARGOLESS_TFM_LOG:-$CARGOLESS_TFM_LOG_DIR/serve.log}"
+CARGOLESS_TFM_LAUNCHD_LABEL="${CARGOLESS_TFM_LAUNCHD_LABEL:-dev.triform.cargoless.tf-multiverse}"
+CARGOLESS_TFM_LAUNCHD_PLIST="${CARGOLESS_TFM_LAUNCHD_PLIST:-$HOME/Library/LaunchAgents/$CARGOLESS_TFM_LAUNCHD_LABEL.plist}"
+CARGOLESS_TFM_RA_CHECK_DISABLED="${CARGOLESS_TFM_RA_CHECK_DISABLED:-1}"
+CARGOLESS_VERDICT_MODE="${CARGOLESS_VERDICT_MODE:-ra}"
+CARGOLESS_RA_SETTLE_MS="${CARGOLESS_RA_SETTLE_MS:-2000}"
+CARGOLESS_PUSH_ONLY="${CARGOLESS_PUSH_ONLY:-1}"
+CARGOLESS_PROJECT_CHECKS_MODE="${CARGOLESS_PROJECT_CHECKS_MODE:-warn}"
+CARGOLESS_TFM_WT_IDLE_SECS="${CARGOLESS_TFM_WT_IDLE_SECS:-21600}"
+CARGOLESS_TFM_WT_DEACTIVATE_SECS="${CARGOLESS_TFM_WT_DEACTIVATE_SECS:-64800}"
+CARGOLESS_TFM_DRAIN_TIMEOUT_SECS="${CARGOLESS_TFM_DRAIN_TIMEOUT_SECS:-30}"
+CARGOLESS_TFM_READY_TIMEOUT_SECS="${CARGOLESS_TFM_READY_TIMEOUT_SECS:-90}"
+TF_CHECK_TIMEOUT_SECS="${TF_CHECK_TIMEOUT_SECS:-900}"
+CARGOLESS_TFM_PATH="${CARGOLESS_TFM_PATH:-$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin}"
+
+DEFAULT_RELEASE_BIN="$REPO_ROOT/target/release/cargoless"
+DEFAULT_DEBUG_BIN="$REPO_ROOT/target/debug/cargoless"
+DEFAULT_BIN="cargoless"
+CARGOLESS_BIN="${CARGOLESS_BIN:-$DEFAULT_BIN}"
+
+die() {
+  echo "[tf-multiverse-daemon] ERROR: $*" >&2
+  exit 2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/tf-multiverse-daemon <command>
+
+Commands:
+  build       Build the release cargoless binary.
+  start       Start the loopback daemon in the background.
+  foreground  Run the daemon in the foreground.
+  stop        Stop the pidfile daemon.
+  restart     Stop, then start.
+  status      Query pidfile and remote daemon health.
+  env         Print exports for tf-multiverse check-remote.
+  paths       Print resolved paths and settings.
+  logs        Tail the daemon log.
+
+Environment:
+  TF_MULTIVERSE_REPO              default /Users/iggy/Documents/GitHub/tf-multiverse
+  CARGOLESS_BIND                  default 127.0.0.1:8787
+  CARGOLESS_REMOTE                default http://$CARGOLESS_BIND
+  CARGOLESS_BIN                   default cargoless on PATH; local target/release fallback
+  CARGOLESS_TFM_DAEMON_ROOT       default user cache dir
+  CARGOLESS_TFM_STATE_DIR         default $CARGOLESS_TFM_DAEMON_ROOT/state
+  CARGOLESS_TFM_CAS_DIR           default $CARGOLESS_TFM_STATE_DIR/cas
+  CARGOLESS_TFM_TARGET_DIR        default $CARGOLESS_TFM_DAEMON_ROOT/target
+  CARGOLESS_TFM_LOG_DIR           default $CARGOLESS_TFM_DAEMON_ROOT/logs
+  CARGOLESS_TFM_LAUNCHD_LABEL     default dev.triform.cargoless.tf-multiverse
+  CARGOLESS_TFM_LAUNCHD_PLIST     default ~/Library/LaunchAgents/$label.plist
+  CARGOLESS_TFM_NO_LAUNCHD        set 1 to force nohup/pidfile start on macOS
+  CARGOLESS_AWAIT_TIMEOUT_SECS    default 45
+  TF_CHECK_TIMEOUT_SECS           default 900
+  CARGOLESS_TFM_RA_CHECK_DISABLED default 1; do not run RA cargo flycheck
+  CARGOLESS_VERDICT_MODE          default ra; development verdicts from RA diagnostics
+  CARGOLESS_RA_SETTLE_MS          default 2000; RA diagnostic settle delay
+  CARGOLESS_PUSH_ONLY             default 1; push requests drive replacement verdicts
+  CARGOLESS_PROJECT_CHECKS_MODE   default warn; hard|warn|off for cargoless.checks.yaml
+  CARGOLESS_TFM_WT_IDLE_SECS      default 21600; keep hot WTs resident for 6h
+  CARGOLESS_TFM_WT_DEACTIVATE_SECS default 64800; deactivate after 24h total quiet
+  CARGOLESS_TFM_DRAIN_TIMEOUT_SECS default 30; graceful quiesce wait before SIGTERM
+  CARGOLESS_TFM_READY_TIMEOUT_SECS default 90; startup readiness wait
+USAGE
+}
+
+ensure_repo() {
+  [ -d "$TF_MULTIVERSE_REPO" ] || die "tf-multiverse repo not found: $TF_MULTIVERSE_REPO"
+  git -C "$TF_MULTIVERSE_REPO" rev-parse --show-toplevel >/dev/null 2>&1 \
+    || die "not a git worktree: $TF_MULTIVERSE_REPO"
+}
+
+ensure_dirs() {
+  mkdir -p "$CARGOLESS_TFM_DAEMON_ROOT" "$CARGOLESS_TFM_STATE_DIR" \
+    "$CARGOLESS_TFM_CAS_DIR" "$CARGOLESS_TFM_TARGET_DIR" "$CARGOLESS_TFM_LOG_DIR"
+}
+
+build_release() {
+  cargo build --release -p cargoless --locked
+}
+
+ensure_bin() {
+  if command -v "$CARGOLESS_BIN" >/dev/null 2>&1; then
+    CARGOLESS_BIN="$(command -v "$CARGOLESS_BIN")"
+  elif [ -x "$CARGOLESS_BIN" ]; then
+    :
+  elif [ -x "$DEFAULT_RELEASE_BIN" ]; then
+    CARGOLESS_BIN="$DEFAULT_RELEASE_BIN"
+  elif [ -x "$DEFAULT_DEBUG_BIN" ]; then
+    CARGOLESS_BIN="$DEFAULT_DEBUG_BIN"
+  else
+    if [ "$CARGOLESS_BIN" = "$DEFAULT_DEBUG_BIN" ] || [ "$CARGOLESS_BIN" = "$DEFAULT_RELEASE_BIN" ] || [ "$CARGOLESS_BIN" = "$DEFAULT_BIN" ]; then
+      build_release
+      CARGOLESS_BIN="$DEFAULT_RELEASE_BIN"
+    else
+      die "cargoless binary is not executable: $CARGOLESS_BIN"
+    fi
+  fi
+}
+
+pid_alive() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+pidfile_pid() {
+  [ -f "$CARGOLESS_TFM_PIDFILE" ] || return 1
+  sed -n '1p' "$CARGOLESS_TFM_PIDFILE"
+}
+
+remote_status() {
+  "$CARGOLESS_BIN" status --remote "$CARGOLESS_REMOTE"
+}
+
+admin_get() {
+  command -v curl >/dev/null 2>&1 || return 127
+  if [ -n "${CARGOLESS_AUTH_TOKEN:-}" ]; then
+    curl -fsS -m 2 -H "Authorization: Bearer $CARGOLESS_AUTH_TOKEN" "$CARGOLESS_REMOTE$1"
+  else
+    curl -fsS -m 2 "$CARGOLESS_REMOTE$1"
+  fi
+}
+
+admin_post() {
+  command -v curl >/dev/null 2>&1 || return 127
+  if [ -n "${CARGOLESS_AUTH_TOKEN:-}" ]; then
+    curl -fsS -m 2 -X POST -H "Authorization: Bearer $CARGOLESS_AUTH_TOKEN" "$CARGOLESS_REMOTE$1"
+  else
+    curl -fsS -m 2 -X POST "$CARGOLESS_REMOTE$1"
+  fi
+}
+
+wait_pid_exit() {
+  local pid="$1"
+  local timeout="${2:-$CARGOLESS_TFM_DRAIN_TIMEOUT_SECS}"
+  [ -n "$pid" ] || return 1
+  local i max
+  max=$((timeout * 4))
+  [ "$max" -gt 0 ] || max=1
+  for i in $(seq 1 "$max"); do
+    if ! pid_alive "$pid"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+wait_remote_down() {
+  local timeout="${1:-$CARGOLESS_TFM_DRAIN_TIMEOUT_SECS}"
+  local i max
+  max=$((timeout * 4))
+  [ "$max" -gt 0 ] || max=1
+  for i in $(seq 1 "$max"); do
+    if ! admin_get /healthz >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+quiesce_and_wait() {
+  local pid="${1:-}"
+  if [ "${CARGOLESS_TFM_QUIESCE:-1}" = "0" ]; then
+    return 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[tf-multiverse-daemon] curl unavailable; skipping graceful quiesce"
+    return 1
+  fi
+  local activity
+  if ! activity="$(admin_post /admin/quiesce 2>/dev/null)"; then
+    echo "[tf-multiverse-daemon] daemon has no quiesce endpoint; falling back to stop signal"
+    return 1
+  fi
+  echo "[tf-multiverse-daemon] quiesce requested: $activity"
+  if [ -n "$pid" ]; then
+    if wait_pid_exit "$pid" "$CARGOLESS_TFM_DRAIN_TIMEOUT_SECS"; then
+      echo "[tf-multiverse-daemon] quiesce drain complete pid=$pid"
+      return 0
+    fi
+  else
+    if wait_remote_down "$CARGOLESS_TFM_DRAIN_TIMEOUT_SECS"; then
+      echo "[tf-multiverse-daemon] quiesce drain complete"
+      return 0
+    fi
+  fi
+  echo "[tf-multiverse-daemon] quiesce timed out after ${CARGOLESS_TFM_DRAIN_TIMEOUT_SECS}s; falling back to stop signal" >&2
+  return 1
+}
+
+use_launchd() {
+  [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] \
+    && [ "${CARGOLESS_TFM_NO_LAUNCHD:-0}" != "1" ] \
+    && command -v launchctl >/dev/null 2>&1
+}
+
+launchd_domain() {
+  printf 'gui/%s\n' "$(id -u)"
+}
+
+launchd_service() {
+  printf '%s/%s\n' "$(launchd_domain)" "$CARGOLESS_TFM_LAUNCHD_LABEL"
+}
+
+launchd_loaded() {
+  launchctl print "$(launchd_service)" >/dev/null 2>&1
+}
+
+launchd_pid() {
+  launchctl print "$(launchd_service)" 2>/dev/null \
+    | awk -F'= ' '/^[[:space:]]*pid = / { print $2; exit }'
+}
+
+write_launchd_plist() {
+  mkdir -p "$(dirname "$CARGOLESS_TFM_LAUNCHD_PLIST")"
+  cat > "$CARGOLESS_TFM_LAUNCHD_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$CARGOLESS_TFM_LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$CARGOLESS_BIN</string>
+    <string>serve</string>
+    <string>--repo</string>
+    <string>$TF_MULTIVERSE_REPO</string>
+    <string>--bind</string>
+    <string>$CARGOLESS_BIND</string>
+    <string>--state-dir</string>
+    <string>$CARGOLESS_TFM_STATE_DIR</string>
+    <string>--cas-dir</string>
+    <string>$CARGOLESS_TFM_CAS_DIR</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$HOME</string>
+    <key>PATH</key>
+    <string>$CARGOLESS_TFM_PATH</string>
+    <key>CARGO_TARGET_DIR</key>
+    <string>$CARGOLESS_TFM_TARGET_DIR</string>
+    <key>TF_RA_CHECK_DISABLED</key>
+    <string>$CARGOLESS_TFM_RA_CHECK_DISABLED</string>
+    <key>TF_CHECK_TIMEOUT_SECS</key>
+    <string>$TF_CHECK_TIMEOUT_SECS</string>
+    <key>CARGOLESS_VERDICT_MODE</key>
+    <string>$CARGOLESS_VERDICT_MODE</string>
+    <key>CARGOLESS_RA_SETTLE_MS</key>
+    <string>$CARGOLESS_RA_SETTLE_MS</string>
+    <key>CARGOLESS_MANAGED_SERVICE</key>
+    <string>1</string>
+    <key>CARGOLESS_PUSH_ONLY</key>
+    <string>$CARGOLESS_PUSH_ONLY</string>
+    <key>CARGOLESS_PROJECT_CHECKS_MODE</key>
+    <string>$CARGOLESS_PROJECT_CHECKS_MODE</string>
+    <key>TF_WT_IDLE_SECS</key>
+    <string>$CARGOLESS_TFM_WT_IDLE_SECS</string>
+    <key>TF_WT_DEACTIVATE_SECS</key>
+    <string>$CARGOLESS_TFM_WT_DEACTIVATE_SECS</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$CARGOLESS_TFM_LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$CARGOLESS_TFM_LOG</string>
+</dict>
+</plist>
+EOF
+}
+
+daemon_env() {
+  export CARGO_TARGET_DIR="$CARGOLESS_TFM_TARGET_DIR"
+  export TF_RA_CHECK_DISABLED="$CARGOLESS_TFM_RA_CHECK_DISABLED"
+  export TF_CHECK_TIMEOUT_SECS
+  export CARGOLESS_VERDICT_MODE
+  export CARGOLESS_RA_SETTLE_MS
+  export CARGOLESS_MANAGED_SERVICE=1
+  export CARGOLESS_PUSH_ONLY
+  export CARGOLESS_PROJECT_CHECKS_MODE
+  export TF_WT_IDLE_SECS="$CARGOLESS_TFM_WT_IDLE_SECS"
+  export TF_WT_DEACTIVATE_SECS="$CARGOLESS_TFM_WT_DEACTIVATE_SECS"
+}
+
+start() {
+  ensure_repo
+  ensure_dirs
+  ensure_bin
+
+  if remote_status >/dev/null 2>&1; then
+    echo "[tf-multiverse-daemon] remote already reachable at $CARGOLESS_REMOTE"
+    return 0
+  fi
+
+  if use_launchd; then
+    write_launchd_plist
+    if ! launchd_loaded; then
+      launchctl bootstrap "$(launchd_domain)" "$CARGOLESS_TFM_LAUNCHD_PLIST" >/dev/null
+    fi
+    launchctl kickstart -k "$(launchd_service)" >/dev/null 2>&1 || true
+    echo "[tf-multiverse-daemon] launchd label: $CARGOLESS_TFM_LAUNCHD_LABEL"
+    echo "[tf-multiverse-daemon] plist: $CARGOLESS_TFM_LAUNCHD_PLIST"
+    echo "[tf-multiverse-daemon] log: $CARGOLESS_TFM_LOG"
+    wait_ready
+    return 0
+  fi
+
+  if pid="$(pidfile_pid 2>/dev/null)" && pid_alive "$pid"; then
+    echo "[tf-multiverse-daemon] already running pid=$pid"
+    remote_status || true
+    return 0
+  fi
+
+  daemon_env
+  echo "[tf-multiverse-daemon] starting $CARGOLESS_BIN"
+  echo "[tf-multiverse-daemon] log: $CARGOLESS_TFM_LOG"
+  (
+    cd "$REPO_ROOT"
+    exec nohup "$CARGOLESS_BIN" \
+      serve \
+      --repo "$TF_MULTIVERSE_REPO" \
+      --bind "$CARGOLESS_BIND" \
+      --state-dir "$CARGOLESS_TFM_STATE_DIR" \
+      --cas-dir "$CARGOLESS_TFM_CAS_DIR" \
+      >>"$CARGOLESS_TFM_LOG" 2>&1
+  ) &
+  local pid=$!
+  printf '%s\n' "$pid" > "$CARGOLESS_TFM_PIDFILE"
+
+  wait_ready "$pid"
+}
+
+wait_ready() {
+  local pid="${1:-}"
+  local i max
+  max=$((CARGOLESS_TFM_READY_TIMEOUT_SECS * 2))
+  [ "$max" -gt 0 ] || max=1
+  for i in $(seq 1 "$max"); do
+    if admin_get /healthz >/dev/null 2>&1; then
+      if [ -z "$pid" ] && use_launchd; then
+        pid="$(launchd_pid)"
+      fi
+      echo "[tf-multiverse-daemon] ready pid=${pid:-unknown} remote=$CARGOLESS_REMOTE"
+      return 0
+    fi
+    if [ -n "$pid" ] && ! pid_alive "$pid"; then
+      echo "[tf-multiverse-daemon] daemon exited during startup; recent log:" >&2
+      tail -80 "$CARGOLESS_TFM_LOG" >&2 || true
+      exit 1
+    fi
+    sleep 0.5
+  done
+
+  echo "[tf-multiverse-daemon] daemon did not become ready within ${CARGOLESS_TFM_READY_TIMEOUT_SECS}s; recent log:" >&2
+  tail -80 "$CARGOLESS_TFM_LOG" >&2 || true
+  exit 1
+}
+
+foreground() {
+  ensure_repo
+  ensure_dirs
+  ensure_bin
+  daemon_env
+  exec "$CARGOLESS_BIN" \
+    serve \
+    --repo "$TF_MULTIVERSE_REPO" \
+    --bind "$CARGOLESS_BIND" \
+    --state-dir "$CARGOLESS_TFM_STATE_DIR" \
+    --cas-dir "$CARGOLESS_TFM_CAS_DIR"
+}
+
+stop() {
+  if use_launchd && launchd_loaded; then
+    local pid=""
+    pid="$(launchd_pid 2>/dev/null || true)"
+    echo "[tf-multiverse-daemon] stopping launchd label=$CARGOLESS_TFM_LAUNCHD_LABEL"
+    quiesce_and_wait "$pid" || true
+    launchctl bootout "$(launchd_domain)" "$CARGOLESS_TFM_LAUNCHD_PLIST" >/dev/null 2>&1 \
+      || launchctl bootout "$(launchd_service)" >/dev/null 2>&1 \
+      || true
+    rm -f "$CARGOLESS_TFM_PIDFILE"
+    echo "[tf-multiverse-daemon] stopped"
+    return 0
+  fi
+
+  local pid=""
+  pid="$(pidfile_pid 2>/dev/null || true)"
+  if [ -z "$pid" ] || ! pid_alive "$pid"; then
+    rm -f "$CARGOLESS_TFM_PIDFILE"
+    echo "[tf-multiverse-daemon] not running"
+    return 0
+  fi
+
+  echo "[tf-multiverse-daemon] stopping pid=$pid"
+  if quiesce_and_wait "$pid"; then
+    rm -f "$CARGOLESS_TFM_PIDFILE"
+    echo "[tf-multiverse-daemon] stopped"
+    return 0
+  fi
+  kill "$pid" >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 40); do
+    if ! pid_alive "$pid"; then
+      rm -f "$CARGOLESS_TFM_PIDFILE"
+      echo "[tf-multiverse-daemon] stopped"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[tf-multiverse-daemon] pid=$pid still alive after SIGTERM; sending SIGKILL" >&2
+  kill -KILL "$pid" >/dev/null 2>&1 || true
+  rm -f "$CARGOLESS_TFM_PIDFILE"
+}
+
+print_env() {
+  cat <<EOF
+export CHECK_REMOTE_ENGINE=cargoless
+export CARGOLESS_BIN="$CARGOLESS_BIN"
+export CARGOLESS_REMOTE="$CARGOLESS_REMOTE"
+export CARGOLESS_AWAIT_TIMEOUT_SECS="$CARGOLESS_AWAIT_TIMEOUT_SECS"
+export CARGOLESS_VERDICT_MODE="$CARGOLESS_VERDICT_MODE"
+EOF
+}
+
+paths() {
+  cat <<EOF
+repo_root=$REPO_ROOT
+tf_multiverse_repo=$TF_MULTIVERSE_REPO
+bin=$CARGOLESS_BIN
+bind=$CARGOLESS_BIND
+remote=$CARGOLESS_REMOTE
+daemon_root=$CARGOLESS_TFM_DAEMON_ROOT
+state_dir=$CARGOLESS_TFM_STATE_DIR
+cas_dir=$CARGOLESS_TFM_CAS_DIR
+target_dir=$CARGOLESS_TFM_TARGET_DIR
+log_dir=$CARGOLESS_TFM_LOG_DIR
+log=$CARGOLESS_TFM_LOG
+pidfile=$CARGOLESS_TFM_PIDFILE
+launchd_label=$CARGOLESS_TFM_LAUNCHD_LABEL
+launchd_plist=$CARGOLESS_TFM_LAUNCHD_PLIST
+tf_ra_check_disabled=$CARGOLESS_TFM_RA_CHECK_DISABLED
+verdict_mode=$CARGOLESS_VERDICT_MODE
+ra_settle_ms=$CARGOLESS_RA_SETTLE_MS
+push_only=$CARGOLESS_PUSH_ONLY
+project_checks_mode=$CARGOLESS_PROJECT_CHECKS_MODE
+wt_idle_secs=$CARGOLESS_TFM_WT_IDLE_SECS
+wt_deactivate_secs=$CARGOLESS_TFM_WT_DEACTIVATE_SECS
+drain_timeout_secs=$CARGOLESS_TFM_DRAIN_TIMEOUT_SECS
+ready_timeout_secs=$CARGOLESS_TFM_READY_TIMEOUT_SECS
+tf_check_timeout_secs=$TF_CHECK_TIMEOUT_SECS
+EOF
+}
+
+status() {
+  ensure_bin
+  paths
+  echo
+  if use_launchd && launchd_loaded; then
+    local launchd_pid_value
+    launchd_pid_value="$(launchd_pid)"
+    echo "launchd_status=loaded pid=$launchd_pid_value"
+  elif use_launchd; then
+    echo "launchd_status=not-loaded"
+  fi
+  if pid="$(pidfile_pid 2>/dev/null)" && pid_alive "$pid"; then
+    echo "pid_status=running pid=$pid"
+  elif use_launchd && launchd_loaded && [ -n "${launchd_pid_value:-}" ] && pid_alive "$launchd_pid_value"; then
+    echo "pid_status=launchd-running pid=$launchd_pid_value"
+  else
+    echo "pid_status=not-running"
+  fi
+  echo
+  remote_status
+}
+
+tail_logs() {
+  ensure_dirs
+  touch "$CARGOLESS_TFM_LOG"
+  tail -f "$CARGOLESS_TFM_LOG"
+}
+
+cmd="${1:-status}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$cmd" in
+  build) build_release "$@" ;;
+  start) start "$@" ;;
+  foreground) foreground "$@" ;;
+  stop) stop "$@" ;;
+  restart) stop; start "$@" ;;
+  status) status "$@" ;;
+  env) print_env "$@" ;;
+  paths) paths "$@" ;;
+  logs) tail_logs "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; die "unknown command: $cmd" ;;
+esac

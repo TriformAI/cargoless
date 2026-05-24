@@ -23,10 +23,10 @@ use std::sync::mpsc::{Receiver, channel};
 use cargoless_proto::Diagnostic;
 
 use super::{
-    PushOverlayAck, Request, TransitionEvent, TransportClient, TransportError, VerdictService,
-    WorktreeStatus, WorktreeSummary, event_from_json, event_to_json, pushoverlayack_from_json,
-    pushoverlayack_to_json, status_from_json, status_to_json, summaries_from_json,
-    summaries_to_json,
+    PushOverlayAck, PushOverlayOptions, Request, TransitionEvent, TransportClient, TransportError,
+    VerdictService, WorktreeStatus, WorktreeSummary, event_from_json, event_to_json,
+    pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
+    summaries_from_json, summaries_to_json,
 };
 
 /// Response framing shared with the request side. A logical reply is one
@@ -58,7 +58,26 @@ fn dispatch_oneshot(svc: &dyn VerdictService, req: &Request) -> String {
             worktree,
             base_ref,
             files,
-        } => pushoverlayack_to_json(&svc.push_overlay(worktree, base_ref, files)),
+            check_profile,
+        } => pushoverlayack_to_json(&svc.push_overlay_with_profile(
+            worktree,
+            base_ref,
+            files,
+            check_profile.as_ref(),
+        )),
+        Request::PushOverlayV2 {
+            worktree,
+            base_ref,
+            files,
+            check_profile,
+            options,
+        } => pushoverlayack_to_json(&svc.push_overlay_with_options(
+            worktree,
+            base_ref,
+            files,
+            check_profile.as_ref(),
+            Some(options),
+        )),
     }
 }
 
@@ -253,13 +272,45 @@ mod imp {
             base_ref: &str,
             files: &[(String, String)],
         ) -> Result<PushOverlayAck, TransportError> {
+            self.push_overlay_with_profile(worktree, base_ref, files, None)
+        }
+
+        fn push_overlay_with_profile(
+            &self,
+            worktree: &str,
+            base_ref: &str,
+            files: &[(String, String)],
+            check_profile: Option<&crate::transport::CheckProfile>,
+        ) -> Result<PushOverlayAck, TransportError> {
+            self.push_overlay_with_options(worktree, base_ref, files, check_profile, None)
+        }
+
+        fn push_overlay_with_options(
+            &self,
+            worktree: &str,
+            base_ref: &str,
+            files: &[(String, String)],
+            check_profile: Option<&crate::transport::CheckProfile>,
+            options: Option<&PushOverlayOptions>,
+        ) -> Result<PushOverlayAck, TransportError> {
             // One NDJSON request line out, one ack line back — the same
             // one-shot shape as get_status/get_verdict.
-            let line = self.one_shot(&Request::PushOverlay {
-                worktree: worktree.to_string(),
-                base_ref: base_ref.to_string(),
-                files: files.to_vec(),
-            })?;
+            let req = match options.filter(|o| !o.is_empty()) {
+                Some(options) => Request::PushOverlayV2 {
+                    worktree: worktree.to_string(),
+                    base_ref: base_ref.to_string(),
+                    files: files.to_vec(),
+                    check_profile: check_profile.cloned(),
+                    options: options.clone(),
+                },
+                None => Request::PushOverlay {
+                    worktree: worktree.to_string(),
+                    base_ref: base_ref.to_string(),
+                    files: files.to_vec(),
+                    check_profile: check_profile.cloned(),
+                },
+            };
+            let line = self.one_shot(&req)?;
             pushoverlayack_from_json(&line)
                 .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into()))
         }

@@ -39,6 +39,8 @@
 //!   FIELD FINDING #3a distinction — RA's project-indexing end rides the
 //!   same `$/progress`/`end` shape as a flycheck end but is **not** a
 //!   verdict boundary; mirrored here so a switch can never settle on it).
+//!   [`LspEvent::FlycheckFailed`] is the one terminal exception: cargo did
+//!   not run successfully, so the barrier settles RED immediately.
 //! * **No pre-settle escape.** [`snapshot`](FlycheckBarrier::snapshot)
 //!   and [`has_authoritative_error`](FlycheckBarrier::has_authoritative_error)
 //!   are honest only once [`is_settled`](FlycheckBarrier::is_settled).
@@ -159,6 +161,9 @@ impl FlycheckBarrier {
     /// * [`LspEvent::FlycheckEnded`] ⇒ if a stale end is still owed:
     ///   consume it, **clear the window** (V→W boundary), stay
     ///   [`Waiting`]; else: latch and return [`Settled`].
+    /// * [`LspEvent::FlycheckFailed`] ⇒ latch [`Settled`] with a synthetic
+    ///   authoritative diagnostic. A failed cargo/flycheck process cannot
+    ///   be a green check.
     /// * [`LspEvent::IndexingEnded`] ⇒ inert — never settles, never
     ///   touches the window (the FIELD FINDING #3a non-boundary).
     /// * Any event after settle ⇒ no-op ([`Settled`]).
@@ -191,6 +196,12 @@ impl FlycheckBarrier {
                     self.settled = true;
                     BarrierState::Settled
                 }
+            }
+            LspEvent::FlycheckFailed { message } => {
+                let pd = crate::lsp::flycheck_failure_diagnostics(message.clone());
+                self.window.insert(pd.uri.clone(), pd);
+                self.settled = true;
+                BarrierState::Settled
             }
             // FIELD FINDING #3a, mirrored: RA's project-indexing end
             // rides the same `$/progress`/`end` shape as a flycheck end
@@ -225,6 +236,17 @@ impl FlycheckBarrier {
         self.window
             .values()
             .any(PublishDiagnostics::has_authoritative_error)
+    }
+
+    /// `true` iff W's window has any error-severity diagnostic from any
+    /// source. This is intentionally weaker than [`has_authoritative_error`]:
+    /// it supports the tf-multiverse development loop where Cargoless replaces
+    /// `cargo check`/`cargo clippy` as an always-on RA-native signal, while
+    /// full Cargo authority is deferred to explicit compile/build gates.
+    pub fn has_any_error(&self) -> bool {
+        self.window
+            .values()
+            .any(PublishDiagnostics::has_any_severity_error)
     }
 }
 
@@ -275,6 +297,12 @@ mod tests {
                 source: Some("rust-analyzer".into()),
             }],
         })
+    }
+
+    fn failed() -> LspEvent {
+        LspEvent::FlycheckFailed {
+            message: "Flycheck failed to run the following command: cargo check".into(),
+        }
     }
 
     #[test]
@@ -417,6 +445,17 @@ mod tests {
             b.snapshot().len(),
             1,
             "the advisory publish is still tracked"
+        );
+    }
+
+    #[test]
+    fn flycheck_failure_settles_red() {
+        let mut b = FlycheckBarrier::arm(false);
+        assert_eq!(b.observe(&failed()), BarrierState::Settled);
+        assert!(b.is_settled());
+        assert!(
+            b.has_authoritative_error(),
+            "cargo/flycheck execution failure is authoritative red"
         );
     }
 

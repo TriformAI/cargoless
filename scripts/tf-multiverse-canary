@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+#
+# Temp-only canary harness for validating cargoless against a 20-agent
+# tf-multiverse-shaped worktree fleet without mutating the operator's
+# live tf-multiverse checkout.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOURCE="${TF_MULTIVERSE_REPO:-/Users/iggy/Documents/GitHub/tf-multiverse}"
+ROOT="${CARGOLESS_TFM_CANARY_ROOT:-/private/tmp/cargoless-tf-multiverse-canary}"
+COUNT="${CARGOLESS_TFM_CANARY_COUNT:-20}"
+REF="${CARGOLESS_TFM_REF:-origin/dev}"
+BIND="${CARGOLESS_BIND:-127.0.0.1:8787}"
+REMOTE="${CARGOLESS_REMOTE:-http://$BIND}"
+DEFAULT_BIN="$REPO_ROOT/target/debug/cargoless"
+BIN="${CARGOLESS_BIN:-$DEFAULT_BIN}"
+
+CLONE="$ROOT/repo"
+WTROOT="$ROOT/worktrees"
+STATE="$ROOT/state"
+CAS="$ROOT/state/cas"
+TARGET_DIR="${CARGOLESS_TFM_TARGET_DIR:-$ROOT/target}"
+MARKER="$ROOT/.cargoless-tf-multiverse-canary"
+
+die() {
+  echo "[tf-multiverse-canary] ERROR: $*" >&2
+  exit 2
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/tf-multiverse-canary <command>
+
+Commands:
+  preflight      Print source checkout, worktree, builder, and binary state.
+  prepare        Recreate a shared temp clone plus N detached canary worktrees.
+  serve-local    Run cargoless serve against the temp clone/worktree fleet.
+  push-all       Push every canary worktree overlay to the remote daemon.
+  check-remote-all
+                 Run tf-multiverse/scripts/check-remote in every canary worktree.
+  status-remote  Query cargoless status --remote.
+  paths          Print resolved canary paths and environment defaults.
+  clean          Remove the temp canary root, if it was created by this script.
+
+Environment:
+  TF_MULTIVERSE_REPO              default /Users/iggy/Documents/GitHub/tf-multiverse
+  CARGOLESS_TFM_CANARY_ROOT       default /private/tmp/cargoless-tf-multiverse-canary
+  CARGOLESS_TFM_CANARY_COUNT      default 20
+  CARGOLESS_TFM_REF               default origin/dev
+  CARGOLESS_BIND                  default 127.0.0.1:8787
+  CARGOLESS_REMOTE                default http://$CARGOLESS_BIND
+  CARGOLESS_BIN                   default target/debug/cargoless
+  CARGOLESS_TFM_TARGET_DIR        default $CARGOLESS_TFM_CANARY_ROOT/target
+  CARGOLESS_TFM_RA_CHECK_DISABLED default 1 for direct-Cargo verdict canary
+  CARGOLESS_TFM_CANARY_JOBS       default CARGOLESS_TFM_CANARY_COUNT
+  CARGOLESS_TFM_CHECK_TIMEOUT     default 240
+  CARGOLESS_TFM_CHECK_ENGINE      default cargoless
+  CARGOLESS_AUTH_TOKEN            optional bearer token for protected daemons
+
+The source tf-multiverse checkout is read-only input. prepare/clean only
+mutate CARGOLESS_TFM_CANARY_ROOT.
+USAGE
+}
+
+line_count() {
+  awk 'END { print NR + 0 }'
+}
+
+ensure_source_repo() {
+  command -v git >/dev/null || die "git not found"
+  [ -d "$SOURCE" ] || die "source repo not found: $SOURCE"
+  git -C "$SOURCE" rev-parse --show-toplevel >/dev/null 2>&1 \
+    || die "source is not a git worktree: $SOURCE"
+}
+
+resolve_base_sha() {
+  git -C "$SOURCE" rev-parse --verify "${REF}^{commit}" 2>/dev/null \
+    || die "ref '$REF' is not available in $SOURCE; fetch it in the source checkout first"
+}
+
+safe_canary_root() {
+  [ -n "$ROOT" ] || die "empty canary root"
+  [ "$ROOT" != "/" ] || die "refusing to use / as canary root"
+  [ "$ROOT" != "$SOURCE" ] || die "canary root must not be the source repo"
+  [ "$ROOT" != "$REPO_ROOT" ] || die "canary root must not be the cargoless repo"
+}
+
+reset_canary_root() {
+  safe_canary_root
+  if [ -e "$ROOT" ] && [ ! -f "$MARKER" ]; then
+    die "$ROOT exists but is not marked as a cargoless tf-multiverse canary root"
+  fi
+  rm -rf "$ROOT"
+  mkdir -p "$ROOT"
+  : > "$MARKER"
+}
+
+ensure_prepared() {
+  [ -f "$MARKER" ] || die "canary root is not prepared; run: scripts/tf-multiverse-canary prepare"
+  [ -d "$CLONE/.git" ] || die "temp clone missing: $CLONE"
+  [ -d "$WTROOT" ] || die "worktree root missing: $WTROOT"
+}
+
+ensure_bin() {
+  if [ ! -x "$BIN" ]; then
+    if [ "$BIN" = "$DEFAULT_BIN" ]; then
+      echo "[tf-multiverse-canary] building $BIN"
+      cargo build -p cargoless --locked
+    else
+      die "cargoless binary is not executable: $BIN"
+    fi
+  fi
+}
+
+print_paths() {
+  cat <<EOF
+source=$SOURCE
+root=$ROOT
+clone=$CLONE
+worktrees=$WTROOT
+state=$STATE
+cas=$CAS
+target_dir=$TARGET_DIR
+ref=$REF
+bind=$BIND
+remote=$REMOTE
+bin=$BIN
+count=$COUNT
+EOF
+}
+
+preflight() {
+  ensure_source_repo
+  print_paths
+  echo
+  echo "source_top=$(git -C "$SOURCE" rev-parse --show-toplevel)"
+  echo "source_head=$(git -C "$SOURCE" rev-parse --short HEAD 2>/dev/null || true)"
+  echo "source_branch=$(git -C "$SOURCE" branch --show-current 2>/dev/null || true)"
+  if base_sha="$(resolve_base_sha)"; then
+    echo "base_ref=$REF"
+    echo "base_sha=$base_sha"
+  fi
+  echo "source_status_entries=$(git -C "$SOURCE" status --porcelain=v1 | line_count)"
+  echo "source_unmerged_entries=$(git -C "$SOURCE" diff --name-only --diff-filter=U | line_count)"
+  echo "source_worktrees=$(git -C "$SOURCE" worktree list --porcelain | awk '/^worktree / { n++ } END { print n + 0 }')"
+
+  if command -v kubectl >/dev/null; then
+    echo
+    echo "k8s: cargoless-builder"
+    kubectl get pods -n cargoless-builder -o wide 2>/dev/null || true
+    echo
+    echo "k8s: triform-builder"
+    kubectl get pods -n triform-builder -o wide 2>/dev/null || true
+  else
+    echo
+    echo "k8s: kubectl not found"
+  fi
+
+  if [ -x "$BIN" ]; then
+    echo
+    "$BIN" version 2>/dev/null || "$BIN" --version 2>/dev/null || true
+  else
+    echo
+    echo "cargoless_binary_missing=$BIN"
+    echo "build with: cargo build -p cargoless --locked"
+  fi
+}
+
+prepare() {
+  ensure_source_repo
+  case "$COUNT" in
+    *[!0-9]*|"") die "CARGOLESS_TFM_CANARY_COUNT must be a positive integer" ;;
+  esac
+  [ "$COUNT" -gt 0 ] || die "CARGOLESS_TFM_CANARY_COUNT must be greater than zero"
+  base_sha="$(resolve_base_sha)"
+
+  reset_canary_root
+  echo "[tf-multiverse-canary] cloning shared repo into $CLONE"
+  git clone --shared --no-checkout "$SOURCE" "$CLONE"
+  git -C "$CLONE" config advice.detachedHead false
+  git -C "$CLONE" cat-file -e "${base_sha}^{commit}" \
+    || die "base object $base_sha was not available in shared clone"
+
+  mkdir -p "$WTROOT"
+  i=1
+  while [ "$i" -le "$COUNT" ]; do
+    n="$(printf "%02d" "$i")"
+    wt="$WTROOT/wt-$n"
+    echo "[tf-multiverse-canary] worktree $n -> $wt"
+    git -C "$CLONE" worktree add --detach "$wt" "$base_sha"
+    i=$((i + 1))
+  done
+
+  printf '%s\n' "$REF" > "$ROOT/base-ref"
+  printf '%s\n' "$base_sha" > "$ROOT/base-sha"
+  echo
+  echo "[tf-multiverse-canary] prepared $COUNT canary worktrees at $WTROOT"
+  echo "[tf-multiverse-canary] source checkout was not modified"
+}
+
+serve_local() {
+  ensure_prepared
+  ensure_bin
+  mkdir -p "$STATE" "$CAS"
+  auth_args=()
+  if [ -n "${CARGOLESS_AUTH_TOKEN:-}" ]; then
+    auth_args=(--auth-token "$CARGOLESS_AUTH_TOKEN")
+  fi
+  mkdir -p "$TARGET_DIR"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$TARGET_DIR}"
+  export TF_RA_CHECK_DISABLED="${TF_RA_CHECK_DISABLED:-${CARGOLESS_TFM_RA_CHECK_DISABLED:-1}}"
+  exec "$BIN" serve \
+    --repo "$CLONE" \
+    --bind "$BIND" \
+    --state-dir "$STATE" \
+    --cas-dir "$CAS" \
+    "${auth_args[@]}" \
+    "$@"
+}
+
+push_all() {
+  ensure_prepared
+  ensure_bin
+  base="${CARGOLESS_TFM_PUSH_BASE:-$(cat "$ROOT/base-sha")}"
+  auth_args=()
+  if [ -n "${CARGOLESS_AUTH_TOKEN:-}" ]; then
+    auth_args=(--auth-token "$CARGOLESS_AUTH_TOKEN")
+  fi
+
+  total=0
+  failed=0
+  for wt in "$WTROOT"/wt-*; do
+    [ -d "$wt" ] || continue
+    total=$((total + 1))
+    echo
+    echo "[tf-multiverse-canary] push $wt"
+    if ! "$BIN" push \
+      --remote "$REMOTE" \
+      --repo "$wt" \
+      --worktree "$wt" \
+      --base "$base" \
+      "${auth_args[@]}"; then
+      failed=1
+    fi
+  done
+  [ "$total" -gt 0 ] || die "no canary worktrees found under $WTROOT"
+  exit "$failed"
+}
+
+check_remote_all() {
+  ensure_source_repo
+  ensure_prepared
+  ensure_bin
+  check_remote_script="${CARGOLESS_TFM_CHECK_REMOTE_SCRIPT:-$SOURCE/scripts/check-remote}"
+  [ -f "$check_remote_script" ] || die "check-remote script not found: $check_remote_script"
+
+  jobs="${CARGOLESS_TFM_CANARY_JOBS:-$COUNT}"
+  case "$jobs" in
+    *[!0-9]*|"") die "CARGOLESS_TFM_CANARY_JOBS must be a positive integer" ;;
+  esac
+  [ "$jobs" -gt 0 ] || die "CARGOLESS_TFM_CANARY_JOBS must be greater than zero"
+
+  base="${CARGOLESS_TFM_PUSH_BASE:-$(cat "$ROOT/base-sha")}"
+  timeout="${CARGOLESS_TFM_CHECK_TIMEOUT:-900}"
+  case "$timeout" in
+    *[!0-9]*|"") die "CARGOLESS_TFM_CHECK_TIMEOUT must be a positive integer" ;;
+  esac
+  [ "$timeout" -gt 0 ] || die "CARGOLESS_TFM_CHECK_TIMEOUT must be greater than zero"
+
+  check_args=("$@")
+  if [ "${#check_args[@]}" -eq 0 ]; then
+    check_args=(-p alchemy)
+  fi
+
+  mkdir -p "$ROOT/logs"
+  echo "[tf-multiverse-canary] check-remote-all jobs=$jobs engine=${CARGOLESS_TFM_CHECK_ENGINE:-cargoless} args=${check_args[*]}"
+
+  total=0
+  failed=0
+  batch_pids=()
+  batch_labels=()
+  batch_logs=()
+
+  wait_batch() {
+    local i pid label log rc
+    for i in "${!batch_pids[@]}"; do
+      pid="${batch_pids[$i]}"
+      label="${batch_labels[$i]}"
+      log="${batch_logs[$i]}"
+      if wait "$pid"; then
+        rc=0
+        echo "[tf-multiverse-canary] check-remote $label ok (log: $log)"
+      else
+        rc=$?
+        failed=1
+        echo "[tf-multiverse-canary] check-remote $label FAILED rc=$rc (log: $log)" >&2
+        tail -40 "$log" >&2 || true
+      fi
+    done
+    batch_pids=()
+    batch_labels=()
+    batch_logs=()
+  }
+
+  for wt in "$WTROOT"/wt-*; do
+    [ -d "$wt" ] || continue
+    total=$((total + 1))
+    label="$(basename "$wt")"
+    log="$ROOT/logs/check-remote-${label}.log"
+    (
+      cd "$wt"
+      export CHECK_REMOTE_ENGINE="${CARGOLESS_TFM_CHECK_ENGINE:-cargoless}"
+      export CARGOLESS_BIN="$BIN"
+      export CARGOLESS_REMOTE="$REMOTE"
+      export CARGOLESS_BASE_REF="$base"
+      export CARGOLESS_AWAIT_TIMEOUT_SECS="$timeout"
+      export CHECK_REMOTE_INTENT_BANNER=0
+      export CHECK_REMOTE_INTENT_PROMPT=0
+      bash "$check_remote_script" "${check_args[@]}"
+    ) >"$log" 2>&1 &
+    batch_pids+=("$!")
+    batch_labels+=("$label")
+    batch_logs+=("$log")
+
+    if [ "${#batch_pids[@]}" -ge "$jobs" ]; then
+      wait_batch
+    fi
+  done
+  [ "$total" -gt 0 ] || die "no canary worktrees found under $WTROOT"
+  if [ "${#batch_pids[@]}" -gt 0 ]; then
+    wait_batch
+  fi
+  echo "[tf-multiverse-canary] check-remote-all complete total=$total failed=$failed"
+  exit "$failed"
+}
+
+status_remote() {
+  ensure_bin
+  "$BIN" status --remote "$REMOTE"
+}
+
+clean() {
+  safe_canary_root
+  if [ -e "$ROOT" ]; then
+    [ -f "$MARKER" ] || die "$ROOT exists but is not marked as a canary root"
+    rm -rf "$ROOT"
+  fi
+  echo "[tf-multiverse-canary] removed $ROOT"
+}
+
+cmd="${1:-help}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$cmd" in
+  preflight) preflight "$@" ;;
+  prepare) prepare "$@" ;;
+  serve-local) serve_local "$@" ;;
+  push-all) push_all "$@" ;;
+  check-remote-all) check_remote_all "$@" ;;
+  status-remote) status_remote "$@" ;;
+  paths) print_paths ;;
+  clean) clean ;;
+  help|-h|--help) usage ;;
+  *) usage; die "unknown command: $cmd" ;;
+esac

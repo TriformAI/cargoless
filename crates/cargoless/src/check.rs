@@ -85,7 +85,7 @@ pub fn run(cfg: &Config) -> ExitCode {
             }
             let advisory_note = advisory_suppression_note(advisory.len());
             ui::ok(format!(
-                "green — every tracked file compiles{advisory_note}"
+                "green — every tracked file compiles and required project checks pass{advisory_note}"
             ));
             ExitCode::SUCCESS
         }
@@ -108,14 +108,14 @@ pub fn run(cfg: &Config) -> ExitCode {
                     String::new()
                 } else {
                     format!(
-                        " ({} advisory hint{} from rust-analyzer; \
+                        " ({} advisory diagnostic{}; \
                          `cargoless watch` for the live stream)",
                         advisory.len(),
                         if advisory.len() == 1 { "" } else { "s" },
                     )
                 };
                 ui::error(format!(
-                    "red — at least one tracked file does not compile, \
+                    "red — the tree is not green, \
                      but no diagnostics were captured before the check \
                      settled (try `cargoless watch` for live updates, or \
                      re-run with `TF_CHECK_TIMEOUT_SECS=300`).{advisory_hint}"
@@ -125,7 +125,7 @@ pub fn run(cfg: &Config) -> ExitCode {
                 let (errs, warns) = severity_tally(&authoritative);
                 let advisory_note = advisory_suppression_note(advisory.len());
                 ui::error(format!(
-                    "red — at least one tracked file does not compile \
+                    "red — code or required project checks are not green \
                      ({errs} error{}, {warns} warning{} surfaced{advisory_note}).",
                     if errs == 1 { "" } else { "s" },
                     if warns == 1 { "" } else { "s" },
@@ -206,11 +206,11 @@ fn partition_by_provenance(
 fn advisory_suppression_note(n: usize) -> String {
     match n {
         0 => String::new(),
-        1 => " (1 rust-analyzer advisory hint suppressed; \
+        1 => " (1 advisory diagnostic suppressed; \
               `cargoless watch` shows the live stream)"
             .to_string(),
         _ => format!(
-            " ({n} rust-analyzer advisory hints suppressed; \
+            " ({n} advisory diagnostics suppressed; \
              `cargoless watch` shows the live stream)"
         ),
     }
@@ -717,9 +717,9 @@ mod tests {
     #[test]
     fn advisory_suppression_note_grammar() {
         assert!(advisory_suppression_note(0).is_empty());
-        assert!(advisory_suppression_note(1).contains("1 rust-analyzer advisory hint suppressed"));
+        assert!(advisory_suppression_note(1).contains("1 advisory diagnostic suppressed"));
         assert!(advisory_suppression_note(1).contains("`cargoless watch`"));
-        assert!(advisory_suppression_note(5).contains("5 rust-analyzer advisory hints suppressed"));
+        assert!(advisory_suppression_note(5).contains("5 advisory diagnostics suppressed"));
     }
 
     #[test]

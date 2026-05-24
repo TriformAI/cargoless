@@ -29,9 +29,9 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use cargoless_proto::{Diagnostic, Severity};
@@ -61,7 +61,7 @@ use serde_json::{Value, json};
 // we DO soften is checkOnSave's subsettings: allTargets=false (lib+bin
 // only, skip tests/benches/examples); invocationStrategy=once +
 // invocationLocation=workspace (one cargo subprocess per workspace, not
-// per-member). Combined with the other 4 settings + honorable mentions
+// per workspace). Combined with the other 4 settings + honorable mentions
 // the expected RA resource reduction is 30-50%.
 // ---------------------------------------------------------------------------
 
@@ -76,6 +76,21 @@ pub struct InitOpts {
     /// Cargo features to enable for RA's cargo-check invocation. Drives
     /// `cargo.features` in the lean init options. Empty = RA picks default.
     pub features: Vec<String>,
+    /// Cargo package selector for RA's flycheck path. Mirrors
+    /// `cargo check -p <pkg>` from tf-multiverse's `scripts/check-remote`.
+    pub package: Option<String>,
+    /// Cargo compilation target for RA's flycheck path. Drives
+    /// `cargo.target` / `check.targets` instead of hand-adding a duplicate
+    /// `--target` extra arg.
+    pub target: Option<String>,
+    /// Whether RA should pass `--no-default-features` to cargo.
+    pub no_default_features: bool,
+    /// Whether RA should pass `--release` to cargo check.
+    pub release: bool,
+    /// Whether RA should run its own cargo flycheck. Remote-push
+    /// deployments can set `TF_RA_CHECK_DISABLED=1` and let the per-push
+    /// direct Cargo check own the fresh green/red boundary.
+    pub cargo_check_enabled: bool,
 }
 
 impl Default for InitOpts {
@@ -95,18 +110,22 @@ impl Default for InitOpts {
         Self {
             proc_macro_enabled: true,
             features: Vec::new(),
+            package: None,
+            target: None,
+            no_default_features: false,
+            release: false,
+            cargo_check_enabled: true,
         }
     }
 }
 
 impl InitOpts {
-    /// Read `TF_PROC_MACRO` (auto | enabled | disabled) + `TF_FEATURES`
-    /// (comma-separated) env vars, resolving "auto" via a Cargo.toml
-    /// scan at `project_root`. The CLI's `--proc-macro` /
-    /// `--features` flags set these env vars before invoking the daemon
-    /// path (same pattern as `TF_DEBOUNCE_MS` / `--debounce-ms` from
-    /// #49 — keeps `LspClient::initialize`'s signature stable across
-    /// callers that don't care about env).
+    /// Read the CLI-exported env vars, resolving `TF_PROC_MACRO=auto`
+    /// via a Cargo.toml scan at `project_root`. The CLI's cargo-shaped
+    /// check flags set these env vars before invoking the daemon path
+    /// (same pattern as `TF_DEBOUNCE_MS` / `--debounce-ms` from #49 —
+    /// keeps `LspClient::initialize`'s signature stable across callers
+    /// that don't care about env).
     pub fn from_env_and_project(project_root: &Path) -> Self {
         // #126 Tier-3: `TF_RA_PROCMACRO_OFF=1` forces RA proc-macro OFF
         // (the −53 % RSS lever) regardless of TF_PROC_MACRO / auto-
@@ -136,7 +155,7 @@ impl InitOpts {
         let features: Vec<String> = std::env::var("TF_FEATURES")
             .ok()
             .map(|s| {
-                s.split(',')
+                s.split([',', ' '])
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned)
@@ -146,11 +165,94 @@ impl InitOpts {
             // own defaults). See InitOpts::default() rationale on why
             // we do NOT default to `["default"]`.
             .unwrap_or_default();
+        let package = nonempty_env("TF_CHECK_PACKAGE");
+        let target = nonempty_env("TF_CHECK_TARGET");
+        let no_default_features = truthy_env("TF_CHECK_NO_DEFAULT_FEATURES");
+        let release = truthy_env("TF_CHECK_RELEASE");
+        let cargo_check_enabled = !truthy_env("TF_RA_CHECK_DISABLED");
         Self {
             proc_macro_enabled,
             features,
+            package,
+            target,
+            no_default_features,
+            release,
+            cargo_check_enabled,
         }
     }
+
+    fn check_extra_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.release {
+            args.push("--release".to_string());
+        }
+        args
+    }
+
+    fn check_override_command(&self) -> Option<Vec<String>> {
+        let package = normalize_check_package_name(self.package.as_ref()?);
+        let mut cmd = vec![
+            "cargo".to_string(),
+            "check".to_string(),
+            "-p".to_string(),
+            package,
+            "--message-format=json".to_string(),
+        ];
+        if let Some(target) = &self.target {
+            cmd.push("--target".to_string());
+            cmd.push(target.clone());
+        }
+        if self.no_default_features {
+            cmd.push("--no-default-features".to_string());
+        }
+        if !self.features.is_empty() {
+            cmd.push("--features".to_string());
+            cmd.push(self.features.join(","));
+        }
+        if self.release {
+            cmd.push("--release".to_string());
+        }
+        Some(cmd)
+    }
+}
+
+pub fn normalize_check_package_name(package: &str) -> String {
+    match package {
+        "physics" => "triform-physics",
+        "portal" => "triform-portal",
+        "server" => "triform-server",
+        "alchemy" => "triform-alchemy",
+        "isolator" | "isolation" => "isolation-executor",
+        "runtime-types" => "triform-runtime-types",
+        "widget" => "triform-widget",
+        "exposure-map" | "exposure" => "triform-exposure",
+        "cli" => "triform-cli",
+        "mcp" => "triform-mcp",
+        "sdk" => "triform-sdk",
+        "tool-dispatch" => "triform-tool-dispatch",
+        "codegen" => "triform-codegen",
+        other => other,
+    }
+    .to_string()
+}
+
+fn nonempty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn truthy_env(key: &str) -> bool {
+    matches!(
+        std::env::var(key)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 /// FIELD FINDING #74: "auto" proc-macro detector — scan `<root>/Cargo.toml`
@@ -261,35 +363,88 @@ fn ra_lru_capacity() -> u32 {
 ///   3. cachePriming.enable: false (skip eager startup analysis).
 ///   4. procMacro.enable: from InitOpts.proc_macro_enabled (auto-detected
 ///      from Cargo.toml or explicit per `cargoless.proc-macro` knob).
-///   5. cargo.allFeatures: false + features: from InitOpts + workspace.
-///      symbol narrowed (only_types, workspace scope).
+///   5. cargo.allTargets/allFeatures: false + features: from InitOpts +
+///      workspace symbol narrowed (only_types, workspace scope).
+///   6. package-scoped profiles set `check.overrideCommand` with the
+///      normalized Cargo package ID so tf-multiverse shorthands
+///      (`-p alchemy`) run the same package as `scripts/check-remote`
+///      (`-p triform-alchemy`).
 ///   + Honorable mentions: hover.actions, lens.enable, completion.
 ///      snippets.custom, assist.expressionFillDefault, references.
 ///      excludeImports — all idle-cost reductions on signals cargoless
 ///      doesn't consume.
 pub fn lean_init_options(opts: &InitOpts) -> Value {
+    let check_override_command = opts
+        .cargo_check_enabled
+        .then(|| opts.check_override_command())
+        .flatten();
+    let check_extra_args = if !opts.cargo_check_enabled || check_override_command.is_some() {
+        Vec::new()
+    } else {
+        opts.check_extra_args()
+    };
+    let check_workspace = opts.cargo_check_enabled && opts.package.is_none();
+    // For a package-scoped remote-check profile, RA's cargo flycheck is
+    // narrowed through `check.overrideCommand` with the normalized Cargo
+    // package name. That preserves cargoless's cargo-shaped operator
+    // shorthand while avoiding a workspace-wide flycheck. RA's separate
+    // build-script/proc-macro preflight otherwise starts from `cargo check
+    // --workspace ...`, which is exactly the tf-multiverse fan-out path
+    // this mode is replacing.
+    let cargo_build_scripts_enabled = opts.cargo_check_enabled && opts.package.is_none();
+    let proc_macro_enabled = opts.proc_macro_enabled && cargo_build_scripts_enabled;
     json!({
-        // (1) checkOnSave — Option B+ softened (not disabled).
+        // Current RA's generated schema names are flat
+        // `rust-analyzer.<section>.<key>` settings. Keep the historical
+        // nested shape below too; RA tolerates unknown keys, and emitting
+        // both lets older deployments keep working while this flat block
+        // carries the 2026-03+ path.
+        "rust-analyzer.checkOnSave": opts.cargo_check_enabled,
+        "rust-analyzer.check.command": "check",
+        "rust-analyzer.check.allTargets": false,
+        "rust-analyzer.check.invocationStrategy": "per_workspace",
+        "rust-analyzer.check.noDefaultFeatures": opts.no_default_features,
+        "rust-analyzer.check.features": opts.features.clone(),
+        "rust-analyzer.check.extraArgs": check_extra_args.clone(),
+        "rust-analyzer.check.overrideCommand": check_override_command.clone(),
+        "rust-analyzer.check.workspace": check_workspace,
+        "rust-analyzer.check.targets": opts.target.clone(),
+        "rust-analyzer.cachePriming.enable": false,
+        "rust-analyzer.lru.capacity": ra_lru_capacity(),
+        "rust-analyzer.procMacro.enable": proc_macro_enabled,
+        "rust-analyzer.cargo.allTargets": false,
+        "rust-analyzer.cargo.allFeatures": false,
+        "rust-analyzer.cargo.buildScripts.enable": cargo_build_scripts_enabled,
+        "rust-analyzer.cargo.features": opts.features.clone(),
+        "rust-analyzer.cargo.noDefaultFeatures": opts.no_default_features,
+        "rust-analyzer.cargo.target": opts.target.clone(),
+        "rust-analyzer.workspace.symbol.search.scope": "workspace",
+        "rust-analyzer.workspace.symbol.search.kind": "only_types",
+        "rust-analyzer.hover.actions.enable": false,
+        "rust-analyzer.lens.enable": false,
+        "rust-analyzer.completion.snippets.custom": {},
+        "rust-analyzer.assist.expressionFillDefault": "todo",
+        "rust-analyzer.references.excludeImports": true,
+
+        // (1) checkOnSave — enabled (not disabled).
         // F8-redo's GREEN gate requires `LspEvent::FlycheckEnded`, which
         // requires RA's cargo-check to actually run. Disabling
-        // checkOnSave breaks the verdict path; we soften its subsettings
-        // for ~15-30% cost cut on the load-bearing flycheck instead.
-        "checkOnSave": {
-            "enable": true,
-            "command": "check",
-            "allTargets": false,
-            "invocationStrategy": "once",
-            "invocationLocation": "workspace",
-            "noDefaultFeatures": false,
-            "features": opts.features.clone(),
-        },
-        // Modern RA's same setting under a different key. RA tolerates
-        // unknown keys, so emitting both is safe across versions.
+        // checkOnSave breaks the verdict path. Current RA expects this
+        // key to be a boolean; the detailed cargo knobs live under
+        // `check.*` below.
+        "checkOnSave": opts.cargo_check_enabled,
+        // RA's check/flycheck settings.
         "check": {
             "command": "check",
             "allTargets": false,
-            "invocationStrategy": "once",
+            "invocationStrategy": "per_workspace",
             "invocationLocation": "workspace",
+            "noDefaultFeatures": opts.no_default_features,
+            "features": opts.features.clone(),
+            "extraArgs": check_extra_args.clone(),
+            "overrideCommand": check_override_command.clone(),
+            "workspace": check_workspace,
+            "targets": opts.target.clone(),
         },
 
         // (2) inlayHints — ALL OFF. cargoless's stream + check output
@@ -335,7 +490,7 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
         // pure waste; on proc-macro projects it is mandatory for
         // correctness. The InitOpts.proc_macro_enabled bool is resolved
         // upstream (env var explicit OR Cargo.toml auto-detect).
-        "procMacro": { "enable": opts.proc_macro_enabled },
+        "procMacro": { "enable": proc_macro_enabled },
 
         // (5) cargo.* + workspace.symbol.* — narrow what RA indexes.
         // allFeatures=false matches cargo's actual default behavior
@@ -344,9 +499,14 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
         // search narrowed to workspace + types-only avoids indexing
         // 3rd-party crate APIs we never query.
         "cargo": {
+            "allTargets": false,
             "allFeatures": false,
+            "buildScripts": {
+                "enable": cargo_build_scripts_enabled,
+            },
             "features": opts.features.clone(),
-            "noDefaultFeatures": false,
+            "noDefaultFeatures": opts.no_default_features,
+            "target": opts.target.clone(),
         },
         "workspace": {
             "symbol": {
@@ -361,7 +521,7 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
         "hover":      { "actions": { "enable": false } },
         "lens":       { "enable": false },
         "completion": { "snippets": { "custom": {} } },
-        "assist":     { "expressionFillDefault": "" },
+        "assist":     { "expressionFillDefault": "todo" },
         "references": { "excludeImports": true },
     })
 }
@@ -435,14 +595,21 @@ impl PublishDiagnostics {
 }
 
 /// What the reader thread streams to the model: a diagnostics notification,
-/// the boundary of a completed flycheck (`cargo check`) pass, or the
-/// boundary of RA's initial workspace indexing (FIELD FINDING #3a).
+/// the boundary of a completed flycheck (`cargo check`) pass, a failed
+/// flycheck process, or the boundary of RA's initial workspace indexing
+/// (FIELD FINDING #3a).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspEvent {
     Diagnostics(PublishDiagnostics),
     /// RA reported a flycheck/`cargo check` `$/progress` `end`. The set of
     /// `source:"rustc"` diagnostics as of now is an AUTHORITATIVE snapshot.
     FlycheckEnded,
+    /// RA reported that its flycheck/cargo subprocess failed before it could
+    /// produce usable diagnostics. This is authoritative RED: a checker that
+    /// cannot run cargo must never publish GREEN.
+    FlycheckFailed {
+        message: String,
+    },
     /// FIELD FINDING #3a: RA reported `$/progress` `end` for its initial
     /// project-indexing (workspace scan / proc-macro server bring-up /
     /// dependency analysis). Before this signal, RA is publishing diagnostics
@@ -651,6 +818,69 @@ pub fn extract_flycheck_end(v: &Value) -> bool {
     token.contains("check") || title.contains("check") || title.contains("flycheck")
 }
 
+fn is_flycheck_failure_message(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("flycheck failed")
+        || msg.contains("cargo watcher failed")
+        || msg.contains("cargo check failed")
+        || msg.contains("failed to run the following command")
+        || msg.contains("produced no valid metadata")
+}
+
+/// Extract a rust-analyzer flycheck/cargo execution failure from a decoded
+/// JSON-RPC notification. RA versions differ in whether this appears as a
+/// `window/showMessage` notification or as text on a flycheck progress item,
+/// so the matcher is deliberately limited to those two LSP surfaces and then
+/// keyed on the cargo/flycheck failure phrases above.
+pub fn extract_flycheck_failure(v: &Value) -> Option<String> {
+    match v.get("method").and_then(Value::as_str)? {
+        "window/showMessage" | "window/showMessageRequest" => {
+            let message = v
+                .get("params")
+                .and_then(|p| p.get("message"))
+                .and_then(Value::as_str)?;
+            is_flycheck_failure_message(message).then(|| message.to_string())
+        }
+        "$/progress" => {
+            let value = v.get("params")?.get("value")?;
+            let mut parts = Vec::new();
+            if let Some(title) = value.get("title").and_then(Value::as_str) {
+                parts.push(title);
+            }
+            if let Some(message) = value.get("message").and_then(Value::as_str) {
+                parts.push(message);
+            }
+            let message = parts.join(": ");
+            is_flycheck_failure_message(&message).then_some(message)
+        }
+        _ => None,
+    }
+}
+
+/// Synthetic diagnostic used when rust-analyzer reports that cargo/flycheck
+/// itself failed. It flows through the same red-verdict machinery as rustc
+/// diagnostics, but with a sentinel path because RA had no file diagnostic
+/// to publish.
+pub fn flycheck_failure_diagnostics(message: impl Into<String>) -> PublishDiagnostics {
+    let message = message.into();
+    let file_path = std::path::PathBuf::from("/__cargoless__/flycheck");
+    PublishDiagnostics {
+        uri: uri_from_path("/__cargoless__/flycheck"),
+        authoritative_errors: 1,
+        advisory_errors: 0,
+        total: 1,
+        diagnostics: vec![Diagnostic {
+            file_path,
+            line: 1,
+            col: 1,
+            severity: Severity::Error,
+            code: Some("CARGOLESS_FLYCHECK_FAILED".to_string()),
+            message,
+            source: Some("rustc".to_string()),
+        }],
+    }
+}
+
 /// FIELD FINDING #3a: true iff `v` is a `$/progress` notification ending RA's
 /// initial workspace indexing (or the related roots-scanning / proc-macro
 /// server bring-up phases that gate "the model is ready"). Generous matching
@@ -672,6 +902,8 @@ pub fn extract_indexing_end(v: &Value) -> bool {
     token.contains("indexing")
         || token.contains("rootscanning")
         || token.contains("rootsscanned")
+        || token.contains("roots scanned")
+        || token.contains("roots_scanned")
         || title.contains("indexing")
         || title.contains("roots scanned")
         || title.contains("scanning")
@@ -701,8 +933,10 @@ pub fn path_from_uri(uri: &str) -> Option<String> {
 /// LSP client bound to one rust-analyzer process's stdio. Construction runs
 /// the `initialize`/`initialized` handshake synchronously (enabling flycheck
 /// via `checkOnSave`), then a reader thread streams [`LspEvent`]s.
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
 pub struct LspClient {
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: SharedWriter,
     next_id: AtomicI64,
 }
 
@@ -719,7 +953,7 @@ impl LspClient {
     /// cargo features narrowed, plus honorable mentions). See module-
     /// doc on the 30-50% RA-resource-reduction rationale.
     pub fn initialize<W, R>(
-        mut w: W,
+        w: W,
         r: R,
         root_path: &str,
         opts: &InitOpts,
@@ -729,6 +963,8 @@ impl LspClient {
         R: Read + Send + 'static,
     {
         let root_uri = uri_from_path(root_path);
+        let init_options = lean_init_options(opts);
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(w)));
         let init = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -739,17 +975,17 @@ impl LspClient {
                 // #21 + F8-redo + #74: lean init options. checkOnSave
                 // stays ON (load-bearing for the GREEN gate); everything
                 // else is tuned down.
-                "initializationOptions": lean_init_options(opts),
+                "initializationOptions": init_options.clone(),
                 "capabilities": {
                     "window": { "workDoneProgress": true },
+                    "workspace": { "configuration": true },
                     "textDocument": {
                         "publishDiagnostics": { "relatedInformation": false }
                     }
                 }
             }
         });
-        w.write_all(&encode_message(init.to_string().as_bytes()))?;
-        w.flush()?;
+        write_lsp_message(&writer, &init)?;
 
         let mut br = BufReader::new(r);
         loop {
@@ -767,6 +1003,7 @@ impl LspClient {
                     if v.get("id").and_then(Value::as_i64) == Some(1) && v.get("method").is_none() {
                         break;
                     }
+                    let _ = respond_to_server_request(&v, &writer, &init_options);
                 }
             }
         }
@@ -776,18 +1013,27 @@ impl LspClient {
             "method": "initialized",
             "params": {}
         });
-        w.write_all(&encode_message(initialized.to_string().as_bytes()))?;
-        w.flush()?;
+        write_lsp_message(&writer, &initialized)?;
+        let config = json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeConfiguration",
+            "params": {
+                "settings": nested_ra_config(&init_options),
+            }
+        });
+        write_lsp_message(&writer, &config)?;
 
         let (tx, rx): (Sender<LspEvent>, Receiver<LspEvent>) = channel();
+        let reader_writer = Arc::clone(&writer);
+        let reader_config = init_options.clone();
         let _reader: JoinHandle<()> = thread::Builder::new()
             .name("tf-lsp-reader".into())
-            .spawn(move || reader_loop(br, tx))
+            .spawn(move || reader_loop(br, tx, reader_writer, reader_config))
             .expect("spawn tf-lsp-reader thread");
 
         Ok((
             Self {
-                writer: Mutex::new(Box::new(w)),
+                writer,
                 next_id: AtomicI64::new(2),
             },
             rx,
@@ -796,13 +1042,7 @@ impl LspClient {
 
     fn notify(&self, method: &str, params: Value) -> io::Result<()> {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let bytes = encode_message(msg.to_string().as_bytes());
-        let mut w = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        w.write_all(&bytes)?;
-        w.flush()
+        write_lsp_message(&self.writer, &msg)
     }
 
     /// `textDocument/didOpen`.
@@ -840,6 +1080,16 @@ impl LspClient {
         )
     }
 
+    /// RA extension: explicitly trigger flycheck for a document. This is
+    /// the headless-daemon equivalent of an editor's "run flycheck"
+    /// command and avoids relying on save-event heuristics alone.
+    pub fn run_flycheck(&self, abs_path: &str) -> io::Result<()> {
+        self.notify(
+            "rust-analyzer/runFlycheck",
+            json!({ "textDocument": { "uri": uri_from_path(abs_path) } }),
+        )
+    }
+
     /// `textDocument/didClose` — RA drops the buffer overlay for `uri`
     /// and reverts to its base/on-disk content for that file.
     ///
@@ -863,7 +1113,143 @@ impl LspClient {
     }
 }
 
-fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>) {
+fn write_lsp_message(writer: &SharedWriter, msg: &Value) -> io::Result<()> {
+    let bytes = encode_message(msg.to_string().as_bytes());
+    let mut w = writer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.write_all(&bytes)?;
+    w.flush()
+}
+
+fn respond_to_server_request(v: &Value, writer: &SharedWriter, config: &Value) -> io::Result<bool> {
+    let Some(id) = v.get("id").cloned() else {
+        return Ok(false);
+    };
+    let Some(method) = v.get("method").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    trace_lsp_request(method, v);
+    let result = if method == "workspace/configuration" {
+        workspace_configuration_result(v, config)
+    } else {
+        Value::Null
+    };
+    write_lsp_message(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+    )?;
+    Ok(true)
+}
+
+fn trace_lsp_request(method: &str, v: &Value) {
+    if std::env::var_os("CARGOLESS_LSP_TRACE").is_none() {
+        return;
+    }
+    let sections: Vec<String> = v
+        .get("params")
+        .and_then(|params| params.get("items"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("section").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!("[cargoless:lsp] request method={method} sections={sections:?}");
+}
+
+fn trace_lsp_notification(v: &Value) {
+    if std::env::var_os("CARGOLESS_LSP_TRACE").is_none() {
+        return;
+    }
+    let Some(method) = v.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    match method {
+        "$/progress" | "window/showMessage" | "window/showMessageRequest" => {
+            eprintln!("[cargoless:lsp] notification {method}: {v}");
+        }
+        "textDocument/publishDiagnostics" => {
+            let uri = v
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let count = v
+                .get("params")
+                .and_then(|p| p.get("diagnostics"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            eprintln!("[cargoless:lsp] notification publishDiagnostics uri={uri} count={count}");
+        }
+        _ => {}
+    }
+}
+
+fn workspace_configuration_result(v: &Value, config: &Value) -> Value {
+    let Some(items) = v
+        .get("params")
+        .and_then(|params| params.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                workspace_configuration_value(item.get("section").and_then(Value::as_str), config)
+            })
+            .collect(),
+    )
+}
+
+fn workspace_configuration_value(section: Option<&str>, config: &Value) -> Value {
+    let Some(section) = section else {
+        return nested_ra_config(config);
+    };
+    if section == "rust-analyzer" {
+        return nested_ra_config(config);
+    }
+    if let Some(value) = config.get(section) {
+        return value.clone();
+    }
+    if let Some(tail) = section.strip_prefix("rust-analyzer.") {
+        if let Some(value) = config.get(tail) {
+            return value.clone();
+        }
+    }
+    Value::Null
+}
+
+fn nested_ra_config(config: &Value) -> Value {
+    let Some(obj) = config.as_object() else {
+        return Value::Null;
+    };
+    let mut out: serde_json::Map<String, Value> = obj
+        .iter()
+        .filter(|(key, _)| !key.starts_with("rust-analyzer.") && key.as_str() != "checkOnSave")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    out.insert(
+        "checkOnSave".to_string(),
+        config
+            .get("rust-analyzer.checkOnSave")
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
+    );
+    Value::Object(out)
+}
+
+fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>, writer: SharedWriter, config: Value) {
     loop {
         match read_message(&mut br) {
             Ok(None) => break, // RA exited cleanly
@@ -872,8 +1258,14 @@ fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>) {
                 let Ok(v) = serde_json::from_slice::<Value>(&body) else {
                     continue;
                 };
+                if matches!(respond_to_server_request(&v, &writer, &config), Ok(true)) {
+                    continue;
+                }
+                trace_lsp_notification(&v);
                 let ev = if let Some(pd) = extract_publish_diagnostics(&v) {
                     LspEvent::Diagnostics(pd)
+                } else if let Some(message) = extract_flycheck_failure(&v) {
+                    LspEvent::FlycheckFailed { message }
                 } else if extract_flycheck_end(&v) {
                     LspEvent::FlycheckEnded
                 } else if extract_indexing_end(&v) {
@@ -1190,6 +1582,15 @@ mod tests {
         .unwrap();
         assert!(extract_indexing_end(&v2));
 
+        // Current RA reports this as a token with a space and no title on
+        // the final end notification.
+        let v2b: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/Roots Scanned",
+                "value":{"kind":"end","message":"1318/1318"}}}"#,
+        )
+        .unwrap();
+        assert!(extract_indexing_end(&v2b));
+
         // Begin/report on the same token is NOT an end.
         let v3: Value = serde_json::from_str(
             r#"{"method":"$/progress","params":{"token":"rustAnalyzer/Indexing",
@@ -1270,6 +1671,52 @@ mod tests {
     }
 
     #[test]
+    fn flycheck_failure_detection_matches_show_message_and_progress() {
+        let show: Value = serde_json::from_str(
+            r#"{"method":"window/showMessage",
+                "params":{"type":1,
+                "message":"Flycheck failed to run the following command: cargo check"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_flycheck_failure(&show).as_deref(),
+            Some("Flycheck failed to run the following command: cargo check")
+        );
+
+        let progress: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/flycheck/0",
+                "value":{"kind":"end","title":"cargo check",
+                "message":"Cargo watcher failed, the command produced no valid metadata"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            extract_flycheck_failure(&progress)
+                .unwrap()
+                .contains("Cargo watcher failed")
+        );
+
+        let clean_end: Value = serde_json::from_str(
+            r#"{"method":"$/progress","params":{"token":"rustAnalyzer/cargoCheck",
+                "value":{"kind":"end","title":"cargo check"}}}"#,
+        )
+        .unwrap();
+        assert!(extract_flycheck_failure(&clean_end).is_none());
+    }
+
+    #[test]
+    fn flycheck_failure_diagnostic_is_authoritative_red() {
+        let pd = flycheck_failure_diagnostics("cargo check failed to start");
+        assert_eq!(pd.uri, "file:///__cargoless__/flycheck");
+        assert_eq!(pd.authoritative_errors, 1);
+        assert!(pd.has_authoritative_error());
+        assert_eq!(
+            pd.diagnostics[0].code.as_deref(),
+            Some("CARGOLESS_FLYCHECK_FAILED")
+        );
+        assert_eq!(pd.diagnostics[0].source.as_deref(), Some("rustc"));
+    }
+
+    #[test]
     fn uri_path_roundtrip() {
         assert_eq!(uri_from_path("/abs/x.rs"), "file:///abs/x.rs");
         assert_eq!(
@@ -1287,23 +1734,28 @@ mod tests {
     fn lean_init_options_shape_has_load_bearing_keys_in_right_places() {
         // The full JSON tree the lean init builder produces. Assert that
         // the EXPECTED nested keys are present at the right paths — a
-        // future refactor that drops e.g. "checkOnSave.enable" or
+        // future refactor that drops e.g. "checkOnSave" or
         // "procMacro.enable" would silently regress the verdict path
         // (#21/F8-redo) or the polish savings (#74).
         let v = lean_init_options(&InitOpts::default());
 
         // checkOnSave is enabled (the F8-redo invariant — disabling would
-        // break the GREEN gate). Option B+ softened subsettings present.
-        assert_eq!(v["checkOnSave"]["enable"], json!(true));
-        assert_eq!(v["checkOnSave"]["command"], json!("check"));
-        assert_eq!(v["checkOnSave"]["allTargets"], json!(false));
-        assert_eq!(v["checkOnSave"]["invocationStrategy"], json!("once"));
-        assert_eq!(v["checkOnSave"]["invocationLocation"], json!("workspace"));
+        // break the GREEN gate). Detailed flycheck settings live under
+        // `check.*`.
+        assert_eq!(v["rust-analyzer.checkOnSave"], json!(true));
+        assert_eq!(v["rust-analyzer.check"]["allTargets"], json!(null));
+        assert_eq!(v["rust-analyzer.check.allTargets"], json!(false));
+        assert_eq!(v["rust-analyzer.check.overrideCommand"], json!(null));
+        assert_eq!(v["rust-analyzer.check.workspace"], json!(true));
+        assert_eq!(v["checkOnSave"], json!(true));
 
-        // Modern "check" key emitted alongside legacy "checkOnSave"
-        // (RA version-skew tolerance).
+        // check settings carry the cargo/flycheck profile.
         assert_eq!(v["check"]["command"], json!("check"));
         assert_eq!(v["check"]["allTargets"], json!(false));
+        assert_eq!(v["check"]["extraArgs"], json!([]));
+        assert_eq!(v["check"]["overrideCommand"], json!(null));
+        assert_eq!(v["check"]["workspace"], json!(true));
+        assert_eq!(v["check"]["targets"], json!(null));
 
         // inlayHints all OFF (cargoless never renders them).
         for k in [
@@ -1335,14 +1787,21 @@ mod tests {
         assert_eq!(v["cachePriming"]["enable"], json!(false));
 
         // procMacro tracks InitOpts.proc_macro_enabled (default=true).
+        assert_eq!(v["rust-analyzer.procMacro.enable"], json!(true));
         assert_eq!(v["procMacro"]["enable"], json!(true));
 
         // cargo: allFeatures OFF, features list from InitOpts (default
         // = empty so cargo uses its own defaults), defaults kept
         // (noDefaultFeatures: false).
+        assert_eq!(v["rust-analyzer.cargo.allTargets"], json!(false));
+        assert_eq!(v["rust-analyzer.cargo.allFeatures"], json!(false));
+        assert_eq!(v["rust-analyzer.cargo.buildScripts.enable"], json!(true));
+        assert_eq!(v["cargo"]["allTargets"], json!(false));
         assert_eq!(v["cargo"]["allFeatures"], json!(false));
+        assert_eq!(v["cargo"]["buildScripts"]["enable"], json!(true));
         assert_eq!(v["cargo"]["features"], json!([]));
         assert_eq!(v["cargo"]["noDefaultFeatures"], json!(false));
+        assert_eq!(v["cargo"]["target"], json!(null));
 
         // workspace.symbol narrowed.
         assert_eq!(
@@ -1358,8 +1817,25 @@ mod tests {
         assert_eq!(v["hover"]["actions"]["enable"], json!(false));
         assert_eq!(v["lens"]["enable"], json!(false));
         assert_eq!(v["completion"]["snippets"]["custom"], json!({}));
-        assert_eq!(v["assist"]["expressionFillDefault"], json!(""));
+        assert_eq!(v["assist"]["expressionFillDefault"], json!("todo"));
         assert_eq!(v["references"]["excludeImports"], json!(true));
+    }
+
+    #[test]
+    fn lean_init_options_can_disable_ra_cargo_flycheck_for_push_daemons() {
+        let v = lean_init_options(&InitOpts {
+            cargo_check_enabled: false,
+            package: Some("alchemy".into()),
+            ..InitOpts::default()
+        });
+
+        assert_eq!(v["rust-analyzer.checkOnSave"], json!(false));
+        assert_eq!(v["checkOnSave"], json!(false));
+        assert_eq!(v["rust-analyzer.check.overrideCommand"], json!(null));
+        assert_eq!(v["check"]["overrideCommand"], json!(null));
+        assert_eq!(v["rust-analyzer.check.workspace"], json!(false));
+        assert_eq!(v["cargo"]["buildScripts"]["enable"], json!(false));
+        assert_eq!(v["procMacro"]["enable"], json!(false));
     }
 
     #[test]
@@ -1367,6 +1843,7 @@ mod tests {
         let v = lean_init_options(&InitOpts {
             proc_macro_enabled: false,
             features: vec!["default".into()],
+            ..InitOpts::default()
         });
         assert_eq!(v["procMacro"]["enable"], json!(false));
     }
@@ -1376,11 +1853,112 @@ mod tests {
         let v = lean_init_options(&InitOpts {
             proc_macro_enabled: true,
             features: vec!["foo".into(), "bar".into()],
+            ..InitOpts::default()
         });
-        // Features appear in BOTH cargo.features AND checkOnSave.features
-        // (RA reads them from one or the other depending on version).
+        // Features appear in both cargo.features and check.features.
         assert_eq!(v["cargo"]["features"], json!(["foo", "bar"]));
-        assert_eq!(v["checkOnSave"]["features"], json!(["foo", "bar"]));
+        assert_eq!(v["check"]["features"], json!(["foo", "bar"]));
+        assert_eq!(v["rust-analyzer.check.features"], json!(["foo", "bar"]));
+    }
+
+    #[test]
+    fn lean_init_options_threads_tf_multiverse_check_profile() {
+        let v = lean_init_options(&InitOpts {
+            proc_macro_enabled: true,
+            features: vec!["ssr-frontend".into(), "telephony".into()],
+            package: Some("triform-server".into()),
+            target: Some("wasm32-unknown-unknown".into()),
+            no_default_features: true,
+            release: true,
+            cargo_check_enabled: true,
+        });
+
+        // Mirrors the tf-multiverse remote-check matrix:
+        //   cargo check --release -p triform-server
+        //   cargo check --target wasm32-unknown-unknown --no-default-features
+        //              --features ...
+        //
+        // rust-analyzer's documented split is:
+        // - package-scoped remote checks: check.overrideCommand carries the
+        //   normalized `-p <package-id>`. buildScripts stay disabled to avoid
+        //   a separate workspace preflight
+        // - target: cargo.target / check.targets
+        // - features/no-default-features: cargo.* and check/checkOnSave.*
+        let override_command = json!([
+            "cargo",
+            "check",
+            "-p",
+            "triform-server",
+            "--message-format=json",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--no-default-features",
+            "--features",
+            "ssr-frontend,telephony",
+            "--release"
+        ]);
+        assert_eq!(v["check"]["extraArgs"], json!([]));
+        assert_eq!(v["check"]["workspace"], json!(false));
+        assert_eq!(v["check"]["overrideCommand"], override_command);
+        assert_eq!(v["rust-analyzer.check.overrideCommand"], override_command);
+        assert_eq!(v["rust-analyzer.check.workspace"], json!(false));
+        assert_eq!(v["rust-analyzer.cargo.buildScripts.enable"], json!(false));
+        assert_eq!(v["rust-analyzer.procMacro.enable"], json!(false));
+        assert_eq!(v["procMacro"]["enable"], json!(false));
+        assert_eq!(v["cargo"]["buildScripts"]["enable"], json!(false));
+        assert_eq!(v["cargo"]["allTargets"], json!(false));
+        assert_eq!(v["cargo"]["target"], json!("wasm32-unknown-unknown"));
+        assert_eq!(v["check"]["targets"], json!("wasm32-unknown-unknown"));
+        assert_eq!(v["cargo"]["noDefaultFeatures"], json!(true));
+        assert_eq!(v["check"]["noDefaultFeatures"], json!(true));
+        assert_eq!(v["check"]["features"], json!(["ssr-frontend", "telephony"]));
+    }
+
+    #[test]
+    fn lean_init_options_normalizes_tf_multiverse_package_aliases() {
+        let v = lean_init_options(&InitOpts {
+            package: Some("alchemy".into()),
+            ..InitOpts::default()
+        });
+
+        assert_eq!(
+            v["check"]["overrideCommand"],
+            json!([
+                "cargo",
+                "check",
+                "-p",
+                "triform-alchemy",
+                "--message-format=json"
+            ])
+        );
+    }
+
+    #[test]
+    fn workspace_configuration_response_serves_nested_and_flat_ra_settings() {
+        let v = lean_init_options(&InitOpts {
+            proc_macro_enabled: true,
+            package: Some("alchemy".into()),
+            ..InitOpts::default()
+        });
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "workspace/configuration",
+            "params": {
+                "items": [
+                    { "section": "rust-analyzer" },
+                    { "section": "rust-analyzer.check.workspace" }
+                ]
+            }
+        });
+
+        let result = workspace_configuration_result(&req, &v);
+
+        assert_eq!(result[0]["check"]["workspace"], json!(false));
+        assert_eq!(result[0]["check"]["extraArgs"], json!([]));
+        assert_eq!(result[0]["checkOnSave"], json!(true));
+        assert_eq!(result[1], json!(false));
+        assert_eq!(result[0]["rust-analyzer.check.workspace"], json!(null));
     }
 
     // ----------------------------------------------------------------
@@ -1401,7 +1979,7 @@ mod tests {
         );
         assert!(v["lru"]["capacity"].is_u64(), "must be a number");
         // Coexists with the verdict-load-bearing key (regression guard).
-        assert_eq!(v["checkOnSave"]["enable"], json!(true));
+        assert_eq!(v["checkOnSave"], json!(true));
     }
 
     #[test]
@@ -1536,11 +2114,16 @@ mod tests {
         // #180: also serialized — `from_env_and_project` reads
         // `TF_PROC_MACRO` too, so this must not run concurrently with the
         // proc-macro env tests (every env-mutating test shares ENV_LOCK).
-        let _g = EnvGuard::set("TF_FEATURES", "csr, hydrate ,");
+        let _g = EnvGuard::set("TF_FEATURES", "csr, hydrate ssr-frontend,telephony");
         let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
         assert_eq!(
             opts.features,
-            vec!["csr".to_string(), "hydrate".to_string()]
+            vec![
+                "csr".to_string(),
+                "hydrate".to_string(),
+                "ssr-frontend".to_string(),
+                "telephony".to_string()
+            ]
         );
     }
 
@@ -1592,5 +2175,28 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("second event");
         assert_eq!(e2, LspEvent::FlycheckEnded);
+    }
+
+    #[test]
+    fn handshake_streams_flycheck_failure_events_over_fakes() {
+        let mut server = encode_message(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        server.extend(encode_message(
+            br#"{"method":"window/showMessage","params":{"type":1,"message":"Flycheck failed to run the following command: cargo check"}}"#,
+        ));
+        let reader = Cursor::new(server);
+        let writer: Vec<u8> = Vec::new();
+
+        let opts = InitOpts::default();
+        let (_client, rx) = LspClient::initialize(writer, reader, "/r", &opts).expect("handshake");
+
+        let ev = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("flycheck failure event");
+        assert_eq!(
+            ev,
+            LspEvent::FlycheckFailed {
+                message: "Flycheck failed to run the following command: cargo check".into()
+            }
+        );
     }
 }

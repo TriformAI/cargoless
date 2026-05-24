@@ -261,6 +261,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 // path (`servedrv::publish_verdict`) where they can
                 // diverge under heartbeat-refresh semantics.
                 analysed_at: statusfile::now_unix(),
+                build_id: cargoless_core::build_id().to_string(),
             },
         );
     };

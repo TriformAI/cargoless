@@ -13,6 +13,9 @@
 //! * `GET /events`                          → `text/event-stream` SSE,
 //!   one `data: <json>\n\n` frame per transition (the "react in real
 //!   time to red" agent-orchestration case, §11)
+//! * `GET /admin/active`                     → quiesce/drain counters
+//! * `POST /admin/quiesce`                   → refuse new pushes, drain,
+//!   then let the daemon exit cleanly for restart
 //!
 //! **Auth (#14 seam, NOT policy):** every request is gated by an
 //! [`Authorizer`]; the default is [`AllowAll`] (the #10 posture —
@@ -27,19 +30,20 @@
 //! and audit-able.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread;
+use std::time::Duration;
 
 use cargoless_proto::Diagnostic;
 
 use super::{
-    Authorizer, PushOverlayAck, Request, TransitionEvent, TransportClient, TransportError,
-    VerdictService, WorktreeStatus, WorktreeSummary, event_from_json, event_to_json,
-    pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
-    summaries_from_json, summaries_to_json,
+    Authorizer, DaemonActivity, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
+    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
+    event_from_json, event_to_json, pushoverlayack_from_json, pushoverlayack_to_json,
+    status_from_json, status_to_json, summaries_from_json, summaries_to_json,
 };
 
 /// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
@@ -49,6 +53,7 @@ use super::{
 /// MiB comfortably covers a whole-file overlay-set for a real workspace
 /// while fail-closed-bounding a hostile/runaway client.
 const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---- tiny request model -------------------------------------------------
 
@@ -128,6 +133,15 @@ fn write_response(w: &mut impl Write, code: u16, reason: &str, ctype: &str, body
     let _ = w.flush();
 }
 
+fn daemon_activity_to_json(activity: &DaemonActivity) -> String {
+    serde_json::json!({
+        "quiescing": activity.quiescing,
+        "active_worktrees": activity.active_worktrees,
+        "pending_pushes": activity.pending_pushes,
+    })
+    .to_string()
+}
+
 // ---- server -------------------------------------------------------------
 
 /// A running HTTP server. Dropping it stops the accept loop; in-flight
@@ -185,6 +199,12 @@ impl HttpServer {
             while !stop_t.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((conn, _)) => {
+                        // The listener is nonblocking so the accept loop can
+                        // poll the stop flag. Some platforms let accepted
+                        // streams inherit that mode; body reads must be
+                        // blocking or a large POST can surface WouldBlock as a
+                        // false "short body".
+                        let _ = conn.set_nonblocking(false);
                         let (svc_c, auth_c, ready_c) = (svc.clone(), auth.clone(), ready.clone());
                         thread::spawn(move || handle(conn, svc_c, auth_c, ready_c));
                     }
@@ -257,6 +277,23 @@ fn handle(
         return;
     }
 
+    // ── POST /admin/quiesce — authenticated graceful-drain request ──
+    // This is an admin write, so it sits behind the same bearer gate as
+    // POST /overlay. It carries no request body: the entire operation is
+    // "refuse new pushes, drain accepted pushed worktrees, then let the
+    // serve loop exit when the counts reach zero".
+    if req.method == "POST" && req.path == "/admin/quiesce" {
+        let activity = svc.request_quiesce();
+        write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            &daemon_activity_to_json(&activity),
+        );
+        return;
+    }
+
     // ── POST /overlay — the server's FIRST body-reading route (Inc 2) ──
     // Bearer-gated: the #14 auth gate above already ran, so POST /overlay
     // inherits the SAME Authorizer as every non-/healthz route — no new
@@ -306,8 +343,36 @@ fn handle(
                 worktree,
                 base_ref,
                 files,
+                check_profile,
             }) => {
-                let ack = svc.push_overlay(&worktree, &base_ref, &files);
+                let ack = svc.push_overlay_with_profile(
+                    &worktree,
+                    &base_ref,
+                    &files,
+                    check_profile.as_ref(),
+                );
+                write_response(
+                    &mut writer,
+                    200,
+                    "OK",
+                    "application/json",
+                    &pushoverlayack_to_json(&ack),
+                );
+            }
+            Some(Request::PushOverlayV2 {
+                worktree,
+                base_ref,
+                files,
+                check_profile,
+                options,
+            }) => {
+                let ack = svc.push_overlay_with_options(
+                    &worktree,
+                    &base_ref,
+                    &files,
+                    check_profile.as_ref(),
+                    Some(&options),
+                );
                 write_response(
                     &mut writer,
                     200,
@@ -335,13 +400,30 @@ fn handle(
         );
         let _ = writer.flush();
         let rx = svc.subscribe();
-        for ev in rx {
-            // SSE frame: `data: <json>\n\n`.
-            if write!(writer, "data: {}\n\n", event_to_json(&ev)).is_err() {
-                break;
-            }
-            if writer.flush().is_err() {
-                break;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(ev) => {
+                    // SSE frame: `data: <json>\n\n`.
+                    if write!(writer, "data: {}\n\n", event_to_json(&ev)).is_err() {
+                        break;
+                    }
+                    if writer.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // A client that exits immediately after its verdict can
+                    // otherwise sit in CLOSE_WAIT until the next verdict. A
+                    // small SSE comment heartbeat detects that closed peer and
+                    // lets the thread/subscription drain promptly.
+                    if writer.write_all(b": keepalive\n\n").is_err() {
+                        break;
+                    }
+                    if writer.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
         return;
@@ -371,6 +453,14 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         }
     }
     match req.path.as_str() {
+        "/daemon" => (
+            200,
+            serde_json::json!({
+                "build_id": crate::build_id(),
+            })
+            .to_string(),
+        ),
+        "/admin/active" => (200, daemon_activity_to_json(&svc.daemon_activity())),
         "/worktrees" => (200, summaries_to_json(&svc.list_worktrees())),
         "/status" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
             Some(w) => match svc.get_status(&w) {
@@ -475,8 +565,19 @@ impl HttpClient {
         Ok(c)
     }
 
+    fn connect(&self) -> Result<TcpStream, TransportError> {
+        let mut addrs = (self.host.as_str(), self.port).to_socket_addrs()?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| TransportError::Protocol("remote resolved to no addresses".into()))?;
+        let stream = TcpStream::connect_timeout(&addr, CLIENT_IO_TIMEOUT)?;
+        stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
+        Ok(stream)
+    }
+
     fn get(&self, path_and_query: &str) -> Result<(u16, String), TransportError> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        let mut stream = self.connect()?;
         write!(
             stream,
             "GET {path_and_query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -495,6 +596,19 @@ impl HttpClient {
             .and_then(|c| c.parse::<u16>().ok())
             .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
         Ok((code, body.to_string()))
+    }
+
+    pub fn daemon_build_id(&self) -> Result<Option<String>, TransportError> {
+        let (code, body) = self.get("/daemon")?;
+        if code == 404 {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| TransportError::Protocol("daemon identity is not json".into()))?;
+        Ok(value
+            .get("build_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string))
     }
 }
 
@@ -529,7 +643,7 @@ impl TransportClient for HttpClient {
     }
 
     fn subscribe(&self) -> Result<Receiver<TransitionEvent>, TransportError> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        let mut stream = self.connect()?;
         write!(
             stream,
             "GET /events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -570,28 +684,69 @@ impl TransportClient for HttpClient {
         base_ref: &str,
         files: &[(String, String)],
     ) -> Result<PushOverlayAck, TransportError> {
+        self.push_overlay_with_profile(worktree, base_ref, files, None)
+    }
+
+    fn push_overlay_with_profile(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&crate::transport::CheckProfile>,
+    ) -> Result<PushOverlayAck, TransportError> {
+        self.push_overlay_with_options(worktree, base_ref, files, check_profile, None)
+    }
+
+    fn push_overlay_with_options(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&crate::transport::CheckProfile>,
+        options: Option<&PushOverlayOptions>,
+    ) -> Result<PushOverlayAck, TransportError> {
         // The server's one body-carrying route. Reuse the frozen
         // `Request` codec for the body (no bespoke JSON); bearer header
         // only when a token is configured (#10 loopback posture sends
         // none — `AllowAll` accepts it).
-        let body = Request::PushOverlay {
-            worktree: worktree.to_string(),
-            base_ref: base_ref.to_string(),
-            files: files.to_vec(),
+        let body = match options.filter(|o| !o.is_empty()) {
+            Some(options) => Request::PushOverlayV2 {
+                worktree: worktree.to_string(),
+                base_ref: base_ref.to_string(),
+                files: files.to_vec(),
+                check_profile: check_profile.cloned(),
+                options: options.clone(),
+            },
+            None => Request::PushOverlay {
+                worktree: worktree.to_string(),
+                base_ref: base_ref.to_string(),
+                files: files.to_vec(),
+                check_profile: check_profile.cloned(),
+            },
         }
         .to_json();
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))?;
-        write!(
-            stream,
+        if body.len() > MAX_OVERLAY_BYTES {
+            return Err(TransportError::Protocol(format!(
+                "overlay payload too large ({} bytes > {} byte limit)",
+                body.len(),
+                MAX_OVERLAY_BYTES
+            )));
+        }
+        let mut req = format!(
             "POST /overlay HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n",
             self.host,
             body.len()
-        )?;
+        )
+        .into_bytes();
         if let Some(tok) = &self.token {
-            write!(stream, "Authorization: Bearer {tok}\r\n")?;
+            req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
         }
-        write!(stream, "\r\n{body}")?;
+        req.extend_from_slice(b"\r\n");
+        req.extend_from_slice(body.as_bytes());
+
+        let mut stream = self.connect()?;
+        stream.write_all(&req)?;
         stream.flush()?;
         let mut raw = String::new();
         stream.read_to_string(&mut raw)?;
@@ -611,7 +766,10 @@ impl TransportClient for HttpClient {
             413 => Err(TransportError::Protocol(
                 "overlay payload too large (413)".into(),
             )),
-            c => Err(TransportError::Protocol(format!("push_overlay HTTP {c}"))),
+            c => Err(TransportError::Protocol(format!(
+                "push_overlay HTTP {c}: {}",
+                resp.trim()
+            ))),
         }
     }
 }
@@ -808,6 +966,7 @@ mod tests {
         .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         for route in [
+            "/admin/active",
             "/status?worktree=green-wt",
             "/verdict?worktree=red-wt",
             "/worktrees",
@@ -882,8 +1041,50 @@ mod tests {
             worktree: "wt-push".into(),
             base_ref: "origin/main".into(),
             files: vec![("src/lib.rs".into(), "fn f(){}".into())],
+            check_profile: None,
         }
         .to_json()
+    }
+
+    #[test]
+    fn admin_active_and_quiesce_routes_are_json_and_bearer_gated() {
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (code, body) = raw_get(s.addr(), "/admin/active");
+        assert_eq!(code, 200);
+        assert!(
+            body.contains("\"active_worktrees\":0") && body.contains("\"pending_pushes\":0"),
+            "admin activity exposes bounded counts as JSON"
+        );
+
+        let (code, body) = raw_post(s.addr(), "/admin/quiesce", "", None);
+        assert_eq!(code, 200);
+        assert!(
+            body.contains("\"active_worktrees\":0") && body.contains("\"pending_pushes\":0"),
+            "admin quiesce responds with the same activity JSON shape"
+        );
+
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        let denied = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(DenyAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(raw_get(denied.addr(), "/admin/active").0, 401);
+        assert_eq!(raw_post(denied.addr(), "/admin/quiesce", "", None).0, 401);
     }
 
     #[test]

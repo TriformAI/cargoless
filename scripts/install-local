@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+# Build and install the local cargoless CLI as the user's default binary.
+# Optionally restart the tf-multiverse daemon so CLI and daemon build IDs align.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_BIN="${INSTALL_BIN:-$HOME/.cargo/bin/cargoless}"
+BACKUP_DIR="${BACKUP_DIR:-${TMPDIR:-/tmp}}"
+RESTART_TFM=0
+VERIFY_TFM="${VERIFY_TFM:-1}"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/install-local [--restart-tf-multiverse] [--no-verify-tf-multiverse]
+
+Environment:
+  INSTALL_BIN   default ~/.cargo/bin/cargoless
+  BACKUP_DIR    default TMPDIR or /tmp
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --restart-tf-multiverse)
+      RESTART_TFM=1
+      shift
+      ;;
+    --no-verify-tf-multiverse)
+      VERIFY_TFM=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      echo "install-local: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+cd "$ROOT"
+
+echo "[install-local] building release cargoless"
+cargo build --release -p cargoless
+
+mkdir -p "$(dirname "$INSTALL_BIN")"
+if [ -x "$INSTALL_BIN" ]; then
+  backup="$BACKUP_DIR/cargoless-installed-prev-$(date +%Y%m%d%H%M%S)"
+  cp -p "$INSTALL_BIN" "$backup"
+  echo "[install-local] previous binary backed up to $backup"
+fi
+
+install -m 0755 "$ROOT/target/release/cargoless" "$INSTALL_BIN"
+echo "[install-local] installed $INSTALL_BIN"
+"$INSTALL_BIN" --version
+
+if [ "$RESTART_TFM" = "1" ]; then
+  echo "[install-local] restarting tf-multiverse daemon"
+  CARGOLESS_BIN="$INSTALL_BIN" "$ROOT/scripts/tf-multiverse-daemon" restart
+fi
+
+if [ "$VERIFY_TFM" = "1" ] && [ -d /Users/iggy/Documents/GitHub/tf-multiverse ]; then
+  echo "[install-local] verifying tf-multiverse project checks"
+  "$INSTALL_BIN" checks run migration-immutability \
+    --root /Users/iggy/Documents/GitHub/tf-multiverse \
+    --profile dev
+fi

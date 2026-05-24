@@ -94,6 +94,18 @@ fn resolve_watch_debounce() -> Duration {
         .unwrap_or(DEFAULT_WATCH_DEBOUNCE)
 }
 
+fn ra_native_verdict_mode() -> bool {
+    std::env::var("CARGOLESS_VERDICT_MODE")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("ra")
+                || v.eq_ignore_ascii_case("advisory")
+                || v.eq_ignore_ascii_case("development")
+        })
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // #21 additive provenance types (cargoless_core::model, serde-free — NOT cargoless-proto)
 // ---------------------------------------------------------------------------
@@ -400,6 +412,13 @@ impl Model {
                 self.reconcile();
                 self.emit_advisory();
             }
+            LspEvent::FlycheckFailed { message } => {
+                let pd = crate::lsp::flycheck_failure_diagnostics(message.clone());
+                self.apply_event(&LspEvent::Diagnostics(pd));
+                self.flycheck_done = true;
+                self.reconcile();
+                self.emit_advisory();
+            }
             LspEvent::IndexingEnded => {
                 // FIELD FINDING #3a: the watch-mode model's authoritative
                 // GREEN is already correctly gated on `flycheck_done` (the
@@ -434,6 +453,16 @@ impl Model {
     /// errors).
     fn authoritative_tree(&self) -> TreeState {
         if !self.flycheck_done {
+            if ra_native_verdict_mode() {
+                if self.auth.is_empty() {
+                    return TreeState::Red;
+                }
+                return if self.auth.values().any(|s| *s == FileState::Red) {
+                    TreeState::Red
+                } else {
+                    TreeState::Green
+                };
+            }
             return TreeState::Red;
         }
         if self.auth.values().any(|s| *s == FileState::Red) {
@@ -603,6 +632,13 @@ pub fn check_verdict(root: &Path) -> io::Result<Verdict> {
             Ok(LspEvent::FlycheckEnded) => {
                 flycheck_seen = true;
             }
+            Ok(LspEvent::FlycheckFailed { message }) => {
+                let pd = crate::lsp::flycheck_failure_diagnostics(message);
+                if let Some(p) = crate::lsp::path_from_uri(&pd.uri) {
+                    auth.insert(p, FileState::Red);
+                }
+                flycheck_seen = true;
+            }
             Ok(LspEvent::IndexingEnded) => {
                 indexing_done = true;
             }
@@ -747,6 +783,14 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
             Ok(LspEvent::FlycheckEnded) => {
                 flycheck_seen = true;
             }
+            Ok(LspEvent::FlycheckFailed { message }) => {
+                let pd = crate::lsp::flycheck_failure_diagnostics(message);
+                if let Some(p) = crate::lsp::path_from_uri(&pd.uri) {
+                    auth.insert(p.clone(), FileState::Red);
+                    diagnostics.insert(p, pd.diagnostics);
+                }
+                flycheck_seen = true;
+            }
             Ok(LspEvent::IndexingEnded) => {
                 indexing_done = true;
             }
@@ -776,6 +820,13 @@ pub fn check_once_with_diagnostics(root: &Path) -> io::Result<CheckResult> {
     for v in diagnostics.values() {
         flat.extend(v.iter().cloned());
     }
+    let project = crate::project_checks::run_dev(&root)?;
+    flat.extend(project.diagnostics);
+    let tree = if tree == TreeState::Red || project.tree == TreeState::Red {
+        TreeState::Red
+    } else {
+        TreeState::Green
+    };
     Ok(CheckResult {
         tree,
         diagnostics: flat,

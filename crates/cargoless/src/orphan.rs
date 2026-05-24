@@ -29,6 +29,9 @@
 //! Unix-only mechanism. On non-Unix (Windows is v0 parking-lot per
 //! CLAUDE.md) `orphaned()` is a permanent `false` — the daemon keeps
 //! the prior behavior there, documented rather than silently wrong.
+//! A service manager that intentionally launches `serve` as a detached
+//! pidfile daemon may set `CARGOLESS_MANAGED_SERVICE=1`; this disables
+//! the parent-shell guard for that process only.
 //!
 //! libc-free: the `getppid` extern is declared locally, matching the
 //! house style of the `kill` extern in `cargoless_core::analyzer` (#44) —
@@ -39,6 +42,10 @@
 /// on each loop iteration.
 #[derive(Debug, Clone, Copy)]
 pub struct ParentWatch {
+    /// Disabled only for an explicitly managed service process. The
+    /// default remains enabled so `watch &` / `build --watch &` still
+    /// self-terminate when their launcher shell disappears.
+    enabled: bool,
     /// The parent pid observed at construction. On non-Unix this is
     /// unused (the field still exists so the struct shape is
     /// platform-stable; `orphaned()` short-circuits).
@@ -51,6 +58,7 @@ impl ParentWatch {
     /// loop, so `orphaned()` has a stable baseline to compare against.
     pub fn capture() -> Self {
         Self {
+            enabled: !managed_service_env(),
             orig_ppid: current_ppid(),
         }
     }
@@ -67,6 +75,9 @@ impl ParentWatch {
     /// On non-Unix: always `false` (no reparenting model we probe in
     /// v0; documented in the module header).
     pub fn orphaned(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
         #[cfg(unix)]
         {
             current_ppid() != self.orig_ppid
@@ -76,6 +87,19 @@ impl ParentWatch {
             false
         }
     }
+}
+
+fn managed_service_env() -> bool {
+    std::env::var("CARGOLESS_MANAGED_SERVICE")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
 }
 
 /// `getppid()` on Unix; a fixed sentinel on non-Unix (so
@@ -171,12 +195,29 @@ mod tests {
         // and a baseline that cannot match the live parent reads
         // orphaned (this test). That fully pins the one-line
         // comparison without a flaky subprocess proxy.
-        let pw = ParentWatch { orig_ppid: 0 };
+        let pw = ParentWatch {
+            enabled: true,
+            orig_ppid: 0,
+        };
         assert!(
             pw.orphaned(),
             "a baseline that can never equal the live getppid() must \
              read orphaned — this is the exact reparent signal the \
              watch loop relies on to self-terminate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_parent_watch_never_reports_orphaned() {
+        let pw = ParentWatch {
+            enabled: false,
+            orig_ppid: 0,
+        };
+        assert!(
+            !pw.orphaned(),
+            "managed service mode must not self-terminate just because \
+             the short-lived launcher script exits"
         );
     }
 }

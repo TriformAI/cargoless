@@ -12,35 +12,45 @@
 //!    path-keyed default) + `--base <ref>` (git base, default HEAD).
 //! 2. Compute the overlay-set:
 //!    `git -C <repo> diff --name-only <base>` → changed-file list →
-//!    read each file's bytes → `(path, content)` pairs.
+//!    add workspace-defining config files → read each file's bytes →
+//!    `(absolute path, content)` pairs.
 //! 3. **Canonicalize ordering** — sort files by path so the daemon's
 //!    `cluster_hash_from_pushed` is deterministic regardless of the
 //!    client's OS-enumeration order (#262 C6 fix, client-side; ~5 LOC,
 //!    naturally adjacent to file-gathering).
-//! 4. `HttpClient::new(url).push_overlay(worktree, base, files)` →
+//! 4. `HttpClient::new(url).push_overlay_with_profile(...)` →
 //!    `PushOverlayAck { accepted, applied_files, worktree }`.
-//! 5. Print the ack; exit 0 (accepted=true), 1 (accepted=false /
-//!    transport error), or 2 (setup error). Fail-soft: never panic
-//!    on a transport failure — surface the actionable message.
+//! 5. Print the ack; optionally `--await-verdict` via `/status`; exit 0
+//!    (green/accepted), 1 (red/rejected/transport
+//!    error), or 2 (setup error). Fail-soft: never panic on a transport
+//!    failure — surface the actionable message.
 //!
 //! ## Honest 2c boundary (stated, not papered over)
 //!
-//! * Push-and-no-block: 2c does NOT poll for the verdict. Per
-//!   D-PUSHOVERLAY §3 "client → POST /overlay → 200 ack → GET /events
-//!   (SSE) OR poll /status" — the verdict round-trips via the
-//!   already-shipped read-plane. Use `cargoless status --remote <url>`
-//!   (from #232 0c) for the verdict. A future `--await-verdict`
-//!   blocking-poll flag is a Wave-2 nicety.
+//! * Push remains ack-first by default: the verdict round-trips via the
+//!   already-shipped read-plane. `--await-verdict` is the blocking
+//!   automation mode; it polls status and guards against accepting a stale
+//!   prior verdict.
 //! * Git ops via `std::process::Command` — same discipline as
 //!   `build.rs`'s trunk subprocess and `watch.rs`'s tooling.
-//! * No new external deps. The client uses already-shipped
-//!   `HttpClient::push_overlay` (2a transport surface on main).
+//! * No new external deps. The client uses the shipped HTTP transport
+//!   surface and its additive profile-aware push verb.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use cargoless_core::transport::TransportClient;
 use cargoless_core::transport::http::HttpClient;
+use cargoless_core::transport::{CheckProfile, PushOverlayOptions, TransportClient};
+
+const WORKSPACE_CONFIG_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+    ".cargo/config.toml",
+    ".cargo/config",
+];
 
 /// CLI-resolved push parameters, ready to drive
 /// `HttpClient::push_overlay` + git-subprocess file enumeration.
@@ -48,6 +58,10 @@ use cargoless_core::transport::http::HttpClient;
 pub struct PushOpts {
     /// Required: `--remote <url>` — the central daemon's HTTP endpoint.
     pub remote: String,
+    /// Optional bearer token for a protected remote daemon. The loopback
+    /// canary path leaves this unset; non-loopback deployments should set
+    /// it via `CARGOLESS_AUTH_TOKEN` or `--auth-token`.
+    pub auth_token: Option<String>,
     /// Local repository root (defaults to cwd). git operations run via
     /// `git -C <repo>`; file reads are `repo.join(rel_path)`.
     pub repo: PathBuf,
@@ -58,6 +72,34 @@ pub struct PushOpts {
     /// future diagnostics; server stores-and-ignores in v0.2.x
     /// (spike open-Q2 default).
     pub base: String,
+    /// Optional per-request cargo-check profile. tf-multiverse uses this
+    /// to push `check-remote` selectors through one shared daemon.
+    pub check_profile: Option<CheckProfile>,
+    /// Server-side repository root. When set, the client sends
+    /// repo-relative overlay paths and asks the daemon to map them under this
+    /// root. This is the central-cluster service mode; absent keeps the
+    /// same-host absolute-path behavior.
+    pub server_root: Option<PathBuf>,
+    /// If true, block until the remote daemon publishes a fresh verdict for
+    /// this worktree.
+    pub await_verdict: bool,
+    /// Wall-clock timeout for `await_verdict`.
+    pub await_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AwaitFreshness {
+    prior_published_at: Option<u64>,
+    not_before_unix: u64,
+}
+
+impl AwaitFreshness {
+    fn is_fresh(self, published_at: u64) -> bool {
+        match self.prior_published_at {
+            Some(prior) => published_at > prior,
+            None => published_at > self.not_before_unix,
+        }
+    }
 }
 
 /// `cargoless push` entry. Returns an `ExitCode` per the v0 CLI
@@ -76,7 +118,7 @@ pub fn run(opts: &PushOpts) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if changed.is_empty() {
+    if changed.is_empty() && !opts.await_verdict {
         eprintln!(
             "[cargoless:push] no changes vs {} in {} — nothing to push",
             opts.base,
@@ -85,15 +127,29 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         return ExitCode::from(0);
     }
 
-    // 2. Read each changed file's bytes. Tolerant: a skipped file
-    //    (read error) warns but does not abort the push — the
-    //    pushed-overlay is best-effort and the server is robust to
-    //    partial sets (the cluster-hash + diff are content-shaped).
-    let mut files: Vec<(String, String)> = Vec::with_capacity(changed.len());
-    for rel in &changed {
+    // 2. Read each changed file plus the workspace-defining config files
+    //    the daemon uses for cluster hashing. Paths are sent as absolute
+    //    file paths to match the FS-watcher mode byte-for-byte at the LSP
+    //    seam (`didOpen`/`didChange` require real `file:///abs/...` URIs).
+    //    Tolerant: a skipped file (read error, usually an absent optional
+    //    config file or deleted changed file) warns but does not abort the
+    //    push — the pushed-overlay is best-effort and the server is robust
+    //    to partial sets (the cluster-hash + diff are content-shaped).
+    let repo_relative = opts.server_root.is_some();
+    let changed_set: BTreeSet<&str> = changed.iter().map(String::as_str).collect();
+    let candidates = overlay_candidate_files(&changed);
+    let mut files: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+    for rel in &candidates {
         let abs = opts.repo.join(rel);
         match std::fs::read_to_string(&abs) {
-            Ok(content) => files.push((rel.clone(), content)),
+            Ok(content) => files.push((payload_path(&opts.repo, rel, repo_relative), content)),
+            Err(_) if changed_set.contains(rel.as_str()) && !abs.exists() => {
+                crate::ui::warn(format!(
+                    "push: `{}` is deleted locally; representing it as an empty overlay file",
+                    abs.display()
+                ));
+                files.push((payload_path(&opts.repo, rel, repo_relative), String::new()));
+            }
             Err(e) => crate::ui::warn(format!("push: skip `{}` (read error: {e})", abs.display())),
         }
     }
@@ -108,7 +164,11 @@ pub fn run(opts: &PushOpts) -> ExitCode {
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     // 4. Build the HTTP client + push.
-    let client = match HttpClient::new(&opts.remote) {
+    let client = match opts.auth_token.as_deref().filter(|t| !t.trim().is_empty()) {
+        Some(token) => HttpClient::with_token(&opts.remote, token),
+        None => HttpClient::new(&opts.remote),
+    };
+    let client = match client {
         Ok(c) => c,
         Err(e) => {
             crate::ui::error(format!(
@@ -118,7 +178,49 @@ pub fn run(opts: &PushOpts) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let ack = match client.push_overlay(&opts.worktree, &opts.base, &files) {
+    let await_freshness = if opts.await_verdict {
+        let prior_published_at = match client.get_status(&opts.worktree) {
+            Ok(Some(status)) => Some(status.published_at),
+            Ok(None) => None,
+            Err(e) => {
+                crate::ui::warn(format!(
+                    "push: pre-push status poll failed while preparing await: {e}"
+                ));
+                None
+            }
+        };
+        Some(AwaitFreshness {
+            prior_published_at,
+            not_before_unix: crate::statusfile::now_unix(),
+        })
+    } else {
+        None
+    };
+    let mut options = PushOverlayOptions {
+        changed_files: if changed.is_empty() {
+            None
+        } else {
+            Some(changed.clone())
+        },
+        ..PushOverlayOptions::default()
+    };
+    if let Some(root) = opts.server_root.as_ref() {
+        options.repo_relative = true;
+        options.analysis_root = Some(root.to_string_lossy().into_owned());
+        options.base_sha = git_resolve_ref(&opts.repo, &opts.base).ok();
+    }
+    let options = if options.is_empty() {
+        None
+    } else {
+        Some(options)
+    };
+    let ack = match client.push_overlay_with_options(
+        &opts.worktree,
+        &opts.base,
+        &files,
+        opts.check_profile.as_ref(),
+        options.as_ref(),
+    ) {
         Ok(a) => a,
         Err(e) => {
             crate::ui::error(format!("push: server `{}` rejected: {e}", opts.remote));
@@ -132,14 +234,71 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         opts.remote, ack.accepted, ack.applied_files, ack.worktree
     );
     eprintln!(
-        "[cargoless:push] verdict: run `cargoless status --remote {}` to poll \
-         (or subscribe via /events SSE)",
+        "[cargoless:push] verdict: polling `cargoless status --remote {}` until fresh",
         opts.remote
     );
-    if ack.accepted {
-        ExitCode::from(0)
-    } else {
-        ExitCode::from(1)
+    if !ack.accepted {
+        return ExitCode::from(1);
+    }
+    if opts.await_verdict {
+        return await_verdict(
+            &client,
+            &opts.worktree,
+            await_freshness.expect("await freshness prepared when await_verdict is true"),
+            opts.await_timeout_secs,
+        );
+    }
+    ExitCode::from(0)
+}
+
+fn await_verdict(
+    client: &HttpClient,
+    worktree: &str,
+    freshness: AwaitFreshness,
+    timeout_secs: u64,
+) -> ExitCode {
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        match client.get_status(worktree) {
+            Ok(Some(status)) if freshness.is_fresh(status.published_at) => {
+                return exit_for_verdict(
+                    "status",
+                    &status.worktree,
+                    &status.verdict,
+                    status.published_at,
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::ui::warn(format!("push: await verdict status poll failed: {e}"));
+            }
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let wait = remaining.min(std::time::Duration::from_millis(200));
+        if wait.is_zero() {
+            break;
+        }
+        std::thread::sleep(wait);
+    }
+    crate::ui::error(format!(
+        "push: timed out after {}s awaiting a fresh verdict for {}",
+        timeout.as_secs(),
+        worktree
+    ));
+    ExitCode::from(1)
+}
+
+fn exit_for_verdict(source: &str, worktree: &str, verdict: &str, published_at: u64) -> ExitCode {
+    eprintln!(
+        "[cargoless:push] fresh verdict via {} worktree={} verdict={} published_at={}",
+        source, worktree, verdict, published_at
+    );
+    match verdict {
+        "green" => ExitCode::from(0),
+        "red" => ExitCode::from(1),
+        _ => ExitCode::from(1),
     }
 }
 
@@ -170,9 +329,43 @@ fn git_changed_files(repo: &Path, base: &str) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
+fn git_resolve_ref(repo: &Path, base: &str) -> std::io::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(format!("{base}^{{commit}}"))
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git rev-parse exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn overlay_candidate_files(changed: &[String]) -> Vec<String> {
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    files.extend(WORKSPACE_CONFIG_FILES.iter().map(|p| (*p).to_string()));
+    files.extend(changed.iter().cloned());
+    files.into_iter().collect()
+}
+
+fn payload_path(repo: &Path, rel: &str, repo_relative: bool) -> String {
+    if repo_relative {
+        rel.to_string()
+    } else {
+        repo.join(rel).to_string_lossy().into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cargoless_core::transport::CargoSubcommand;
 
     /// **2c keystone test — the client-side composing-equivalence
     /// shape.** Two semantically-identical pushes (same `(path,
@@ -229,14 +422,86 @@ mod tests {
         // --worktree W --base origin/main` invocation resolves to.
         let opts = PushOpts {
             remote: "http://localhost:8080".to_string(),
+            auth_token: Some("token".to_string()),
             repo: PathBuf::from("/r"),
             worktree: "/r".to_string(),
             base: "HEAD".to_string(),
+            check_profile: Some(CheckProfile {
+                subcommand: CargoSubcommand::Check,
+                package: Some("triform-server".into()),
+                target: None,
+                features: Vec::new(),
+                no_default_features: false,
+                release: false,
+                extra_args: Vec::new(),
+            }),
+            server_root: None,
+            await_verdict: true,
+            await_timeout_secs: 10,
         };
         // Cheap clone+eq sanity (the v0 CLI Opts shape relies on
         // PartialEq for the parser tests in main.rs).
         let cloned = opts.clone();
         assert_eq!(opts, cloned);
+    }
+
+    #[test]
+    fn await_freshness_requires_newer_status_when_prior_exists() {
+        let guard = AwaitFreshness {
+            prior_published_at: Some(100),
+            not_before_unix: 100,
+        };
+        assert!(!guard.is_fresh(99));
+        assert!(!guard.is_fresh(100));
+        assert!(guard.is_fresh(101));
+    }
+
+    #[test]
+    fn await_freshness_uses_push_start_when_no_prior_status_exists() {
+        let guard = AwaitFreshness {
+            prior_published_at: None,
+            not_before_unix: 100,
+        };
+        assert!(!guard.is_fresh(99));
+        assert!(!guard.is_fresh(100));
+        assert!(guard.is_fresh(101));
+    }
+
+    #[test]
+    fn overlay_candidates_include_workspace_config_and_dedupe() {
+        let files = overlay_candidate_files(&[
+            "src/lib.rs".to_string(),
+            "Cargo.toml".to_string(),
+            "src/lib.rs".to_string(),
+        ]);
+        assert!(files.contains(&"Cargo.toml".to_string()));
+        assert!(files.contains(&"Cargo.lock".to_string()));
+        assert!(files.contains(&"rust-toolchain.toml".to_string()));
+        assert!(files.contains(&".cargo/config.toml".to_string()));
+        assert_eq!(
+            files.iter().filter(|p| p.as_str() == "src/lib.rs").count(),
+            1
+        );
+        assert_eq!(
+            files.iter().filter(|p| p.as_str() == "Cargo.toml").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn payload_paths_are_absolute_like_fs_watcher_mode() {
+        assert_eq!(
+            payload_path(Path::new("/repo/wt"), "src/lib.rs", false),
+            "/repo/wt/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn payload_paths_can_be_repo_relative_for_central_daemon_mode() {
+        assert_eq!(
+            payload_path(Path::new("/repo/wt"), "src/lib.rs", true),
+            "src/lib.rs"
+        );
     }
 
     #[test]

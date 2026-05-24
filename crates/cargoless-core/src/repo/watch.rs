@@ -19,11 +19,11 @@
 //! the daemon would be blind to them.
 //!
 //! The **only** filter that still applies to a routed worktree path is the
-//! universal build-noise floor (`target/`, `.git/`) — those are never a
-//! legitimate watch target in *any* Cargo tree, which is exactly the
-//! unconditional invariant [`crate::watcher::IgnoreRules`] already enforces
-//! (it ignores `target`/`.git` anywhere, even against `!`-negation). We
-//! reuse that invariant rather than re-deriving it.
+//! universal build/tool-noise floor (`target/`, `.git/`, `.cargoless/`) —
+//! those are never a legitimate watch target in *any* Cargo tree, which is
+//! exactly the unconditional invariant [`crate::watcher::IgnoreRules`]
+//! already enforces for build/VCS noise. We add `.cargoless/` here because
+//! the repo-scoped daemon writes its own status/diagnostic files there.
 //!
 //! ## House purity seam
 //!
@@ -106,13 +106,13 @@ impl WtRouter {
     }
 
     /// Routing **for monitoring**: the owning worktree for `abs_path`,
-    /// applying *only* the universal build-noise floor (`target/`,
-    /// `.git/` anywhere under the worktree are never a watch target —
-    /// the unconditional [`crate::watcher::IgnoreRules`] invariant). This
-    /// is the §4 inversion in one call: gitignore is overridden (a
-    /// gitignored worktree subtree IS monitored), but compiler/VCS noise
-    /// is still floored out so a `cargo` build inside a worktree does not
-    /// storm the daemon.
+    /// applying *only* the universal build/tool-noise floor (`target/`,
+    /// `.git/`, `.cargoless/` anywhere under the worktree are never a
+    /// watch target). This is the §4 inversion in one call: gitignore is
+    /// overridden (a gitignored worktree subtree IS monitored), but
+    /// compiler/VCS/cargoless-owned noise is still floored out so a
+    /// `cargo` build or status write inside a worktree does not storm the
+    /// daemon.
     ///
     /// `None` ⇒ either not under any known worktree, or it is build noise
     /// within one (both correctly "do not route as a content change").
@@ -128,6 +128,7 @@ impl WtRouter {
                 std::path::Component::Normal(s)
                     if s == std::ffi::OsStr::new("target")
                         || s == std::ffi::OsStr::new(".git")
+                        || s == std::ffi::OsStr::new(".cargoless")
             )
         });
         if is_noise { None } else { Some(wt) }
@@ -154,7 +155,7 @@ impl WtRouter {
 /// * **No fabricated WtId.** The *only* `WtId`s that can ever appear in
 ///   [`poll`](Self::poll) output are exact [`WtRouter::route_for_monitoring`]
 ///   results. A path that routes to `None` (under no worktree, or
-///   `target/`/`.git/` build-noise inside one) is dropped —
+///   `target/`/`.git/`/`.cargoless/` noise inside one) is dropped —
 ///   [`record`](Self::record) returns `false` and creates no debouncer
 ///   entry. (Leans entirely on the backstop-CLEAR'd router.)
 /// * **Per-WT debounce isolation.** Each `WtId` owns its *own*
@@ -388,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn monitoring_floors_target_and_git_noise_within_a_wt() {
+    fn monitoring_floors_target_git_and_cargoless_noise_within_a_wt() {
         // The inversion overrides gitignore for *content*, but the
         // universal build/VCS-noise floor still applies INSIDE a routed
         // worktree (a `cargo` build in agent-x must not storm the daemon).
@@ -399,13 +400,18 @@ mod tests {
             r.route_for_monitoring(Path::new(&format!("{base}/src/lib.rs"))),
             Some(Path::new(&base))
         );
-        // target/ and .git/ inside the worktree → floored (None).
+        // target/, .git/, and cargoless-owned state inside the worktree
+        // → floored (None).
         assert_eq!(
             r.route_for_monitoring(Path::new(&format!("{base}/target/debug/build/x"))),
             None
         );
         assert_eq!(
             r.route_for_monitoring(Path::new(&format!("{base}/.git/index"))),
+            None
+        );
+        assert_eq!(
+            r.route_for_monitoring(Path::new(&format!("{base}/.cargoless/cli-status"))),
             None
         );
         // Not under any worktree → None.
@@ -487,9 +493,10 @@ mod tests {
         let t0 = Instant::now();
         // Under no worktree.
         assert!(!rw.record(Path::new("/etc/passwd"), t0));
-        // Build-noise inside a routed worktree (target/ and .git/).
+        // Tool/build-noise inside a routed worktree.
         assert!(!rw.record(Path::new(&format!("{REPO}/target/debug/x")), t0));
         assert!(!rw.record(Path::new(&format!("{REPO}/.git/index")), t0));
+        assert!(!rw.record(Path::new(&format!("{REPO}/.cargoless/cli-status")), t0));
         // No debouncer entry was fabricated ⇒ nothing ever settles.
         assert!(rw.poll(t0 + QUIET + QUIET).is_empty());
         assert_eq!(rw.time_until_ready(t0), None);

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${CARGOLESS_SERVE_IMAGE:-registry.triform.cloud/cargoless-serve:latest}"
+
+cd "$ROOT"
+docker build -f deploy/cargoless-serve.Dockerfile -t "$IMAGE" .
+docker push "$IMAGE"

@@ -12,8 +12,8 @@ use std::sync::mpsc::Receiver;
 use cargoless_proto::Diagnostic;
 
 use super::{
-    PushOverlayAck, TransitionEvent, TransportClient, TransportError, VerdictService,
-    WorktreeStatus, WorktreeSummary,
+    PushOverlayAck, PushOverlayOptions, TransitionEvent, TransportClient, TransportError,
+    VerdictService, WorktreeStatus, WorktreeSummary,
 };
 
 /// Wraps any [`VerdictService`] and presents it as a [`TransportClient`].
@@ -57,9 +57,36 @@ impl TransportClient for InProcClient {
         base_ref: &str,
         files: &[(String, String)],
     ) -> Result<PushOverlayAck, TransportError> {
+        self.push_overlay_with_profile(worktree, base_ref, files, None)
+    }
+
+    fn push_overlay_with_profile(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&crate::transport::CheckProfile>,
+    ) -> Result<PushOverlayAck, TransportError> {
+        self.push_overlay_with_options(worktree, base_ref, files, check_profile, None)
+    }
+
+    fn push_overlay_with_options(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&crate::transport::CheckProfile>,
+        options: Option<&PushOverlayOptions>,
+    ) -> Result<PushOverlayAck, TransportError> {
         // Single-binary mode: forward straight to the in-memory service —
         // infallible, zero IPC (the in-proc adapter's whole point).
-        Ok(self.service.push_overlay(worktree, base_ref, files))
+        Ok(self.service.push_overlay_with_options(
+            worktree,
+            base_ref,
+            files,
+            check_profile,
+            options,
+        ))
     }
 }
 
@@ -117,6 +144,7 @@ pub(crate) mod testmock {
                 "green-wt" => Some(WorktreeStatus {
                     worktree: worktree.into(),
                     verdict: "green".into(),
+                    daemon_build_id: crate::build_id().to_string(),
                     crates: vec![CrateVerdict {
                         name: "isolation".into(),
                         verdict: "green".into(),
@@ -128,6 +156,7 @@ pub(crate) mod testmock {
                 "red-wt" => Some(WorktreeStatus {
                     worktree: worktree.into(),
                     verdict: "red".into(),
+                    daemon_build_id: crate::build_id().to_string(),
                     // Honesty case: unattributable error ⇒ empty crates;
                     // verdict stands alone (the #9/#11 invariant on the
                     // wire).
@@ -154,11 +183,13 @@ pub(crate) mod testmock {
                 WorktreeSummary {
                     worktree: "green-wt".into(),
                     verdict: "green".into(),
+                    daemon_build_id: crate::build_id().to_string(),
                     red_diagnostics: 0,
                 },
                 WorktreeSummary {
                     worktree: "red-wt".into(),
                     verdict: "red".into(),
+                    daemon_build_id: crate::build_id().to_string(),
                     red_diagnostics: 1,
                 },
             ]

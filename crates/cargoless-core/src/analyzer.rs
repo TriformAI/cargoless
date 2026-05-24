@@ -363,6 +363,9 @@ fn monitor_loop(shared: Arc<Shared>) {
 pub fn rust_analyzer_command() -> io::Result<Command> {
     let exe = resolve_rust_analyzer()?;
     let mut cmd = Command::new(exe);
+    if let Some(path) = std::env::var_os("CARGOLESS_RA_LOG_FILE") {
+        cmd.arg("--log-file").arg(path).arg("--no-log-buffering");
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

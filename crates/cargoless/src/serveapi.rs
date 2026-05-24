@@ -38,14 +38,16 @@
 //! already emits keeps the read-plane consistent with the write-plane
 //! rather than fabricating detail the loop does not yet compute.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use cargoless_core::Diagnostic;
 use cargoless_core::transport::{
-    PushOverlayAck, TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
+    CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions, TransitionEvent,
+    VerdictService, WorktreeStatus, WorktreeSummary,
 };
 
 /// Poison-tolerant lock (same discipline as `model::poisoned` /
@@ -70,9 +72,30 @@ pub struct PushedOverlay {
     /// Whole-file `(path, content)` pairs — the same shape the FS path
     /// builds via `std::fs::read_to_string` per file.
     pub files: Vec<(String, String)>,
+    /// Server-side root for central-daemon pushes. When set, the serve loop
+    /// uses this as the rust-analyzer workspace root while keeping `worktree`
+    /// as the client-visible status key.
+    pub analysis_root: Option<PathBuf>,
+    /// Client's resolved base SHA, diagnostics-only. The server fetch/reset
+    /// result remains authoritative.
+    pub base_sha: Option<String>,
     /// Unix timestamp of the push receipt. Diagnostics-only for 2b;
     /// future idle-evict policy (Wave-2) reads this.
     pub last_push_unix: u64,
+    /// Repo-relative files changed by the client diff. Project-check
+    /// trigger filtering uses this instead of the overlay file list because
+    /// overlays include extra workspace config files for cluster routing.
+    pub changed_files: Option<Vec<String>>,
+    /// Optional per-push Cargo check profile. This lets a single
+    /// repo-scoped daemon accept tf-multiverse's per-invocation
+    /// `check-remote` selectors without restarting RA per package.
+    pub check_profile: Option<CheckProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectCheckRunContext {
+    pub root: PathBuf,
+    pub changed_files: Option<Vec<String>>,
 }
 
 /// The serve-loop's live verdict state, presented as the shipped logical
@@ -100,6 +123,10 @@ pub struct ServeVerdictState {
     /// same WT REPLACES the prior overlay before consumption) is the
     /// natural BTreeMap semantic.
     pushed: Mutex<BTreeMap<String, PushedOverlay>>,
+    /// Serializes central-daemon mirror fetch/reset operations. The HTTP
+    /// adapter can accept several requests concurrently; the checked-out
+    /// mirror is one mutable filesystem and must move one base at a time.
+    sync_lock: Mutex<()>,
     /// #240/2b — push-arrival signal channel. The serve loop drains
     /// this alongside ctrl_rx; each received worktree-key is the
     /// wakeup signal that a push needs servicing. `Option<Sender>`
@@ -108,6 +135,21 @@ pub struct ServeVerdictState {
     /// `HttpServer::bind` exposes `push_overlay` to clients (so no
     /// push can race the channel-not-yet-attached window).
     push_signal: Mutex<Option<Sender<String>>>,
+    /// Admin drain state. A restart requests quiesce through HTTP; after
+    /// that, new pushes are refused while accepted pushed worktrees stay
+    /// active until their next authoritative verdict is published.
+    drain: Mutex<DrainState>,
+    /// Project-check context captured when a pushed overlay is consumed.
+    /// The verdict arm runs later, after rust-analyzer settles, so the
+    /// changed-file trigger set and central-daemon analysis root need a
+    /// small handoff store keyed by the client-visible worktree.
+    project_check_context: Mutex<BTreeMap<String, ProjectCheckRunContext>>,
+}
+
+#[derive(Default)]
+struct DrainState {
+    quiescing: bool,
+    active_worktrees: BTreeSet<String>,
 }
 
 impl ServeVerdictState {
@@ -132,6 +174,7 @@ impl ServeVerdictState {
         let status = WorktreeStatus {
             worktree: worktree.clone(),
             verdict: verdict.to_string(),
+            daemon_build_id: cargoless_core::build_id().to_string(),
             // Honest Inc-0 boundary: identical to the zeros the durable
             // `statusfile`/`publish_verdict` path already writes (see
             // module doc). Not fabricated detail.
@@ -144,12 +187,13 @@ impl ServeVerdictState {
         };
         poisoned(&self.statuses).insert(worktree.clone(), status);
         let ev = TransitionEvent {
-            worktree,
+            worktree: worktree.clone(),
             verdict: verdict.to_string(),
             red_diagnostics: 0,
             published_at,
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
+        self.mark_worktree_published(&worktree);
     }
 
     /// #240/2b — wire the push-arrival signal channel. Called ONCE by
@@ -187,6 +231,69 @@ impl ServeVerdictState {
     pub fn peek_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
         poisoned(&self.pushed).get(wt_key).cloned()
     }
+
+    /// Server-side analysis root for a pending pushed overlay, if the client
+    /// supplied one. The serve loop uses this before consuming the overlay so
+    /// first-push cluster spawn uses the daemon's mirror path, not the
+    /// client's pod-local worktree key.
+    pub fn analysis_root_for(&self, wt_key: &str) -> Option<PathBuf> {
+        poisoned(&self.pushed)
+            .get(wt_key)
+            .and_then(|p| p.analysis_root.clone())
+    }
+
+    pub(crate) fn record_project_check_context(
+        &self,
+        worktree: &str,
+        root: PathBuf,
+        changed_files: Option<Vec<String>>,
+    ) {
+        poisoned(&self.project_check_context).insert(
+            worktree.to_string(),
+            ProjectCheckRunContext {
+                root,
+                changed_files,
+            },
+        );
+    }
+
+    pub(crate) fn take_project_check_context(
+        &self,
+        worktree: &str,
+    ) -> Option<ProjectCheckRunContext> {
+        poisoned(&self.project_check_context).remove(worktree)
+    }
+
+    pub fn quiescing(&self) -> bool {
+        poisoned(&self.drain).quiescing
+    }
+
+    pub fn drain_complete(&self) -> bool {
+        let drain = poisoned(&self.drain);
+        drain.quiescing && drain.active_worktrees.is_empty() && poisoned(&self.pushed).is_empty()
+    }
+
+    fn mark_push_active(&self, worktree: &str) -> bool {
+        let mut drain = poisoned(&self.drain);
+        if drain.quiescing {
+            return false;
+        }
+        drain.active_worktrees.insert(worktree.to_string());
+        true
+    }
+
+    fn mark_worktree_published(&self, worktree: &str) {
+        poisoned(&self.drain).active_worktrees.remove(worktree);
+    }
+
+    fn activity_snapshot(&self) -> DaemonActivity {
+        let drain = poisoned(&self.drain);
+        DaemonActivity {
+            quiescing: drain.quiescing,
+            active_worktrees: drain.active_worktrees.len() as u32,
+            pending_pushes: poisoned(&self.pushed).len() as u32,
+        }
+    }
 }
 
 impl VerdictService for ServeVerdictState {
@@ -222,6 +329,7 @@ impl VerdictService for ServeVerdictState {
             .map(|s| WorktreeSummary {
                 worktree: s.worktree.clone(),
                 verdict: s.verdict.clone(),
+                daemon_build_id: s.daemon_build_id.clone(),
                 red_diagnostics: s.red_diagnostics,
             })
             .collect()
@@ -255,11 +363,83 @@ impl VerdictService for ServeVerdictState {
         base_ref: &str,
         files: &[(String, String)],
     ) -> PushOverlayAck {
+        self.push_overlay_with_profile(worktree, base_ref, files, None)
+    }
+
+    fn push_overlay_with_profile(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&CheckProfile>,
+    ) -> PushOverlayAck {
+        self.push_overlay_with_options(worktree, base_ref, files, check_profile, None)
+    }
+
+    fn push_overlay_with_options(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&CheckProfile>,
+        options: Option<&PushOverlayOptions>,
+    ) -> PushOverlayAck {
+        if self.quiescing() {
+            return rejected_push(worktree, "daemon is quiescing");
+        }
+        let mut mapped_files = files.to_vec();
+        let mut analysis_root = None;
+        let mut base_sha = None;
+        let mut changed_files = None;
+        if let Some(options) = options {
+            changed_files = options.changed_files.clone();
+            analysis_root = options
+                .analysis_root
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            base_sha = options
+                .base_sha
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            if options.repo_relative {
+                let Some(root) = analysis_root.as_ref() else {
+                    return rejected_push(worktree, "repo-relative push missing analysis_root");
+                };
+                mapped_files = match map_repo_relative_files(root, files) {
+                    Ok(files) => files,
+                    Err(e) => return rejected_push(worktree, &e),
+                };
+            }
+
+            if let Some(root) = analysis_root.as_ref() {
+                let base = base_ref.trim();
+                if !base.is_empty() {
+                    let _guard = poisoned(&self.sync_lock);
+                    if let Err(e) = sync_analysis_root(root, base) {
+                        return rejected_push(worktree, &e);
+                    }
+                }
+            }
+        }
+
+        if !self.mark_push_active(worktree) {
+            return rejected_push(worktree, "daemon is quiescing");
+        }
+
         let applied_files = files.len() as u32;
         let pushed = PushedOverlay {
             base_ref: base_ref.to_string(),
-            files: files.to_vec(),
+            files: mapped_files,
+            analysis_root,
+            base_sha,
             last_push_unix: crate::statusfile::now_unix(),
+            changed_files,
+            check_profile: check_profile.cloned(),
         };
         poisoned(&self.pushed).insert(worktree.to_string(), pushed);
         // Wake the serve loop (best-effort — see attach_push_signal doc).
@@ -272,15 +452,117 @@ impl VerdictService for ServeVerdictState {
             applied_files,
         }
     }
+
+    fn daemon_activity(&self) -> DaemonActivity {
+        self.activity_snapshot()
+    }
+
+    fn request_quiesce(&self) -> DaemonActivity {
+        {
+            let mut drain = poisoned(&self.drain);
+            drain.quiescing = true;
+        }
+        self.activity_snapshot()
+    }
+}
+
+fn rejected_push(worktree: &str, why: &str) -> PushOverlayAck {
+    eprintln!("[cargoless:push] rejected worktree={worktree}: {why}");
+    PushOverlayAck {
+        worktree: worktree.to_string(),
+        accepted: false,
+        applied_files: 0,
+    }
+}
+
+fn map_repo_relative_files(
+    root: &Path,
+    files: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    files
+        .iter()
+        .map(|(path, content)| {
+            let rel = safe_repo_relative_path(path)?;
+            Ok((
+                root.join(rel).to_string_lossy().into_owned(),
+                content.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(format!("repo-relative push carried absolute path `{path}`"));
+    }
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("repo-relative path escapes repo root: `{path}`"));
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err("repo-relative push carried an empty path".to_string());
+    }
+    Ok(out)
+}
+
+fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
+    if !root.join(".git").exists() {
+        return Err(format!(
+            "analysis_root `{}` is not a git checkout",
+            root.display()
+        ));
+    }
+    let fetch_ref = base_ref
+        .strip_prefix("origin/")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(base_ref);
+    run_git(root, &["fetch", "--prune", "origin", fetch_ref])?;
+    run_git(root, &["reset", "--hard", base_ref])?;
+    Ok(())
+}
+
+fn run_git(root: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            format!(
+                "git {:?} in `{}` failed to start: {e}",
+                args,
+                root.display()
+            )
+        })?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "git {:?} in `{}` exited {:?}: {}",
+        args,
+        root.display(),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
     use cargoless_core::transport::http::{HttpClient, HttpServer};
-    use cargoless_core::transport::{AllowAll, TransportClient, VerdictService};
+    use cargoless_core::transport::{
+        AllowAll, CargoSubcommand, PushOverlayOptions, TransportClient, VerdictService,
+    };
 
     use super::*;
 
@@ -415,12 +697,82 @@ mod tests {
         assert_eq!(peeked.base_ref, "origin/main");
         assert_eq!(peeked.files.len(), 2);
         assert_eq!(peeked.files, files);
+        assert_eq!(peeked.check_profile, None);
 
         // Signal fired with the WT key.
         let signal = rx
             .recv_timeout(std::time::Duration::from_millis(200))
             .expect("push_signal wakeup");
         assert_eq!(signal, "/wt-a");
+    }
+
+    #[test]
+    fn push_overlay_with_profile_stores_per_request_cargo_profile() {
+        let api = ServeVerdictState::new();
+        let profile = CheckProfile {
+            subcommand: CargoSubcommand::Check,
+            package: Some("alchemy".into()),
+            target: Some("wasm32-unknown-unknown".into()),
+            features: vec!["hydrate".into()],
+            no_default_features: true,
+            release: true,
+            extra_args: vec!["--tests".into()],
+        };
+        let files = vec![("/wt/Cargo.toml".to_string(), "[workspace]\n".to_string())];
+
+        let ack = api.push_overlay_with_profile("/wt", "origin/dev", &files, Some(&profile));
+
+        assert!(ack.accepted);
+        let pushed = api.peek_overlay_for("/wt").expect("stored");
+        assert_eq!(pushed.check_profile, Some(profile));
+    }
+
+    #[test]
+    fn push_overlay_with_options_maps_repo_relative_paths_to_analysis_root() {
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some("/workspace/tf-multiverse".into()),
+            base_sha: Some("abc123".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+        };
+
+        let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
+
+        assert!(ack.accepted);
+        let pushed = api.peek_overlay_for("/client/wt").expect("stored");
+        assert_eq!(
+            pushed.files,
+            vec![(
+                "/workspace/tf-multiverse/src/lib.rs".to_string(),
+                "pub fn x() {}".to_string()
+            )]
+        );
+        assert_eq!(
+            pushed.analysis_root.as_deref(),
+            Some(Path::new("/workspace/tf-multiverse"))
+        );
+        assert_eq!(pushed.base_sha.as_deref(), Some("abc123"));
+        assert_eq!(pushed.changed_files, Some(vec!["src/lib.rs".into()]));
+    }
+
+    #[test]
+    fn push_overlay_with_options_rejects_escaping_repo_relative_paths() {
+        let api = ServeVerdictState::new();
+        let files = vec![("../outside.rs".to_string(), "bad".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some("/workspace/tf-multiverse".into()),
+            base_sha: None,
+            changed_files: None,
+        };
+
+        let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
+
+        assert!(!ack.accepted);
+        assert_eq!(ack.applied_files, 0);
+        assert!(api.peek_overlay_for("/client/wt").is_none());
     }
 
     #[test]
@@ -574,5 +926,53 @@ mod tests {
             count, 3,
             "3 signals (one per push) — consume-side coalesces"
         );
+    }
+
+    #[test]
+    fn quiesce_refuses_new_pushes_and_drains_on_publish() {
+        let api = ServeVerdictState::new();
+        let files = vec![("/wt/src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+
+        let ack = api.push_overlay("/wt", "main", &files);
+        assert!(ack.accepted);
+        assert_eq!(
+            api.daemon_activity(),
+            DaemonActivity {
+                quiescing: false,
+                active_worktrees: 1,
+                pending_pushes: 1,
+            }
+        );
+
+        let activity = api.request_quiesce();
+        assert!(activity.quiescing);
+        assert_eq!(activity.active_worktrees, 1);
+        assert_eq!(activity.pending_pushes, 1);
+
+        let rejected = api.push_overlay("/wt-2", "main", &files);
+        assert!(
+            !rejected.accepted,
+            "quiescing daemon refuses fresh pushed work"
+        );
+        assert!(api.peek_overlay_for("/wt-2").is_none());
+
+        let consumed = api.take_overlay_for("/wt").expect("pending overlay");
+        assert_eq!(consumed.files, files);
+        assert_eq!(api.daemon_activity().pending_pushes, 0);
+        assert!(
+            !api.drain_complete(),
+            "publishing the accepted push's verdict is the drain boundary"
+        );
+
+        api.publish(Path::new("/wt"), false);
+        assert_eq!(
+            api.daemon_activity(),
+            DaemonActivity {
+                quiescing: true,
+                active_worktrees: 0,
+                pending_pushes: 0,
+            }
+        );
+        assert!(api.drain_complete());
     }
 }
