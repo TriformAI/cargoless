@@ -122,7 +122,7 @@ spec:
             - { name: workspace, mountPath: /workspace }
       containers:
         - name: serve
-          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.0
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.1-push-ready
           imagePullPolicy: Always
           command: ["/bin/bash", "-lc"]
           args:
