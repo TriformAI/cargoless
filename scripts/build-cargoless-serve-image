@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${CARGOLESS_SERVE_IMAGE:-registry.triform.cloud/cargoless-serve:latest}"
+VERSION="$(awk -F' = ' '/^version = / { gsub(/"/, "", $2); print $2; exit }' "$ROOT/Cargo.toml")"
+IMAGE="${CARGOLESS_SERVE_IMAGE:-registry.triform.cloud/cargoless/cargoless-serve:${VERSION}}"
+PLATFORM="${CARGOLESS_SERVE_PLATFORM:-linux/amd64}"
 
 cd "$ROOT"
-docker build -f deploy/cargoless-serve.Dockerfile -t "$IMAGE" .
+docker build --platform "$PLATFORM" -f deploy/cargoless-serve.Dockerfile -t "$IMAGE" .
 docker push "$IMAGE"
