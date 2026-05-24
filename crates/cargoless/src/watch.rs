@@ -194,6 +194,7 @@ pub fn run(cfg: &Config) -> ExitCode {
                 // analysed_at == updated honestly for v0; the distinction
                 // is preserved for the Model R serve --repo path.
                 analysed_at: statusfile::now_unix(),
+                build_id: cargoless_core::build_id().to_string(),
             },
         );
         // Model R #11: retain the full diagnostic list for a red tree

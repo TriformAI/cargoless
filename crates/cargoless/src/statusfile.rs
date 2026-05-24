@@ -18,6 +18,7 @@
 //! verdict=green|red|unknown       # authoritative tree verdict at last update
 //! crates=<name>:<v>,<name>:<v>    # schema=2, OPTIONAL — see below
 //! red_diagnostics=<u32>           # schema=2 — count of error-severity diags
+//! build_id=<string>               # schema=2 — writer binary identity
 //! ```
 //!
 //! **schema=2 (Model R #9, `D-FLEET-SHARED-DAEMON` §9):** adds the
@@ -110,6 +111,8 @@ pub struct Status {
     /// close; full OTEL+SigNoz spans land in #246). Zero on schema=1 or
     /// pre-#247 files (forward-compatible default).
     pub analysed_at: u64,
+    /// Writer binary identity. Empty for old status files.
+    pub build_id: String,
 }
 
 pub fn path(root: &Path) -> PathBuf {
@@ -172,6 +175,7 @@ impl Status {
         // compatible: a schema=2 reader pre-#247 will ignore the unknown
         // `analysed_at` key (the parse-arm-driven discipline).
         out.push_str(&format!("analysed_at={}\n", self.analysed_at));
+        out.push_str(&format!("build_id={}\n", self.build_id));
         out
     }
 
@@ -194,6 +198,7 @@ impl Status {
                 "crates" => s.crates = parse_crates(v.trim()),
                 "red_diagnostics" => s.red_diagnostics = v.trim().parse().unwrap_or(0),
                 "analysed_at" => s.analysed_at = v.trim().parse().unwrap_or(0),
+                "build_id" => s.build_id = v.trim().to_string(),
                 _ => {}
             }
         }
@@ -292,6 +297,15 @@ pub fn run_status(cfg: &Config) -> ExitCode {
             STALE_AFTER.as_secs()
         ));
     }
+    ui::step(format!("cli: {}", cargoless_core::build_id()));
+    if st.build_id.is_empty() {
+        ui::step("daemon: unknown build (status file predates build identity)".to_string());
+    } else {
+        ui::step(format!("daemon: {}", st.build_id));
+        if st.build_id != cargoless_core::build_id() {
+            ui::warn("daemon build differs from CLI; restart the daemon for binary alignment");
+        }
+    }
     ui::step(format!("project: {}", cfg.detection.describe()));
     report_latest_green(&cfg.root);
 
@@ -316,7 +330,7 @@ pub fn run_status(cfg: &Config) -> ExitCode {
 /// * `3` — no reachable daemon at `url` (the local "no/stale daemon"
 ///   analogue — fall-through-safe, never a panic);
 /// * `2` — `url` is not a usable remote URL (setup error).
-pub fn run_status_remote(url: &str) -> ExitCode {
+pub fn run_status_remote(url: &str, worktree: Option<&str>) -> ExitCode {
     use cargoless_core::transport::TransportClient;
     use cargoless_core::transport::discovery::{Resolution, resolve};
     use cargoless_core::transport::http::HttpClient;
@@ -338,12 +352,86 @@ pub fn run_status_remote(url: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let remote_build = client.daemon_build_id().ok().flatten();
+    let report_build_alignment = |remote_build: Option<&str>| {
+        ui::step(format!("cli: {}", cargoless_core::build_id()));
+        match remote_build {
+            Some(id) if !id.is_empty() => {
+                ui::step(format!("daemon: {id}"));
+                if id != cargoless_core::build_id() {
+                    ui::warn(
+                        "remote daemon build differs from CLI; restart the daemon for binary alignment",
+                    );
+                }
+            }
+            _ => ui::step("daemon: unknown build".to_string()),
+        }
+    };
+    if let Some(worktree) = worktree {
+        match client.get_status(worktree) {
+            Ok(Some(status)) => {
+                let build = if status.daemon_build_id.is_empty() {
+                    remote_build.as_deref()
+                } else {
+                    Some(status.daemon_build_id.as_str())
+                };
+                let verdict = Verdict::parse(&status.verdict);
+                match verdict {
+                    Verdict::Green => {
+                        ui::ok(format!(
+                            "remote daemon {target} worktree {} verdict green ({}s old)",
+                            status.worktree, status.heartbeat_age_secs
+                        ));
+                        report_build_alignment(build);
+                        return ExitCode::SUCCESS;
+                    }
+                    Verdict::Red => {
+                        ui::error(format!(
+                            "remote daemon {target} worktree {} verdict red ({} red diagnostic{}, {}s old)",
+                            status.worktree,
+                            status.red_diagnostics,
+                            if status.red_diagnostics == 1 { "" } else { "s" },
+                            status.heartbeat_age_secs
+                        ));
+                        report_build_alignment(build);
+                        return ExitCode::from(1);
+                    }
+                    Verdict::Unknown => {
+                        ui::warn(format!(
+                            "remote daemon {target} worktree {} verdict unknown",
+                            status.worktree
+                        ));
+                        report_build_alignment(build);
+                        return ExitCode::from(3);
+                    }
+                }
+            }
+            Ok(None) => {
+                ui::warn(format!(
+                    "remote daemon {target} has no verdict yet for {worktree}"
+                ));
+                return ExitCode::from(3);
+            }
+            Err(e) => {
+                ui::warn(format!(
+                    "no reachable cargoless daemon at {target} ({e}) — is \
+                     `serve --repo <dir> --bind <host:port>` running there?"
+                ));
+                return ExitCode::from(3);
+            }
+        }
+    }
     match client.list_worktrees() {
         Ok(list) if !list.is_empty() => {
+            let build = list
+                .iter()
+                .find_map(|w| (!w.daemon_build_id.is_empty()).then_some(w.daemon_build_id.as_str()))
+                .or(remote_build.as_deref());
             ui::ok(format!(
                 "remote daemon {target} live — {} worktree(s):",
                 list.len()
             ));
+            report_build_alignment(build);
             for w in &list {
                 ui::step(format!(
                     "{}  verdict {}  ({} red diagnostic{})",
@@ -361,6 +449,7 @@ pub fn run_status_remote(url: &str) -> ExitCode {
             ui::ok(format!(
                 "remote daemon {target} reachable — no worktree verdicts yet"
             ));
+            report_build_alignment(remote_build.as_deref());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -666,6 +755,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 0,
             analysed_at: 0,
+            build_id: "test-build".into(),
         };
         assert_eq!(Status::parse(&st.serialize()), st);
         let forward = format!("{}future_key=42\n", st.serialize());
@@ -690,6 +780,7 @@ mod tests {
             ],
             red_diagnostics: 2,
             analysed_at: 0,
+            build_id: "test-build".into(),
         };
         let wire = st.serialize();
         assert!(wire.starts_with("schema=2\n"), "schema bumped: {wire}");
@@ -728,6 +819,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 3,
             analysed_at: 0,
+            build_id: "test-build".into(),
         };
         let wire = st.serialize();
         assert!(!wire.contains("crates="), "no crates line: {wire}");
@@ -764,6 +856,7 @@ mod tests {
             crates: vec![("x".into(), Verdict::Green)],
             red_diagnostics: 0,
             analysed_at: 0,
+            build_id: "test-build".into(),
         };
         let wire = st.serialize();
         // The schema=1-era parser was exactly today's parser minus the
@@ -814,6 +907,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 0,
             analysed_at: 200, // settled 50s before write (meaningful gap)
+            build_id: "test-build".into(),
         };
         let wire = st.serialize();
         assert!(wire.contains("analysed_at=200\n"), "emitted: {wire}");
@@ -899,6 +993,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 0,
             analysed_at: 0,
+            build_id: "test-build".into(),
         };
         write(&root, &st);
         let back = Status::parse(&std::fs::read_to_string(path(&root)).unwrap());
@@ -922,6 +1017,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 0,
             analysed_at: 0,
+            build_id: "test-build".into(),
         }
     }
 

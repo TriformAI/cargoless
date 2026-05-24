@@ -67,6 +67,104 @@ pub struct CrateVerdict {
     pub verdict: String,
 }
 
+/// Cargo subcommand attached to a pushed overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CargoSubcommand {
+    #[default]
+    Check,
+    Clippy,
+}
+
+impl CargoSubcommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CargoSubcommand::Check => "check",
+            CargoSubcommand::Clippy => "clippy",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "check" => Some(CargoSubcommand::Check),
+            "clippy" => Some(CargoSubcommand::Clippy),
+            _ => None,
+        }
+    }
+}
+
+/// Cargo profile attached to a pushed overlay.
+///
+/// This is intentionally the same small surface as the tf-multiverse
+/// `check-remote` entrypoint: subcommand, package, target, features,
+/// no-default-features, release, and a bounded set of extra Cargo selectors.
+/// The serve daemon can keep one repo-scoped RA alive while each pushed
+/// request still proves its final green with the exact Cargo selector the
+/// caller asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CheckProfile {
+    pub subcommand: CargoSubcommand,
+    pub package: Option<String>,
+    pub target: Option<String>,
+    pub features: Vec<String>,
+    pub no_default_features: bool,
+    pub release: bool,
+    pub extra_args: Vec<String>,
+}
+
+impl CheckProfile {
+    pub fn is_empty(&self) -> bool {
+        self.subcommand == CargoSubcommand::Check
+            && self.package.as_deref().unwrap_or("").trim().is_empty()
+            && self.target.as_deref().unwrap_or("").trim().is_empty()
+            && self.features.is_empty()
+            && !self.no_default_features
+            && !self.release
+            && self.extra_args.is_empty()
+    }
+}
+
+/// Optional metadata for a pushed overlay.
+///
+/// The original push wire carried client-local absolute paths, which is
+/// correct for a same-host daemon. A central cluster daemon needs a different
+/// shape: the client sends repo-relative paths and the server maps them onto
+/// its own mirror root before rust-analyzer sees them. These fields are
+/// additive and absent on old/local clients.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PushOverlayOptions {
+    /// `true` means `files[*].0` are repo-relative paths. The receiving daemon
+    /// must join them under `analysis_root` before applying the overlay.
+    pub repo_relative: bool,
+    /// Server-side repository root to analyze, for example
+    /// `/workspace/tf-multiverse` in the cluster daemon pod.
+    pub analysis_root: Option<String>,
+    /// Client's resolved base SHA, diagnostics-only. The server still fetches
+    /// its own latest base ref before accepting central-mode pushes.
+    pub base_sha: Option<String>,
+    /// Repo-relative files changed by the client diff. These are distinct
+    /// from `files`: the overlay payload also includes workspace config files
+    /// needed for cluster routing, while project-check triggers should see
+    /// only the user diff.
+    pub changed_files: Option<Vec<String>>,
+}
+
+impl PushOverlayOptions {
+    pub fn is_empty(&self) -> bool {
+        !self.repo_relative
+            && self
+                .analysis_root
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && self.base_sha.as_deref().unwrap_or("").trim().is_empty()
+            && self
+                .changed_files
+                .as_ref()
+                .is_none_or(|files| files.is_empty())
+    }
+}
+
 /// Transport-agnostic worktree status (the `get_status` payload, §10.1).
 /// `crates` empty ⇒ no trustworthy per-crate breakdown (single-crate, or
 /// the #9 unattributable-error honesty case); `verdict` is **always** the
@@ -76,6 +174,7 @@ pub struct CrateVerdict {
 pub struct WorktreeStatus {
     pub worktree: String,
     pub verdict: String,
+    pub daemon_build_id: String,
     pub crates: Vec<CrateVerdict>,
     pub red_diagnostics: u32,
     pub heartbeat_age_secs: u64,
@@ -89,6 +188,7 @@ pub struct WorktreeStatus {
 pub struct WorktreeSummary {
     pub worktree: String,
     pub verdict: String,
+    pub daemon_build_id: String,
     pub red_diagnostics: u32,
 }
 
@@ -102,6 +202,19 @@ pub struct TransitionEvent {
     pub verdict: String,
     pub red_diagnostics: u32,
     pub published_at: u64,
+}
+
+/// Daemon drain/quiesce state exposed through the admin HTTP surface.
+///
+/// `active_worktrees` counts worktrees with an accepted pushed overlay whose
+/// fresh verdict has not yet been published. `pending_pushes` is the subset
+/// still waiting in the overlay store. A restart is drain-safe once
+/// `quiescing == true` and both counts reach zero.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DaemonActivity {
+    pub quiescing: bool,
+    pub active_worktrees: u32,
+    pub pending_pushes: u32,
 }
 
 /// The single logical API (§10.1). The Stream-B serve loop implements
@@ -150,6 +263,46 @@ pub trait VerdictService: Send + Sync {
             applied_files: 0,
         }
     }
+
+    /// Increment 3 — same write-ingest path with a per-request cargo check
+    /// profile. Default delegates to the profile-less verb so older/mock
+    /// services fail closed or accept exactly as before.
+    fn push_overlay_with_profile(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        _check_profile: Option<&CheckProfile>,
+    ) -> PushOverlayAck {
+        self.push_overlay(worktree, base_ref, files)
+    }
+
+    /// Increment 4 — push overlay plus optional central-daemon mapping
+    /// metadata. Default delegates to the existing profile-aware path so old
+    /// services remain source-compatible and keep their current behavior.
+    fn push_overlay_with_options(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&CheckProfile>,
+        _options: Option<&PushOverlayOptions>,
+    ) -> PushOverlayAck {
+        self.push_overlay_with_profile(worktree, base_ref, files, check_profile)
+    }
+
+    /// Admin read: current drain/quiesce state. Default keeps older/mock
+    /// services source-compatible and reports "idle, not quiescing".
+    fn daemon_activity(&self) -> DaemonActivity {
+        DaemonActivity::default()
+    }
+
+    /// Admin write: enter quiesce mode. A real daemon refuses subsequent
+    /// pushes, drains accepted work, then exits from its serve loop. Default
+    /// is a no-op so non-daemon test services keep compiling.
+    fn request_quiesce(&self) -> DaemonActivity {
+        self.daemon_activity()
+    }
 }
 
 /// The **client** counterpart of [`VerdictService`] — the uniform
@@ -184,6 +337,32 @@ pub trait TransportClient {
         Err(TransportError::Protocol(
             "push_overlay unsupported by this transport".into(),
         ))
+    }
+
+    /// Increment 3 — push overlay plus exact cargo-check profile. Default
+    /// delegates to the profile-less method for existing clients.
+    fn push_overlay_with_profile(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        _check_profile: Option<&CheckProfile>,
+    ) -> Result<PushOverlayAck, TransportError> {
+        self.push_overlay(worktree, base_ref, files)
+    }
+
+    /// Increment 4 — push overlay plus optional central-daemon mapping
+    /// metadata. Default delegates to the existing profile-aware path for
+    /// transports that have not opted into the extended wire yet.
+    fn push_overlay_with_options(
+        &self,
+        worktree: &str,
+        base_ref: &str,
+        files: &[(String, String)],
+        check_profile: Option<&CheckProfile>,
+        _options: Option<&PushOverlayOptions>,
+    ) -> Result<PushOverlayAck, TransportError> {
+        self.push_overlay_with_profile(worktree, base_ref, files, check_profile)
     }
 }
 
@@ -376,6 +555,17 @@ pub enum Request {
         worktree: String,
         base_ref: String,
         files: Vec<(String, String)>,
+        check_profile: Option<CheckProfile>,
+    },
+    /// Increment 4 — central-daemon push. Same operation as PushOverlay, with
+    /// additive metadata that lets a remote daemon map repo-relative overlays
+    /// onto its own checked-out mirror root.
+    PushOverlayV2 {
+        worktree: String,
+        base_ref: String,
+        files: Vec<(String, String)>,
+        check_profile: Option<CheckProfile>,
+        options: PushOverlayOptions,
     },
 }
 
@@ -402,15 +592,33 @@ impl Request {
             // missing/`!array` `files` ⇒ empty vec, a malformed element
             // (no `path`) is skipped; never a panic. `base_ref` absent ⇒
             // empty string (same posture as `wt()`).
-            "push_overlay" => Some(Request::PushOverlay {
-                worktree: wt(),
-                base_ref: v
+            "push_overlay" => {
+                let worktree = wt();
+                let base_ref = v
                     .get("base_ref")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
-                    .to_string(),
-                files: overlay_files_from_json(v.get("files")),
-            }),
+                    .to_string();
+                let files = overlay_files_from_json(v.get("files"));
+                let check_profile = check_profile_from_json(v.get("check_profile"));
+                let options = push_overlay_options_from_json(&v);
+                if options.is_empty() {
+                    Some(Request::PushOverlay {
+                        worktree,
+                        base_ref,
+                        files,
+                        check_profile,
+                    })
+                } else {
+                    Some(Request::PushOverlayV2 {
+                        worktree,
+                        base_ref,
+                        files,
+                        check_profile,
+                        options,
+                    })
+                }
+            }
             _ => None,
         }
     }
@@ -428,15 +636,169 @@ impl Request {
                 worktree,
                 base_ref,
                 files,
+                check_profile,
             } => serde_json::json!({
                 "op": "push_overlay",
                 "worktree": worktree,
                 "base_ref": base_ref,
                 "files": overlay_files_to_json(files),
+                "check_profile": check_profile_json(check_profile.as_ref()),
             }),
+            Request::PushOverlayV2 {
+                worktree,
+                base_ref,
+                files,
+                check_profile,
+                options,
+            } => {
+                let mut v = serde_json::json!({
+                    "op": "push_overlay",
+                    "worktree": worktree,
+                    "base_ref": base_ref,
+                    "files": overlay_files_to_json(files),
+                    "check_profile": check_profile_json(check_profile.as_ref()),
+                    "repo_relative": options.repo_relative,
+                });
+                if let serde_json::Value::Object(ref mut map) = v {
+                    if let Some(root) = options.analysis_root.as_deref() {
+                        map.insert(
+                            "analysis_root".to_string(),
+                            serde_json::Value::String(root.to_string()),
+                        );
+                    }
+                    if let Some(sha) = options.base_sha.as_deref() {
+                        map.insert(
+                            "base_sha".to_string(),
+                            serde_json::Value::String(sha.to_string()),
+                        );
+                    }
+                    if let Some(changed_files) = options
+                        .changed_files
+                        .as_ref()
+                        .filter(|files| !files.is_empty())
+                    {
+                        map.insert(
+                            "changed_files".to_string(),
+                            serde_json::Value::Array(
+                                changed_files
+                                    .iter()
+                                    .map(|path| serde_json::Value::String(path.clone()))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                }
+                v
+            }
         };
         v.to_string()
     }
+}
+
+fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
+    PushOverlayOptions {
+        repo_relative: v
+            .get("repo_relative")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        analysis_root: v
+            .get("analysis_root")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        base_sha: v
+            .get("base_sha")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        changed_files: string_array_from_json(v.get("changed_files")),
+    }
+}
+
+fn string_array_from_json(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    v.and_then(serde_json::Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn check_profile_json(profile: Option<&CheckProfile>) -> serde_json::Value {
+    let Some(profile) = profile else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "subcommand": profile.subcommand.as_str(),
+        "package": profile.package.as_deref(),
+        "target": profile.target.as_deref(),
+        "features": &profile.features,
+        "no_default_features": profile.no_default_features,
+        "release": profile.release,
+        "extra_args": &profile.extra_args,
+    })
+}
+
+fn check_profile_from_json(v: Option<&serde_json::Value>) -> Option<CheckProfile> {
+    let v = v?;
+    if v.is_null() {
+        return None;
+    }
+    let profile = CheckProfile {
+        subcommand: v
+            .get("subcommand")
+            .and_then(serde_json::Value::as_str)
+            .and_then(CargoSubcommand::parse)
+            .unwrap_or_default(),
+        package: v
+            .get("package")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        target: v
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        features: v
+            .get("features")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        no_default_features: v
+            .get("no_default_features")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        release: v
+            .get("release")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        extra_args: v
+            .get("extra_args")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    (!profile.is_empty()).then_some(profile)
 }
 
 /// Serialise the `PushOverlay` `files` payload as a JSON array of
@@ -547,6 +909,7 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
     serde_json::json!({
         "worktree": s.worktree,
         "verdict": s.verdict,
+        "daemon_build_id": s.daemon_build_id,
         "crates": crate_verdicts_json(&s.crates),
         "red_diagnostics": s.red_diagnostics,
         "heartbeat_age_secs": s.heartbeat_age_secs,
@@ -565,6 +928,11 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("verdict")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
+            .to_string(),
+        daemon_build_id: v
+            .get("daemon_build_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
             .to_string(),
         crates: crate_verdicts_from_json(v.get("crates")),
         red_diagnostics: v
@@ -590,6 +958,7 @@ pub fn summaries_to_json(list: &[WorktreeSummary]) -> String {
                 serde_json::json!({
                     "worktree": s.worktree,
                     "verdict": s.verdict,
+                    "daemon_build_id": s.daemon_build_id,
                     "red_diagnostics": s.red_diagnostics,
                 })
             })
@@ -614,6 +983,11 @@ pub fn summaries_from_json(text: &str) -> Vec<WorktreeSummary> {
                     .get("verdict")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown")
+                    .to_string(),
+                daemon_build_id: s
+                    .get("daemon_build_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
                     .to_string(),
                 red_diagnostics: s
                     .get("red_diagnostics")
@@ -836,6 +1210,7 @@ mod tests {
         let s = WorktreeStatus {
             worktree: "tf-mv-flat".into(),
             verdict: "red".into(),
+            daemon_build_id: "test-build".into(),
             crates: vec![],
             red_diagnostics: 3,
             heartbeat_age_secs: 2,
@@ -846,6 +1221,7 @@ mod tests {
         let s2 = WorktreeStatus {
             worktree: "tf-mv-check".into(),
             verdict: "red".into(),
+            daemon_build_id: "test-build".into(),
             crates: vec![
                 CrateVerdict {
                     name: "isolation".into(),
@@ -871,6 +1247,7 @@ mod tests {
         // Missing scalars default, never panic.
         let s = status_from_json(r#"{"worktree":"w"}"#).unwrap();
         assert_eq!(s.verdict, "unknown");
+        assert_eq!(s.daemon_build_id, "");
         assert_eq!(s.red_diagnostics, 0);
         assert!(s.crates.is_empty());
     }
@@ -881,11 +1258,13 @@ mod tests {
             WorktreeSummary {
                 worktree: "a".into(),
                 verdict: "green".into(),
+                daemon_build_id: "test-build".into(),
                 red_diagnostics: 0,
             },
             WorktreeSummary {
                 worktree: "b".into(),
                 verdict: "red".into(),
+                daemon_build_id: "test-build".into(),
                 red_diagnostics: 2,
             },
         ];
@@ -898,6 +1277,7 @@ mod tests {
             vec![WorktreeSummary {
                 worktree: "ok".into(),
                 verdict: "red".into(),
+                daemon_build_id: "".into(),
                 red_diagnostics: 1
             }]
         );
@@ -928,6 +1308,15 @@ mod tests {
                 worktree: "wt-x".into(),
                 base_ref: "origin/main".into(),
                 files,
+                check_profile: Some(CheckProfile {
+                    subcommand: CargoSubcommand::Check,
+                    package: Some("triform-server".into()),
+                    target: Some("wasm32-unknown-unknown".into()),
+                    features: vec!["hydrate".into()],
+                    no_default_features: true,
+                    release: true,
+                    extra_args: vec![],
+                }),
             };
             assert_eq!(
                 Request::from_json(&r.to_json()),
@@ -935,6 +1324,69 @@ mod tests {
                 "exact roundtrip: {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn push_overlay_check_profile_defaults_check_and_roundtrips_clippy() {
+        let legacy = Request::from_json(
+            r#"{"op":"push_overlay","worktree":"wt","base_ref":"b","files":[],
+                "check_profile":{"package":"triform-alchemy"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            Request::PushOverlay {
+                worktree: "wt".into(),
+                base_ref: "b".into(),
+                files: vec![],
+                check_profile: Some(CheckProfile {
+                    subcommand: CargoSubcommand::Check,
+                    package: Some("triform-alchemy".into()),
+                    target: None,
+                    features: vec![],
+                    no_default_features: false,
+                    release: false,
+                    extra_args: vec![],
+                }),
+            }
+        );
+
+        let clippy = Request::PushOverlay {
+            worktree: "wt".into(),
+            base_ref: "b".into(),
+            files: vec![],
+            check_profile: Some(CheckProfile {
+                subcommand: CargoSubcommand::Clippy,
+                package: Some("triform-alchemy".into()),
+                target: None,
+                features: vec![],
+                no_default_features: false,
+                release: false,
+                extra_args: vec![
+                    "--manifest-path".into(),
+                    "crates/alchemy/Cargo.toml".into(),
+                    "--tests".into(),
+                ],
+            }),
+        };
+        assert_eq!(Request::from_json(&clippy.to_json()), Some(clippy));
+    }
+
+    #[test]
+    fn push_overlay_v2_roundtrips_central_daemon_options() {
+        let req = Request::PushOverlayV2 {
+            worktree: "/client/wt".into(),
+            base_ref: "origin/dev".into(),
+            files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
+            check_profile: None,
+            options: PushOverlayOptions {
+                repo_relative: true,
+                analysis_root: Some("/workspace/tf-multiverse".into()),
+                base_sha: Some("abc123".into()),
+                changed_files: Some(vec!["src/lib.rs".into()]),
+            },
+        };
+        assert_eq!(Request::from_json(&req.to_json()), Some(req));
     }
 
     #[test]
@@ -949,6 +1401,7 @@ mod tests {
                 worktree: "w".into(),
                 base_ref: String::new(),
                 files: vec![],
+                check_profile: None,
             }
         );
         let bad_elem = Request::from_json(
@@ -962,6 +1415,7 @@ mod tests {
                 worktree: "w".into(),
                 base_ref: "b".into(),
                 files: vec![("ok.rs".into(), "c".into())], // bad element skipped
+                check_profile: None,
             }
         );
         // `files` not an array ⇒ empty, no panic.

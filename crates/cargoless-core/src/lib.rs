@@ -27,6 +27,7 @@ pub mod model;
 pub mod multiplex;
 pub mod overlay;
 pub mod procmacro;
+pub mod project_checks;
 pub mod recovery;
 pub mod repo;
 pub mod shutdown;
@@ -68,7 +69,21 @@ pub use model::LifecycleEvent;
 /// CLAUDE.md) — explicitly NOT `"tf"` / `"tf-trunk"` (Terraform
 /// collision, rejected per CLAUDE.md; the old `tf-trunk` value leaked
 /// that rejected token into `--version` output).
-pub const BUILD_ID: &str = concat!("cargoless ", env!("CARGO_PKG_VERSION"));
+pub const BUILD_ID: &str = concat!(
+    "cargoless ",
+    env!("CARGO_PKG_VERSION"),
+    " git=",
+    env!("CARGOLESS_GIT_SHA"),
+    " dirty=",
+    env!("CARGOLESS_GIT_DIRTY"),
+    " built=",
+    env!("CARGOLESS_BUILD_UNIX")
+);
+
+pub const PRODUCT_VERSION: &str = concat!("cargoless ", env!("CARGO_PKG_VERSION"));
+pub const BUILD_GIT_SHA: &str = env!("CARGOLESS_GIT_SHA");
+pub const BUILD_GIT_DIRTY: &str = env!("CARGOLESS_GIT_DIRTY");
+pub const BUILD_UNIX: &str = env!("CARGOLESS_BUILD_UNIX");
 
 /// Returns [`BUILD_ID`]. Kept as a fn (not just the const) because
 /// callers historically bound to `cargoless_core::build_id()`; both paths now
@@ -88,18 +103,22 @@ mod tests {
         // invariants a future edit (incl. the D1 rename) must keep:
         let id = build_id();
 
-        // 1. Non-empty `<name> <version>` shape.
+        // 1. Non-empty `<name> <version> ...` shape.
         let (name, version) = id
             .split_once(' ')
-            .expect("BUILD_ID is `<product> <version>` (one space)");
+            .expect("BUILD_ID starts with `<product> <version>`");
         assert!(!name.is_empty(), "product name must not be empty");
         assert!(!version.is_empty(), "version must not be empty");
 
         // 2. Carries the crate version (D1 rename must not drop it).
         assert_eq!(
-            version,
+            version.split_whitespace().next().unwrap_or_default(),
             env!("CARGO_PKG_VERSION"),
-            "BUILD_ID must end with the workspace package version"
+            "BUILD_ID must include the workspace package version"
+        );
+        assert!(
+            id.contains(" git=") && id.contains(" dirty=") && id.contains(" built="),
+            "BUILD_ID must include enough build provenance to distinguish binaries: {id}"
         );
 
         // 3. Terraform-collision guard (the project-long invariant):

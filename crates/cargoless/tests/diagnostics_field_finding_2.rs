@@ -72,13 +72,14 @@ fn cargoless_check_against_red_fixture_prints_diagnostics() {
     }
     let bin = env!("CARGO_BIN_EXE_cargoless");
     let root = fixture_with_known_error();
-    // Tight cap: a cold RA + cargo-check pass on a 1-file fixture is
-    // typically <30s; double that for slow CI without flapping.
+    // Use the product default hard cap. The remote ci-gate's first cold
+    // run can spend more than 60s in RA/toolchain warm-up before the rich
+    // diagnostic arrives, while same-SHA warm runs settle in a few seconds.
+    // This test verifies the diagnostic contract, not a latency SLO.
     let out = Command::new(bin)
         .arg("check")
         .arg("--root")
         .arg(&root)
-        .env("TF_CHECK_TIMEOUT_SECS", "60")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

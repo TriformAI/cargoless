@@ -68,26 +68,27 @@
 //! catch compile/borrow/clippy/contract-shape); runtime is the
 //! downstream half of the closed chain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitCode};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
 use cargoless_core::activitymgr::ActivityTracker;
 use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
 use cargoless_core::cluster::WorkspaceConfigHash;
-use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent};
+use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
 use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
-use cargoless_core::lsp::{InitOpts, LspClient, LspEvent};
+use cargoless_core::lsp::{InitOpts, LspClient, LspEvent, normalize_check_package_name};
 use cargoless_core::multiplex::LspVerb;
 use cargoless_core::multiplex::OverlayMultiplexer;
 use cargoless_core::overlay::OverlaySet;
 use cargoless_core::repo::RepoScope;
 use cargoless_core::repo::watch::{RepoWatchRouter, WtId, WtRouter};
+use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 
 use crate::orphan::ParentWatch;
 use crate::statusfile::{self, Status, Verdict};
@@ -102,6 +103,10 @@ const QUIET: Duration = Duration::from_millis(200);
 struct ClusterState {
     /// RAII: dropping the supervisor kills + reaps the RA (TeardownRa).
     _supervisor: Supervisor,
+    /// This cluster's hash and event sink, retained so background cargo
+    /// checks can feed their completion back through the same driver.
+    cluster: WorkspaceConfigHash,
+    lsp_tx: Sender<(WorkspaceConfigHash, LspEvent)>,
     /// The currently-live RA's client; `None` until the first
     /// `Spawned` message lands, swapped on every (re)spawn.
     lsp: Option<Arc<LspClient>>,
@@ -111,6 +116,51 @@ struct ClusterState {
     driver: ClusterDriver,
     /// Monotonic LSP document version for `did_change`.
     next_ver: i64,
+    /// True once the current RA instance has finished its initial roots scan.
+    /// First batches are deferred until this flips so save/flycheck is not
+    /// lost during RA workspace bootstrap.
+    ready: bool,
+    /// Worktrees with a routed batch that arrived before the current RA
+    /// instance reached project-ready.
+    deferred: VecDeque<WtId>,
+}
+
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+fn push_only_mode() -> bool {
+    truthy_env("CARGOLESS_PUSH_ONLY") || truthy_env("TF_FS_WATCH_DISABLED")
+}
+
+fn ra_native_verdict_mode() -> bool {
+    std::env::var("CARGOLESS_VERDICT_MODE")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("ra")
+                || v.eq_ignore_ascii_case("advisory")
+                || v.eq_ignore_ascii_case("development")
+        })
+        .unwrap_or(false)
+}
+
+fn ra_native_settle_delay() -> Duration {
+    std::env::var("CARGOLESS_RA_SETTLE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(2_000))
 }
 
 /// Control messages from the per-cluster Supervisor `on_spawn` hook to
@@ -305,14 +355,30 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // bring-up still routes through the proven per-cluster RA reap.
     install_signal_stops();
     crate::ui::wait("repo-scoped Model R daemon up. Ctrl-C / SIGTERM to stop.");
+    let push_only = push_only_mode();
+    if push_only {
+        crate::ui::wait(
+            "push-only mode enabled — filesystem watch batches are suppressed; \
+             remote push requests drive verdicts.",
+        );
+    }
     // #225 0d: the daemon's serve loop is now live → flip the /healthz
     // readiness latch (503 {"status":"starting"} → 200 {"status":"ready"}).
     // This is the ONE meaningful readiness transition the k8s probe needs;
     // it is harmless (a no-op observer) when `--bind` is absent.
     ready.store(true, Ordering::Relaxed);
+    let mut last_status_heartbeat = Instant::now()
+        .checked_sub(statusfile::HEARTBEAT)
+        .unwrap_or_else(Instant::now);
+    heartbeat_repo_status(&repo_root);
+    let mut quiesce_announced = false;
 
     // ---- the serve loop (single owner ⇒ Judgment A holds composed) ---
     loop {
+        if last_status_heartbeat.elapsed() >= statusfile::HEARTBEAT {
+            heartbeat_repo_status(&repo_root);
+            last_status_heartbeat = Instant::now();
+        }
         if SHUTDOWN.load(Ordering::SeqCst) {
             crate::ui::warn(
                 "SIGTERM/SIGINT received — draining: reaping per-cluster \
@@ -323,6 +389,18 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         if parent.orphaned() {
             crate::ui::warn("parent process exited — shutting down (FIELD FINDING #13b parity).");
             break;
+        }
+        if api.quiescing() {
+            if !quiesce_announced {
+                crate::ui::warn(
+                    "quiesce requested — refusing new pushes and draining accepted worktrees.",
+                );
+                quiesce_announced = true;
+            }
+            if api.drain_complete() {
+                crate::ui::warn("quiesce drain complete — exiting cleanly for restart.");
+                break;
+            }
         }
 
         // (v) respawn-staleness closure: the SOLE site a cluster's
@@ -352,30 +430,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // BEFORE swapping in the new LspClient, so any LspEvents drained
         // next iteration from the new RA cannot interleave with the dead
         // state.
-        while let Ok(Ctrl::Spawned(h, client)) = ctrl_rx.try_recv() {
-            if let Some(cs) = clusters.get_mut(&h) {
-                cs.driver.reset_after_respawn();
-                cs.mux.reset();
-                cs.lsp = Some(client);
-                // #246 5c KEYSTONE: the `overlay.reset` event — load-bearing
-                // for AC4 diagnostics. Its PRESENCE between an `ra.respawn`
-                // span (emitted inside on_spawn) and the next
-                // `verdict.publish` proves the #190 + #247 structural-
-                // precondition-restore ran; ABSENCE is the smoking gun for
-                // the proven-core-precondition-violated-at-integration-seam
-                // false-GREEN path. Pairs with the always-on `[cargoless:obs]`
-                // eprintln (kept as ops-without-collector fallback).
-                tracing::info!(
-                    cluster_id = %h.as_str(),
-                    reset_actually_called = true,
-                    "overlay.reset",
-                );
-                eprintln!(
-                    "[cargoless:obs] respawn cluster={} driver+mux reset (#247)",
-                    h.as_str()
-                );
-            }
-        }
+        drain_spawned(&mut clusters, &ctrl_rx);
 
         // #240/2b — overlay-push ingest drain. The PushOverlay write-plane
         // wakeup signal: every `api.push_overlay(...)` call sends the
@@ -398,7 +453,8 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             // pushes for the same WT, this is a no-op (entry::or_insert).
             if !wt_hash.contains_key(&wt) {
                 let h = cluster_hash_from_pushed(&api, &wt_key);
-                cluster_root.entry(h.clone()).or_insert_with(|| wt.clone());
+                let root = api.analysis_root_for(&wt_key).unwrap_or_else(|| wt.clone());
+                cluster_root.entry(h.clone()).or_insert(root);
                 wt_hash.insert(wt.clone(), h);
             }
             // The cluster hash for this WT (always present after the
@@ -417,23 +473,25 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                     lsp_tx.clone(),
                     ctrl_tx.clone(),
                 );
+                // `spawn_cluster` runs the initial LSP handshake inside
+                // the Supervisor hook and queues `Ctrl::Spawned` before
+                // returning. Drain it now so the first pushed batch does
+                // not switch while `cs.lsp` is still None, then get reset
+                // by the next loop's spawn drain.
+                drain_spawned(&mut clusters, &ctrl_rx);
             }
             // Feed the SAME DriverEvent::RoutedBatch the watcher path
             // feeds — clusterdrv sees no difference. The SwitchOverlay
             // arm's source pick (FS-read vs api.take_overlay_for) is
             // where the pushed/FS divergence actually lives (one line).
-            step(
-                &mut clusters,
-                &h,
-                DriverEvent::RoutedBatch { wt: wt.clone() },
-                &pending_batch,
-                &api,
-            );
+            route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
         }
 
         // Drain forwarded RA events → the owning cluster's ClusterDriver.
         while let Ok((h, ev)) = lsp_rx.try_recv() {
             if clusters.contains_key(&h) {
+                let ev = early_red_event(ev);
+                let indexing_ended = matches!(ev, LspEvent::IndexingEnded);
                 step(
                     &mut clusters,
                     &h,
@@ -441,48 +499,71 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                     &pending_batch,
                     &api,
                 );
+                if indexing_ended {
+                    let deferred = mark_ready_and_take_deferred(&mut clusters, &h);
+                    for wt in deferred {
+                        step(
+                            &mut clusters,
+                            &h,
+                            DriverEvent::RoutedBatch { wt },
+                            &pending_batch,
+                            &api,
+                        );
+                    }
+                }
             }
         }
 
-        // Routed file-changes: raw_repo_watch yields changed absolute
-        // paths (Receiver<PathBuf>); feed them straight into the proven
-        // RepoWatchRouter (it owns §4 routing + target/.git floor +
-        // per-WT debounce). Drain any burst non-blocking after the first
-        // so a save-storm coalesces into one debounced batch.
-        let now = Instant::now();
-        match raw_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(path) => {
-                repo_watch.record(&path, now);
-                while let Ok(p) = raw_rx.try_recv() {
-                    repo_watch.record(&p, now);
+        if push_only {
+            // tf-multiverse check-remote replacement mode. The live repo
+            // can have hundreds of independently edited worktrees; those
+            // filesystem edits must not start background watch transactions
+            // in the same daemon that is serving pushed RA-native
+            // check/clippy replacement verdicts.
+            // Drain the OS watcher so its channel cannot grow unbounded,
+            // but never turn those events into DriverEvent::RoutedBatch.
+            match raw_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(_) => while raw_rx.try_recv().is_ok() {},
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            // Routed file-changes: raw_repo_watch yields changed absolute
+            // paths (Receiver<PathBuf>); feed them straight into the
+            // proven RepoWatchRouter (it owns §4 routing + target/.git
+            // floor + per-WT debounce). Drain any burst non-blocking
+            // after the first so a save-storm coalesces into one
+            // debounced batch.
+            let now = Instant::now();
+            match raw_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(path) => {
+                    repo_watch.record(&path, now);
+                    while let Ok(p) = raw_rx.try_recv() {
+                        repo_watch.record(&p, now);
+                    }
                 }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        for (wt, batch) in repo_watch.poll(Instant::now()) {
-            let Some(h) = wt_hash.get(&wt).cloned() else {
-                continue;
-            };
-            activity.touch(wt.clone(), Instant::now());
-            pending_batch.insert(wt.clone(), batch);
-            // Ensure the cluster's RA exists (proven 0→1 SpawnRa).
-            if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
-                spawn_cluster(
-                    &mut clusters,
-                    &h,
-                    cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
-                    lsp_tx.clone(),
-                    ctrl_tx.clone(),
-                );
+            for (wt, batch) in repo_watch.poll(Instant::now()) {
+                let Some(h) = wt_hash.get(&wt).cloned() else {
+                    continue;
+                };
+                activity.touch(wt.clone(), Instant::now());
+                pending_batch.insert(wt.clone(), batch);
+                // Ensure the cluster's RA exists (proven 0→1 SpawnRa).
+                if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
+                    spawn_cluster(
+                        &mut clusters,
+                        &h,
+                        cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
+                        lsp_tx.clone(),
+                        ctrl_tx.clone(),
+                    );
+                    drain_spawned(&mut clusters, &ctrl_rx);
+                }
+                route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
             }
-            step(
-                &mut clusters,
-                &h,
-                DriverEvent::RoutedBatch { wt: wt.clone() },
-                &pending_batch,
-                &api,
-            );
         }
 
         // Activity tick → deactivation edges (proven WtLifecycle).
@@ -531,6 +612,32 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // future exit path can silently leave the listener thread spinning.
     drop(http_server);
     ExitCode::SUCCESS
+}
+
+fn heartbeat_repo_status(repo_root: &Path) {
+    let now = statusfile::now_unix();
+    let mut status = std::fs::read_to_string(statusfile::path(repo_root))
+        .ok()
+        .map(|text| Status::parse(&text))
+        .filter(|st| st.root == repo_root.to_string_lossy())
+        .unwrap_or_else(|| Status {
+            pid: std::process::id(),
+            root: repo_root.to_string_lossy().into_owned(),
+            started: now,
+            updated: now,
+            verdict_str: Verdict::Unknown.as_str().to_string(),
+            crates: Vec::new(),
+            red_diagnostics: 0,
+            analysed_at: 0,
+            build_id: cargoless_core::build_id().to_string(),
+        });
+    status.pid = std::process::id();
+    status.updated = now;
+    status.build_id = cargoless_core::build_id().to_string();
+    if status.started == 0 {
+        status.started = now;
+    }
+    statusfile::write(repo_root, &status);
 }
 
 /// WtId (PathBuf) → the `String` key `ClusterLifecycle` uses.
@@ -604,6 +711,7 @@ fn spawn_cluster(
     };
     let hook_root = root.clone();
     let hook_h = h.clone();
+    let cluster_lsp_tx = lsp_tx.clone();
     let on_spawn = move |child: &mut Child| {
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return;
@@ -652,12 +760,102 @@ fn spawn_cluster(
         h.clone(),
         ClusterState {
             _supervisor: supervisor,
+            cluster: h.clone(),
+            lsp_tx: cluster_lsp_tx,
             lsp: None,
             mux: OverlayMultiplexer::new(),
-            driver: ClusterDriver::new(),
+            driver: if ra_native_verdict_mode() {
+                ClusterDriver::with_verdict_policy(VerdictPolicy::RaNative)
+            } else {
+                ClusterDriver::new()
+            },
             next_ver: 2,
+            ready: false,
+            deferred: VecDeque::new(),
         },
     );
+}
+
+fn drain_spawned(
+    clusters: &mut BTreeMap<WorkspaceConfigHash, ClusterState>,
+    ctrl_rx: &Receiver<Ctrl>,
+) {
+    while let Ok(Ctrl::Spawned(h, client)) = ctrl_rx.try_recv() {
+        if let Some(cs) = clusters.get_mut(&h) {
+            cs.driver.reset_after_respawn();
+            cs.mux.reset();
+            cs.lsp = Some(client);
+            cs.ready = false;
+            // #246 5c KEYSTONE: the `overlay.reset` event — load-bearing
+            // for AC4 diagnostics. Its PRESENCE between an `ra.respawn`
+            // span (emitted inside on_spawn) and the next
+            // `verdict.publish` proves the #190 + #247 structural-
+            // precondition-restore ran; ABSENCE is the smoking gun for
+            // the proven-core-precondition-violated-at-integration-seam
+            // false-GREEN path. Pairs with the always-on `[cargoless:obs]`
+            // eprintln (kept as ops-without-collector fallback).
+            tracing::info!(
+                cluster_id = %h.as_str(),
+                reset_actually_called = true,
+                "overlay.reset",
+            );
+            eprintln!(
+                "[cargoless:obs] respawn cluster={} driver+mux reset (#247)",
+                h.as_str()
+            );
+        }
+    }
+}
+
+fn route_or_defer(
+    clusters: &mut BTreeMap<WorkspaceConfigHash, ClusterState>,
+    h: &WorkspaceConfigHash,
+    wt: WtId,
+    pending_batch: &BTreeMap<WtId, Vec<PathBuf>>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
+) {
+    let ready = {
+        let Some(cs) = clusters.get_mut(h) else {
+            return;
+        };
+        if !cs.ready {
+            if !cs.deferred.contains(&wt) {
+                cs.deferred.push_back(wt.clone());
+            }
+            false
+        } else {
+            true
+        }
+    };
+    if ready {
+        step(
+            clusters,
+            h,
+            DriverEvent::RoutedBatch { wt },
+            pending_batch,
+            api,
+        );
+    }
+}
+
+fn mark_ready_and_take_deferred(
+    clusters: &mut BTreeMap<WorkspaceConfigHash, ClusterState>,
+    h: &WorkspaceConfigHash,
+) -> Vec<WtId> {
+    let Some(cs) = clusters.get_mut(h) else {
+        return Vec::new();
+    };
+    cs.ready = true;
+    cs.deferred.drain(..).collect()
+}
+
+fn early_red_event(ev: LspEvent) -> LspEvent {
+    match ev {
+        LspEvent::Diagnostics(pd) if pd.has_any_severity_error() => LspEvent::FlycheckFailed {
+            message: format!("rust-analyzer reported error diagnostics for {}", pd.uri),
+        },
+        other => other,
+    }
 }
 
 /// Feed one `DriverEvent` to a cluster's `ClusterDriver` and faithfully
@@ -673,6 +871,16 @@ fn step(
         return;
     };
     let action = cs.driver.on_event(ev);
+    exec_driver_action(cs, action, pending_batch, api);
+}
+
+fn exec_driver_action(
+    cs: &mut ClusterState,
+    action: ClusterAction,
+    pending_batch: &BTreeMap<WtId, Vec<PathBuf>>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
+) {
+    let take_followup = matches!(action, ClusterAction::EmitVerdict { .. });
     // #247 obs: log the wire-side detection of barrier-settle (= the
     // moment ClusterDriver emits an EmitVerdict — Judgment B's sole
     // attribution boundary, observed BEFORE we dispatch the action to
@@ -711,8 +919,10 @@ fn step(
     // on subsequent `DriverEvent::Lsp` in later serve-loop iterations —
     // restoring the proven core's exactly-once precondition AT THE WIRE
     // SEAM (the core is never weakened to accommodate a seam misuse).
-    if let Some(followup) = cs.driver.take_followup() {
-        exec(cs, followup, pending_batch, api);
+    if take_followup {
+        if let Some(followup) = cs.driver.take_followup() {
+            exec(cs, followup, pending_batch, api);
+        }
     }
 }
 
@@ -769,20 +979,28 @@ fn exec(
             // recorded on BOTH exit paths — the early-return case STILL
             // carries valid attrs, distinguishing "0-file early return"
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
-            let pairs: Vec<(String, String)> =
-                if let Some(pushed) = api.take_overlay_for(&wt.to_string_lossy()) {
-                    pushed.files
-                } else {
-                    let mut pairs = Vec::new();
-                    if let Some(files) = pending_batch.get(&wt) {
-                        for f in files {
-                            if let Ok(text) = std::fs::read_to_string(f) {
-                                pairs.push((f.to_string_lossy().into_owned(), text));
-                            }
+            let mut pushed_check_profile = None;
+            let wt_key = wt.to_string_lossy().into_owned();
+            let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
+                pushed_check_profile = pushed.check_profile;
+                let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
+                api.record_project_check_context(
+                    &wt_key,
+                    project_root,
+                    pushed.changed_files.clone(),
+                );
+                pushed.files
+            } else {
+                let mut pairs = Vec::new();
+                if let Some(files) = pending_batch.get(&wt) {
+                    for f in files {
+                        if let Ok(text) = std::fs::read_to_string(f) {
+                            pairs.push((f.to_string_lossy().into_owned(), text));
                         }
                     }
-                    pairs
-                };
+                }
+                pairs
+            };
             let file_count = pairs.len() as u64;
             let overlay_size_bytes: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
             _span.record("file_count", file_count);
@@ -794,7 +1012,9 @@ fn exec(
                 // carries valid attrs at drop.
                 return;
             };
-            let target = OverlaySet::from_pairs(pairs.iter().map(|(p, c)| (p.clone(), c.clone())));
+            let lsp_pairs = lsp_source_pairs(&pairs);
+            let target =
+                OverlaySet::from_pairs(lsp_pairs.iter().map(|(p, c)| (p.clone(), c.clone())));
             for verb in cs.mux.switch_to(&target) {
                 match verb {
                     LspVerb::DidOpen { path, content } => {
@@ -810,21 +1030,350 @@ fn exec(
                     }
                 }
             }
-            // Trigger the flycheck the barrier waits on. Save a real
-            // file of the WT (first changed file, else its Cargo.toml).
-            let save = pending_batch
-                .get(&wt)
-                .and_then(|f| f.first().cloned())
-                .unwrap_or_else(|| wt.join("Cargo.toml"));
-            let _ = lsp.did_save(&save.to_string_lossy());
+            // Default mode still uses the flycheck/cargo barrier. In
+            // CARGOLESS_VERDICT_MODE=ra, tf-multiverse explicitly replaces
+            // iterative cargo check/clippy with RA-native continuous verdicts:
+            // no didSave/runFlycheck, no direct Cargo subprocess. A delayed
+            // synthetic settle lets RA publish diagnostics for the just-applied
+            // overlay before the existing barrier publishes the worktree bit.
+            if pushed_check_profile.is_none() {
+                if ra_native_verdict_mode() {
+                    spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
+                } else {
+                    let save = save_trigger_path(&wt, pending_batch, &pairs);
+                    let save = save.to_string_lossy();
+                    let _ = lsp.did_save(&save);
+                    let _ = lsp.run_flycheck(&save);
+                    spawn_direct_cargo_check(&wt, cs.cluster.clone(), cs.lsp_tx.clone(), None);
+                }
+            } else {
+                // Profiled push is now reserved for explicit compile/build
+                // gates. It remains available, but check-remote/clippy-remote
+                // no longer use it in the replacement flow.
+                spawn_direct_cargo_check(
+                    &wt,
+                    cs.cluster.clone(),
+                    cs.lsp_tx.clone(),
+                    pushed_check_profile,
+                );
+            }
         }
         ClusterAction::EmitVerdict {
             wt,
             authoritative_error,
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
-            publish_verdict(&wt, authoritative_error, api);
+            let project_check_context = api.take_project_check_context(&wt.to_string_lossy());
+            match project_checks_mode() {
+                ProjectChecksMode::Off => publish_verdict(&wt, authoritative_error, api),
+                ProjectChecksMode::Warn => {
+                    publish_verdict(&wt, authoritative_error, api);
+                    spawn_project_checks_warn(wt, project_check_context);
+                }
+                ProjectChecksMode::Hard => {
+                    let project_check_error =
+                        run_project_checks_and_log(&wt, project_check_context);
+                    publish_verdict(&wt, authoritative_error || project_check_error, api);
+                }
+            }
         }
+    }
+}
+
+fn save_trigger_path(
+    wt: &WtId,
+    pending_batch: &BTreeMap<WtId, Vec<PathBuf>>,
+    overlay_pairs: &[(String, String)],
+) -> PathBuf {
+    if let Some(path) = pending_batch.get(wt).and_then(|files| files.first()) {
+        return path.clone();
+    }
+
+    overlay_pairs
+        .iter()
+        .map(|(path, _)| overlay_path_for_wt(wt, path))
+        .find(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .or_else(|| {
+            overlay_pairs
+                .first()
+                .map(|(path, _)| overlay_path_for_wt(wt, path))
+        })
+        .unwrap_or_else(|| wt.join("Cargo.toml"))
+}
+
+fn lsp_source_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter(|(path, _)| is_rust_source_path(path))
+        .cloned()
+        .collect()
+}
+
+fn is_rust_source_path(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|ext| ext == "rs")
+}
+
+fn overlay_path_for_wt(wt: &WtId, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        wt.join(path)
+    }
+}
+
+fn spawn_ra_native_settle(
+    wt: &WtId,
+    h: WorkspaceConfigHash,
+    tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+) {
+    let wt = wt.clone();
+    let delay = ra_native_settle_delay();
+    let _ = std::thread::Builder::new()
+        .name("tf-ra-settle".into())
+        .spawn(move || {
+            eprintln!(
+                "[cargoless:obs] ra-native-settle-started wt={} delay_ms={} (#tfmv)",
+                wt.display(),
+                delay.as_millis()
+            );
+            std::thread::sleep(delay);
+            eprintln!(
+                "[cargoless:obs] ra-native-settle-ended wt={} status=settled (#tfmv)",
+                wt.display()
+            );
+            let _ = tx.send((h, LspEvent::FlycheckEnded));
+        });
+}
+
+fn spawn_direct_cargo_check(
+    wt: &WtId,
+    h: WorkspaceConfigHash,
+    tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    check_profile: Option<CheckProfile>,
+) {
+    let wt = wt.clone();
+    let opts = init_opts_for_direct_check(&wt, check_profile.as_ref());
+    let subcommand = direct_cargo_subcommand(check_profile.as_ref());
+    let extra_args = direct_cargo_extra_args(check_profile.as_ref());
+    if direct_cargo_check_args(&opts, subcommand, &extra_args).is_none() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("tf-cargo-check".into())
+        .spawn(move || {
+            if let Some(ev) = direct_cargo_check_event(&wt, check_profile) {
+                let _ = tx.send((h, ev));
+            }
+        });
+}
+
+fn direct_cargo_check_event(wt: &WtId, check_profile: Option<CheckProfile>) -> Option<LspEvent> {
+    let opts = init_opts_for_direct_check(wt, check_profile.as_ref());
+    let subcommand = direct_cargo_subcommand(check_profile.as_ref());
+    let extra_args = direct_cargo_extra_args(check_profile.as_ref());
+    let label = direct_cargo_check_label(&opts, subcommand, &extra_args);
+    let args = direct_cargo_check_args(&opts, subcommand, &extra_args)?;
+    eprintln!(
+        "[cargoless:obs] cargo-{}-started wt={} profile={} at={} (#tfmv)",
+        subcommand.as_str(),
+        wt.display(),
+        label,
+        statusfile::now_unix()
+    );
+    let started = Instant::now();
+    match run_direct_cargo_check(wt, &args, direct_cargo_timeout()) {
+        Ok(true) => {
+            eprintln!(
+                "[cargoless:obs] cargo-{}-ended wt={} profile={} status=green elapsed_ms={} (#tfmv)",
+                subcommand.as_str(),
+                wt.display(),
+                label,
+                started.elapsed().as_millis()
+            );
+            Some(LspEvent::FlycheckEnded)
+        }
+        Ok(false) => {
+            let message = format!("cargo {} failed for profile {label}", subcommand.as_str());
+            eprintln!(
+                "[cargoless:obs] cargo-{}-ended wt={} profile={} status=red elapsed_ms={} (#tfmv)",
+                subcommand.as_str(),
+                wt.display(),
+                label,
+                started.elapsed().as_millis()
+            );
+            Some(LspEvent::FlycheckFailed { message })
+        }
+        Err(e) => {
+            let message = format!(
+                "failed to run cargo {} for profile {label}: {e}",
+                subcommand.as_str()
+            );
+            eprintln!(
+                "[cargoless:obs] cargo-{}-ended wt={} profile={} status=failed elapsed_ms={} error={} (#tfmv)",
+                subcommand.as_str(),
+                wt.display(),
+                label,
+                started.elapsed().as_millis(),
+                e
+            );
+            Some(LspEvent::FlycheckFailed { message })
+        }
+    }
+}
+
+fn init_opts_for_direct_check(wt: &WtId, check_profile: Option<&CheckProfile>) -> InitOpts {
+    if let Some(profile) = check_profile {
+        return InitOpts {
+            features: profile.features.clone(),
+            package: profile.package.clone(),
+            target: profile.target.clone(),
+            no_default_features: profile.no_default_features,
+            release: profile.release,
+            ..InitOpts::default()
+        };
+    }
+    InitOpts::from_env_and_project(wt)
+}
+
+fn direct_cargo_subcommand(check_profile: Option<&CheckProfile>) -> CargoSubcommand {
+    check_profile.map(|p| p.subcommand).unwrap_or_default()
+}
+
+fn direct_cargo_extra_args(check_profile: Option<&CheckProfile>) -> Vec<String> {
+    check_profile
+        .map(|p| p.extra_args.clone())
+        .unwrap_or_default()
+}
+
+fn direct_cargo_check_label(
+    opts: &InitOpts,
+    subcommand: CargoSubcommand,
+    extra_args: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if subcommand != CargoSubcommand::Check {
+        parts.push(format!("subcommand={}", subcommand.as_str()));
+    }
+    if let Some(package) = opts.package.as_deref().map(normalize_check_package_name) {
+        parts.push(format!("package={package}"));
+    }
+    if let Some(target) = &opts.target {
+        parts.push(format!("target={target}"));
+    }
+    if !opts.features.is_empty() {
+        parts.push(format!("features={}", opts.features.join(",")));
+    }
+    if opts.no_default_features {
+        parts.push("no-default-features".to_string());
+    }
+    if opts.release {
+        parts.push("release".to_string());
+    }
+    if !extra_args.is_empty() {
+        parts.push(format!("extra_args={}", extra_args.join(" ")));
+    }
+    if parts.is_empty() {
+        "workspace".to_string()
+    } else {
+        parts.join(";")
+    }
+}
+
+fn direct_cargo_check_args(
+    opts: &InitOpts,
+    subcommand: CargoSubcommand,
+    extra_args: &[String],
+) -> Option<Vec<String>> {
+    if subcommand == CargoSubcommand::Check
+        && opts.package.is_none()
+        && opts.target.is_none()
+        && opts.features.is_empty()
+        && !opts.no_default_features
+        && !opts.release
+        && extra_args.is_empty()
+    {
+        return None;
+    }
+    let mut args = vec![subcommand.as_str().to_string()];
+    if let Some(package) = opts.package.as_deref().map(normalize_check_package_name) {
+        args.push("-p".to_string());
+        args.push(package);
+    }
+    args.extend(extra_args.iter().cloned());
+    args.push("--message-format=json".to_string());
+    if let Some(target) = &opts.target {
+        args.push("--target".to_string());
+        args.push(target.clone());
+    }
+    if opts.no_default_features {
+        args.push("--no-default-features".to_string());
+    }
+    if !opts.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(opts.features.join(","));
+    }
+    if opts.release {
+        args.push("--release".to_string());
+    }
+    Some(args)
+}
+
+fn direct_cargo_timeout() -> Duration {
+    std::env::var("TF_CHECK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(900))
+}
+
+fn cargo_launcher() -> (String, Vec<String>) {
+    if let Ok(bin) = std::env::var("CARGOLESS_CARGO") {
+        let bin = bin.trim();
+        if !bin.is_empty() {
+            return (bin.to_string(), Vec::new());
+        }
+    }
+    if Command::new("rustup")
+        .args(["run", "stable", "cargo", "--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return (
+            "rustup".to_string(),
+            vec!["run".to_string(), "stable".to_string(), "cargo".to_string()],
+        );
+    }
+    ("cargo".to_string(), Vec::new())
+}
+
+fn run_direct_cargo_check(
+    wt: &WtId,
+    cargo_args: &[String],
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let (program, prefix) = cargo_launcher();
+    let mut cmd = Command::new(program);
+    cmd.current_dir(wt)
+        .args(prefix)
+        .args(cargo_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -882,6 +1431,7 @@ fn publish_verdict(
         // path would tick `updated` without re-checking, leaving
         // `analysed_at` at the original settle time).
         analysed_at: now,
+        build_id: cargoless_core::build_id().to_string(),
     };
     statusfile::write(wt, &st);
     eprintln!(
@@ -894,4 +1444,284 @@ fn publish_verdict(
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.
     api.publish(wt, authoritative_error);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectChecksMode {
+    Off,
+    Warn,
+    Hard,
+}
+
+fn project_checks_mode() -> ProjectChecksMode {
+    match std::env::var("CARGOLESS_PROJECT_CHECKS_MODE")
+        .unwrap_or_else(|_| "hard".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "false" | "disabled" => ProjectChecksMode::Off,
+        "warn" => ProjectChecksMode::Warn,
+        _ => ProjectChecksMode::Hard,
+    }
+}
+
+fn spawn_project_checks_warn(
+    wt: PathBuf,
+    context: Option<crate::serveapi::ProjectCheckRunContext>,
+) {
+    let display = wt.display().to_string();
+    if let Err(e) = std::thread::Builder::new()
+        .name("cargoless-project-checks-warn".to_string())
+        .spawn(move || {
+            let red = run_project_checks_and_log(&wt, context);
+            eprintln!(
+                "[cargoless:obs] project-checks-warn wt={} gate=false observed_red={}",
+                wt.display(),
+                red
+            );
+        })
+    {
+        eprintln!(
+            "[cargoless:obs] project-checks-warn wt={} spawn_error={}",
+            display, e
+        );
+    }
+}
+
+fn run_project_checks_and_log(
+    wt: &Path,
+    context: Option<crate::serveapi::ProjectCheckRunContext>,
+) -> bool {
+    let root = context.as_ref().map(|ctx| ctx.root.as_path()).unwrap_or(wt);
+    let changed_files = context
+        .as_ref()
+        .and_then(|ctx| ctx.changed_files.as_deref());
+    match cargoless_core::project_checks::run_dev_with_changes(root, changed_files) {
+        Ok(report) if report.results.is_empty() && report.skipped.is_empty() => false,
+        Ok(report) => {
+            let cache_hits = report.results.iter().filter(|r| r.cache_hit).count();
+            let slowest = slowest_project_checks(&report.results);
+            eprintln!(
+                "[cargoless:obs] project-checks wt={} root={} verdict={} checks={} skipped={} cache_hits={} duration_ms={} slowest={}",
+                wt.display(),
+                root.display(),
+                if report.tree == cargoless_core::TreeState::Red {
+                    "red"
+                } else {
+                    "green"
+                },
+                report.results.len(),
+                report.skipped.len(),
+                cache_hits,
+                report.duration_ms,
+                slowest
+            );
+            for diagnostic in report
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == cargoless_core::Severity::Error)
+                .take(8)
+            {
+                eprintln!(
+                    "[cargoless:obs] project-check-red wt={} path={} line={} code={} message={}",
+                    wt.display(),
+                    diagnostic.file_path.display(),
+                    diagnostic.line,
+                    diagnostic.code.as_deref().unwrap_or("project-check"),
+                    diagnostic.message.lines().next().unwrap_or("")
+                );
+            }
+            report.tree == cargoless_core::TreeState::Red
+        }
+        Err(e) => {
+            eprintln!(
+                "[cargoless:obs] project-checks wt={} verdict=red setup_error={}",
+                wt.display(),
+                e
+            );
+            true
+        }
+    }
+}
+
+fn slowest_project_checks(
+    results: &[cargoless_core::project_checks::ProjectCheckResult],
+) -> String {
+    let mut items: Vec<_> = results
+        .iter()
+        .filter(|r| r.duration_ms > 0)
+        .map(|r| (r.duration_ms, r.id.as_str()))
+        .collect();
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let rendered: Vec<String> = items
+        .into_iter()
+        .take(3)
+        .map(|(duration, id)| format!("{id}:{duration}ms"))
+        .collect();
+    if rendered.is_empty() {
+        "-".to_string()
+    } else {
+        rendered.join(",")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_trigger_prefers_pending_fs_batch() {
+        let wt = PathBuf::from("/repo/wt-01");
+        let mut pending = BTreeMap::new();
+        pending.insert(wt.clone(), vec![wt.join("alchemy/src/lib.rs")]);
+
+        let save = save_trigger_path(
+            &wt,
+            &pending,
+            &[(
+                "/repo/wt-01/other/src/main.rs".into(),
+                "fn main() {}".into(),
+            )],
+        );
+
+        assert_eq!(save, wt.join("alchemy/src/lib.rs"));
+    }
+
+    #[test]
+    fn save_trigger_prefers_rust_file_from_pushed_overlay() {
+        let wt = PathBuf::from("/repo/wt-01");
+        let pending = BTreeMap::new();
+
+        let save = save_trigger_path(
+            &wt,
+            &pending,
+            &[
+                ("/repo/wt-01/Cargo.toml".into(), "[workspace]".into()),
+                (
+                    "/repo/wt-01/alchemy/src/protocols/transfer.rs".into(),
+                    "pub struct TransferProtocol;".into(),
+                ),
+            ],
+        );
+
+        assert_eq!(save, wt.join("alchemy/src/protocols/transfer.rs"));
+    }
+
+    #[test]
+    fn save_trigger_normalizes_relative_pushed_paths() {
+        let wt = PathBuf::from("/repo/wt-01");
+        let pending = BTreeMap::new();
+
+        let save = save_trigger_path(
+            &wt,
+            &pending,
+            &[("alchemy/src/lib.rs".into(), "pub fn f() {}".into())],
+        );
+
+        assert_eq!(save, wt.join("alchemy/src/lib.rs"));
+    }
+
+    #[test]
+    fn lsp_overlay_pairs_keep_only_rust_sources() {
+        let pairs = vec![
+            ("/repo/wt-01/Cargo.toml".into(), "[workspace]".into()),
+            ("/repo/wt-01/Cargo.lock".into(), "# lock".into()),
+            (
+                "/repo/wt-01/alchemy/src/protocols/transfer.rs".into(),
+                "pub struct TransferProtocol;".into(),
+            ),
+            ("/repo/wt-01/.cargo/config.toml".into(), "[build]".into()),
+        ];
+
+        let lsp_pairs = lsp_source_pairs(&pairs);
+
+        assert_eq!(
+            lsp_pairs,
+            vec![(
+                "/repo/wt-01/alchemy/src/protocols/transfer.rs".into(),
+                "pub struct TransferProtocol;".into(),
+            )]
+        );
+    }
+
+    #[test]
+    fn direct_cargo_check_args_normalize_tf_multiverse_package_aliases() {
+        let args = direct_cargo_check_args(
+            &InitOpts {
+                package: Some("alchemy".into()),
+                target: Some("wasm32-unknown-unknown".into()),
+                no_default_features: true,
+                features: vec!["ssr-frontend".into(), "telephony".into()],
+                release: true,
+                ..InitOpts::default()
+            },
+            CargoSubcommand::Check,
+            &[],
+        )
+        .expect("package mode builds direct cargo args");
+
+        assert_eq!(
+            args,
+            vec![
+                "check",
+                "-p",
+                "triform-alchemy",
+                "--message-format=json",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--no-default-features",
+                "--features",
+                "ssr-frontend,telephony",
+                "--release",
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_cargo_clippy_args_allow_workspace_profile() {
+        let args = direct_cargo_check_args(&InitOpts::default(), CargoSubcommand::Clippy, &[])
+            .expect("clippy-only profile still runs direct cargo");
+
+        assert_eq!(args, vec!["clippy", "--message-format=json"]);
+    }
+
+    #[test]
+    fn direct_cargo_check_args_forward_extra_selectors() {
+        let extra = vec![
+            "--manifest-path".to_string(),
+            "tools/Cargo.toml".to_string(),
+            "--tests".to_string(),
+            "--locked".to_string(),
+        ];
+        let args = direct_cargo_check_args(&InitOpts::default(), CargoSubcommand::Check, &extra)
+            .expect("extra cargo selectors make a profile non-empty");
+
+        assert_eq!(
+            args,
+            vec![
+                "check",
+                "--manifest-path",
+                "tools/Cargo.toml",
+                "--tests",
+                "--locked",
+                "--message-format=json",
+            ]
+        );
+    }
+
+    #[test]
+    fn early_red_event_maps_ra_error_diagnostics_to_terminal_red() {
+        let ev = LspEvent::Diagnostics(cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///repo/wt/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: Vec::new(),
+        });
+
+        assert!(matches!(
+            early_red_event(ev),
+            LspEvent::FlycheckFailed { message } if message.contains("file:///repo/wt/src/lib.rs")
+        ));
+    }
 }

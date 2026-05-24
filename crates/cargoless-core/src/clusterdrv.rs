@@ -68,6 +68,19 @@ use crate::barrier::{BarrierState, FlycheckBarrier};
 use crate::lsp::LspEvent;
 use crate::repo::watch::WtId;
 
+/// Which diagnostic source is allowed to decide a settled worktree verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerdictPolicy {
+    /// Cargo/rustc-flycheck authority: green/red comes from rustc-source
+    /// errors in a completed flycheck window.
+    #[default]
+    Authoritative,
+    /// Development-loop authority: green/red comes from RA-native diagnostics
+    /// after a debounce-style settle. This is deliberately for replacing
+    /// iterative `cargo check` / `cargo clippy`, not for compile/deploy gates.
+    RaNative,
+}
+
 /// One in-flight per-cluster transaction: the worktree being checked and
 /// its (owned) flycheck barrier. Private — the barrier is never handed
 /// out (Judgment B: no non-`Settled` verdict extraction path).
@@ -122,6 +135,7 @@ pub enum DriverEvent {
 /// two structural judgments (A serialization, B `is_settled` gate).
 #[derive(Debug, Default)]
 pub struct ClusterDriver {
+    verdict_policy: VerdictPolicy,
     /// The single in-flight transaction, or `None` when the cluster RA
     /// is idle (no WT mid-check). Judgment A: at most one, ever.
     current: Option<ActiveTxn>,
@@ -139,6 +153,13 @@ impl ClusterDriver {
     /// Fresh idle cluster (no transaction, empty queue).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_verdict_policy(verdict_policy: VerdictPolicy) -> Self {
+        Self {
+            verdict_policy,
+            ..Self::default()
+        }
     }
 
     /// `true` while a transaction is in flight (the cluster RA is busy).
@@ -215,9 +236,13 @@ impl ClusterDriver {
                     .current
                     .take()
                     .expect("current is Some in the Settled arm");
+                let verdict_error = match self.verdict_policy {
+                    VerdictPolicy::Authoritative => txn.barrier.has_authoritative_error(),
+                    VerdictPolicy::RaNative => txn.barrier.has_any_error(),
+                };
                 let action = ClusterAction::EmitVerdict {
                     wt: txn.wt.clone(),
-                    authoritative_error: txn.barrier.has_authoritative_error(),
+                    authoritative_error: verdict_error,
                 };
                 // Transaction complete ⇒ start the next serialized one
                 // (self-recheck of the just-finished WT takes priority
@@ -366,6 +391,23 @@ mod tests {
             }],
         })
     }
+    fn advisory_err(uri: &str) -> LspEvent {
+        LspEvent::Diagnostics(PublishDiagnostics {
+            uri: uri.into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: vec![Diagnostic {
+                file_path: uri.into(),
+                line: 1,
+                col: 1,
+                severity: Severity::Error,
+                code: None,
+                message: "native".into(),
+                source: Some("rust-analyzer".into()),
+            }],
+        })
+    }
 
     #[test]
     fn idle_cluster_first_batch_starts_transaction() {
@@ -445,6 +487,20 @@ mod tests {
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
                 authoritative_error: false
+            }
+        );
+    }
+
+    #[test]
+    fn ra_native_policy_treats_advisory_error_as_red() {
+        let mut d = ClusterDriver::with_verdict_policy(VerdictPolicy::RaNative);
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") });
+        d.on_event(DriverEvent::Lsp(advisory_err("file:///r/a/x.rs")));
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
+            ClusterAction::EmitVerdict {
+                wt: wt("/r/a"),
+                authoritative_error: true
             }
         );
     }

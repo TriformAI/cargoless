@@ -21,8 +21,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use cargoless_core::transport::{CargoSubcommand, CheckProfile};
+
 mod build;
 mod check;
+mod checks;
 mod clean;
 mod config;
 mod cratemap;
@@ -43,6 +46,8 @@ enum Cmd {
     Build,
     Status,
     Clean,
+    /// Native project-check manifest inspection and execution.
+    Checks,
     /// Model R Stream B #3: repo-scoped daemon (`serve --repo <path>`).
     Serve,
     /// #240/2c: thin push-client — push a local overlay-set to a remote
@@ -69,9 +74,24 @@ struct Opts {
     /// Plumbed via `TF_PROC_MACRO` env to `cargoless_core::lsp::InitOpts`.
     proc_macro: Option<String>,
     /// #74 RA weight-shedding: cargo features to enable in RA's
-    /// cargo-check invocation. Comma-separated. Default (when unset):
-    /// `default`. Plumbed via `TF_FEATURES` env.
+    /// cargo-check invocation. Comma/space-separated. Plumbed via
+    /// `TF_FEATURES` env.
     features: Option<String>,
+    /// Cargo package selector for RA's cargo-check invocation. Mirrors
+    /// `cargo check -p <pkg>` and the tf-multiverse `check-remote` surface.
+    package: Option<String>,
+    /// Cargo target triple for RA's cargo-check invocation.
+    target: Option<String>,
+    /// Cargo `--no-default-features` for RA's cargo-check invocation.
+    no_default_features: bool,
+    /// Cargo `--release` for RA's cargo-check invocation.
+    release: bool,
+    /// `push --cargo-subcommand check|clippy` — the authoritative direct
+    /// Cargo command the daemon should run for this pushed profile.
+    cargo_subcommand: Option<CargoSubcommand>,
+    /// Extra Cargo selectors forwarded to the daemon's direct `cargo check`
+    /// or `cargo clippy` command for pushed profiles.
+    cargo_extra_args: Vec<String>,
     // ── Model R Stream B #3 `serve` flags ───────────────────────────
     // Plain Option-of-value (no clap types): main builds a
     // `serve::ServeOpts` from these, which maps to the frozen
@@ -104,6 +124,20 @@ struct Opts {
     /// Default `HEAD`. Carried in the push payload; server stores +
     /// ignores in v0.2.x (D-INC2-2B §11 open-Q2 default).
     push_base: Option<String>,
+    /// `push --server-root <path>` — server-side repo root for central
+    /// daemon mode.
+    push_server_root: Option<PathBuf>,
+    /// `push --await-verdict` — block until the remote publishes a fresh
+    /// verdict for this pushed worktree.
+    push_await_verdict: bool,
+    /// `push --await-timeout-secs <N>` — max wait for fresh verdict.
+    push_await_timeout_secs: Option<u64>,
+    /// `checks list|run|explain`.
+    checks_action: Option<String>,
+    /// Optional check id for `checks run <id>` / `checks explain <id>`.
+    checks_id: Option<String>,
+    /// Optional profile for `checks run --profile <name>`.
+    checks_profile: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -135,6 +169,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "build" => Cmd::Build,
         "status" => Cmd::Status,
         "clean" => Cmd::Clean,
+        "checks" => Cmd::Checks,
         "serve" => Cmd::Serve,
         "push" => Cmd::Push,
         "help" | "-h" | "--help" => Cmd::Help,
@@ -177,6 +212,58 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
             "--features" => {
                 let v = it.next().ok_or(ParseError::MissingValue("--features"))?;
                 opts.features = Some(v.clone());
+            }
+            a if a.starts_with("--features=") => {
+                opts.features = Some(a["--features=".len()..].to_string());
+            }
+            "-p" | "--package" => {
+                opts.package = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--package"))?
+                        .clone(),
+                );
+            }
+            a if a.starts_with("--package=") => {
+                opts.package = Some(a["--package=".len()..].to_string());
+            }
+            a if a.starts_with("-p=") => {
+                opts.package = Some(a["-p=".len()..].to_string());
+            }
+            "--target" => {
+                opts.target = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--target"))?
+                        .clone(),
+                );
+            }
+            a if a.starts_with("--target=") => {
+                opts.target = Some(a["--target=".len()..].to_string());
+            }
+            "--no-default-features" => opts.no_default_features = true,
+            "--release" => opts.release = true,
+            "--cargo-subcommand" => {
+                let v = it
+                    .next()
+                    .ok_or(ParseError::MissingValue("--cargo-subcommand"))?;
+                opts.cargo_subcommand = Some(CargoSubcommand::parse(v).ok_or(
+                    ParseError::MissingValue("--cargo-subcommand (check|clippy)"),
+                )?);
+            }
+            "--profile" if cmd == Cmd::Checks => {
+                opts.checks_profile = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--profile"))?
+                        .clone(),
+                );
+            }
+            a if cargo_extra_arg_takes_value(a).is_some() => {
+                let flag = cargo_extra_arg_takes_value(a).unwrap();
+                opts.cargo_extra_args.push(flag.to_string());
+                opts.cargo_extra_args
+                    .push(it.next().ok_or(ParseError::MissingValue(flag))?.clone());
+            }
+            a if cargo_extra_arg_equals_form(a) || cargo_extra_arg_flag(a) => {
+                opts.cargo_extra_args.push(a.to_string());
             }
             // ── Model R Stream B #3 `serve` flags ───────────────────
             "--repo" => {
@@ -223,6 +310,30 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
             "--base" => {
                 opts.push_base = Some(it.next().ok_or(ParseError::MissingValue("--base"))?.clone());
             }
+            "--server-root" => {
+                opts.push_server_root = Some(PathBuf::from(
+                    it.next().ok_or(ParseError::MissingValue("--server-root"))?,
+                ));
+            }
+            "--await-verdict" => opts.push_await_verdict = true,
+            "--await-timeout-secs" => {
+                let v = it
+                    .next()
+                    .ok_or(ParseError::MissingValue("--await-timeout-secs"))?;
+                opts.push_await_timeout_secs = Some(v.parse::<u64>().map_err(|_| {
+                    ParseError::MissingValue("--await-timeout-secs (numeric seconds)")
+                })?);
+            }
+            other
+                if cmd == Cmd::Checks
+                    && !other.starts_with('-')
+                    && opts.checks_action.is_none() =>
+            {
+                opts.checks_action = Some(other.to_string());
+            }
+            other if cmd == Cmd::Checks && !other.starts_with('-') && opts.checks_id.is_none() => {
+                opts.checks_id = Some(other.to_string());
+            }
             "-h" | "--help" => {
                 return Ok(Parsed {
                     cmd: Cmd::Help,
@@ -247,6 +358,8 @@ fn usage() {
     println!("                        Maintain the latest-green artifact in <DIR>");
     println!("  status                Daemon liveness + current verdict + latest-green");
     println!("  clean                 Remove the local content-addressed cache");
+    println!("  checks list|run|explain");
+    println!("                        Inspect or run cargoless.checks.yaml project checks");
     println!("  serve --repo <DIR>    Model R repo-scoped daemon: auto-discovers");
     println!("                        worktrees, one shared daemon for the fleet");
     println!();
@@ -271,11 +384,18 @@ fn usage() {
         "                        (default auto = Cargo.toml-scan picks; \
          also TF_PROC_MACRO env)"
     );
-    println!(
-        "  --features <FEATS>    cargo features for RA's check (comma-separated; \
-         default 'default';"
-    );
+    println!("  --features <FEATS>    cargo features for RA's check (comma/space-separated;");
     println!("                        also TF_FEATURES env)");
+    println!("  -p, --package <PKG>   cargo package for RA's check (TF_CHECK_PACKAGE)");
+    println!("  --target <TRIPLE>     cargo target for RA's check (TF_CHECK_TARGET)");
+    println!("  --release             run RA's check as `cargo check --release`");
+    println!("                        (TF_CHECK_RELEASE=1)");
+    println!("  --no-default-features pass through to RA's cargo check");
+    println!("                        (TF_CHECK_NO_DEFAULT_FEATURES=1)");
+    println!("  --cargo-subcommand <check|clippy>");
+    println!("                        push: direct Cargo command for awaited verdict");
+    println!("  --manifest-path/--tests/--all-targets/etc.");
+    println!("                        push: extra Cargo selectors for direct verdicts");
     println!(
         "  --remote <URL>        status: query a remote `serve --bind` daemon \
          over HTTP"
@@ -284,6 +404,8 @@ fn usage() {
         "                        (e.g. http://host:8080) instead of the local \
          cli-status file"
     );
+    println!("  --worktree <KEY>      status/push: query or push one served worktree");
+    println!("  --server-root <DIR>   push: server-side repo root for central daemon mode");
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
     println!();
@@ -301,6 +423,9 @@ fn usage() {
         "  --auth-token <SECRET> Bearer token for authed HTTP \
          (prefer CARGOLESS_AUTH_TOKEN env)"
     );
+    println!("  --await-verdict      push: wait for a fresh remote verdict");
+    println!("  --await-timeout-secs <N>");
+    println!("                        push: max wait for --await-verdict (default 900)");
     println!();
     println!(
         "check/watch/build/status/clean are single-project (headless, no \
@@ -310,6 +435,133 @@ fn usage() {
         "serve is the Model R repo-scoped daemon (one shared daemon \
          auto-discovering the fleet)."
     );
+}
+
+fn apply_runtime_env(opts: &Opts) {
+    // FIELD FINDING #5 (#49): the `--debounce-ms` flag (when given) is
+    // plumbed to `cargoless_core::model::watch` via the `TF_DEBOUNCE_MS` env var,
+    // keeping the frozen `watch()` signature unchanged. Idiomatic match to
+    // `TF_CHECK_TIMEOUT_SECS` (the #21/#43 path). Setting an env var from
+    // a CLI is process-local; no risk of leaking outward.
+    if let Some(ms) = opts.debounce_ms {
+        // SAFETY: single-threaded init phase, no other threads observe env
+        // yet. set_var is unsafe on 2024 edition due to multi-thread reads.
+        unsafe {
+            std::env::set_var("TF_DEBOUNCE_MS", ms.to_string());
+        }
+    }
+    // #74 RA weight-shedding + tf-multiverse cargo-profile compatibility.
+    // The CLI exports env vars; cargoless_core::lsp::InitOpts consumes
+    // them while constructing RA initializationOptions. This keeps the
+    // core API stable while giving `check`, `watch`, and `serve` the same
+    // cargo-shaped selectors as `scripts/check-remote`.
+    if let Some(pm) = opts.proc_macro.as_deref() {
+        unsafe {
+            std::env::set_var("TF_PROC_MACRO", pm);
+        }
+    }
+    if let Some(fs) = opts.features.as_deref() {
+        unsafe {
+            std::env::set_var("TF_FEATURES", fs);
+        }
+    }
+    if let Some(package) = opts.package.as_deref() {
+        unsafe {
+            std::env::set_var("TF_CHECK_PACKAGE", package);
+        }
+    }
+    if let Some(target) = opts.target.as_deref() {
+        unsafe {
+            std::env::set_var("TF_CHECK_TARGET", target);
+        }
+    }
+    if opts.no_default_features {
+        unsafe {
+            std::env::set_var("TF_CHECK_NO_DEFAULT_FEATURES", "1");
+        }
+    }
+    if opts.release {
+        unsafe {
+            std::env::set_var("TF_CHECK_RELEASE", "1");
+        }
+    }
+}
+
+fn auth_token_for_push(cli: Option<String>) -> Option<String> {
+    cli.or_else(|| std::env::var("CARGOLESS_AUTH_TOKEN").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn split_features(v: &str) -> Vec<String> {
+    v.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn cargo_extra_arg_takes_value(flag: &str) -> Option<&'static str> {
+    match flag {
+        "--manifest-path" => Some("--manifest-path"),
+        "--bin" => Some("--bin"),
+        "--example" => Some("--example"),
+        "--test" => Some("--test"),
+        "--bench" => Some("--bench"),
+        "--profile" => Some("--profile"),
+        "--exclude" => Some("--exclude"),
+        _ => None,
+    }
+}
+
+fn cargo_extra_arg_equals_form(arg: &str) -> bool {
+    [
+        "--manifest-path=",
+        "--bin=",
+        "--example=",
+        "--test=",
+        "--bench=",
+        "--profile=",
+        "--exclude=",
+    ]
+    .iter()
+    .any(|prefix| arg.starts_with(prefix))
+}
+
+fn cargo_extra_arg_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--lib"
+            | "--bins"
+            | "--examples"
+            | "--tests"
+            | "--benches"
+            | "--all-targets"
+            | "--workspace"
+            | "--all"
+            | "--all-features"
+            | "--locked"
+            | "--offline"
+            | "--frozen"
+            | "--keep-going"
+    )
+}
+
+fn check_profile_from_opts(opts: &Opts) -> Option<CheckProfile> {
+    let profile = CheckProfile {
+        subcommand: opts.cargo_subcommand.unwrap_or_default(),
+        package: opts.package.clone(),
+        target: opts.target.clone(),
+        features: opts
+            .features
+            .as_deref()
+            .map(split_features)
+            .unwrap_or_default(),
+        no_default_features: opts.no_default_features,
+        release: opts.release,
+        extra_args: opts.cargo_extra_args.clone(),
+    };
+    (!profile.is_empty()).then_some(profile)
 }
 
 fn main() -> ExitCode {
@@ -326,6 +578,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    apply_runtime_env(&parsed.opts);
 
     match &parsed.cmd {
         Cmd::Help => {
@@ -358,7 +612,7 @@ fn main() -> ExitCode {
         // *remote* daemon must not require a local cargoless project.
         Cmd::Status => {
             if let Some(url) = parsed.opts.remote.as_deref() {
-                return statusfile::run_status_remote(url);
+                return statusfile::run_status_remote(url, parsed.opts.push_worktree.as_deref());
             }
         }
         // #240/2c — `push --remote <url>` pushes a local overlay-set to
@@ -395,9 +649,14 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|| "HEAD".to_string());
             return push::run(&push::PushOpts {
                 remote,
+                auth_token: auth_token_for_push(parsed.opts.auth_token.clone()),
                 repo,
                 worktree,
                 base,
+                check_profile: check_profile_from_opts(&parsed.opts),
+                server_root: parsed.opts.push_server_root.clone(),
+                await_verdict: parsed.opts.push_await_verdict,
+                await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
             });
         }
         _ => {}
@@ -419,38 +678,18 @@ fn main() -> ExitCode {
         }
     };
 
-    // FIELD FINDING #5 (#49): the `--debounce-ms` flag (when given) is
-    // plumbed to `cargoless_core::model::watch` via the `TF_DEBOUNCE_MS` env var,
-    // keeping the frozen `watch()` signature unchanged. Idiomatic match to
-    // `TF_CHECK_TIMEOUT_SECS` (the #21/#43 path). Setting an env var from
-    // a CLI is process-local; no risk of leaking outward.
-    if let Some(ms) = parsed.opts.debounce_ms {
-        // SAFETY: single-threaded init phase, no other threads observe env
-        // yet. set_var is unsafe on 2024 edition due to multi-thread reads.
-        unsafe {
-            std::env::set_var("TF_DEBOUNCE_MS", ms.to_string());
-        }
-    }
-    // #74 RA weight-shedding knobs — same pattern as TF_DEBOUNCE_MS:
-    // CLI flag exports the env var, cargoless_core::lsp::InitOpts reads it in
-    // `from_env_and_project`. Keeps cargoless-core's API surface stable.
-    if let Some(pm) = parsed.opts.proc_macro.as_deref() {
-        unsafe {
-            std::env::set_var("TF_PROC_MACRO", pm);
-        }
-    }
-    if let Some(fs) = parsed.opts.features.as_deref() {
-        unsafe {
-            std::env::set_var("TF_FEATURES", fs);
-        }
-    }
-
     match parsed.cmd {
         Cmd::Check if parsed.opts.watch => watch::run(&cfg),
         Cmd::Check => check::run(&cfg),
         Cmd::Watch => watch::run(&cfg),
         Cmd::Build => build::run(&cfg, parsed.opts.out.as_deref()),
         Cmd::Status => statusfile::run_status(&cfg),
+        Cmd::Checks => checks::run(
+            &cfg,
+            parsed.opts.checks_action.as_deref(),
+            parsed.opts.checks_id.as_deref(),
+            parsed.opts.checks_profile.as_deref(),
+        ),
         Cmd::Clean => clean::run(&cfg),
         Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push => unreachable!("handled above"),
     }
@@ -479,6 +718,9 @@ mod tests {
             ("build", Cmd::Build),
             ("status", Cmd::Status),
             ("clean", Cmd::Clean),
+            ("checks", Cmd::Checks),
+            ("serve", Cmd::Serve),
+            ("push", Cmd::Push),
             ("version", Cmd::Version),
         ] {
             assert_eq!(parse(&v(&[s])).unwrap().cmd, c);
@@ -609,6 +851,12 @@ mod tests {
     }
 
     #[test]
+    fn features_flag_accepts_equals_form() {
+        let p = parse(&v(&["check", "--features=ssr-frontend telephony"])).unwrap();
+        assert_eq!(p.opts.features.as_deref(), Some("ssr-frontend telephony"));
+    }
+
+    #[test]
     fn features_flag_missing_value_is_actionable() {
         assert_eq!(
             parse(&v(&["watch", "--features"])),
@@ -624,6 +872,12 @@ mod tests {
             "disabled",
             "--features",
             "csr",
+            "-p",
+            "triform-portal",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--no-default-features",
+            "--release",
             "--debounce-ms",
             "300",
             "--root",
@@ -633,8 +887,111 @@ mod tests {
         assert_eq!(p.cmd, Cmd::Watch);
         assert_eq!(p.opts.proc_macro.as_deref(), Some("disabled"));
         assert_eq!(p.opts.features.as_deref(), Some("csr"));
+        assert_eq!(p.opts.package.as_deref(), Some("triform-portal"));
+        assert_eq!(p.opts.target.as_deref(), Some("wasm32-unknown-unknown"));
+        assert!(p.opts.no_default_features);
+        assert!(p.opts.release);
         assert_eq!(p.opts.debounce_ms, Some(300));
         assert_eq!(p.opts.root.as_deref(), Some(std::path::Path::new("/p")));
+    }
+
+    #[test]
+    fn check_profile_flags_parse_cargo_compatible_forms() {
+        let p = parse(&v(&[
+            "check",
+            "--package=triform-server",
+            "--target=x86_64-unknown-linux-gnu",
+            "--release",
+            "--no-default-features",
+        ]))
+        .unwrap();
+        assert_eq!(p.opts.package.as_deref(), Some("triform-server"));
+        assert_eq!(p.opts.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert!(p.opts.release);
+        assert!(p.opts.no_default_features);
+
+        let p2 = parse(&v(&["check", "-p=physics"])).unwrap();
+        assert_eq!(p2.opts.package.as_deref(), Some("physics"));
+    }
+
+    #[test]
+    fn checks_command_parses_action_id_and_profile() {
+        let p = parse(&v(&[
+            "checks",
+            "run",
+            "generated-frontend",
+            "--profile",
+            "canary",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::Checks);
+        assert_eq!(p.opts.checks_action.as_deref(), Some("run"));
+        assert_eq!(p.opts.checks_id.as_deref(), Some("generated-frontend"));
+        assert_eq!(p.opts.checks_profile.as_deref(), Some("canary"));
+        assert!(p.opts.cargo_extra_args.is_empty());
+    }
+
+    #[test]
+    fn push_cargo_subcommand_parses_check_and_clippy() {
+        let check = parse(&v(&["push", "--cargo-subcommand", "check"])).unwrap();
+        assert_eq!(check.opts.cargo_subcommand, Some(CargoSubcommand::Check));
+
+        let clippy = parse(&v(&["push", "--cargo-subcommand", "clippy"])).unwrap();
+        assert_eq!(clippy.opts.cargo_subcommand, Some(CargoSubcommand::Clippy));
+    }
+
+    #[test]
+    fn push_cargo_subcommand_rejects_invalid_values() {
+        assert_eq!(
+            parse(&v(&["push", "--cargo-subcommand"])),
+            Err(ParseError::MissingValue("--cargo-subcommand"))
+        );
+        let r = parse(&v(&["push", "--cargo-subcommand", "test"]));
+        assert!(
+            matches!(r, Err(ParseError::MissingValue(s)) if s.contains("--cargo-subcommand")),
+            "invalid cargo subcommand must be actionable: {r:?}"
+        );
+    }
+
+    #[test]
+    fn push_extra_cargo_selectors_are_forwarded() {
+        let p = parse(&v(&[
+            "push",
+            "--manifest-path",
+            "tools/Cargo.toml",
+            "--tests",
+            "--all-targets",
+            "--locked",
+            "--bin=worker",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.opts.cargo_extra_args,
+            vec![
+                "--manifest-path",
+                "tools/Cargo.toml",
+                "--tests",
+                "--all-targets",
+                "--locked",
+                "--bin=worker",
+            ]
+        );
+    }
+
+    #[test]
+    fn check_profile_flags_missing_values_are_actionable() {
+        assert_eq!(
+            parse(&v(&["check", "-p"])),
+            Err(ParseError::MissingValue("--package"))
+        );
+        assert_eq!(
+            parse(&v(&["check", "--target"])),
+            Err(ParseError::MissingValue("--target"))
+        );
+        assert_eq!(
+            parse(&v(&["push", "--manifest-path"])),
+            Err(ParseError::MissingValue("--manifest-path"))
+        );
     }
 
     #[test]
@@ -642,5 +999,20 @@ mod tests {
         let p = parse(&v(&["watch"])).unwrap();
         assert_eq!(p.opts.proc_macro, None);
         assert_eq!(p.opts.features, None);
+        assert_eq!(p.opts.package, None);
+        assert_eq!(p.opts.target, None);
+        assert_eq!(p.opts.cargo_subcommand, None);
+        assert!(p.opts.cargo_extra_args.is_empty());
+        assert!(!p.opts.no_default_features);
+        assert!(!p.opts.release);
+    }
+
+    #[test]
+    fn push_auth_token_prefers_cli_and_ignores_blank() {
+        assert_eq!(
+            auth_token_for_push(Some(" cli-token ".to_string())).as_deref(),
+            Some("cli-token")
+        );
+        assert_eq!(auth_token_for_push(Some("   ".to_string())), None);
     }
 }

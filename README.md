@@ -291,6 +291,32 @@ $ cargoless serve --repo /path/to/repo
 >> serve: one multiplexed rust-analyzer; per-worktree verdicts live
 ```
 
+Cargo profile flags mirror the existing `cargo check` / `cargo clippy`
+remote-check shape, so large workspaces can carry package, target,
+feature, no-default-features, release, and subcommand selectors into
+cargoless:
+
+```bash
+$ cargoless check -p triform-server \
+    --target wasm32-unknown-unknown \
+    --features "ssr-frontend telephony" \
+    --no-default-features \
+    --release
+```
+
+The same profile can be pushed to a repo-scoped daemon and waited on by
+automation:
+
+```bash
+$ cargoless push --remote http://127.0.0.1:8787 \
+    --repo /path/to/worktree \
+    --worktree /path/to/worktree \
+    --base origin/dev \
+    --cargo-subcommand clippy \
+    -p triform-server \
+    --await-verdict
+```
+
 You do **not** run `cargoless watch` in each worktree at fleet scale —
 that is the per-tree daemon model `serve --repo` replaces. `watch`
 remains the single-worktree path for a one-off project.
