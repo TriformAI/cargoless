@@ -31,19 +31,19 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use cargoless_proto::Diagnostic;
 
 use super::{
-    Authorizer, DaemonActivity, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
-    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
     event_from_json, event_to_json, pushoverlayack_from_json, pushoverlayack_to_json,
-    status_from_json, status_to_json, summaries_from_json, summaries_to_json,
+    status_from_json, status_to_json, summaries_from_json, summaries_to_json, Authorizer,
+    DaemonActivity, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent, TransportClient,
+    TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
 };
 
 /// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
@@ -120,7 +120,11 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        if k == key { Some(v.to_string()) } else { None }
+        if k == key {
+            Some(v.to_string())
+        } else {
+            None
+        }
     })
 }
 
@@ -523,10 +527,10 @@ fn pct_decode(s: &str) -> String {
 pub struct HttpClient {
     host: String,
     port: u16,
-    /// Bearer token for the authed write path (`push_overlay` →
-    /// `POST /overlay`). `None` ⇒ no `Authorization` header is sent —
-    /// correct for the #10 loopback/`AllowAll` posture, and the GET read
-    /// methods are unchanged (token-less) either way. Increment 2.
+    /// Bearer token for protected HTTP transport routes. `None` ⇒ no
+    /// `Authorization` header is sent, correct for the #10
+    /// loopback/`AllowAll` posture. Network daemons that bind with an auth
+    /// token require it for read and write routes.
     token: Option<String>,
 }
 
@@ -534,7 +538,7 @@ impl HttpClient {
     /// Parse `http://host:port` (the only scheme #10 serves; #14 may add
     /// TLS). Returns a protocol error on a malformed base rather than
     /// panicking — discovery then falls through. Token-less (the GET read
-    /// paths are unchanged); use [`Self::with_token`] for an authed push.
+    /// paths are token-less); use [`Self::with_token`] for an authed daemon.
     pub fn new(base: &str) -> Result<Self, TransportError> {
         let rest = base
             .strip_prefix("http://")
@@ -556,9 +560,7 @@ impl HttpClient {
     }
 
     /// Increment 2 — like [`Self::new`] but carrying a bearer token the
-    /// `push_overlay` write path presents as `Authorization: Bearer` (a
-    /// `BearerToken`-protected daemon). Additive: `new`'s token-less GET
-    /// behaviour is unchanged.
+    /// client presents as `Authorization: Bearer` to protected routes.
     pub fn with_token(base: &str, token: impl Into<String>) -> Result<Self, TransportError> {
         let mut c = Self::new(base)?;
         c.token = Some(token.into());
@@ -580,9 +582,13 @@ impl HttpClient {
         let mut stream = self.connect()?;
         write!(
             stream,
-            "GET {path_and_query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            "GET {path_and_query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             self.host
         )?;
+        if let Some(tok) = &self.token {
+            write!(stream, "Authorization: Bearer {tok}\r\n")?;
+        }
+        write!(stream, "\r\n")?;
         stream.flush()?;
         let mut raw = String::new();
         stream.read_to_string(&mut raw)?;
@@ -603,6 +609,9 @@ impl HttpClient {
         if code == 404 {
             return Ok(None);
         }
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
         let value: serde_json::Value = serde_json::from_str(&body)
             .map_err(|_| TransportError::Protocol("daemon identity is not json".into()))?;
         Ok(value
@@ -618,6 +627,9 @@ impl TransportClient for HttpClient {
         if code == 404 {
             return Ok(None);
         }
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
         Ok(status_from_json(&body))
     }
 
@@ -626,6 +638,9 @@ impl TransportClient for HttpClient {
         if code == 404 {
             return Ok(None);
         }
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
         match serde_json::from_str::<serde_json::Value>(body.trim()) {
             Ok(serde_json::Value::String(s)) => Ok(Some(s)),
             _ => Err(TransportError::Protocol("verdict not a string".into())),
@@ -633,12 +648,18 @@ impl TransportClient for HttpClient {
     }
 
     fn get_diagnostics(&self, w: &str) -> Result<Vec<Diagnostic>, TransportError> {
-        let (_code, body) = self.get(&format!("/worktrees/{w}/diagnostics"))?;
+        let (code, body) = self.get(&format!("/worktrees/{w}/diagnostics"))?;
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
         Ok(crate::diagnostics_store::deserialize(&body))
     }
 
     fn list_worktrees(&self) -> Result<Vec<WorktreeSummary>, TransportError> {
-        let (_code, body) = self.get("/worktrees")?;
+        let (code, body) = self.get("/worktrees")?;
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
         Ok(summaries_from_json(&body))
     }
 
@@ -646,9 +667,13 @@ impl TransportClient for HttpClient {
         let mut stream = self.connect()?;
         write!(
             stream,
-            "GET /events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            "GET /events HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             self.host
         )?;
+        if let Some(tok) = &self.token {
+            write!(stream, "Authorization: Bearer {tok}\r\n")?;
+        }
+        write!(stream, "\r\n")?;
         stream.flush()?;
         let (tx, rx) = channel();
         thread::spawn(move || {
@@ -778,8 +803,8 @@ impl TransportClient for HttpClient {
 mod tests {
     use std::time::Duration;
 
-    use super::super::AllowAll;
     use super::super::inproc::testmock::MockService;
+    use super::super::{AllowAll, BearerToken};
     use super::*;
 
     fn server() -> HttpServer {
@@ -855,6 +880,32 @@ mod tests {
         // body to None/err, never panics.
         let r = c.get_status("green-wt");
         assert!(r.is_ok() || r.is_err(), "must not panic under deny");
+    }
+
+    #[test]
+    fn bearer_client_sends_token_on_remote_reads() {
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(BearerToken::new("sekret")),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let bare = client_for(&s);
+        assert!(matches!(
+            bare.get_status("green-wt"),
+            Err(TransportError::Unauthorized)
+        ));
+
+        let authed =
+            HttpClient::with_token(&format!("http://{}", s.addr()), "sekret").expect("client");
+        assert_eq!(
+            authed.get_verdict("green-wt").unwrap(),
+            Some("green".into())
+        );
+        assert_eq!(authed.get_status("red-wt").unwrap().unwrap().verdict, "red");
+        assert_eq!(authed.list_worktrees().unwrap().len(), 2);
     }
 
     #[test]
