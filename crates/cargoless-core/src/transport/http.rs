@@ -31,19 +31,19 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread;
 use std::time::Duration;
 
 use cargoless_proto::Diagnostic;
 
 use super::{
+    Authorizer, DaemonActivity, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
+    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
     event_from_json, event_to_json, pushoverlayack_from_json, pushoverlayack_to_json,
-    status_from_json, status_to_json, summaries_from_json, summaries_to_json, Authorizer,
-    DaemonActivity, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent, TransportClient,
-    TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
+    status_from_json, status_to_json, summaries_from_json, summaries_to_json,
 };
 
 /// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
@@ -120,11 +120,7 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        if k == key {
-            Some(v.to_string())
-        } else {
-            None
-        }
+        if k == key { Some(v.to_string()) } else { None }
     })
 }
 
