@@ -1,0 +1,270 @@
+# Central cargoless daemon for tf-multiverse.
+#
+# This is the active service counterpart to cargoless-builder.k8s.yaml:
+# - cargoless-builder is a passive sleep pod for legacy kubectl-exec cargo runs.
+# - cargoless-serve is a long-lived `cargoless serve` daemon with one warm
+#   rust-analyzer process answering changed-file overlay pushes.
+#
+# Required out-of-band secrets:
+#
+#   kubectl -n cargoless-builder create secret generic cargoless-serve-auth \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+#   kubectl -n cargoless-builder create secret generic forgejo-cargoless-auth \
+#     --from-literal=username=<forgejo-bot-user> \
+#     --from-literal=token=<forgejo-bot-token>
+#
+# Consumers in other namespaces need their own copy of cargoless-serve-auth;
+# Kubernetes Secrets are namespace-local.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-builder
+    app.kubernetes.io/part-of: cargoless
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cargoless-tf-multiverse-workspace
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: triform-replicated-fsn-2x
+  resources:
+    requests:
+      storage: 150Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cargoless-serve
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-serve
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cargoless-serve
+        app.kubernetes.io/part-of: cargoless
+    spec:
+      terminationGracePeriodSeconds: 90
+      imagePullSecrets:
+        - name: registry-pull
+      initContainers:
+        - name: fix-permissions
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /workspace
+              chown 1000:1000 /workspace || true
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+        - name: repo-bootstrap
+          image: registry.triform.cloud/triform-dev:latest
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          env:
+            - name: FORGEJO_USER
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: FORGEJO_TOKEN
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+          args:
+            - |
+              set -eu
+              repo=/workspace/tf-multiverse
+              url="https://${FORGEJO_USER}:${FORGEJO_TOKEN}@forgejo.triform.dev/triform/tf-multiverse.git"
+              if [ ! -d "$repo/.git" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+                echo "[cargoless-serve] initializing repo"
+                rm -rf "$repo"
+                mkdir -p "$repo"
+                git -C "$repo" init --quiet
+                git -C "$repo" remote add origin "$url"
+                echo "[cargoless-serve] fetching origin/dev"
+                git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet
+                git -C "$repo" checkout -f --quiet origin/dev
+              else
+                echo "[cargoless-serve] repo present; attempting origin/dev refresh"
+                if git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+                  git -C "$repo" remote set-url origin "$url"
+                else
+                  git -C "$repo" remote add origin "$url"
+                fi
+                if git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet; then
+                  git -C "$repo" checkout -f --quiet origin/dev
+                else
+                  echo "[cargoless-serve] warning: origin/dev fetch failed; keeping seeded repo at $(git -C "$repo" rev-parse --short HEAD)" >&2
+                fi
+              fi
+              git -C "$repo" config user.email "cargoless-serve@triform.dev"
+              git -C "$repo" config user.name "cargoless-serve"
+              echo "[cargoless-serve] repo ready @ $(git -C "$repo" rev-parse --short HEAD)"
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+      containers:
+        - name: serve
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.0
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              git config --global --add safe.directory /workspace/tf-multiverse
+              exec /usr/local/bin/cargoless serve \
+                --repo /workspace/tf-multiverse \
+                --bind 0.0.0.0:8787 \
+                --state-dir /workspace/cargoless-state \
+                --cas-dir /workspace/cargoless-state/cas
+          env:
+            - name: CARGOLESS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef: { name: cargoless-serve-auth, key: token }
+            - { name: CARGO_HOME, value: "/workspace/.cargo" }
+            - { name: RUSTUP_HOME, value: "/workspace/.rustup" }
+            - { name: CARGO_TARGET_DIR, value: "/workspace/target" }
+            - { name: CARGO_INCREMENTAL, value: "0" }
+          ports:
+            - name: http
+              containerPort: 8787
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              cpu: "12"
+              memory: 48Gi
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+        - name: repo-sync
+          image: registry.triform.cloud/triform-dev:latest
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          env:
+            - name: FORGEJO_USER
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: FORGEJO_TOKEN
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+          args:
+            - |
+              set -u
+              repo=/workspace/tf-multiverse
+              url="https://${FORGEJO_USER}:${FORGEJO_TOKEN}@forgejo.triform.dev/triform/tf-multiverse.git"
+              while true; do
+                if [ -d "$repo/.git" ]; then
+                  if git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+                    git -C "$repo" remote set-url origin "$url" 2>/dev/null || true
+                  else
+                    git -C "$repo" remote add origin "$url" 2>/dev/null || true
+                  fi
+                  if git -C "$repo" fetch origin dev:refs/remotes/origin/dev --quiet; then
+                    current="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+                    target="$(git -C "$repo" rev-parse origin/dev 2>/dev/null || true)"
+                    if [ -n "$target" ] && [ "$current" != "$target" ]; then
+                      echo "[cargoless-serve] advancing base ${current:-unknown} -> $target"
+                      git -C "$repo" checkout -f --quiet "$target" || true
+                    fi
+                  fi
+                fi
+                sleep 30
+              done
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cargoless-tf-multiverse-workspace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cargoless-serve
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cargoless-serve
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cargoless-serve-netpol
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/part-of: cargoless
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-serve
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: coder-workspaces
+          podSelector:
+            matchLabels:
+              app: pr-verifier
+      ports:
+        - { port: 8787, protocol: TCP }
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - { port: 80, protocol: TCP }
+        - { port: 443, protocol: TCP }
