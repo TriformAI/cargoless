@@ -71,23 +71,23 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
 use cargoless_core::activitymgr::ActivityTracker;
-use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
+use cargoless_core::analyzer::{rust_analyzer_command, Supervisor};
 use cargoless_core::cluster::WorkspaceConfigHash;
 use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
-use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
-use cargoless_core::lsp::{InitOpts, LspClient, LspEvent, normalize_check_package_name};
+use cargoless_core::clustermgr::{read_workspace_config, ClusterLifecycle, LifecycleAction};
+use cargoless_core::lsp::{normalize_check_package_name, InitOpts, LspClient, LspEvent};
 use cargoless_core::multiplex::LspVerb;
 use cargoless_core::multiplex::OverlayMultiplexer;
 use cargoless_core::overlay::OverlaySet;
-use cargoless_core::repo::RepoScope;
 use cargoless_core::repo::watch::{RepoWatchRouter, WtId, WtRouter};
+use cargoless_core::repo::RepoScope;
 use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 
 use crate::orphan::ParentWatch;
@@ -152,6 +152,10 @@ fn ra_native_verdict_mode() -> bool {
                 || v.eq_ignore_ascii_case("development")
         })
         .unwrap_or(false)
+}
+
+fn ready_after_respawn_for_modes(push_only: bool, ra_native: bool) -> bool {
+    push_only && ra_native
 }
 
 fn ra_native_settle_delay() -> Duration {
@@ -785,7 +789,11 @@ fn drain_spawned(
             cs.driver.reset_after_respawn();
             cs.mux.reset();
             cs.lsp = Some(client);
-            cs.ready = false;
+            // In pushed RA-native service mode, a request already carries the
+            // concrete overlay to check and `spawn_ra_native_settle` provides
+            // the settle delay. Do not wait for an IndexingEnded notification
+            // that rust-analyzer may never emit on a cold, push-only daemon.
+            cs.ready = ready_after_respawn_for_modes(push_only_mode(), ra_native_verdict_mode());
             // #246 5c KEYSTONE: the `overlay.reset` event — load-bearing
             // for AC4 diagnostics. Its PRESENCE between an `ra.respawn`
             // span (emitted inside on_spawn) and the next
@@ -1642,6 +1650,14 @@ mod tests {
                 "pub struct TransferProtocol;".into(),
             )]
         );
+    }
+
+    #[test]
+    fn push_only_ra_native_is_ready_after_respawn_without_indexing_end() {
+        assert!(ready_after_respawn_for_modes(true, true));
+        assert!(!ready_after_respawn_for_modes(true, false));
+        assert!(!ready_after_respawn_for_modes(false, true));
+        assert!(!ready_after_respawn_for_modes(false, false));
     }
 
     #[test]
