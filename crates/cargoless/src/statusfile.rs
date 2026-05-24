@@ -345,7 +345,15 @@ pub fn run_status_remote(url: &str, worktree: Option<&str>) -> ExitCode {
         ));
         return ExitCode::from(2);
     };
-    let client = match HttpClient::new(&target) {
+    let client = match std::env::var("CARGOLESS_AUTH_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        Some(token) => HttpClient::with_token(&target, token),
+        None => HttpClient::new(&target),
+    };
+    let client = match client {
         Ok(c) => c,
         Err(e) => {
             ui::error(format!("--remote {target}: {e}"));
