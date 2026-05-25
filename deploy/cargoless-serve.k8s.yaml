@@ -128,7 +128,7 @@ spec:
         - name: serve
           image: registry.triform.cloud/cargoless/cargoless-serve:0.2.6-project-check-tools
           imagePullPolicy: Always
-          command: ["/bin/bash", "-lc"]
+          command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
@@ -142,6 +142,7 @@ spec:
             - name: CARGOLESS_AUTH_TOKEN
               valueFrom:
                 secretKeyRef: { name: cargoless-serve-auth, key: token }
+            - { name: PATH, value: "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: CARGO_HOME, value: "/workspace/.cargo" }
             - { name: RUSTUP_HOME, value: "/usr/local/rustup" }
             - { name: RUSTUP_TOOLCHAIN, value: "1.93.1-x86_64-unknown-linux-gnu" }
