@@ -96,6 +96,9 @@ pub struct PushedOverlay {
 pub(crate) struct ProjectCheckRunContext {
     pub root: PathBuf,
     pub changed_files: Option<Vec<String>>,
+    pub base_ref: String,
+    pub overlay_files: Vec<(String, String)>,
+    pub materialize_overlay: bool,
 }
 
 /// The serve-loop's live verdict state, presented as the shipped logical
@@ -247,12 +250,18 @@ impl ServeVerdictState {
         worktree: &str,
         root: PathBuf,
         changed_files: Option<Vec<String>>,
+        base_ref: String,
+        overlay_files: Vec<(String, String)>,
+        materialize_overlay: bool,
     ) {
         poisoned(&self.project_check_context).insert(
             worktree.to_string(),
             ProjectCheckRunContext {
                 root,
                 changed_files,
+                base_ref,
+                overlay_files,
+                materialize_overlay,
             },
         );
     }
@@ -262,6 +271,29 @@ impl ServeVerdictState {
         worktree: &str,
     ) -> Option<ProjectCheckRunContext> {
         poisoned(&self.project_check_context).remove(worktree)
+    }
+
+    pub(crate) fn with_project_check_overlay<T>(
+        &self,
+        context: &ProjectCheckRunContext,
+        f: impl FnOnce(&Path) -> T,
+    ) -> Result<T, String> {
+        if !context.materialize_overlay {
+            return Ok(f(&context.root));
+        }
+
+        let _guard = poisoned(&self.sync_lock);
+        reset_analysis_root(&context.root, &context.base_ref)?;
+        materialize_overlay_files(&context.root, &context.overlay_files)?;
+        let result = f(&context.root);
+        if let Err(e) = reset_analysis_root(&context.root, &context.base_ref) {
+            eprintln!(
+                "[cargoless:obs] project-check-overlay-cleanup root={} error={}",
+                context.root.display(),
+                e
+            );
+        }
+        Ok(result)
     }
 
     pub fn quiescing(&self) -> bool {
@@ -524,7 +556,42 @@ fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(base_ref);
     run_git(root, &["fetch", "--prune", "origin", fetch_ref])?;
+    reset_analysis_root(root, base_ref)?;
+    Ok(())
+}
+
+fn reset_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     run_git(root, &["reset", "--hard", base_ref])?;
+    run_git(root, &["clean", "-fd", "-e", ".cargoless"])?;
+    Ok(())
+}
+
+fn materialize_overlay_files(root: &Path, files: &[(String, String)]) -> Result<(), String> {
+    for (path, content) in files {
+        let path = Path::new(path);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        if !abs.starts_with(root) {
+            return Err(format!(
+                "overlay path `{}` escapes analysis_root `{}`",
+                abs.display(),
+                root.display()
+            ));
+        }
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "could not create overlay parent `{}`: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(&abs, content)
+            .map_err(|e| format!("could not materialize overlay `{}`: {e}", abs.display()))?;
+    }
     Ok(())
 }
 
@@ -565,6 +632,35 @@ mod tests {
     };
 
     use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargoless-serveapi-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     /// THE Increment-0 GATE differential test: a **remote** read of the
     /// real [`ServeVerdictState`] (over the shipped HTTP+SSE adapter) is
@@ -755,6 +851,65 @@ mod tests {
         );
         assert_eq!(pushed.base_sha.as_deref(), Some("abc123"));
         assert_eq!(pushed.changed_files, Some(vec!["src/lib.rs".into()]));
+    }
+
+    #[test]
+    fn project_check_overlay_materializes_changed_files_then_cleans_root() {
+        let root = temp_root("project-overlay");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".cargoless/tree.cache")).unwrap();
+        std::fs::write(root.join(".cargoless/tree.cache/keep"), "cached\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        let base = String::from("HEAD");
+
+        let api = ServeVerdictState::new();
+        let context = ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec!["src/lib.rs".into(), "new.yaml".into()]),
+            base_ref: base,
+            overlay_files: vec![
+                (
+                    root.join("src/lib.rs").to_string_lossy().into_owned(),
+                    "pub fn changed() {}\n".to_string(),
+                ),
+                (
+                    root.join("new.yaml").to_string_lossy().into_owned(),
+                    "value: changed\n".to_string(),
+                ),
+            ],
+            materialize_overlay: true,
+        };
+
+        let seen = api
+            .with_project_check_overlay(&context, |root| {
+                (
+                    std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+                    std::fs::read_to_string(root.join("new.yaml")).unwrap(),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(seen.0, "pub fn changed() {}\n");
+        assert_eq!(seen.1, "value: changed\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn old() {}\n"
+        );
+        assert!(!root.join("new.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(".cargoless/tree.cache/keep")).unwrap(),
+            "cached\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

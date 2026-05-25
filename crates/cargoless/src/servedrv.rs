@@ -992,10 +992,14 @@ fn exec(
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
                 pushed_check_profile = pushed.check_profile;
                 let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
+                let materialize_overlay = pushed.analysis_root.is_some();
                 api.record_project_check_context(
                     &wt_key,
                     project_root,
                     pushed.changed_files.clone(),
+                    pushed.base_ref.clone(),
+                    pushed.files.clone(),
+                    materialize_overlay,
                 );
                 pushed.files
             } else {
@@ -1064,11 +1068,11 @@ fn exec(
                 ProjectChecksMode::Off => publish_verdict(&wt, authoritative_error, api),
                 ProjectChecksMode::Warn => {
                     publish_verdict(&wt, authoritative_error, api);
-                    spawn_project_checks_warn(wt, project_check_context);
+                    spawn_project_checks_warn(wt, project_check_context, Arc::clone(api));
                 }
                 ProjectChecksMode::Hard => {
                     let project_check_error =
-                        run_project_checks_and_log(&wt, project_check_context);
+                        run_project_checks_and_log(&wt, project_check_context, api);
                     publish_verdict(&wt, authoritative_error || project_check_error, api);
                 }
             }
@@ -1235,12 +1239,13 @@ fn project_checks_mode() -> ProjectChecksMode {
 fn spawn_project_checks_warn(
     wt: PathBuf,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
+    api: Arc<crate::serveapi::ServeVerdictState>,
 ) {
     let display = wt.display().to_string();
     if let Err(e) = std::thread::Builder::new()
         .name("cargoless-project-checks-warn".to_string())
         .spawn(move || {
-            let red = run_project_checks_and_log(&wt, context);
+            let red = run_project_checks_and_log(&wt, context, &api);
             eprintln!(
                 "[cargoless:obs] project-checks-warn wt={} gate=false observed_red={}",
                 wt.display(),
@@ -1258,14 +1263,24 @@ fn spawn_project_checks_warn(
 fn run_project_checks_and_log(
     wt: &Path,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
 ) -> bool {
     let root = context.as_ref().map(|ctx| ctx.root.as_path()).unwrap_or(wt);
     let changed_files = context
         .as_ref()
         .and_then(|ctx| ctx.changed_files.as_deref());
-    match cargoless_core::project_checks::run_dev_with_changes(root, changed_files) {
-        Ok(report) if report.results.is_empty() && report.skipped.is_empty() => false,
-        Ok(report) => {
+    let report = match context.as_ref() {
+        Some(ctx) => api.with_project_check_overlay(ctx, |root| {
+            cargoless_core::project_checks::run_dev_with_changes(root, changed_files)
+        }),
+        None => Ok(cargoless_core::project_checks::run_dev_with_changes(
+            root,
+            changed_files,
+        )),
+    };
+    match report {
+        Ok(Ok(report)) if report.results.is_empty() && report.skipped.is_empty() => false,
+        Ok(Ok(report)) => {
             let cache_hits = report.results.iter().filter(|r| r.cache_hit).count();
             let slowest = slowest_project_checks(&report.results);
             eprintln!(
@@ -1300,10 +1315,19 @@ fn run_project_checks_and_log(
             }
             report.tree == cargoless_core::TreeState::Red
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!(
                 "[cargoless:obs] project-checks wt={} verdict=red setup_error={}",
                 wt.display(),
+                e
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[cargoless:obs] project-checks wt={} root={} verdict=red overlay_error={}",
+                wt.display(),
+                root.display(),
                 e
             );
             true
