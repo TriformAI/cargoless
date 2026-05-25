@@ -290,9 +290,48 @@ fn try_init(cfg: &TelemetryConfig) -> Result<ShutdownHandle, String> {
         ])
         .build();
 
+    // INFRA-49: Use `with_simple_exporter` instead of `with_batch_exporter`.
+    //
+    // Background: `with_batch_exporter` spawns a long-lived background
+    // thread (`OpenTelemetry.Traces.BatchProcessor`) that needs an
+    // ambient Tokio runtime to drive its async HTTP export calls. We
+    // build the provider inside `serve.rs`'s `runtime.block_on(...)`
+    // scope, so the *exporter handle* gets a runtime; but the
+    // batch-processor thread it spawns is its own scope and has no
+    // ambient runtime when it later wakes up to flush. Observed live
+    // on cargoless 0.2.7 (PR #22 + tf-multiverse PR #3526):
+    //
+    //     thread 'OpenTelemetry.Traces.BatchProcessor' panicked at ...:
+    //     there is no reactor running, must be called from the context
+    //     of a Tokio 1.x runtime
+    //
+    // followed by repeating
+    //
+    //     WARN opentelemetry_sdk: BatchSpanProcessor.OnEnd.AfterShutdown
+    //     Spans are being emitted even after Shutdown.
+    //
+    // — the SDK enters permanent shutdown after one panic and silently
+    // drops every subsequent span. Net effect: SigNoz dashboards see
+    // nothing even though the daemon emits every span correctly. The
+    // existing `[cargoless:obs]` stderr lines remained as the only
+    // observability surface.
+    //
+    // `with_simple_exporter` exports synchronously inline on each
+    // span emit, sidestepping the background-thread runtime hazard
+    // entirely. Latency cost per span is the OTLP HTTP call's round-
+    // trip (in-cluster signoz collector is ~1-2ms), but `verdict.publish`
+    // fires on the order of seconds, not microseconds, so the cost is
+    // negligible. Batch is the right choice for high-volume
+    // instrumentation (per-request HTTP servers); cargoless's verdict
+    // cadence is operator-watching-the-tree, not request-firehose.
+    //
+    // Higher throughput can revisit later by either keeping a
+    // long-lived runtime handle alive for the daemon lifetime + entering
+    // it around the batch thread (option 2 in INFRA-49) or switching
+    // to gRPC + `with_tokio` (option 3). Both are larger refactors.
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(exporter)
+        .with_simple_exporter(exporter)
         .with_sampler(Sampler::TraceIdRatioBased(cfg.otel_sampler_arg))
         .build();
 
