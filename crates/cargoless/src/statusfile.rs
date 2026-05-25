@@ -80,6 +80,102 @@ impl Verdict {
     }
 }
 
+/// Honest verdict + the evidence backing it.
+///
+/// Constructed only via [`VerdictPayload::green`], [`VerdictPayload::red`],
+/// and [`VerdictPayload::unknown`]. The constructors enforce the rule that
+/// closes the 2026-05-25 `INFRA-36` recurrence-class: **a `Red` verdict
+/// must be backed by either a non-zero diagnostic count or an analysis
+/// failure reason; otherwise it is downgraded to `Unknown`**.
+///
+/// Before this type existed the daemon's publish path took a bare
+/// `authoritative_error: bool` and unconditionally wrote
+/// `red_diagnostics: 0`, producing the "verdict=red, 0 diagnostics"
+/// liar state that took ~3 operator-hours and a `--skip-cargoless`
+/// override to disambiguate from a real code break (INFRA-36).
+///
+/// The downgrade is intentionally defensive: if a caller ever discovers
+/// a new path that wants to emit `Red` without backing evidence, the
+/// constructor turns it into `Unknown` with a self-describing reason,
+/// rather than silently propagating the historical lie. SigNoz then
+/// surfaces the violation as a real telemetry event (the
+/// `verdict.publish` span sees `verdict=unknown` + the reason string),
+/// instead of an invisible "0 diagnostics RED".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictPayload {
+    pub verdict: Verdict,
+    /// Count of error-severity diagnostics that justify a `Red` verdict.
+    /// Zero on `Green` and on `Unknown` (where `analysis_failure_reason`
+    /// carries the explanation instead).
+    pub red_diagnostics: u32,
+    /// Why a non-Green verdict was emitted *without* per-diagnostic
+    /// detail — e.g., `"project_check_setup_error: <msg>"`,
+    /// `"overlay_apply_error: <msg>"`, `"red_claimed_without_evidence"`.
+    /// Always populated on `Unknown`; always `None` on `Green` and `Red`.
+    pub analysis_failure_reason: Option<String>,
+}
+
+impl VerdictPayload {
+    /// Build a `Green` payload. Diagnostics are necessarily zero; no
+    /// failure reason.
+    pub fn green() -> Self {
+        Self {
+            verdict: Verdict::Green,
+            red_diagnostics: 0,
+            analysis_failure_reason: None,
+        }
+    }
+
+    /// Build a `Red` payload backed by `diagnostic_count` error-severity
+    /// diagnostics.
+    ///
+    /// **Type-discipline guard:** if `diagnostic_count == 0`, the
+    /// payload is downgraded to `Unknown` with reason
+    /// `"red_claimed_without_evidence"` — the unrepresentable state
+    /// from INFRA-36 cannot leave this constructor. This is the
+    /// single source of truth that makes "verdict=red, 0 diagnostics"
+    /// structurally impossible across every publish path.
+    pub fn red(diagnostic_count: u32) -> Self {
+        if diagnostic_count == 0 {
+            return Self::unknown("red_claimed_without_evidence");
+        }
+        Self {
+            verdict: Verdict::Red,
+            red_diagnostics: diagnostic_count,
+            analysis_failure_reason: None,
+        }
+    }
+
+    /// Build an `Unknown` payload — the daemon is reporting honestly
+    /// that it could not determine a verdict. `reason` is a short,
+    /// stable, attribute-friendly string (e.g.,
+    /// `"project_check_setup_error"`, `"overlay_apply_error"`) that
+    /// can drive SigNoz dashboards / alerts. A longer human message
+    /// can be appended with `: <detail>`; the leading classifier is
+    /// what telemetry queries group on.
+    pub fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            verdict: Verdict::Unknown,
+            red_diagnostics: 0,
+            analysis_failure_reason: Some(reason.into()),
+        }
+    }
+
+    /// Convenience for the legacy `bool`-driven publish call sites —
+    /// they currently know "something errored, no diagnostic detail
+    /// available". The honest answer is `Unknown` with a reason
+    /// naming the call site, not `Red`. This shim exists so the few
+    /// callers that have not been refactored yet at least stop
+    /// emitting the liar state.
+    pub fn from_bool_unattributed(authoritative_error: bool) -> Self {
+        if authoritative_error {
+            Self::unknown("ra_native_unattributed_error")
+        } else {
+            Self::green()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Status {
     pub pid: u32,
@@ -98,6 +194,16 @@ pub struct Status {
     /// asymmetric-stream "how bad is red" scalar (`D-FLEET-SHARED-DAEMON`
     /// §9.2). Zero on green and on a schema=1 file.
     pub red_diagnostics: u32,
+    /// **INFRA-36** — non-empty iff `verdict_str == "unknown"`. Stable
+    /// classifier explaining why a non-Green verdict was emitted
+    /// without per-diagnostic detail. Persisted to the local
+    /// statusfile so `cargoless status` can render
+    /// `"unknown: <reason>"` end-to-end — the operator on the same
+    /// machine sees the same honest answer the SSE subscriber
+    /// receives. Empty on schema=1 and pre-INFRA-36 files
+    /// (forward-compatible default; serializer omits the line when
+    /// empty so unaware readers see no new key).
+    pub verdict_failure_reason: String,
     /// #247 in-scope obs fold: unix-seconds timestamp of the
     /// AUTHORITATIVE analysis that produced this verdict (= the
     /// barrier-settle instant observed at `publish_verdict`). Distinct
@@ -169,6 +275,16 @@ impl Status {
             out.push_str(&format!("crates={joined}\n"));
         }
         out.push_str(&format!("red_diagnostics={}\n", self.red_diagnostics));
+        // INFRA-36: `verdict_failure_reason=<reason>` emitted ONLY when
+        // populated (i.e., on Unknown verdicts). Empty ⇒ omit the line
+        // so pre-INFRA-36 readers see no new key and continue to
+        // parse the file unchanged.
+        if !self.verdict_failure_reason.is_empty() {
+            out.push_str(&format!(
+                "verdict_failure_reason={}\n",
+                self.verdict_failure_reason
+            ));
+        }
         // #247: analysed_at emitted unconditionally (zero on green/never-
         // checked is meaningful — distinguishes "no authoritative check
         // yet" from a stale "recently re-heartbeated" state). Forward-
@@ -197,6 +313,9 @@ impl Status {
                 "verdict" => s.verdict_str = v.trim().to_string(),
                 "crates" => s.crates = parse_crates(v.trim()),
                 "red_diagnostics" => s.red_diagnostics = v.trim().parse().unwrap_or(0),
+                "verdict_failure_reason" => {
+                    s.verdict_failure_reason = v.trim().to_string()
+                }
                 "analysed_at" => s.analysed_at = v.trim().parse().unwrap_or(0),
                 "build_id" => s.build_id = v.trim().to_string(),
                 _ => {}
@@ -762,6 +881,7 @@ mod tests {
             verdict_str: "green".into(),
             crates: vec![],
             red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
         };
@@ -787,6 +907,7 @@ mod tests {
                 ("physics".into(), Verdict::Red),
             ],
             red_diagnostics: 2,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
         };
@@ -826,6 +947,7 @@ mod tests {
             verdict_str: "red".into(),
             crates: vec![],
             red_diagnostics: 3,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
         };
@@ -863,6 +985,7 @@ mod tests {
             verdict_str: "green".into(),
             crates: vec![("x".into(), Verdict::Green)],
             red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
         };
@@ -914,6 +1037,7 @@ mod tests {
             verdict_str: "green".into(),
             crates: vec![],
             red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
             analysed_at: 200, // settled 50s before write (meaningful gap)
             build_id: "test-build".into(),
         };
@@ -1000,6 +1124,7 @@ mod tests {
             verdict_str: "red".into(),
             crates: vec![],
             red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
         };
@@ -1024,6 +1149,7 @@ mod tests {
             verdict_str: verdict.into(),
             crates: vec![],
             red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
         }
@@ -1253,5 +1379,87 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // INFRA-36 — VerdictPayload constructor discipline
+    //
+    // These tests pin the invariant that closes the recurrence class:
+    // **no construction of `Red` without backing evidence**. They are the
+    // type-system guardrail behind the structural fix to `publish_verdict`
+    // and `serveapi::publish` — a future regression that tries to emit
+    // "verdict=red, 0 diagnostics" hits one of these assertions instead
+    // of poisoning a remote operator's debugging session.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verdict_payload_green_has_no_diagnostics_no_reason() {
+        let p = VerdictPayload::green();
+        assert_eq!(p.verdict, Verdict::Green);
+        assert_eq!(p.red_diagnostics, 0);
+        assert!(p.analysis_failure_reason.is_none());
+    }
+
+    #[test]
+    fn verdict_payload_red_with_diagnostics_round_trips() {
+        let p = VerdictPayload::red(7);
+        assert_eq!(p.verdict, Verdict::Red);
+        assert_eq!(p.red_diagnostics, 7);
+        assert!(p.analysis_failure_reason.is_none());
+    }
+
+    #[test]
+    fn verdict_payload_red_with_zero_diagnostics_downgrades_to_unknown() {
+        // This is the INFRA-36 invariant. The constructor MUST refuse to
+        // produce the historical liar state.
+        let p = VerdictPayload::red(0);
+        assert_eq!(
+            p.verdict,
+            Verdict::Unknown,
+            "red(0) MUST NOT produce Verdict::Red — that is the bug \
+             this constructor exists to prevent"
+        );
+        assert_eq!(p.red_diagnostics, 0);
+        assert_eq!(
+            p.analysis_failure_reason.as_deref(),
+            Some("red_claimed_without_evidence"),
+            "the downgrade MUST be self-describing so SigNoz can alert \
+             on the violation rather than hiding it inside a silent \
+             color flip"
+        );
+    }
+
+    #[test]
+    fn verdict_payload_unknown_carries_reason_and_zero_diagnostics() {
+        let p = VerdictPayload::unknown("project_check_setup_error: foo");
+        assert_eq!(p.verdict, Verdict::Unknown);
+        assert_eq!(p.red_diagnostics, 0);
+        assert_eq!(
+            p.analysis_failure_reason.as_deref(),
+            Some("project_check_setup_error: foo")
+        );
+    }
+
+    #[test]
+    fn verdict_payload_from_bool_unattributed_never_produces_red() {
+        // Legacy shim — callers that still pass a bare bool get an
+        // Unknown (with a stable reason classifier) rather than a Red
+        // liar. The classifier `ra_native_unattributed_error` is the
+        // SigNoz query key for "this site has not been refactored yet
+        // and is producing low-quality verdicts".
+        let p = VerdictPayload::from_bool_unattributed(true);
+        assert_eq!(
+            p.verdict,
+            Verdict::Unknown,
+            "the bool-only path MUST NOT synthesize a Red verdict — it \
+             has no diagnostic evidence to back one"
+        );
+        assert_eq!(
+            p.analysis_failure_reason.as_deref(),
+            Some("ra_native_unattributed_error")
+        );
+
+        let g = VerdictPayload::from_bool_unattributed(false);
+        assert_eq!(g.verdict, Verdict::Green);
     }
 }

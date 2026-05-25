@@ -189,6 +189,11 @@ pub fn run(cfg: &Config) -> ExitCode {
                 verdict_str: verdict.as_str().to_string(),
                 crates,
                 red_diagnostics,
+                // INFRA-36: `watch` is the single-WT RA-native path; the
+                // model settles to Green or Red authoritatively, so
+                // there is no Unknown-class internal error to surface
+                // here. Empty by shape parity with the Model R path.
+                verdict_failure_reason: String::new(),
                 // #247: v0 watch path — settle ≈ write instant (the
                 // model fires BecameGreen/Red and we write immediately).
                 // analysed_at == updated honestly for v0; the distinction

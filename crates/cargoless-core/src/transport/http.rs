@@ -847,6 +847,7 @@ mod tests {
             worktree: "red-wt".into(),
             verdict: "red".into(),
             red_diagnostics: 1,
+            verdict_failure_reason: None,
             published_at: 5,
         };
         svc.emit(ev.clone());

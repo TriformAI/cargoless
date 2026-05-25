@@ -177,6 +177,13 @@ pub struct WorktreeStatus {
     pub daemon_build_id: String,
     pub crates: Vec<CrateVerdict>,
     pub red_diagnostics: u32,
+    /// **INFRA-36** — non-empty iff `verdict == "unknown"`. Stable
+    /// classifier string (e.g., `"project_check_setup_error: <detail>"`,
+    /// `"ra_native_unattributed_error"`) that distinguishes a real
+    /// gate-failed Red from a daemon-couldn't-evaluate Unknown. SigNoz
+    /// dashboards group on the leading classifier (the substring before
+    /// `: `) to separate "gate doing its job" from "gate didn't run".
+    pub verdict_failure_reason: Option<String>,
     pub heartbeat_age_secs: u64,
     pub published_at: u64,
 }
@@ -201,6 +208,12 @@ pub struct TransitionEvent {
     pub worktree: String,
     pub verdict: String,
     pub red_diagnostics: u32,
+    /// **INFRA-36** — see [`WorktreeStatus::verdict_failure_reason`]
+    /// for the contract. Mirrored on transition events so SSE
+    /// subscribers can distinguish a real Red transition from an
+    /// Unknown-the-daemon-couldn't-evaluate without round-tripping a
+    /// `get_status` call.
+    pub verdict_failure_reason: Option<String>,
     pub published_at: u64,
 }
 
@@ -905,8 +918,13 @@ fn crate_verdicts_from_json(v: Option<&serde_json::Value>) -> Vec<CrateVerdict> 
 }
 
 /// Serialise a `WorktreeStatus` to the wire JSON.
+///
+/// **INFRA-36:** emits `verdict_failure_reason` only when populated, so
+/// pre-INFRA-36 clients parsing this output see no new key (the absent
+/// case is `None`, which `serde_json::Value::Null` would also represent
+/// — omitting is cleaner and stays additive on the wire).
 pub fn status_to_json(s: &WorktreeStatus) -> String {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "worktree": s.worktree,
         "verdict": s.verdict,
         "daemon_build_id": s.daemon_build_id,
@@ -914,12 +932,24 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
         "red_diagnostics": s.red_diagnostics,
         "heartbeat_age_secs": s.heartbeat_age_secs,
         "published_at": s.published_at,
-    })
-    .to_string()
+    });
+    if let Some(reason) = &s.verdict_failure_reason {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert(
+                "verdict_failure_reason".to_string(),
+                serde_json::Value::String(reason.clone()),
+            );
+    }
+    obj.to_string()
 }
 
 /// Parse wire JSON back to a `WorktreeStatus` (best-effort: a missing
 /// `worktree` ⇒ `None`; missing scalars ⇒ 0/empty, never a panic).
+///
+/// **INFRA-36:** `verdict_failure_reason` is optional on the wire and
+/// `None` when absent — backward-compatible with pre-INFRA-36 servers
+/// that never emit the key.
 pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     Some(WorktreeStatus {
@@ -939,6 +969,10 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("red_diagnostics")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
+        verdict_failure_reason: v
+            .get("verdict_failure_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string()),
         heartbeat_age_secs: v
             .get("heartbeat_age_secs")
             .and_then(serde_json::Value::as_u64)
@@ -999,20 +1033,34 @@ pub fn summaries_from_json(text: &str) -> Vec<WorktreeSummary> {
 }
 
 /// Serialise a transition event (SSE `data:` payload / Unix NDJSON line).
+///
+/// **INFRA-36:** `verdict_failure_reason` is emitted only when populated
+/// — pre-INFRA-36 clients see no new key, additive forward-compat.
 pub fn event_to_json(e: &TransitionEvent) -> String {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "worktree": e.worktree,
         "verdict": e.verdict,
         "red_diagnostics": e.red_diagnostics,
         "published_at": e.published_at,
-    })
-    .to_string()
+    });
+    if let Some(reason) = &e.verdict_failure_reason {
+        obj.as_object_mut()
+            .expect("event_to_json constructed an object literal")
+            .insert(
+                "verdict_failure_reason".to_string(),
+                serde_json::Value::String(reason.clone()),
+            );
+    }
+    obj.to_string()
 }
 
 /// Parse a transition event from its wire JSON (the `subscribe` NDJSON
 /// frame / SSE `data:` payload). Shared by the Unix + HTTP stream
 /// clients so both decode byte-identically. Best-effort: a malformed
 /// frame ⇒ `None` (the stream client skips it, never panics).
+///
+/// **INFRA-36:** `verdict_failure_reason` defaults to `None` when
+/// absent — backward-compatible with pre-INFRA-36 servers.
 pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     Some(TransitionEvent {
@@ -1026,6 +1074,10 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
             .get("red_diagnostics")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
+        verdict_failure_reason: v
+            .get("verdict_failure_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string()),
         published_at: v
             .get("published_at")
             .and_then(serde_json::Value::as_u64)
@@ -1213,6 +1265,7 @@ mod tests {
             daemon_build_id: "test-build".into(),
             crates: vec![],
             red_diagnostics: 3,
+            verdict_failure_reason: None,
             heartbeat_age_secs: 2,
             published_at: 1234567890,
         };
@@ -1233,6 +1286,7 @@ mod tests {
                 },
             ],
             red_diagnostics: 1,
+            verdict_failure_reason: None,
             heartbeat_age_secs: 0,
             published_at: 42,
         };
