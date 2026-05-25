@@ -820,9 +820,7 @@ mod tests {
             Path::new("/r/wt-broken"),
             crate::statusfile::VerdictPayload::unknown("project_check_setup_error: oops"),
         );
-        let status = api
-            .get_status("/r/wt-broken")
-            .expect("status present");
+        let status = api.get_status("/r/wt-broken").expect("status present");
         assert_eq!(status.verdict, "unknown");
         assert_eq!(status.red_diagnostics, 0);
         assert_eq!(

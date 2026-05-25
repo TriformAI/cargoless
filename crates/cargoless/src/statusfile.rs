@@ -313,9 +313,7 @@ impl Status {
                 "verdict" => s.verdict_str = v.trim().to_string(),
                 "crates" => s.crates = parse_crates(v.trim()),
                 "red_diagnostics" => s.red_diagnostics = v.trim().parse().unwrap_or(0),
-                "verdict_failure_reason" => {
-                    s.verdict_failure_reason = v.trim().to_string()
-                }
+                "verdict_failure_reason" => s.verdict_failure_reason = v.trim().to_string(),
                 "analysed_at" => s.analysed_at = v.trim().parse().unwrap_or(0),
                 "build_id" => s.build_id = v.trim().to_string(),
                 _ => {}

@@ -52,7 +52,7 @@ use super::{
 /// more; a larger declared length is refused `413` before any read. 32
 /// MiB comfortably covers a whole-file overlay-set for a real workspace
 /// while fail-closed-bounding a hostile/runaway client.
-const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---- tiny request model -------------------------------------------------
@@ -1225,5 +1225,23 @@ mod tests {
         assert_eq!(ack.worktree, "wt-z");
         assert!(!ack.accepted);
         drop(s);
+    }
+
+    #[test]
+    fn http_client_refuses_oversized_overlay_before_connect() {
+        // Port 9 is intentionally not served here. A connection-refused error
+        // would prove the cap check happened too late.
+        let c = HttpClient::new("http://127.0.0.1:9").expect("client");
+        let huge = "x".repeat(MAX_OVERLAY_BYTES + 1);
+        let err = c
+            .push_overlay("wt-z", "origin/main", &[("src/big.rs".into(), huge)])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, TransportError::Protocol(ref msg)
+                if msg.contains("overlay payload too large")
+                    && msg.contains(&MAX_OVERLAY_BYTES.to_string())),
+            "oversized push must fail locally with the HTTP cap message, got {err:?}"
+        );
     }
 }

@@ -1313,10 +1313,9 @@ fn compose_hard_mode_payload(
     use statusfile::VerdictPayload;
     match (authoritative_error, summary) {
         (_, ProjectCheckSummary::Red { error_count }) => VerdictPayload::red(error_count),
-        (
-            _,
-            ProjectCheckSummary::Indeterminate { reason, detail },
-        ) => VerdictPayload::unknown(format!("{reason}: {detail}")),
+        (_, ProjectCheckSummary::Indeterminate { reason, detail }) => {
+            VerdictPayload::unknown(format!("{reason}: {detail}"))
+        }
         (true, _) => VerdictPayload::unknown("ra_native_unattributed_error"),
         (false, ProjectCheckSummary::Green) | (false, ProjectCheckSummary::Empty) => {
             VerdictPayload::green()
@@ -1390,7 +1389,10 @@ enum ProjectCheckSummary {
     /// etc.). `reason` is the stable classifier; `detail` is the
     /// human-readable tail for diagnosis. Maps to `Verdict::Unknown`,
     /// NOT `Red` — the gate did not evaluate, so it cannot vote.
-    Indeterminate { reason: &'static str, detail: String },
+    Indeterminate {
+        reason: &'static str,
+        detail: String,
+    },
     /// No checks were selected (empty profile, no triggers matched).
     /// Treated as green for verdict purposes — nothing to gate on.
     Empty,
@@ -1766,8 +1768,7 @@ mod tests {
 
     #[test]
     fn compose_clean_red_is_red_with_diagnostics() {
-        let p =
-            compose_hard_mode_payload(false, ProjectCheckSummary::Red { error_count: 12 });
+        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Red { error_count: 12 });
         assert_eq!(p.verdict, statusfile::Verdict::Red);
         assert_eq!(p.red_diagnostics, 12);
         assert!(
@@ -1787,7 +1788,9 @@ mod tests {
         );
         assert_eq!(p.verdict, statusfile::Verdict::Unknown);
         assert_eq!(p.red_diagnostics, 0);
-        let reason = p.analysis_failure_reason.expect("indeterminate carries reason");
+        let reason = p
+            .analysis_failure_reason
+            .expect("indeterminate carries reason");
         assert!(
             reason.starts_with("project_check_setup_error"),
             "the classifier substring (before `: `) MUST come first so \
@@ -1802,8 +1805,7 @@ mod tests {
         // Both inputs error, but project-checks have specific diagnostic
         // evidence; the composition uses that evidence rather than
         // collapsing to a generic Unknown.
-        let p =
-            compose_hard_mode_payload(true, ProjectCheckSummary::Red { error_count: 3 });
+        let p = compose_hard_mode_payload(true, ProjectCheckSummary::Red { error_count: 3 });
         assert_eq!(p.verdict, statusfile::Verdict::Red);
         assert_eq!(p.red_diagnostics, 3);
     }
