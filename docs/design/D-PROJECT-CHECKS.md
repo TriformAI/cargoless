@@ -210,6 +210,33 @@ diagnostic list is the next observability increment.
 - Timeouts are bounded by the smaller of the check timeout and the profile
   remaining budget.
 
+## Team Resource Discipline
+
+Cargoless runs in shared team environments. A local check invocation can affect
+other agents by consuming daemon CPU, project-check slots, cluster bandwidth, or
+the shared Kubernetes builder cache. Operators and agents must treat every gate
+run as shared infrastructure work, not as a private local command.
+
+Current behavior to remember: profile selection is config-driven. The branch
+protection project-check profile may run every included check even for a change
+that only edits YAML or documentation, because changed-overlay trigger pruning
+is not implemented yet. A pure-YAML branch-protection validation observed 54
+project checks. That was fast enough, but it is still real shared work.
+
+Until trigger pruning lands:
+
+- Do not repeatedly run broad profiles just to "see what happens".
+- Prefer the narrow command that answers the question: one named check, one
+  profile, or one normal merge-path invocation.
+- If a change is outside Rust/workspace-config surfaces, expect the current
+  profile to still run all included checks unless the command explicitly limits
+  it.
+- When adding checks to shared profiles, include tight `inputs`, `triggers`,
+  `timeout_ms`, and a conservative `max_parallel` expectation. A check that is
+  cheap alone can become expensive across a 20-agent fleet.
+- Treat path-trigger short-circuiting as a high-priority product improvement,
+  but do not rely on it until the implementation proves it in live gate output.
+
 ## Safety
 
 Project checks execute repository code. That is acceptable for local trusted
