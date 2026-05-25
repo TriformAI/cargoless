@@ -7,6 +7,23 @@
 - Cluster `cargoless-builder` is healthy again with a fresh `cargoless-cache` PVC.
 - Local installed binary was updated during the rollout to `cargoless 0.2.0 git=294922a19bc6 dirty=true built=1779691114`.
 
+## 2026-05-25 FSN Scale Addendum
+
+- The canonical `cargoless-serve` pod is shard 0 and stays on FSN.
+- `deploy/cargoless-serve-shards.k8s.yaml` adds three more FSN shard pods
+  (`cargoless-serve-shard-0..2`) for local-agent fan-out.
+- Each extra shard uses a disposable `triform-builder-cache-fsn` 20Gi PVC. The
+  repo is cloned on boot, so this avoids multiplying the old 150Gi workspace
+  reservation and keeps the extra capacity off HEL.
+- Local `tf-multiverse/scripts/check-remote` hashes each worktree over four
+  lanes and starts a matching loopback bridge:
+  - shard 0 -> `svc/cargoless-serve`, local port 8787
+  - shard 1 -> `pod/cargoless-serve-shard-0`, local port 8788
+  - shard 2 -> `pod/cargoless-serve-shard-1`, local port 8789
+  - shard 3 -> `pod/cargoless-serve-shard-2`, local port 8790
+- Do not pin `CARGOLESS_REMOTE=http://127.0.0.1:8787` for routine work; that
+  defeats sharding and funnels agents back through one daemon.
+
 ## What Landed
 
 - PR #12, `294922a`: minimal push overlay.
