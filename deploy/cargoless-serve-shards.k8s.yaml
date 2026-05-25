@@ -1,64 +1,51 @@
-# Central cargoless daemon for tf-multiverse.
+# Additional FSN Cargoless serve shards for local-agent fan-out.
 #
-# This is the active service counterpart to cargoless-builder.k8s.yaml:
-# - cargoless-builder is a passive sleep pod for legacy kubectl-exec cargo runs.
-# - cargoless-serve is a long-lived `cargoless serve` daemon with one warm
-#   rust-analyzer process answering changed-file overlay pushes.
+# The canonical `cargoless-serve` Deployment remains shard 0 and keeps the
+# stable Service name used by existing clients. These shard pods are addressed
+# directly by local `scripts/cargoless-cluster-bridge` port-forwards:
+#   shard 1 -> pod/cargoless-serve-shard-0
+#   shard 2 -> pod/cargoless-serve-shard-1
+#   shard 3 -> pod/cargoless-serve-shard-2
 #
-# Required out-of-band secrets:
-#
-#   kubectl -n cargoless-builder create secret generic cargoless-serve-auth \
-#     --from-literal=token="$(openssl rand -hex 32)"
-#
-#   kubectl -n cargoless-builder create secret generic forgejo-cargoless-auth \
-#     --from-literal=username=<forgejo-bot-user> \
-#     --from-literal=token=<forgejo-bot-token>
-#
-# Consumers in other namespaces need their own copy of cargoless-serve-auth;
-# Kubernetes Secrets are namespace-local.
+# Each pod owns a disposable FSN builder-cache PVC. The workspace is cloned from
+# Forgejo on boot, so losing a shard cache costs warmup time, not source data.
 ---
 apiVersion: v1
-kind: Namespace
+kind: Service
 metadata:
-  name: cargoless-builder
-  labels:
-    app.kubernetes.io/name: cargoless-builder
-    app.kubernetes.io/part-of: cargoless
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: cargoless-tf-multiverse-workspace
+  name: cargoless-serve-sharded
   namespace: cargoless-builder
   labels:
-    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/name: cargoless-serve-shard
     app.kubernetes.io/part-of: cargoless
 spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: triform-replicated-fsn-2x
-  resources:
-    requests:
-      storage: 150Gi
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cargoless-serve-shard
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
-  name: cargoless-serve
+  name: cargoless-serve-shard
   namespace: cargoless-builder
   labels:
-    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/name: cargoless-serve-shard
     app.kubernetes.io/part-of: cargoless
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  serviceName: cargoless-serve-sharded
+  replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app.kubernetes.io/name: cargoless-serve
+      app.kubernetes.io/name: cargoless-serve-shard
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: cargoless-serve
+        app.kubernetes.io/name: cargoless-serve-shard
         app.kubernetes.io/part-of: cargoless
     spec:
       nodeSelector:
@@ -98,16 +85,15 @@ spec:
               repo=/workspace/tf-multiverse
               url="https://${FORGEJO_USER}:${FORGEJO_TOKEN}@forgejo.triform.dev/triform/tf-multiverse.git"
               if [ ! -d "$repo/.git" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-                echo "[cargoless-serve] initializing repo"
+                echo "[cargoless-serve-shard] initializing repo"
                 rm -rf "$repo"
                 mkdir -p "$repo"
                 git -C "$repo" init --quiet
                 git -C "$repo" remote add origin "$url"
-                echo "[cargoless-serve] fetching origin/dev"
                 git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet
                 git -C "$repo" checkout -f --quiet origin/dev
               else
-                echo "[cargoless-serve] repo present; attempting origin/dev refresh"
+                echo "[cargoless-serve-shard] repo present; attempting origin/dev refresh"
                 if git -C "$repo" remote get-url origin >/dev/null 2>&1; then
                   git -C "$repo" remote set-url origin "$url"
                 else
@@ -116,12 +102,12 @@ spec:
                 if git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet; then
                   git -C "$repo" checkout -f --quiet origin/dev
                 else
-                  echo "[cargoless-serve] warning: origin/dev fetch failed; keeping seeded repo at $(git -C "$repo" rev-parse --short HEAD)" >&2
+                  echo "[cargoless-serve-shard] warning: origin/dev fetch failed; keeping seeded repo at $(git -C "$repo" rev-parse --short HEAD)" >&2
                 fi
               fi
               git -C "$repo" config user.email "cargoless-serve@triform.dev"
               git -C "$repo" config user.name "cargoless-serve"
-              echo "[cargoless-serve] repo ready @ $(git -C "$repo" rev-parse --short HEAD)"
+              echo "[cargoless-serve-shard] repo ready @ $(git -C "$repo" rev-parse --short HEAD)"
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
       containers:
@@ -151,30 +137,20 @@ spec:
             - name: http
               containerPort: 8787
           startupProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            httpGet: { path: /healthz, port: http }
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            httpGet: { path: /healthz, port: http }
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
+            httpGet: { path: /healthz, port: http }
             periodSeconds: 20
             failureThreshold: 3
           resources:
-            requests:
-              cpu: "4"
-              memory: 16Gi
-            limits:
-              cpu: "12"
-              memory: 48Gi
+            requests: { cpu: "4", memory: 16Gi }
+            limits: { cpu: "12", memory: 48Gi }
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
         - name: repo-sync
@@ -204,7 +180,7 @@ spec:
                     current="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
                     target="$(git -C "$repo" rev-parse origin/dev 2>/dev/null || true)"
                     if [ -n "$target" ] && [ "$current" != "$target" ]; then
-                      echo "[cargoless-serve] advancing base ${current:-unknown} -> $target"
+                      echo "[cargoless-serve-shard] advancing base ${current:-unknown} -> $target"
                       git -C "$repo" checkout -f --quiet "$target" || true
                     fi
                   fi
@@ -216,40 +192,31 @@ spec:
             limits: { cpu: "1", memory: "2Gi" }
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
-      volumes:
-        - name: workspace
-          persistentVolumeClaim:
-            claimName: cargoless-tf-multiverse-workspace
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: cargoless-serve
-  namespace: cargoless-builder
-  labels:
-    app.kubernetes.io/name: cargoless-serve
-    app.kubernetes.io/part-of: cargoless
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: cargoless-serve
-  ports:
-    - name: http
-      port: 8787
-      targetPort: http
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+        labels:
+          app.kubernetes.io/name: cargoless-serve-shard
+          app.kubernetes.io/part-of: cargoless
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: triform-builder-cache-fsn
+        resources:
+          requests:
+            storage: 20Gi
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: cargoless-serve-netpol
+  name: cargoless-serve-shard-netpol
   namespace: cargoless-builder
   labels:
-    app.kubernetes.io/name: cargoless-serve
+    app.kubernetes.io/name: cargoless-serve-shard
     app.kubernetes.io/part-of: cargoless
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: cargoless-serve
+      app.kubernetes.io/name: cargoless-serve-shard
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
