@@ -626,6 +626,7 @@ fn heartbeat_repo_status(repo_root: &Path) {
             verdict_str: Verdict::Unknown.as_str().to_string(),
             crates: Vec::new(),
             red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: cargoless_core::build_id().to_string(),
         });
@@ -1063,19 +1064,43 @@ fn exec(
             authoritative_error,
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
+            //
+            // INFRA-36: payload composition now plumbs real diagnostic
+            // counts and failure reasons through to `publish_verdict`
+            // rather than collapsing every internal failure into a bool
+            // and writing `red_diagnostics: 0` at the publish boundary.
+            // The historical liar state ("verdict=red, 0 diagnostics")
+            // is no longer constructible — `VerdictPayload::red(0)`
+            // downgrades to `Unknown` with a self-describing reason.
             let project_check_context = api.take_project_check_context(&wt.to_string_lossy());
-            match project_checks_mode() {
-                ProjectChecksMode::Off => publish_verdict(&wt, authoritative_error, api),
+            let payload = match project_checks_mode() {
+                ProjectChecksMode::Off => {
+                    // No project-check signal; the only input is the
+                    // RA-native bool. Routed through the legacy shim
+                    // which produces Green-or-Unknown (never an
+                    // unattributed Red).
+                    statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
+                }
                 ProjectChecksMode::Warn => {
-                    publish_verdict(&wt, authoritative_error, api);
-                    spawn_project_checks_warn(wt, project_check_context, Arc::clone(api));
+                    // Warn mode: RA-native is the publish input;
+                    // project-checks run advisory in a background
+                    // thread (logged + telemetered, but cannot change
+                    // the published verdict by design).
+                    spawn_project_checks_warn(wt.clone(), project_check_context, Arc::clone(api));
+                    statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
                 }
                 ProjectChecksMode::Hard => {
-                    let project_check_error =
-                        run_project_checks_and_log(&wt, project_check_context, api);
-                    publish_verdict(&wt, authoritative_error || project_check_error, api);
+                    // Hard mode: both inputs compose. The merge rule
+                    // is "any Red wins; otherwise any Unknown wins;
+                    // else Green" — and crucially, each non-Green
+                    // outcome carries its own evidence (RA-native:
+                    // analysis_failure_reason; project-checks: real
+                    // error_count or its own classifier).
+                    let summary = run_project_checks_and_log(&wt, project_check_context, api);
+                    compose_hard_mode_payload(authoritative_error, summary)
                 }
-            }
+            };
+            publish_verdict(&wt, payload, api);
         }
     }
 }
@@ -1161,15 +1186,13 @@ fn spawn_ra_native_settle(
 /// authoritative write-plane.
 fn publish_verdict(
     wt: &Path,
-    authoritative_error: bool,
+    payload: statusfile::VerdictPayload,
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
-    let verdict = if authoritative_error {
-        Verdict::Red
-    } else {
-        Verdict::Green
-    };
     let now = statusfile::now_unix();
+    let verdict = payload.verdict;
+    let red_diagnostics = payload.red_diagnostics;
+    let failure_reason = payload.analysis_failure_reason.clone();
     // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
     // This span MUST be the only emission of `verdict.publish`, mirroring
     // the structural invariant that publish_verdict is called from exactly
@@ -1177,14 +1200,35 @@ fn publish_verdict(
     // emission seam introducing a non-EmitVerdict path would by-pass this
     // span site → loud telemetry signal at the type-system level (Layer-2
     // keystone criterion at the OTEL surface).
+    //
+    // INFRA-36 enrichment (2026-05-25): `red_diagnostics` and
+    // `verdict_failure_reason` are now first-class span attributes so a
+    // SigNoz query can answer "did the daemon emit a Red without
+    // backing evidence?" — historically that produced silent
+    // mis-attribution; the `VerdictPayload` constructor now refuses it
+    // statically, so a non-zero count surfacing on `verdict=red` (and a
+    // populated `verdict_failure_reason` surfacing on `verdict=unknown`)
+    // becomes the load-bearing telemetry contract.
+    let otel_status = match verdict {
+        statusfile::Verdict::Green => "OK",
+        // Both Red and Unknown represent the daemon-side error condition
+        // worth surfacing in SigNoz's `hasError=true` filter — the
+        // distinction is then made by reading `verdict_color` +
+        // `verdict_failure_reason`. Treating them both as ERROR keeps
+        // operators from missing Unknown verdicts (the new, honest
+        // failure mode) in the same dashboards that currently page on Red.
+        statusfile::Verdict::Red | statusfile::Verdict::Unknown => "ERROR",
+    };
     let _span = tracing::info_span!(
         "verdict.publish",
         worktree = %wt.display(),
         verdict_color = verdict.as_str(),
+        red_diagnostics = red_diagnostics,
+        verdict_failure_reason = failure_reason.as_deref().unwrap_or(""),
         pid = std::process::id(),
         trigger_source = "EmitVerdict",
         analysed_at = now,
-        otel.status_code = if authoritative_error { "ERROR" } else { "OK" },
+        otel.status_code = otel_status,
     )
     .entered();
     let st = Status {
@@ -1194,7 +1238,12 @@ fn publish_verdict(
         updated: now,
         verdict_str: verdict.as_str().to_string(),
         crates: Vec::new(),
-        red_diagnostics: 0,
+        red_diagnostics,
+        // INFRA-36: persist the failure reason to the on-disk
+        // statusfile so `cargoless status` renders an honest
+        // `verdict=unknown (reason: ...)` summary instead of a
+        // bare `unknown` that asks the operator to go fishing.
+        verdict_failure_reason: failure_reason.clone().unwrap_or_default(),
         // #247 obs: analysed_at = settle-observed instant (Judgment B sole
         // attribution site = the moment the wire reached this arm). For
         // the current single-write path, analysed_at == updated; the
@@ -1206,15 +1255,17 @@ fn publish_verdict(
     };
     statusfile::write(wt, &st);
     eprintln!(
-        "[cargoless:obs] verdict-emit wt={} verdict={} analysed_at={} (#247)",
+        "[cargoless:obs] verdict-emit wt={} verdict={} red_diagnostics={} reason={} analysed_at={} (#247,INFRA-36)",
         wt.display(),
         verdict.as_str(),
+        red_diagnostics,
+        failure_reason.as_deref().unwrap_or("-"),
         now
     );
     // Same site, mirror sink: feed the read-plane VerdictService + emit
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.
-    api.publish(wt, authoritative_error);
+    api.publish(wt, payload);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1236,6 +1287,43 @@ fn project_checks_mode() -> ProjectChecksMode {
     }
 }
 
+/// Compose a `VerdictPayload` from the RA-native bool + the
+/// project-checks summary, under the INFRA-36 honesty contract.
+///
+/// Precedence: real `Red` wins over `Unknown` wins over `Green`. Each
+/// non-Green branch carries the most-specific evidence available.
+///
+/// * RA-native `authoritative_error == true` AND project-checks
+///   `Red { n }` → `Red(n)` (the project-check diagnostics are the
+///   accountable evidence; the RA-native bool, having no diagnostic
+///   detail of its own, is subsumed).
+/// * RA-native `authoritative_error == true` AND project-checks Green /
+///   Empty / Indeterminate → `Unknown("ra_native_unattributed_error")`
+///   (we can't synthesize a Red without diagnostics; the project-checks
+///   side either has nothing or has its own Indeterminate which is
+///   composed in the next arm).
+/// * RA-native clean AND project-checks `Red { n }` → `Red(n)`.
+/// * RA-native clean AND project-checks `Indeterminate { reason, .. }`
+///   → `Unknown(reason)` — gate didn't run, so it didn't vote.
+/// * Both clean → `Green`.
+fn compose_hard_mode_payload(
+    authoritative_error: bool,
+    summary: ProjectCheckSummary,
+) -> statusfile::VerdictPayload {
+    use statusfile::VerdictPayload;
+    match (authoritative_error, summary) {
+        (_, ProjectCheckSummary::Red { error_count }) => VerdictPayload::red(error_count),
+        (
+            _,
+            ProjectCheckSummary::Indeterminate { reason, detail },
+        ) => VerdictPayload::unknown(format!("{reason}: {detail}")),
+        (true, _) => VerdictPayload::unknown("ra_native_unattributed_error"),
+        (false, ProjectCheckSummary::Green) | (false, ProjectCheckSummary::Empty) => {
+            VerdictPayload::green()
+        }
+    }
+}
+
 fn spawn_project_checks_warn(
     wt: PathBuf,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
@@ -1245,12 +1333,25 @@ fn spawn_project_checks_warn(
     if let Err(e) = std::thread::Builder::new()
         .name("cargoless-project-checks-warn".to_string())
         .spawn(move || {
-            let red = run_project_checks_and_log(&wt, context, &api);
+            let summary = run_project_checks_and_log(&wt, context, &api);
             eprintln!(
-                "[cargoless:obs] project-checks-warn wt={} gate=false observed_red={}",
+                "[cargoless:obs] project-checks-warn wt={} gate=false summary={}",
                 wt.display(),
-                red
+                match &summary {
+                    ProjectCheckSummary::Green => "green".to_string(),
+                    ProjectCheckSummary::Empty => "empty".to_string(),
+                    ProjectCheckSummary::Red { error_count } => {
+                        format!("red(errors={error_count})")
+                    }
+                    ProjectCheckSummary::Indeterminate { reason, .. } => {
+                        format!("unknown({reason})")
+                    }
+                }
             );
+            // Don't shadow the verdict in warn mode — the only
+            // observable contract is the eprintln + the (already
+            // emitted) verdict.project_checks span.
+            let _ = summary;
         })
     {
         eprintln!(
@@ -1260,11 +1361,46 @@ fn spawn_project_checks_warn(
     }
 }
 
+/// Outcome of a Hard-mode project-checks run, in a shape that
+/// `publish_verdict` can compose with the RA-native verdict to produce
+/// an honest `VerdictPayload`.
+///
+/// **INFRA-36 contract:** the historical return type was a bare
+/// `bool` ("did anything go wrong?") that collapsed three distinct
+/// truths into one signal — real per-check violations, internal
+/// setup errors, and overlay-apply errors all became "Red" with no
+/// diagnostic count. The new type keeps them distinct so:
+///
+///   * real per-check violations → `Red` with the actual error count
+///   * setup / overlay errors → `Unknown` with a classifier reason
+///     (`project_check_setup_error` / `project_check_overlay_error`)
+///   * no checks ran → `Green` (no signal to publish)
+///
+/// SigNoz dashboards then group on `verdict_failure_reason` to
+/// separate "the gate is doing its job" from "the daemon couldn't
+/// run the gate at all".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectCheckSummary {
+    /// Checks ran cleanly and the tree is green.
+    Green,
+    /// Checks ran and at least one required check failed; `error_count`
+    /// is the count of error-severity diagnostics.
+    Red { error_count: u32 },
+    /// Checks could not run (manifest load error, overlay-apply error,
+    /// etc.). `reason` is the stable classifier; `detail` is the
+    /// human-readable tail for diagnosis. Maps to `Verdict::Unknown`,
+    /// NOT `Red` — the gate did not evaluate, so it cannot vote.
+    Indeterminate { reason: &'static str, detail: String },
+    /// No checks were selected (empty profile, no triggers matched).
+    /// Treated as green for verdict purposes — nothing to gate on.
+    Empty,
+}
+
 fn run_project_checks_and_log(
     wt: &Path,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
     api: &Arc<crate::serveapi::ServeVerdictState>,
-) -> bool {
+) -> ProjectCheckSummary {
     let root = context.as_ref().map(|ctx| ctx.root.as_path()).unwrap_or(wt);
     let changed_files = context
         .as_ref()
@@ -1278,24 +1414,51 @@ fn run_project_checks_and_log(
             changed_files,
         )),
     };
+    // INFRA-36 span: complementary to verdict.publish, scoped to the
+    // project-checks layer. Lets SigNoz reconstruct "what did the gate
+    // actually compute?" independent of "what verdict did the daemon
+    // publish?" — the two should agree, and a divergence is itself a
+    // bug worth alerting on.
+    let _span = tracing::info_span!(
+        "verdict.project_checks",
+        worktree = %wt.display(),
+        root = %root.display(),
+    )
+    .entered();
     match report {
-        Ok(Ok(report)) if report.results.is_empty() && report.skipped.is_empty() => false,
+        Ok(Ok(report)) if report.results.is_empty() && report.skipped.is_empty() => {
+            tracing::info!(outcome = "empty", "no project checks selected");
+            ProjectCheckSummary::Empty
+        }
         Ok(Ok(report)) => {
             let cache_hits = report.results.iter().filter(|r| r.cache_hit).count();
             let slowest = slowest_project_checks(&report.results);
+            let error_count = report
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == cargoless_core::Severity::Error)
+                .count() as u32;
+            let tree_red = report.tree == cargoless_core::TreeState::Red;
+            tracing::info!(
+                outcome = if tree_red { "red" } else { "green" },
+                checks = report.results.len(),
+                skipped = report.skipped.len(),
+                cache_hits = cache_hits,
+                duration_ms = report.duration_ms as u64,
+                error_count = error_count,
+                slowest = %slowest,
+                "project checks completed"
+            );
             eprintln!(
-                "[cargoless:obs] project-checks wt={} root={} verdict={} checks={} skipped={} cache_hits={} duration_ms={} slowest={}",
+                "[cargoless:obs] project-checks wt={} root={} verdict={} checks={} skipped={} cache_hits={} duration_ms={} error_count={} slowest={}",
                 wt.display(),
                 root.display(),
-                if report.tree == cargoless_core::TreeState::Red {
-                    "red"
-                } else {
-                    "green"
-                },
+                if tree_red { "red" } else { "green" },
                 report.results.len(),
                 report.skipped.len(),
                 cache_hits,
                 report.duration_ms,
+                error_count,
                 slowest
             );
             for diagnostic in report
@@ -1313,24 +1476,67 @@ fn run_project_checks_and_log(
                     diagnostic.message.lines().next().unwrap_or("")
                 );
             }
-            report.tree == cargoless_core::TreeState::Red
+            if tree_red {
+                // Defensive: if the tree is Red the error_count should
+                // be > 0 (per `result_from_diags` in cargoless-core,
+                // which enforces it at the per-check layer). If it
+                // somehow isn't, route through Indeterminate rather
+                // than fabricating a Red — this is the parallel of
+                // `VerdictPayload::red(0)`'s downgrade at the
+                // project-check layer.
+                if error_count == 0 {
+                    ProjectCheckSummary::Indeterminate {
+                        reason: "project_check_red_without_diagnostics",
+                        detail: format!(
+                            "tree=red but error_count=0 across {} results",
+                            report.results.len()
+                        ),
+                    }
+                } else {
+                    ProjectCheckSummary::Red { error_count }
+                }
+            } else {
+                ProjectCheckSummary::Green
+            }
         }
         Ok(Err(e)) => {
+            // Setup error: manifest load failed, etc. The gate could
+            // not evaluate; the honest verdict is Indeterminate, NOT
+            // Red. The reason classifier `project_check_setup_error`
+            // is the SigNoz dashboard query key.
+            tracing::warn!(
+                outcome = "indeterminate",
+                reason = "project_check_setup_error",
+                error = %e,
+                "project checks setup failed"
+            );
             eprintln!(
-                "[cargoless:obs] project-checks wt={} verdict=red setup_error={}",
+                "[cargoless:obs] project-checks wt={} verdict=unknown setup_error={}",
                 wt.display(),
                 e
             );
-            true
+            ProjectCheckSummary::Indeterminate {
+                reason: "project_check_setup_error",
+                detail: e.to_string(),
+            }
         }
         Err(e) => {
+            tracing::warn!(
+                outcome = "indeterminate",
+                reason = "project_check_overlay_error",
+                error = %e,
+                "project checks overlay-apply failed"
+            );
             eprintln!(
-                "[cargoless:obs] project-checks wt={} root={} verdict=red overlay_error={}",
+                "[cargoless:obs] project-checks wt={} root={} verdict=unknown overlay_error={}",
                 wt.display(),
                 root.display(),
                 e
             );
-            true
+            ProjectCheckSummary::Indeterminate {
+                reason: "project_check_overlay_error",
+                detail: e.to_string(),
+            }
         }
     }
 }
@@ -1528,5 +1734,119 @@ mod tests {
             early_red_event(ev),
             LspEvent::FlycheckFailed { message } if message.contains("file:///repo/wt/src/lib.rs")
         ));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // INFRA-36 — compose_hard_mode_payload truth table
+    //
+    // The core composition rule that closes the recurrence class:
+    //   * Red payload requires real diagnostics (per-check error count).
+    //   * Unknown payload carries a specific reason classifier.
+    //   * The historical "RA-native errored, no project-check signal" path
+    //     no longer produces an undocumented Red — it produces an Unknown
+    //     with `ra_native_unattributed_error` so SigNoz can surface the
+    //     low-quality verdict for follow-up.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn compose_clean_clean_is_green() {
+        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Green);
+        assert_eq!(p.verdict, statusfile::Verdict::Green);
+        assert_eq!(p.red_diagnostics, 0);
+        assert!(p.analysis_failure_reason.is_none());
+    }
+
+    #[test]
+    fn compose_clean_empty_is_green() {
+        // Empty project-checks (no selected) is treated as silent —
+        // nothing to gate on. Green is the right composition.
+        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Empty);
+        assert_eq!(p.verdict, statusfile::Verdict::Green);
+    }
+
+    #[test]
+    fn compose_clean_red_is_red_with_diagnostics() {
+        let p =
+            compose_hard_mode_payload(false, ProjectCheckSummary::Red { error_count: 12 });
+        assert_eq!(p.verdict, statusfile::Verdict::Red);
+        assert_eq!(p.red_diagnostics, 12);
+        assert!(
+            p.analysis_failure_reason.is_none(),
+            "a real Red carries diagnostics — not a reason classifier"
+        );
+    }
+
+    #[test]
+    fn compose_clean_indeterminate_is_unknown_with_classifier() {
+        let p = compose_hard_mode_payload(
+            false,
+            ProjectCheckSummary::Indeterminate {
+                reason: "project_check_setup_error",
+                detail: "manifest not found".to_string(),
+            },
+        );
+        assert_eq!(p.verdict, statusfile::Verdict::Unknown);
+        assert_eq!(p.red_diagnostics, 0);
+        let reason = p.analysis_failure_reason.expect("indeterminate carries reason");
+        assert!(
+            reason.starts_with("project_check_setup_error"),
+            "the classifier substring (before `: `) MUST come first so \
+             SigNoz dashboards can group on it without parsing the \
+             whole reason string. Got: {reason}"
+        );
+        assert!(reason.contains("manifest not found"));
+    }
+
+    #[test]
+    fn compose_ra_native_error_with_project_checks_red_takes_real_diagnostics() {
+        // Both inputs error, but project-checks have specific diagnostic
+        // evidence; the composition uses that evidence rather than
+        // collapsing to a generic Unknown.
+        let p =
+            compose_hard_mode_payload(true, ProjectCheckSummary::Red { error_count: 3 });
+        assert_eq!(p.verdict, statusfile::Verdict::Red);
+        assert_eq!(p.red_diagnostics, 3);
+    }
+
+    #[test]
+    fn compose_ra_native_error_alone_is_unknown_not_red() {
+        // **The INFRA-36 keystone test.** Historical behavior: this
+        // exact input produced `verdict=red, red_diagnostics=0` — the
+        // liar state. New behavior: `Unknown(ra_native_unattributed_error)`
+        // so the operator can distinguish "the gate is broken" from
+        // "the code is broken".
+        for summary in [ProjectCheckSummary::Green, ProjectCheckSummary::Empty] {
+            let p = compose_hard_mode_payload(true, summary);
+            assert_eq!(
+                p.verdict,
+                statusfile::Verdict::Unknown,
+                "RA-native bool-only error MUST NOT synthesize a Red — \
+                 there are no diagnostics to back it"
+            );
+            assert_eq!(
+                p.analysis_failure_reason.as_deref(),
+                Some("ra_native_unattributed_error"),
+                "the classifier `ra_native_unattributed_error` is the \
+                 SigNoz query key for the historical liar-state path \
+                 — it must remain stable across releases"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_ra_native_error_with_project_checks_indeterminate_is_unknown_with_pc_reason() {
+        // Both sides Indeterminate: the project-check classifier is
+        // more specific than the bare RA-native bool, so it wins.
+        let p = compose_hard_mode_payload(
+            true,
+            ProjectCheckSummary::Indeterminate {
+                reason: "project_check_overlay_error",
+                detail: "PVC ENOSPC".to_string(),
+            },
+        );
+        assert_eq!(p.verdict, statusfile::Verdict::Unknown);
+        let reason = p.analysis_failure_reason.expect("indeterminate");
+        assert!(reason.starts_with("project_check_overlay_error"));
+        assert!(reason.contains("PVC ENOSPC"));
     }
 }

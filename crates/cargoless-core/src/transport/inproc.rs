@@ -150,6 +150,7 @@ pub(crate) mod testmock {
                         verdict: "green".into(),
                     }],
                     red_diagnostics: 0,
+                    verdict_failure_reason: None,
                     heartbeat_age_secs: 1,
                     published_at: 1000,
                 }),
@@ -162,6 +163,7 @@ pub(crate) mod testmock {
                     // wire).
                     crates: vec![],
                     red_diagnostics: 1,
+                    verdict_failure_reason: None,
                     heartbeat_age_secs: 0,
                     published_at: 1001,
                 }),
@@ -236,6 +238,7 @@ mod tests {
             worktree: "red-wt".into(),
             verdict: "red".into(),
             red_diagnostics: 1,
+            verdict_failure_reason: None,
             published_at: 7,
         };
         svc.emit(ev.clone());

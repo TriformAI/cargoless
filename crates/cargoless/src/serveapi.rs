@@ -170,19 +170,31 @@ impl ServeVerdictState {
     /// the in-memory status map AND fans out one [`TransitionEvent`]
     /// (subscribe-emit, plan 0b). One real verdict ⇒ one map update ⇒ one
     /// event; never a fabricated transition.
-    pub fn publish(&self, wt: &Path, authoritative_error: bool) {
+    ///
+    /// **INFRA-36:** payload-shaped (was `authoritative_error: bool`).
+    /// The SSE mirror now reflects the same honest verdict + diagnostic
+    /// count + failure reason that `publish_verdict` writes to the
+    /// statusfile — a remote `subscribe` client sees what a local
+    /// `status` reader sees, instead of every error condition
+    /// collapsing into `verdict=red, red_diagnostics=0`.
+    pub fn publish(&self, wt: &Path, payload: crate::statusfile::VerdictPayload) {
         let worktree = wt.to_string_lossy().into_owned();
-        let verdict = if authoritative_error { "red" } else { "green" };
+        let verdict_color = payload.verdict.as_str().to_string();
+        let red_diagnostics = payload.red_diagnostics;
+        let failure_reason = payload.analysis_failure_reason.clone();
         let published_at = crate::statusfile::now_unix();
         let status = WorktreeStatus {
             worktree: worktree.clone(),
-            verdict: verdict.to_string(),
+            verdict: verdict_color.clone(),
             daemon_build_id: cargoless_core::build_id().to_string(),
-            // Honest Inc-0 boundary: identical to the zeros the durable
-            // `statusfile`/`publish_verdict` path already writes (see
-            // module doc). Not fabricated detail.
+            // Per-crate roll-up is still empty here (the publish path
+            // doesn't have the cratemap context — that lives in
+            // `build.rs::write_status`); the load-bearing change is
+            // that `red_diagnostics` and `verdict_failure_reason` are
+            // now honest scalars from the payload, NOT hardcoded zeros.
             crates: Vec::new(),
-            red_diagnostics: 0,
+            red_diagnostics,
+            verdict_failure_reason: failure_reason.clone(),
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -191,8 +203,9 @@ impl ServeVerdictState {
         poisoned(&self.statuses).insert(worktree.clone(), status);
         let ev = TransitionEvent {
             worktree: worktree.clone(),
-            verdict: verdict.to_string(),
-            red_diagnostics: 0,
+            verdict: verdict_color,
+            red_diagnostics,
+            verdict_failure_reason: failure_reason,
             published_at,
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
@@ -696,7 +709,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80)); // subscriber registers
 
         // ── tree state 1: GREEN ──────────────────────────────────────
-        api.publish(wt, /*authoritative_error=*/ false);
+        api.publish(wt, crate::statusfile::VerdictPayload::green());
         let local_v = api.get_verdict(&key);
         let remote_v = client.get_verdict(&key).expect("remote get_verdict");
         assert_eq!(local_v.as_deref(), Some("green"), "local sees GREEN");
@@ -717,7 +730,9 @@ mod tests {
         );
 
         // ── tree state 2: RED (same wt — a real transition) ───────────
-        api.publish(wt, /*authoritative_error=*/ true);
+        // INFRA-36: red MUST be backed by a real diagnostic count; the
+        // test publishes 1 to exercise the non-empty path.
+        api.publish(wt, crate::statusfile::VerdictPayload::red(1));
         let local_s = api.get_status(&key).map(|s| s.verdict);
         let remote_s = client
             .get_status(&key)
@@ -753,13 +768,69 @@ mod tests {
 
     #[test]
     fn get_diagnostics_is_honest_empty_inc0_boundary() {
-        // The stated Inc-0 boundary, pinned: no fabricated diagnostics —
-        // empty is the correct answer for the state the loop computes.
+        // **INFRA-36 update (was: Inc-0 boundary):** the diagnostics
+        // *list* (per-diag detail) is still not retained at the
+        // serveapi layer — that's a later increment as the original
+        // contract said. But the *count* (`red_diagnostics` on
+        // `WorktreeStatus`) is now honest: when the publish path
+        // supplies a real count, `get_status` returns it.
+        //
+        // This test now pins two things:
+        //   1. The per-diagnostic detail list is still empty here
+        //      (the increment-0 boundary the original test guarded).
+        //   2. But `red_diagnostics` is the real count, NOT 0 — the
+        //      INFRA-36 invariant that closes the "verdict=red, 0
+        //      diagnostics" liar state.
         let api = ServeVerdictState::new();
-        api.publish(Path::new("/r/wt"), true);
+        api.publish(
+            Path::new("/r/wt"),
+            crate::statusfile::VerdictPayload::red(5),
+        );
         assert!(
             api.get_diagnostics("/r/wt").is_empty(),
-            "Inc-0: diagnostics-retention wiring is a later increment"
+            "per-diagnostic detail list is not retained at this layer \
+             (the original Inc-0 boundary still holds)"
+        );
+        let status = api.get_status("/r/wt").expect("status present");
+        assert_eq!(status.verdict, "red");
+        assert_eq!(
+            status.red_diagnostics, 5,
+            "INFRA-36: red_diagnostics MUST reflect the count supplied \
+             at publish time — not the historical hardcoded 0 that \
+             produced the verdict=red,0-diagnostics liar state"
+        );
+        assert!(
+            status.verdict_failure_reason.is_none(),
+            "a real Red verdict carries no failure reason — the reason \
+             is the populated-vs-empty diagnostic count itself"
+        );
+    }
+
+    #[test]
+    fn publish_unknown_payload_carries_reason_on_wire() {
+        // **INFRA-36 invariant test:** the new `Unknown` verdict path
+        // — what the daemon publishes when project-checks couldn't
+        // evaluate, or when RA-native reported an unattributed error
+        // — must surface on the SSE-mirror state with both the
+        // verdict color and the reason classifier. SigNoz dashboards
+        // / a remote `subscribe` client both depend on these being
+        // honest.
+        let api = ServeVerdictState::new();
+        api.publish(
+            Path::new("/r/wt-broken"),
+            crate::statusfile::VerdictPayload::unknown("project_check_setup_error: oops"),
+        );
+        let status = api
+            .get_status("/r/wt-broken")
+            .expect("status present");
+        assert_eq!(status.verdict, "unknown");
+        assert_eq!(status.red_diagnostics, 0);
+        assert_eq!(
+            status.verdict_failure_reason.as_deref(),
+            Some("project_check_setup_error: oops"),
+            "INFRA-36: the SSE-mirror state MUST carry the reason \
+             classifier so a remote subscriber sees the same honest \
+             answer the local `cargoless status` reader sees"
         );
     }
 
@@ -1119,7 +1190,7 @@ mod tests {
             "publishing the accepted push's verdict is the drain boundary"
         );
 
-        api.publish(Path::new("/wt"), false);
+        api.publish(Path::new("/wt"), crate::statusfile::VerdictPayload::green());
         assert_eq!(
             api.daemon_activity(),
             DaemonActivity {
