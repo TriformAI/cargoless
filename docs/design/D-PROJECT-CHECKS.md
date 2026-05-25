@@ -201,8 +201,9 @@ diagnostic list is the next observability increment.
   improvement.
 - The current implementation selects checks by profile and reuses a cached
   result when the manifest, check definition, profile, and input fingerprints
-  match. `triggers` are presently used as the input set when `inputs` is
-  omitted; changed-overlay trigger pruning is a follow-up optimization.
+  match. `triggers` are used for changed-file pruning when the caller supplies
+  a changed-file set (`cargoless checks run --base <ref>` or pushed daemon
+  context); when `inputs` is omitted, `triggers` are also used as the input set.
 - A cached green can be reused only when the cache key includes every file in
   `inputs` and the `command` argv.
 - Required checks with no cache entry run, so a new worktree never gets a
@@ -217,25 +218,26 @@ other agents by consuming daemon CPU, project-check slots, cluster bandwidth, or
 the shared Kubernetes builder cache. Operators and agents must treat every gate
 run as shared infrastructure work, not as a private local command.
 
-Current behavior to remember: profile selection is config-driven. The branch
-protection project-check profile may run every included check even for a change
-that only edits YAML or documentation, because changed-overlay trigger pruning
-is not implemented yet. A pure-YAML branch-protection validation observed 54
-project checks. That was fast enough, but it is still real shared work.
+Current behavior to remember: profile selection is config-driven unless the
+caller supplies changed-file context. A branch-protection command that runs
+`cargoless checks run --profile <name>` with no `--base` must run every included
+check, even for YAML or documentation-only changes. A pure-YAML branch-
+protection validation observed 54 project checks before the standalone CLI had
+`--base` pruning. That was fast enough, but it was still real shared work.
 
-Until trigger pruning lands:
+For shared gate paths:
 
 - Do not repeatedly run broad profiles just to "see what happens".
 - Prefer the narrow command that answers the question: one named check, one
   profile, or one normal merge-path invocation.
-- If a change is outside Rust/workspace-config surfaces, expect the current
-  profile to still run all included checks unless the command explicitly limits
-  it.
+- For branch-diff validations, use `cargoless checks run --profile <name>
+  --base <ref>` so Cargoless can skip untriggered checks and print the changed
+  scope in the verdict line.
 - When adding checks to shared profiles, include tight `inputs`, `triggers`,
   `timeout_ms`, and a conservative `max_parallel` expectation. A check that is
   cheap alone can become expensive across a 20-agent fleet.
-- Treat path-trigger short-circuiting as a high-priority product improvement,
-  but do not rely on it until the implementation proves it in live gate output.
+- Treat any `scope=full` output in branch-protection automation as a resource
+  smell unless the full profile is intentional.
 
 ## Safety
 

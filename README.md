@@ -317,6 +317,15 @@ $ cargoless push --remote http://127.0.0.1:8787 \
     --await-verdict
 ```
 
+Project checks can also run against a branch diff. Shared gate automation
+should pass `--base` so Cargoless can skip checks whose triggers do not match
+the changed paths:
+
+```bash
+$ cargoless checks run --profile dev --base origin/dev
+ok project checks green — 4 checks evaluated, 50 skipped (...) [scope=changed ...]
+```
+
 You do **not** run `cargoless watch` in each worktree at fleet scale —
 that is the per-tree daemon model `serve --repo` replaces. `watch`
 remains the single-worktree path for a one-off project.
