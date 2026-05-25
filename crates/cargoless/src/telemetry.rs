@@ -4,9 +4,25 @@
 //! pure data). Stands up the `tracing` ↔ `opentelemetry_sdk` ↔ OTLP-exporter
 //! stack per the canonical SigNoz Rust OTel guide:
 //!
-//! * Transport: **OTLP HTTP/protobuf via async `reqwest-client`** (not
-//!   `grpc-tonic`). Wire-shape equivalent at the SigNoz collector; matches
-//!   the documented vendor path.
+//! * Transport: **OTLP HTTP/protobuf via blocking `reqwest-blocking-client`**
+//!   (not `grpc-tonic`, not async `reqwest-client`). Wire-shape equivalent
+//!   at the SigNoz collector; matches the documented vendor path. The
+//!   **blocking** client is load-bearing — see INFRA-49 follow-up below.
+//!
+//! ## INFRA-49 — why blocking transport
+//!
+//! The simple-exporter (chosen over batch-exporter to sidestep the
+//! BatchSpanProcessor's "no reactor running" panic — see comment at
+//! `try_init`'s `with_simple_exporter` call) exports spans synchronously
+//! inline on each span emit. With the async `reqwest-client` feature,
+//! that export tries to drive a `.send().await` future from cargoless's
+//! main worker thread, which is NOT inside the Tokio runtime context
+//! (the runtime guards init+shutdown, not the daemon's verdict-emit
+//! loop) — same "no reactor running" panic class as the batch case,
+//! caught by a different code path. The blocking client uses
+//! `reqwest::blocking::Client` which has no runtime requirement at
+//! call time. ~1-2ms per export to the in-cluster signoz collector;
+//! verdict cadence is seconds, so the cost is negligible.
 //! * Runtime: **tokio current-thread**, owned by `serve.rs` via
 //!   `runtime.block_on(async { ... })`. The daemon's existing sync code
 //!   runs unchanged inside the async context — tokio is the substrate the
