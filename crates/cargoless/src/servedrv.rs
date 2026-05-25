@@ -151,7 +151,7 @@ fn ra_native_verdict_mode() -> bool {
                 || v.eq_ignore_ascii_case("advisory")
                 || v.eq_ignore_ascii_case("development")
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn ready_after_respawn_for_modes(push_only: bool, ra_native: bool) -> bool {
@@ -1038,32 +1038,30 @@ fn exec(
                     }
                 }
             }
-            // Default mode still uses the flycheck/cargo barrier. In
-            // CARGOLESS_VERDICT_MODE=ra, tf-multiverse explicitly replaces
-            // iterative cargo check/clippy with RA-native continuous verdicts:
-            // no didSave/runFlycheck, no direct Cargo subprocess. A delayed
-            // synthetic settle lets RA publish diagnostics for the just-applied
-            // overlay before the existing barrier publishes the worktree bit.
-            if pushed_check_profile.is_none() {
-                if ra_native_verdict_mode() {
-                    spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
-                } else {
-                    let save = save_trigger_path(&wt, pending_batch, &pairs);
-                    let save = save.to_string_lossy();
-                    let _ = lsp.did_save(&save);
-                    let _ = lsp.run_flycheck(&save);
-                    spawn_direct_cargo_check(&wt, cs.cluster.clone(), cs.lsp_tx.clone(), None);
-                }
-            } else {
-                // Profiled push is now reserved for explicit compile/build
-                // gates. It remains available, but check-remote/clippy-remote
-                // no longer use it in the replacement flow.
-                spawn_direct_cargo_check(
-                    &wt,
-                    cs.cluster.clone(),
-                    cs.lsp_tx.clone(),
-                    pushed_check_profile,
+            // Cargoless replaces iterative cargo check/clippy; pushed Cargo
+            // selectors are compatibility metadata, not an execution request.
+            // They must not create a minute-scale direct Cargo lane inside
+            // the daemon.
+            if pushed_check_profile.is_some() {
+                eprintln!(
+                    "[cargoless:obs] pushed-check-profile-ignored wt={} replacement=ra-native (#tfmv)",
+                    wt.display()
                 );
+            }
+            // The default replacement verdict path has no didSave/runFlycheck
+            // and no direct Cargo subprocess. The historical flycheck/cargo
+            // barrier remains only for explicit legacy deployments.
+            // A delayed synthetic settle lets RA publish diagnostics for the
+            // just-applied overlay before the existing barrier publishes the
+            // worktree bit.
+            if ra_native_verdict_mode() || pushed_check_profile.is_some() {
+                spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
+            } else {
+                let save = save_trigger_path(&wt, pending_batch, &pairs);
+                let save = save.to_string_lossy();
+                let _ = lsp.did_save(&save);
+                let _ = lsp.run_flycheck(&save);
+                spawn_direct_cargo_check(&wt, cs.cluster.clone(), cs.lsp_tx.clone(), None);
             }
         }
         ClusterAction::EmitVerdict {
