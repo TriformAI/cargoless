@@ -73,24 +73,24 @@ struct Opts {
     /// `disabled` (force off — non-proc-macro projects, max savings).
     /// Plumbed via `TF_PROC_MACRO` env to `cargoless_core::lsp::InitOpts`.
     proc_macro: Option<String>,
-    /// #74 RA weight-shedding: cargo features to enable in RA's
-    /// cargo-check invocation. Comma/space-separated. Plumbed via
-    /// `TF_FEATURES` env.
+    /// #74 RA weight-shedding: feature set for RA analysis.
+    /// Comma/space-separated. Plumbed via `TF_FEATURES` env.
     features: Option<String>,
-    /// Cargo package selector for RA's cargo-check invocation. Mirrors
-    /// `cargo check -p <pkg>` and the tf-multiverse `check-remote` surface.
+    /// Package selector for RA analysis. Mirrors the tf-multiverse
+    /// `check-remote` surface without turning `push` into a Cargo wrapper.
     package: Option<String>,
-    /// Cargo target triple for RA's cargo-check invocation.
+    /// Target triple for RA analysis.
     target: Option<String>,
-    /// Cargo `--no-default-features` for RA's cargo-check invocation.
+    /// Disable default features for RA analysis.
     no_default_features: bool,
-    /// Cargo `--release` for RA's cargo-check invocation.
+    /// Release-profile hint for RA analysis.
     release: bool,
-    /// `push --cargo-subcommand check|clippy` — the authoritative direct
-    /// Cargo command the daemon should run for this pushed profile.
+    /// Compatibility marker accepted from old `check-remote` callers.
+    /// `push` never treats this as permission to run Cargo; Cargoless is the
+    /// replacement verdict path, not a Cargo wrapper.
     cargo_subcommand: Option<CargoSubcommand>,
-    /// Extra Cargo selectors forwarded to the daemon's direct `cargo check`
-    /// or `cargo clippy` command for pushed profiles.
+    /// Compatibility selectors accepted from old `check-remote` callers.
+    /// They are parsed so callers do not fail, but ignored by `push`.
     cargo_extra_args: Vec<String>,
     // ── Model R Stream B #3 `serve` flags ───────────────────────────
     // Plain Option-of-value (no clap types): main builds a
@@ -384,18 +384,14 @@ fn usage() {
         "                        (default auto = Cargo.toml-scan picks; \
          also TF_PROC_MACRO env)"
     );
-    println!("  --features <FEATS>    cargo features for RA's check (comma/space-separated;");
+    println!("  --features <FEATS>    feature set for RA analysis (comma/space-separated;");
     println!("                        also TF_FEATURES env)");
-    println!("  -p, --package <PKG>   cargo package for RA's check (TF_CHECK_PACKAGE)");
-    println!("  --target <TRIPLE>     cargo target for RA's check (TF_CHECK_TARGET)");
-    println!("  --release             run RA's check as `cargo check --release`");
+    println!("  -p, --package <PKG>   package selector for RA analysis (TF_CHECK_PACKAGE)");
+    println!("  --target <TRIPLE>     target triple for RA analysis (TF_CHECK_TARGET)");
+    println!("  --release             release-profile hint for RA analysis");
     println!("                        (TF_CHECK_RELEASE=1)");
-    println!("  --no-default-features pass through to RA's cargo check");
+    println!("  --no-default-features disable default features for RA analysis");
     println!("                        (TF_CHECK_NO_DEFAULT_FEATURES=1)");
-    println!("  --cargo-subcommand <check|clippy>");
-    println!("                        push: direct Cargo command for awaited verdict");
-    println!("  --manifest-path/--tests/--all-targets/etc.");
-    println!("                        push: extra Cargo selectors for direct verdicts");
     println!(
         "  --remote <URL>        status: query a remote `serve --bind` daemon \
          over HTTP"
@@ -493,14 +489,6 @@ fn auth_token_for_push(cli: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn split_features(v: &str) -> Vec<String> {
-    v.split([',', ' '])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 fn cargo_extra_arg_takes_value(flag: &str) -> Option<&'static str> {
     match flag {
         "--manifest-path" => Some("--manifest-path"),
@@ -547,21 +535,11 @@ fn cargo_extra_arg_flag(arg: &str) -> bool {
     )
 }
 
-fn check_profile_from_opts(opts: &Opts) -> Option<CheckProfile> {
-    let profile = CheckProfile {
-        subcommand: opts.cargo_subcommand.unwrap_or_default(),
-        package: opts.package.clone(),
-        target: opts.target.clone(),
-        features: opts
-            .features
-            .as_deref()
-            .map(split_features)
-            .unwrap_or_default(),
-        no_default_features: opts.no_default_features,
-        release: opts.release,
-        extra_args: opts.cargo_extra_args.clone(),
-    };
-    (!profile.is_empty()).then_some(profile)
+fn check_profile_from_opts(_opts: &Opts) -> Option<CheckProfile> {
+    // Cargoless replaces iterative cargo check/clippy. Push-time cargo
+    // selectors remain accepted for caller compatibility, but they must never
+    // request a direct Cargo subprocess from the daemon.
+    None
 }
 
 fn main() -> ExitCode {
@@ -954,7 +932,27 @@ mod tests {
     }
 
     #[test]
-    fn push_extra_cargo_selectors_are_forwarded() {
+    fn push_cargo_selectors_do_not_create_direct_cargo_profile() {
+        let parsed = parse(&v(&[
+            "push",
+            "--cargo-subcommand",
+            "clippy",
+            "-p",
+            "triform-portal",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--no-default-features",
+            "--features",
+            "hydrate",
+            "--tests",
+        ]))
+        .unwrap();
+
+        assert_eq!(check_profile_from_opts(&parsed.opts), None);
+    }
+
+    #[test]
+    fn push_extra_cargo_selectors_are_parsed_for_compatibility() {
         let p = parse(&v(&[
             "push",
             "--manifest-path",
