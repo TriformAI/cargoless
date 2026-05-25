@@ -79,7 +79,7 @@ use std::time::{Duration, Instant};
 use cargoless_core::activity::ActivityConfig;
 use cargoless_core::activitymgr::ActivityTracker;
 use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
-use cargoless_core::cluster::WorkspaceConfigHash;
+use cargoless_core::cluster::{WorkspaceConfig, WorkspaceConfigHash};
 use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
 use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
 use cargoless_core::lsp::{InitOpts, LspClient, LspEvent};
@@ -438,13 +438,12 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // `clusterdrv` / `multiplex` see no difference (pushed-vs-FS is
         // a SOURCE mode, not a wire mode; the proven cores stay
         // byte-untouched). On first push for a never-seen WT, we
-        // register it: derive the cluster hash from the pushed
-        // workspace-config files (Cargo.toml / Cargo.lock / rust-toolchain
-        // / .cargo/config — present in the pushed `files` per
-        // D-PUSHOVERLAY §4.3 tap-2 substitute). Best-effort: a missing
-        // workspace-config in the push still routes (split-safe — that
-        // WT gets its own cluster, same v0-bias-to-split discipline as
-        // the FS path's `read_workspace_config(_).is_err() => skip`).
+        // register it: derive the cluster hash from the server-side base
+        // checkout, then apply any pushed workspace-config overrides
+        // (Cargo.toml / Cargo.lock / rust-toolchain / .cargo/config).
+        // Best-effort: an unreadable base config falls back to the pushed
+        // overrides only, preserving split-safe routing without forcing the
+        // client to resend unchanged config bodies on every push.
         while let Ok(wt_key) = push_rx.try_recv() {
             let wt: WtId = PathBuf::from(&wt_key);
             // Register on first push (tap 1 substitute) + derive cluster
@@ -644,19 +643,16 @@ fn path_key(wt: &WtId) -> String {
     wt.to_string_lossy().into_owned()
 }
 
-/// #240/2b — derive a WorkspaceConfigHash from a pushed overlay's
-/// `files` (path,content pairs) without disk-reading the worktree.
-/// Substitutes the FS path's `read_workspace_config` for pushed-mode
-/// WTs (D-PUSHOVERLAY §4.3 tap-2). PEEKS at the api's pushed store
-/// (does NOT consume — `take_overlay_for` does that later in the
-/// SwitchOverlay arm). Best-effort: a push with no Cargo.toml etc.
-/// hashes to the all-absent (default) WorkspaceConfig — split-safe
-/// since identical empty pushes group together, distinct from any
-/// real workspace.
+/// #240/2b — derive a WorkspaceConfigHash for a pushed overlay. PEEKS at the
+/// api's pushed store (does NOT consume — `take_overlay_for` does that later
+/// in the SwitchOverlay arm). The server owns the base checkout, so unchanged
+/// workspace config is read from disk; pushed config bodies are only overrides
+/// for changed config files. This keeps the push body to the actual local diff
+/// while preserving the same cluster-routing shape as the FS path.
 ///
 /// Path-matching is suffix-based: `path.ends_with("Cargo.toml")` so
 /// both absolute (`/abs/wt/Cargo.toml`) and relative (`Cargo.toml`)
-/// push paths resolve. The 4 workspace-defining files mirror
+/// push paths resolve. The workspace-defining files mirror
 /// `clustermgr::read_workspace_config`'s set.
 fn cluster_hash_from_pushed(
     api: &Arc<crate::serveapi::ServeVerdictState>,
@@ -673,19 +669,28 @@ fn cluster_hash_from_pushed(
             .find(|(p, _)| p.ends_with(suffix))
             .map(|(_, c)| c.clone())
     }
-    let cargo_toml = find(&pushed.files, "Cargo.toml");
-    let cargo_lock = find(&pushed.files, "Cargo.lock");
-    let rust_toolchain = find(&pushed.files, "rust-toolchain.toml")
-        .or_else(|| find(&pushed.files, "rust-toolchain"));
-    let cargo_config =
-        find(&pushed.files, ".cargo/config.toml").or_else(|| find(&pushed.files, ".cargo/config"));
-    cargoless_core::cluster::WorkspaceConfig::new(
-        cargo_toml,
-        cargo_lock,
-        rust_toolchain,
-        cargo_config,
-    )
-    .hash()
+    let root = pushed
+        .analysis_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(wt_key));
+    let mut cfg = read_workspace_config(&root).unwrap_or_else(|_| WorkspaceConfig::default());
+    if let Some(content) = find(&pushed.files, "Cargo.toml") {
+        cfg.cargo_toml = Some(content);
+    }
+    if let Some(content) = find(&pushed.files, "Cargo.lock") {
+        cfg.cargo_lock = Some(content);
+    }
+    if let Some(content) =
+        find(&pushed.files, "rust-toolchain.toml").or_else(|| find(&pushed.files, "rust-toolchain"))
+    {
+        cfg.rust_toolchain = Some(content);
+    }
+    if let Some(content) =
+        find(&pushed.files, ".cargo/config.toml").or_else(|| find(&pushed.files, ".cargo/config"))
+    {
+        cfg.cargo_config = Some(content);
+    }
+    cfg.hash()
 }
 
 /// Construct a cluster's RA Supervisor (sole `ClusterState` creation
@@ -1330,6 +1335,77 @@ fn slowest_project_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cargoless_core::transport::{PushOverlayOptions, VerdictService};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargoless-servedrv-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn cluster_hash_from_pushed_reads_base_config_when_overlay_has_no_config() {
+        let root = temp_root("base-config");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "# base lock\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: None,
+            changed_files: Some(vec!["src/lib.rs".into()]),
+        };
+
+        let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
+
+        assert!(ack.accepted);
+        assert_eq!(
+            cluster_hash_from_pushed(&api, "/client/wt"),
+            read_workspace_config(&root).unwrap().hash()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cluster_hash_from_pushed_overrides_changed_config_only() {
+        let root = temp_root("changed-config");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[\"base\"]\n").unwrap();
+        std::fs::write(root.join("Cargo.lock"), "# base lock\n").unwrap();
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        let changed_cargo_toml = "[workspace]\nmembers=[\"changed\"]\n";
+        let files = vec![("Cargo.toml".to_string(), changed_cargo_toml.to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: None,
+            changed_files: Some(vec!["Cargo.toml".into()]),
+        };
+
+        let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
+
+        assert!(ack.accepted);
+        assert_eq!(
+            cluster_hash_from_pushed(&api, "/client/wt"),
+            WorkspaceConfig::new(
+                Some(changed_cargo_toml.to_string()),
+                Some("# base lock\n".to_string()),
+                None,
+                None,
+            )
+            .hash()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn save_trigger_prefers_pending_fs_batch() {
