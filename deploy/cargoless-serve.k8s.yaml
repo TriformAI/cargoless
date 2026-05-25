@@ -126,7 +126,7 @@ spec:
             - { name: workspace, mountPath: /workspace }
       containers:
         - name: serve
-          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.1-no-cargo-exec
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.2-minimal-overlay
           imagePullPolicy: Always
           command: ["/bin/bash", "-lc"]
           args:
