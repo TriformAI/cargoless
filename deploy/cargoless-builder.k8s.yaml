@@ -81,6 +81,7 @@ spec:
         app.kubernetes.io/name: cargoless-builder
     spec:
       # Long-lived idle build host; ci-gate kubectl-execs into it on demand.
+      shareProcessNamespace: true
       terminationGracePeriodSeconds: 5
       imagePullSecrets:
         - name: registry-pull
@@ -108,9 +109,11 @@ spec:
             requests:
               cpu: "2"
               memory: 4Gi
+              ephemeral-storage: 1Gi
             limits:
               cpu: "8"
               memory: 16Gi
+              ephemeral-storage: 8Gi
           volumeMounts:
             - name: cache
               mountPath: /cache
