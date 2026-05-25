@@ -12,8 +12,10 @@
 //!    path-keyed default) + `--base <ref>` (git base, default HEAD).
 //! 2. Compute the overlay-set:
 //!    `git -C <repo> diff --name-only <base>` → changed-file list →
-//!    add workspace-defining config files → read each file's bytes →
-//!    `(absolute path, content)` pairs.
+//!    add workspace-defining config files + changed Rust source files →
+//!    read each selected file's bytes → `(absolute path, content)` pairs.
+//!    Non-Rust changed paths still travel as `changed_files` metadata so
+//!    project checks can select correctly without bloating the LSP overlay.
 //! 3. **Canonicalize ordering** — sort files by path so the daemon's
 //!    `cluster_hash_from_pushed` is deterministic regardless of the
 //!    client's OS-enumeration order (#262 C6 fix, client-side; ~5 LOC,
@@ -127,10 +129,14 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         return ExitCode::from(0);
     }
 
-    // 2. Read each changed file plus the workspace-defining config files
-    //    the daemon uses for cluster hashing. Paths are sent as absolute
-    //    file paths to match the FS-watcher mode byte-for-byte at the LSP
-    //    seam (`didOpen`/`didChange` require real `file:///abs/...` URIs).
+    // 2. Read each changed Rust source file plus the workspace-defining
+    //    config files the daemon uses for cluster hashing. Paths are sent as
+    //    absolute file paths to match the FS-watcher mode byte-for-byte at
+    //    the LSP seam (`didOpen`/`didChange` require real `file:///abs/...`
+    //    URIs). Non-Rust changed paths are intentionally metadata-only via
+    //    PushOverlayOptions::changed_files; servedrv filters the body to Rust
+    //    source before applying the RA overlay, so sending large JSON/docs
+    //    contents only wastes the wire cap.
     //    Tolerant: a skipped file (read error, usually an absent optional
     //    config file or deleted changed file) warns but does not abort the
     //    push — the pushed-overlay is best-effort and the server is robust
@@ -350,8 +356,18 @@ fn git_resolve_ref(repo: &Path, base: &str) -> std::io::Result<String> {
 fn overlay_candidate_files(changed: &[String]) -> Vec<String> {
     let mut files: BTreeSet<String> = BTreeSet::new();
     files.extend(WORKSPACE_CONFIG_FILES.iter().map(|p| (*p).to_string()));
-    files.extend(changed.iter().cloned());
+    files.extend(
+        changed
+            .iter()
+            .filter(|path| is_push_overlay_content_file(path))
+            .cloned(),
+    );
     files.into_iter().collect()
+}
+
+fn is_push_overlay_content_file(rel: &str) -> bool {
+    WORKSPACE_CONFIG_FILES.iter().any(|path| *path == rel)
+        || Path::new(rel).extension().is_some_and(|ext| ext == "rs")
 }
 
 fn payload_path(repo: &Path, rel: &str, repo_relative: bool) -> String {
@@ -486,6 +502,37 @@ mod tests {
             files.iter().filter(|p| p.as_str() == "Cargo.toml").count(),
             1
         );
+    }
+
+    #[test]
+    fn overlay_candidates_skip_non_rust_changed_contents() {
+        let files = overlay_candidate_files(&[
+            "src/lib.rs".to_string(),
+            "coverage/exposed_faces.json".to_string(),
+            "chemistry/generators/rust/CONFIG_COVERAGE.json".to_string(),
+            "scripts/deploy".to_string(),
+            "README.md".to_string(),
+        ]);
+
+        assert!(files.contains(&"src/lib.rs".to_string()));
+        assert!(files.contains(&"Cargo.toml".to_string()));
+        assert!(files.contains(&"Cargo.lock".to_string()));
+        assert!(!files.contains(&"coverage/exposed_faces.json".to_string()));
+        assert!(!files.contains(&"chemistry/generators/rust/CONFIG_COVERAGE.json".to_string()));
+        assert!(!files.contains(&"scripts/deploy".to_string()));
+        assert!(!files.contains(&"README.md".to_string()));
+    }
+
+    #[test]
+    fn overlay_candidate_content_filter_keeps_workspace_config_files() {
+        for path in WORKSPACE_CONFIG_FILES {
+            assert!(
+                is_push_overlay_content_file(path),
+                "workspace config file should be sent as overlay content: {path}"
+            );
+        }
+        assert!(is_push_overlay_content_file("crates/cargoless/src/lib.rs"));
+        assert!(!is_push_overlay_content_file("generated/schema.json"));
     }
 
     #[test]

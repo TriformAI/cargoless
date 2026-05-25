@@ -299,7 +299,7 @@ pub fn run_status(cfg: &Config) -> ExitCode {
     }
     ui::step(format!("cli: {}", cargoless_core::build_id()));
     if st.build_id.is_empty() {
-        ui::step("daemon: unknown build (status file predates build identity)".to_string());
+        ui::step("daemon: unknown build (status file predates build identity)");
     } else {
         ui::step(format!("daemon: {}", st.build_id));
         if st.build_id != cargoless_core::build_id() {
@@ -372,7 +372,7 @@ pub fn run_status_remote(url: &str, worktree: Option<&str>) -> ExitCode {
                     );
                 }
             }
-            _ => ui::step("daemon: unknown build".to_string()),
+            _ => ui::step("daemon: unknown build"),
         }
     };
     if let Some(worktree) = worktree {
