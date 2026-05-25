@@ -13,3 +13,4 @@ Cargo.lock.orig
 # Internal config + permission lists — must never enter this OSS-bound repo.
 # The project contract lives in /CLAUDE.md (root) + docs/EXECUTION.md instead.
 .claude/
+.codex-worktrees/
