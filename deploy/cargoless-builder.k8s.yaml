@@ -152,3 +152,32 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+---
+# Buildx Kubernetes builders use their own pods rather than the long-lived
+# cargoless-builder pod. Keep their egress explicit too, otherwise image
+# builds can boot but time out while resolving registry.triform.cloud.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cargoless-buildkit-egress
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-buildkit
+spec:
+  podSelector:
+    matchLabels:
+      app: cargoless-kube0
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+      to:
+        - namespaceSelector: {}
+    - ports:
+        - {port: 80, protocol: TCP}
+        - {port: 443, protocol: TCP}
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
