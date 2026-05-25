@@ -126,7 +126,7 @@ spec:
             - { name: workspace, mountPath: /workspace }
       containers:
         - name: serve
-          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.3-checks-base-pruning
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.4-existing-red-report
           imagePullPolicy: Always
           command: ["/bin/bash", "-lc"]
           args:
