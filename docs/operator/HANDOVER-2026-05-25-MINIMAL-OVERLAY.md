@@ -50,9 +50,18 @@ The temporary Kubernetes buildx deployment `cargoless-kube0` was removed after t
 - The replacement cache starts cold. The next cargoless repository `scripts/ci-gate` run may pay a rebuild cost.
 - `cargoless-serve` uses its own tf-multiverse workspace PVC and was not affected by the cache replacement.
 - Local `.codex-worktrees/` scratch is ignored by both Docker context and git.
+- Branch-protection project checks are currently profile/config-driven, not
+  fully path-pruned. A pure-YAML validation can still run every included check
+  in the selected profile; one observed run executed 54 project checks. This is
+  fast enough for now, but it is shared team infrastructure work. Agents should
+  avoid repeated broad-profile runs and use the narrowest check/profile that
+  answers the current question until changed-overlay trigger pruning is live.
 
 ## Next Steps
 
 - Run a few normal tf-multiverse agent merges through `scripts/check-remote` and watch the new push accounting line.
 - Add server-side request metrics for overlay body bytes, metadata-only paths, verdict latency, and concurrent pushes.
+- Implement changed-overlay trigger pruning for project checks so YAML/docs-only
+  changes can skip unrelated check bodies instead of running the full included
+  profile.
 - Keep the replacement model strict: no legacy cargo-check fallback in tf-multiverse merge paths.
