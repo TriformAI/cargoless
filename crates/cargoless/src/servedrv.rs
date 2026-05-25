@@ -70,7 +70,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -82,13 +82,12 @@ use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
 use cargoless_core::cluster::WorkspaceConfigHash;
 use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
 use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
-use cargoless_core::lsp::{InitOpts, LspClient, LspEvent, normalize_check_package_name};
+use cargoless_core::lsp::{InitOpts, LspClient, LspEvent};
 use cargoless_core::multiplex::LspVerb;
 use cargoless_core::multiplex::OverlayMultiplexer;
 use cargoless_core::overlay::OverlaySet;
 use cargoless_core::repo::RepoScope;
 use cargoless_core::repo::watch::{RepoWatchRouter, WtId, WtRouter};
-use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 
 use crate::orphan::ParentWatch;
 use crate::statusfile::{self, Status, Verdict};
@@ -143,15 +142,11 @@ fn push_only_mode() -> bool {
 }
 
 fn ra_native_verdict_mode() -> bool {
-    std::env::var("CARGOLESS_VERDICT_MODE")
-        .ok()
-        .map(|v| {
-            let v = v.trim();
-            v.eq_ignore_ascii_case("ra")
-                || v.eq_ignore_ascii_case("advisory")
-                || v.eq_ignore_ascii_case("development")
-        })
-        .unwrap_or(true)
+    // Product invariant: Cargoless replaces iterative cargo check/clippy; it
+    // does not offer a hidden mode that executes them from daemon verdict
+    // requests. Keep the helper so existing mode-plumbing stays simple, but
+    // make the answer unconditional.
+    true
 }
 
 fn ready_after_respawn_for_modes(push_only: bool, ra_native: bool) -> bool {
@@ -1048,21 +1043,11 @@ fn exec(
                     wt.display()
                 );
             }
-            // The default replacement verdict path has no didSave/runFlycheck
-            // and no direct Cargo subprocess. The historical flycheck/cargo
-            // barrier remains only for explicit legacy deployments.
-            // A delayed synthetic settle lets RA publish diagnostics for the
-            // just-applied overlay before the existing barrier publishes the
-            // worktree bit.
-            if ra_native_verdict_mode() || pushed_check_profile.is_some() {
-                spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
-            } else {
-                let save = save_trigger_path(&wt, pending_batch, &pairs);
-                let save = save.to_string_lossy();
-                let _ = lsp.did_save(&save);
-                let _ = lsp.run_flycheck(&save);
-                spawn_direct_cargo_check(&wt, cs.cluster.clone(), cs.lsp_tx.clone(), None);
-            }
+            // The replacement verdict path has no didSave/runFlycheck and no
+            // direct Cargo subprocess. A delayed synthetic settle lets RA
+            // publish diagnostics for the just-applied overlay before the
+            // existing barrier publishes the worktree bit.
+            spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
         }
         ClusterAction::EmitVerdict {
             wt,
@@ -1086,6 +1071,7 @@ fn exec(
     }
 }
 
+#[cfg(test)]
 fn save_trigger_path(
     wt: &WtId,
     pending_batch: &BTreeMap<WtId, Vec<PathBuf>>,
@@ -1119,6 +1105,7 @@ fn is_rust_source_path(path: &str) -> bool {
     Path::new(path).extension().is_some_and(|ext| ext == "rs")
 }
 
+#[cfg(test)]
 fn overlay_path_for_wt(wt: &WtId, path: &str) -> PathBuf {
     let path = PathBuf::from(path);
     if path.is_absolute() {
@@ -1150,237 +1137,6 @@ fn spawn_ra_native_settle(
             );
             let _ = tx.send((h, LspEvent::FlycheckEnded));
         });
-}
-
-fn spawn_direct_cargo_check(
-    wt: &WtId,
-    h: WorkspaceConfigHash,
-    tx: Sender<(WorkspaceConfigHash, LspEvent)>,
-    check_profile: Option<CheckProfile>,
-) {
-    let wt = wt.clone();
-    let opts = init_opts_for_direct_check(&wt, check_profile.as_ref());
-    let subcommand = direct_cargo_subcommand(check_profile.as_ref());
-    let extra_args = direct_cargo_extra_args(check_profile.as_ref());
-    if direct_cargo_check_args(&opts, subcommand, &extra_args).is_none() {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("tf-cargo-check".into())
-        .spawn(move || {
-            if let Some(ev) = direct_cargo_check_event(&wt, check_profile) {
-                let _ = tx.send((h, ev));
-            }
-        });
-}
-
-fn direct_cargo_check_event(wt: &WtId, check_profile: Option<CheckProfile>) -> Option<LspEvent> {
-    let opts = init_opts_for_direct_check(wt, check_profile.as_ref());
-    let subcommand = direct_cargo_subcommand(check_profile.as_ref());
-    let extra_args = direct_cargo_extra_args(check_profile.as_ref());
-    let label = direct_cargo_check_label(&opts, subcommand, &extra_args);
-    let args = direct_cargo_check_args(&opts, subcommand, &extra_args)?;
-    eprintln!(
-        "[cargoless:obs] cargo-{}-started wt={} profile={} at={} (#tfmv)",
-        subcommand.as_str(),
-        wt.display(),
-        label,
-        statusfile::now_unix()
-    );
-    let started = Instant::now();
-    match run_direct_cargo_check(wt, &args, direct_cargo_timeout()) {
-        Ok(true) => {
-            eprintln!(
-                "[cargoless:obs] cargo-{}-ended wt={} profile={} status=green elapsed_ms={} (#tfmv)",
-                subcommand.as_str(),
-                wt.display(),
-                label,
-                started.elapsed().as_millis()
-            );
-            Some(LspEvent::FlycheckEnded)
-        }
-        Ok(false) => {
-            let message = format!("cargo {} failed for profile {label}", subcommand.as_str());
-            eprintln!(
-                "[cargoless:obs] cargo-{}-ended wt={} profile={} status=red elapsed_ms={} (#tfmv)",
-                subcommand.as_str(),
-                wt.display(),
-                label,
-                started.elapsed().as_millis()
-            );
-            Some(LspEvent::FlycheckFailed { message })
-        }
-        Err(e) => {
-            let message = format!(
-                "failed to run cargo {} for profile {label}: {e}",
-                subcommand.as_str()
-            );
-            eprintln!(
-                "[cargoless:obs] cargo-{}-ended wt={} profile={} status=failed elapsed_ms={} error={} (#tfmv)",
-                subcommand.as_str(),
-                wt.display(),
-                label,
-                started.elapsed().as_millis(),
-                e
-            );
-            Some(LspEvent::FlycheckFailed { message })
-        }
-    }
-}
-
-fn init_opts_for_direct_check(wt: &WtId, check_profile: Option<&CheckProfile>) -> InitOpts {
-    if let Some(profile) = check_profile {
-        return InitOpts {
-            features: profile.features.clone(),
-            package: profile.package.clone(),
-            target: profile.target.clone(),
-            no_default_features: profile.no_default_features,
-            release: profile.release,
-            ..InitOpts::default()
-        };
-    }
-    InitOpts::from_env_and_project(wt)
-}
-
-fn direct_cargo_subcommand(check_profile: Option<&CheckProfile>) -> CargoSubcommand {
-    check_profile.map(|p| p.subcommand).unwrap_or_default()
-}
-
-fn direct_cargo_extra_args(check_profile: Option<&CheckProfile>) -> Vec<String> {
-    check_profile
-        .map(|p| p.extra_args.clone())
-        .unwrap_or_default()
-}
-
-fn direct_cargo_check_label(
-    opts: &InitOpts,
-    subcommand: CargoSubcommand,
-    extra_args: &[String],
-) -> String {
-    let mut parts = Vec::new();
-    if subcommand != CargoSubcommand::Check {
-        parts.push(format!("subcommand={}", subcommand.as_str()));
-    }
-    if let Some(package) = opts.package.as_deref().map(normalize_check_package_name) {
-        parts.push(format!("package={package}"));
-    }
-    if let Some(target) = &opts.target {
-        parts.push(format!("target={target}"));
-    }
-    if !opts.features.is_empty() {
-        parts.push(format!("features={}", opts.features.join(",")));
-    }
-    if opts.no_default_features {
-        parts.push("no-default-features".to_string());
-    }
-    if opts.release {
-        parts.push("release".to_string());
-    }
-    if !extra_args.is_empty() {
-        parts.push(format!("extra_args={}", extra_args.join(" ")));
-    }
-    if parts.is_empty() {
-        "workspace".to_string()
-    } else {
-        parts.join(";")
-    }
-}
-
-fn direct_cargo_check_args(
-    opts: &InitOpts,
-    subcommand: CargoSubcommand,
-    extra_args: &[String],
-) -> Option<Vec<String>> {
-    if subcommand == CargoSubcommand::Check
-        && opts.package.is_none()
-        && opts.target.is_none()
-        && opts.features.is_empty()
-        && !opts.no_default_features
-        && !opts.release
-        && extra_args.is_empty()
-    {
-        return None;
-    }
-    let mut args = vec![subcommand.as_str().to_string()];
-    if let Some(package) = opts.package.as_deref().map(normalize_check_package_name) {
-        args.push("-p".to_string());
-        args.push(package);
-    }
-    args.extend(extra_args.iter().cloned());
-    args.push("--message-format=json".to_string());
-    if let Some(target) = &opts.target {
-        args.push("--target".to_string());
-        args.push(target.clone());
-    }
-    if opts.no_default_features {
-        args.push("--no-default-features".to_string());
-    }
-    if !opts.features.is_empty() {
-        args.push("--features".to_string());
-        args.push(opts.features.join(","));
-    }
-    if opts.release {
-        args.push("--release".to_string());
-    }
-    Some(args)
-}
-
-fn direct_cargo_timeout() -> Duration {
-    std::env::var("TF_CHECK_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(900))
-}
-
-fn cargo_launcher() -> (String, Vec<String>) {
-    if let Ok(bin) = std::env::var("CARGOLESS_CARGO") {
-        let bin = bin.trim();
-        if !bin.is_empty() {
-            return (bin.to_string(), Vec::new());
-        }
-    }
-    if Command::new("rustup")
-        .args(["run", "stable", "cargo", "--version"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-    {
-        return (
-            "rustup".to_string(),
-            vec!["run".to_string(), "stable".to_string(), "cargo".to_string()],
-        );
-    }
-    ("cargo".to_string(), Vec::new())
-}
-
-fn run_direct_cargo_check(
-    wt: &WtId,
-    cargo_args: &[String],
-    timeout: Duration,
-) -> std::io::Result<bool> {
-    let (program, prefix) = cargo_launcher();
-    let mut cmd = Command::new(program);
-    cmd.current_dir(wt)
-        .args(prefix)
-        .args(cargo_args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = cmd.spawn()?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.success());
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Write `wt`'s per-worktree verdict — the only place a verdict is
@@ -1656,71 +1412,6 @@ mod tests {
         assert!(!ready_after_respawn_for_modes(true, false));
         assert!(!ready_after_respawn_for_modes(false, true));
         assert!(!ready_after_respawn_for_modes(false, false));
-    }
-
-    #[test]
-    fn direct_cargo_check_args_normalize_tf_multiverse_package_aliases() {
-        let args = direct_cargo_check_args(
-            &InitOpts {
-                package: Some("alchemy".into()),
-                target: Some("wasm32-unknown-unknown".into()),
-                no_default_features: true,
-                features: vec!["ssr-frontend".into(), "telephony".into()],
-                release: true,
-                ..InitOpts::default()
-            },
-            CargoSubcommand::Check,
-            &[],
-        )
-        .expect("package mode builds direct cargo args");
-
-        assert_eq!(
-            args,
-            vec![
-                "check",
-                "-p",
-                "triform-alchemy",
-                "--message-format=json",
-                "--target",
-                "wasm32-unknown-unknown",
-                "--no-default-features",
-                "--features",
-                "ssr-frontend,telephony",
-                "--release",
-            ]
-        );
-    }
-
-    #[test]
-    fn direct_cargo_clippy_args_allow_workspace_profile() {
-        let args = direct_cargo_check_args(&InitOpts::default(), CargoSubcommand::Clippy, &[])
-            .expect("clippy-only profile still runs direct cargo");
-
-        assert_eq!(args, vec!["clippy", "--message-format=json"]);
-    }
-
-    #[test]
-    fn direct_cargo_check_args_forward_extra_selectors() {
-        let extra = vec![
-            "--manifest-path".to_string(),
-            "tools/Cargo.toml".to_string(),
-            "--tests".to_string(),
-            "--locked".to_string(),
-        ];
-        let args = direct_cargo_check_args(&InitOpts::default(), CargoSubcommand::Check, &extra)
-            .expect("extra cargo selectors make a profile non-empty");
-
-        assert_eq!(
-            args,
-            vec![
-                "check",
-                "--manifest-path",
-                "tools/Cargo.toml",
-                "--tests",
-                "--locked",
-                "--message-format=json",
-            ]
-        );
     }
 
     #[test]
