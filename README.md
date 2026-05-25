@@ -326,6 +326,21 @@ $ cargoless checks run --profile dev --base origin/dev
 ok project checks green — 4 checks evaluated, 50 skipped (...) [scope=changed ...]
 ```
 
+Merge automation can also ask Cargoless to distinguish new failures from
+failures that already exist at the base ref:
+
+```bash
+$ cargoless checks run --profile dev --base origin/dev \
+    --allow-existing-red --report-json /tmp/cargoless-checks.json
+ok project checks green-with-existing-red — 1 inherited required red accepted ...
+```
+
+In that mode, Cargoless exits green only when every required red in the current
+worktree has the same diagnostic fingerprint at `--base`. New or worsened reds
+still exit red. Cargoless emits the machine-readable decision in the JSON report;
+repo-specific automation should use that report to file or update the owning
+ticket before merging.
+
 You do **not** run `cargoless watch` in each worktree at fleet scale —
 that is the per-tree daemon model `serve --repo` replaces. `watch`
 remains the single-worktree path for a one-off project.

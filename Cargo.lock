@@ -73,6 +73,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-opentelemetry",

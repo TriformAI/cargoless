@@ -139,6 +139,12 @@ struct Opts {
     checks_id: Option<String>,
     /// Optional profile for `checks run --profile <name>`.
     checks_profile: Option<String>,
+    /// `checks run --allow-existing-red` — compare required reds to `--base`
+    /// and exit green when every red already exists at the base ref.
+    checks_allow_existing_red: bool,
+    /// `checks run --report-json <path>` — write machine-readable check
+    /// decision data for repo-specific ticketing wrappers.
+    checks_report_json: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -256,6 +262,14 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .ok_or(ParseError::MissingValue("--profile"))?
                         .clone(),
                 );
+            }
+            "--allow-existing-red" if cmd == Cmd::Checks => {
+                opts.checks_allow_existing_red = true;
+            }
+            "--report-json" if cmd == Cmd::Checks => {
+                opts.checks_report_json = Some(PathBuf::from(
+                    it.next().ok_or(ParseError::MissingValue("--report-json"))?,
+                ));
             }
             a if cargo_extra_arg_takes_value(a).is_some() => {
                 let flag = cargo_extra_arg_takes_value(a).unwrap();
@@ -403,6 +417,8 @@ fn usage() {
     );
     println!("  --worktree <KEY>      status/push: query or push one served worktree");
     println!("  --base <REF>          push/checks: git base ref for changed-file pruning");
+    println!("  --allow-existing-red  checks: allow reds already present at --base");
+    println!("  --report-json <PATH>  checks: write machine-readable check decision data");
     println!("  --server-root <DIR>   push: server-side repo root for central daemon mode");
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
@@ -670,6 +686,8 @@ fn main() -> ExitCode {
             parsed.opts.checks_id.as_deref(),
             parsed.opts.checks_profile.as_deref(),
             parsed.opts.push_base.as_deref(),
+            parsed.opts.checks_allow_existing_red,
+            parsed.opts.checks_report_json.as_deref(),
         ),
         Cmd::Clean => clean::run(&cfg),
         Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push => unreachable!("handled above"),
@@ -905,6 +923,9 @@ mod tests {
             "canary",
             "--base",
             "origin/main",
+            "--allow-existing-red",
+            "--report-json",
+            "checks.json",
         ]))
         .unwrap();
         assert_eq!(p.cmd, Cmd::Checks);
@@ -912,6 +933,11 @@ mod tests {
         assert_eq!(p.opts.checks_id.as_deref(), Some("generated-frontend"));
         assert_eq!(p.opts.checks_profile.as_deref(), Some("canary"));
         assert_eq!(p.opts.push_base.as_deref(), Some("origin/main"));
+        assert!(p.opts.checks_allow_existing_red);
+        assert_eq!(
+            p.opts.checks_report_json.as_deref(),
+            Some(std::path::Path::new("checks.json"))
+        );
         assert!(p.opts.cargo_extra_args.is_empty());
     }
 

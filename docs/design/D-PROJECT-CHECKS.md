@@ -191,6 +191,33 @@ same required project-check result into the published green/red verdict and
 logs project-check summaries; extending the remote status payload with the full
 diagnostic list is the next observability increment.
 
+## Regression-Only Merge Gates
+
+Shared merge automation can accept a branch even when the base branch already
+contains a required project-check red. The important distinction is whether the
+branch introduced or worsened the red.
+
+`cargoless checks run --profile <name> --base <ref> --allow-existing-red`
+compares the required red checks in the current worktree with the same check ids
+run against a temporary detached worktree at `<ref>`. Diagnostics are compared as
+multisets of stable fingerprints:
+
+```text
+source | code | repo-relative path | normalized message
+```
+
+If every current required red fingerprint is present at the base with at least
+the same count, Cargoless exits `0` and reports
+`green-with-existing-red`. If any fingerprint is new or has a higher count than
+the base, Cargoless exits `1`.
+
+Use `--report-json <path>` with this mode. The report contains the final
+`decision`, the selected profile, base ref, changed paths, required-red counts,
+and `red_classifications[]` entries marked `new` or `existing`. Cargoless does
+not know how a product team tracks work; wrappers such as `scripts/dev-merge`
+should turn `existing` classifications into BUGS/INFRA tickets before allowing
+the merge to continue.
+
 ## Scheduler Semantics
 
 - Checks run in parallel up to `profiles.<name>.max_parallel`.

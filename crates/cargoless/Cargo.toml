@@ -70,6 +70,7 @@ path = "src/main.rs"
 
 [dependencies]
 cargoless-core = { path = "../cargoless-core", version = "0.2.0" }  # publish-ready
+serde_json = "1"
 
 # ──────────────────────────────────────────────────────────────────────────
 # #246 Wave-1 5a: OTEL + SigNoz telemetry stack.
