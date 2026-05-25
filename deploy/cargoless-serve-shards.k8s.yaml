@@ -112,9 +112,9 @@ spec:
             - { name: workspace, mountPath: /workspace }
       containers:
         - name: serve
-          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.4-existing-red-report
+          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.6-project-check-tools
           imagePullPolicy: Always
-          command: ["/bin/bash", "-lc"]
+          command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
@@ -128,11 +128,14 @@ spec:
             - name: CARGOLESS_AUTH_TOKEN
               valueFrom:
                 secretKeyRef: { name: cargoless-serve-auth, key: token }
+            - { name: PATH, value: "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: CARGO_HOME, value: "/workspace/.cargo" }
-            - { name: RUSTUP_HOME, value: "/workspace/.rustup" }
+            - { name: RUSTUP_HOME, value: "/usr/local/rustup" }
+            - { name: RUSTUP_TOOLCHAIN, value: "1.93.1-x86_64-unknown-linux-gnu" }
             - { name: CARGO_TARGET_DIR, value: "/workspace/target" }
             - { name: CARGO_INCREMENTAL, value: "0" }
-            - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "off" }
+            - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "hard" }
+            - { name: CARGOLESS_REMOTE_PROJECT_CHECKS, value: "1" }
           ports:
             - name: http
               containerPort: 8787

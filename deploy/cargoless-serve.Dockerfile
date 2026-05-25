@@ -11,12 +11,28 @@ RUN rustup component add rust-analyzer \
 
 FROM registry.triform.cloud/mirror/triform-builder-v2:0.1
 
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        ca-certificates \
+        clang \
+        git \
+        jq \
+        libssl-dev \
+        lld \
+        pkg-config \
+        python3-yaml \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /src/target/release/cargoless /usr/local/bin/cargoless
 COPY --from=builder /tmp/rust-analyzer /usr/local/bin/rust-analyzer
 COPY --from=builder /tmp/rust-analyzer-libs/ /usr/local/lib/rust-analyzer/
 
-ENV CARGO_HOME=/cache/cargo \
-    RUSTUP_HOME=/cache/rustup \
+ENV PATH=/usr/local/cargo/bin:$PATH \
+    CARGO_HOME=/cache/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    RUSTUP_TOOLCHAIN=1.93.1-x86_64-unknown-linux-gnu \
     CARGO_TARGET_DIR=/cache/target \
     LD_LIBRARY_PATH=/usr/local/lib/rust-analyzer \
     CARGO_INCREMENTAL=0 \
