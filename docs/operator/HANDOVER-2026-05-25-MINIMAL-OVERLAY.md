@@ -2,8 +2,8 @@
 
 ## Current State
 
-- `main` is at `d325e8c` after PR #14.
-- Cluster `cargoless-serve` is live on `registry.triform.cloud/cargoless/cargoless-serve:0.2.2-minimal-overlay`.
+- `main` is at `2980aeb` after PR #17.
+- Cluster `cargoless-serve` should run `registry.triform.cloud/cargoless/cargoless-serve:0.2.3-checks-base-pruning` after the checks-base-pruning rollout.
 - Cluster `cargoless-builder` is healthy again with a fresh `cargoless-cache` PVC.
 - Local installed binary was updated during the rollout to `cargoless 0.2.0 git=294922a19bc6 dirty=true built=1779691114`.
 
@@ -21,6 +21,13 @@
 - PR #14, `d325e8c`: preserved the live-good `cargoless-builder` pod template.
   - Restored `shareProcessNamespace: true`.
   - Restored ephemeral-storage request/limit (`1Gi`/`8Gi`).
+- PR #17, `2980aeb`: diff-scoped project check CLI runs.
+  - `cargoless checks run --profile <name> --base <ref>` now derives changed
+    files from git and skips untriggered checks.
+  - Verdict output reports `scope=changed`, the base ref, changed path count,
+    and skipped untriggered count.
+  - Shared gate automation must pass `--base`; `scope=full` is for intentional
+    operator audits, not routine multi-agent merge traffic.
 
 ## Live Verification
 
@@ -61,6 +68,6 @@ The temporary Kubernetes buildx deployment `cargoless-kube0` was removed after t
 
 - Run a few normal tf-multiverse agent merges through `scripts/check-remote` and watch the new push accounting line.
 - Add server-side request metrics for overlay body bytes, metadata-only paths, verdict latency, and concurrent pushes.
-- Wire every shared branch-protection caller to `cargoless checks run --base
+- Keep every shared branch-protection caller on `cargoless checks run --base
   <ref>` and treat `scope=full` as intentional-only.
 - Keep the replacement model strict: no legacy cargo-check fallback in tf-multiverse merge paths.
