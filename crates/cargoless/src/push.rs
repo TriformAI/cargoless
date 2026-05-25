@@ -323,7 +323,7 @@ fn exit_for_verdict(source: &str, worktree: &str, verdict: &str, published_at: u
 /// Run `git -C <repo> diff --name-only <base>` and return the changed
 /// file list (one path per line, repo-relative). Errors surface the
 /// stderr verbatim — actionable to the operator.
-fn git_changed_files(repo: &Path, base: &str) -> std::io::Result<Vec<String>> {
+pub(crate) fn git_changed_files(repo: &Path, base: &str) -> std::io::Result<Vec<String>> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)

@@ -11,10 +11,11 @@ pub fn run(
     action: Option<&str>,
     id: Option<&str>,
     profile: Option<&str>,
+    base: Option<&str>,
 ) -> ExitCode {
     match action.unwrap_or("list") {
         "list" => list(cfg),
-        "run" => run_checks(cfg, id, profile.unwrap_or("dev")),
+        "run" => run_checks(cfg, id, profile.unwrap_or("dev"), base),
         "explain" => explain(cfg, id),
         other => {
             ui::error(format!(
@@ -90,8 +91,26 @@ fn explain(cfg: &Config, id: Option<&str>) -> ExitCode {
     }
 }
 
-fn run_checks(cfg: &Config, id: Option<&str>, profile: &str) -> ExitCode {
-    match cargoless_core::project_checks::run_profile(&cfg.root, profile, id) {
+fn run_checks(cfg: &Config, id: Option<&str>, profile: &str, base: Option<&str>) -> ExitCode {
+    let changed_files = match base {
+        Some(base) => match crate::push::git_changed_files(&cfg.root, base) {
+            Ok(files) => Some((base.to_string(), files)),
+            Err(e) => {
+                ui::error(format!(
+                    "could not determine changed files for project-check pruning against `{base}`: {e}"
+                ));
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let changed_slice = changed_files.as_ref().map(|(_, files)| files.as_slice());
+    match cargoless_core::project_checks::run_profile_with_changes(
+        &cfg.root,
+        profile,
+        id,
+        changed_slice,
+    ) {
         Ok(report) => {
             let mut err = std::io::stderr();
             let _ = crate::check::render_diagnostics(&mut err, &cfg.root, &report.diagnostics);
@@ -103,9 +122,10 @@ fn run_checks(cfg: &Config, id: Option<&str>, profile: &str) -> ExitCode {
                 .count();
             let cache_hits = report.results.iter().filter(|r| r.cache_hit).count();
             let ran = report.results.len();
+            let scope = check_scope_summary(changed_files.as_ref(), report.skipped.len());
             if report.tree == cargoless_core::TreeState::Green {
                 ui::ok(format!(
-                    "project checks green — {ran} check{} evaluated, {} skipped ({cache_hits} cache hit{}) in {}ms",
+                    "project checks green — {ran} check{} evaluated, {} skipped ({cache_hits} cache hit{}) in {}ms{scope}",
                     if ran == 1 { "" } else { "s" },
                     report.skipped.len(),
                     if cache_hits == 1 { "" } else { "s" },
@@ -114,7 +134,7 @@ fn run_checks(cfg: &Config, id: Option<&str>, profile: &str) -> ExitCode {
                 ExitCode::SUCCESS
             } else {
                 ui::error(format!(
-                    "project checks red — {failed} required check{} failed out of {ran} ({} skipped) in {}ms",
+                    "project checks red — {failed} required check{} failed out of {ran} ({} skipped) in {}ms{scope}",
                     if failed == 1 { "" } else { "s" },
                     report.skipped.len(),
                     report.duration_ms,
@@ -127,4 +147,16 @@ fn run_checks(cfg: &Config, id: Option<&str>, profile: &str) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn check_scope_summary(changed_files: Option<&(String, Vec<String>)>, skipped: usize) -> String {
+    let Some((base, changed)) = changed_files else {
+        return " [scope=full]".to_string();
+    };
+    format!(
+        " [scope=changed base={} changed_paths={} skipped_untriggered={}]",
+        base,
+        changed.len(),
+        skipped
+    )
 }

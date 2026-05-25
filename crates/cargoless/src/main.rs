@@ -120,9 +120,10 @@ struct Opts {
     /// absent, defaults to the canonical absolute `--repo` path
     /// (path-keyed identity, D-INC2-2B §11 open-Q1 default).
     push_worktree: Option<String>,
-    /// `push --base <ref>` — git base ref for `git diff --name-only`.
-    /// Default `HEAD`. Carried in the push payload; server stores +
-    /// ignores in v0.2.x (D-INC2-2B §11 open-Q2 default).
+    /// `push --base <ref>` / `checks run --base <ref>` — git base ref for
+    /// `git diff --name-only`. Push defaults to `HEAD`; checks default to a
+    /// full profile unless this is provided. In checks mode the changed-file
+    /// list prunes project checks whose triggers do not match the branch diff.
     push_base: Option<String>,
     /// `push --server-root <path>` — server-side repo root for central
     /// daemon mode.
@@ -401,6 +402,7 @@ fn usage() {
          cli-status file"
     );
     println!("  --worktree <KEY>      status/push: query or push one served worktree");
+    println!("  --base <REF>          push/checks: git base ref for changed-file pruning");
     println!("  --server-root <DIR>   push: server-side repo root for central daemon mode");
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
@@ -667,6 +669,7 @@ fn main() -> ExitCode {
             parsed.opts.checks_action.as_deref(),
             parsed.opts.checks_id.as_deref(),
             parsed.opts.checks_profile.as_deref(),
+            parsed.opts.push_base.as_deref(),
         ),
         Cmd::Clean => clean::run(&cfg),
         Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push => unreachable!("handled above"),
@@ -900,12 +903,15 @@ mod tests {
             "generated-frontend",
             "--profile",
             "canary",
+            "--base",
+            "origin/main",
         ]))
         .unwrap();
         assert_eq!(p.cmd, Cmd::Checks);
         assert_eq!(p.opts.checks_action.as_deref(), Some("run"));
         assert_eq!(p.opts.checks_id.as_deref(), Some("generated-frontend"));
         assert_eq!(p.opts.checks_profile.as_deref(), Some("canary"));
+        assert_eq!(p.opts.push_base.as_deref(), Some("origin/main"));
         assert!(p.opts.cargo_extra_args.is_empty());
     }
 
