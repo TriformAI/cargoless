@@ -68,11 +68,11 @@
 //! catch compile/borrow/clippy/contract-shape); runtime is the
 //! downstream half of the closed chain.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -95,6 +95,9 @@ use crate::statusfile::{self, Status, Verdict};
 /// v0 debounce quiet-window for the per-WT routed batches (the same
 /// order as the v0 single-watch default; runtime-tunable later).
 const QUIET: Duration = Duration::from_millis(200);
+const DEFAULT_PROJECT_CHECKS_WARN_MAX_PARALLEL: usize = 2;
+
+static PROJECT_CHECKS_WARN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// One cluster's live state. Constructed at exactly one site (the
 /// `SpawnRa` arm); the `ClusterDriver`/`OverlayMultiplexer` are mutated
@@ -444,7 +447,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // Best-effort: an unreadable base config falls back to the pushed
         // overrides only, preserving split-safe routing without forcing the
         // client to resend unchanged config bodies on every push.
-        while let Ok(wt_key) = push_rx.try_recv() {
+        for wt_key in drain_unique_push_keys(&push_rx) {
             let wt: WtId = PathBuf::from(&wt_key);
             // Register on first push (tap 1 substitute) + derive cluster
             // hash from pushed content (tap 2 substitute). On subsequent
@@ -642,6 +645,14 @@ fn heartbeat_repo_status(repo_root: &Path) {
 /// WtId (PathBuf) → the `String` key `ClusterLifecycle` uses.
 fn path_key(wt: &WtId) -> String {
     wt.to_string_lossy().into_owned()
+}
+
+fn drain_unique_push_keys(push_rx: &Receiver<String>) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    while let Ok(wt_key) = push_rx.try_recv() {
+        keys.insert(wt_key);
+    }
+    keys.into_iter().collect()
 }
 
 /// #240/2b — derive a WorkspaceConfigHash for a pushed overlay. PEEKS at the
@@ -1329,9 +1340,19 @@ fn spawn_project_checks_warn(
     api: Arc<crate::serveapi::ServeVerdictState>,
 ) {
     let display = wt.display().to_string();
+    let Some(permit) = try_acquire_project_checks_warn_slot() else {
+        eprintln!(
+            "[cargoless:obs] project-checks-warn wt={} skipped=backpressure active={} max={}",
+            display,
+            PROJECT_CHECKS_WARN_ACTIVE.load(Ordering::Relaxed),
+            project_checks_warn_max_parallel()
+        );
+        return;
+    };
     if let Err(e) = std::thread::Builder::new()
         .name("cargoless-project-checks-warn".to_string())
         .spawn(move || {
+            let _permit = permit;
             let summary = run_project_checks_and_log(&wt, context, &api);
             eprintln!(
                 "[cargoless:obs] project-checks-warn wt={} gate=false summary={}",
@@ -1357,6 +1378,46 @@ fn spawn_project_checks_warn(
             "[cargoless:obs] project-checks-warn wt={} spawn_error={}",
             display, e
         );
+    }
+}
+
+struct ProjectChecksWarnPermit;
+
+impl Drop for ProjectChecksWarnPermit {
+    fn drop(&mut self) {
+        PROJECT_CHECKS_WARN_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn project_checks_warn_max_parallel() -> usize {
+    std::env::var("CARGOLESS_PROJECT_CHECKS_WARN_MAX_PARALLEL")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_PROJECT_CHECKS_WARN_MAX_PARALLEL)
+}
+
+fn try_acquire_project_checks_warn_slot() -> Option<ProjectChecksWarnPermit> {
+    try_acquire_project_checks_warn_slot_with_max(project_checks_warn_max_parallel())
+}
+
+fn try_acquire_project_checks_warn_slot_with_max(
+    max_parallel: usize,
+) -> Option<ProjectChecksWarnPermit> {
+    let mut current = PROJECT_CHECKS_WARN_ACTIVE.load(Ordering::Relaxed);
+    loop {
+        if current >= max_parallel {
+            return None;
+        }
+        match PROJECT_CHECKS_WARN_ACTIVE.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(ProjectChecksWarnPermit),
+            Err(next) => current = next,
+        }
     }
 }
 
@@ -1606,6 +1667,37 @@ mod tests {
             read_workspace_config(&root).unwrap().hash()
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn push_signal_drain_coalesces_duplicate_worktrees() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send("/wt-b".to_string()).unwrap();
+        tx.send("/wt-a".to_string()).unwrap();
+        tx.send("/wt-b".to_string()).unwrap();
+        drop(tx);
+
+        assert_eq!(
+            drain_unique_push_keys(&rx),
+            vec!["/wt-a".to_string(), "/wt-b".to_string()],
+            "rapid repeated pushes for one worktree should service the latest stored overlay once"
+        );
+    }
+
+    #[test]
+    fn warn_project_check_slots_are_bounded_and_released() {
+        PROJECT_CHECKS_WARN_ACTIVE.store(0, Ordering::Relaxed);
+        let first = try_acquire_project_checks_warn_slot_with_max(1).expect("first slot");
+        assert!(
+            try_acquire_project_checks_warn_slot_with_max(1).is_none(),
+            "second advisory check should be backpressured when the cap is full"
+        );
+        drop(first);
+        assert!(
+            try_acquire_project_checks_warn_slot_with_max(1).is_some(),
+            "slot should be available again after the permit drops"
+        );
+        PROJECT_CHECKS_WARN_ACTIVE.store(0, Ordering::Relaxed);
     }
 
     #[test]

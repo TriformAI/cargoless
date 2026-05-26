@@ -465,7 +465,7 @@ impl VerdictService for ServeVerdictState {
                 let base = base_ref.trim();
                 if !base.is_empty() {
                     let _guard = poisoned(&self.sync_lock);
-                    if let Err(e) = sync_analysis_root(root, base) {
+                    if let Err(e) = ensure_analysis_root(root, base, base_sha.as_deref()) {
                         return rejected_push(worktree, &e);
                     }
                 }
@@ -573,6 +573,34 @@ fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_analysis_root(
+    root: &Path,
+    base_ref: &str,
+    expected_base_sha: Option<&str>,
+) -> Result<(), String> {
+    if !root.join(".git").exists() {
+        return Err(format!(
+            "analysis_root `{}` is not a git checkout",
+            root.display()
+        ));
+    }
+    if let Some(sha) = expected_base_sha.map(str::trim).filter(|s| !s.is_empty()) {
+        if analysis_root_clean_at_sha(root, sha)? {
+            return Ok(());
+        }
+    }
+    sync_analysis_root(root, base_ref)
+}
+
+fn analysis_root_clean_at_sha(root: &Path, expected_sha: &str) -> Result<bool, String> {
+    let head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    if head.trim() != expected_sha {
+        return Ok(false);
+    }
+    Ok(run_git_success(root, &["diff", "--quiet"])?
+        && run_git_success(root, &["diff", "--cached", "--quiet"])?)
+}
+
 fn reset_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     run_git(root, &["reset", "--hard", base_ref])?;
     run_git(root, &["clean", "-fd", "-e", ".cargoless"])?;
@@ -623,6 +651,47 @@ fn run_git(root: &Path, args: &[&str]) -> Result<(), String> {
         })?;
     if out.status.success() {
         return Ok(());
+    }
+    Err(format!(
+        "git {:?} in `{}` exited {:?}: {}",
+        args,
+        root.display(),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+fn run_git_success(root: &Path, args: &[&str]) -> Result<bool, String> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()
+        .map_err(|e| {
+            format!(
+                "git {:?} in `{}` failed to start: {e}",
+                args,
+                root.display()
+            )
+        })?;
+    Ok(status.success())
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            format!(
+                "git {:?} in `{}` failed to start: {e}",
+                args,
+                root.display()
+            )
+        })?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
     Err(format!(
         "git {:?} in `{}` exited {:?}: {}",
@@ -920,6 +989,49 @@ mod tests {
         );
         assert_eq!(pushed.base_sha.as_deref(), Some("abc123"));
         assert_eq!(pushed.changed_files, Some(vec!["src/lib.rs".into()]));
+    }
+
+    #[test]
+    fn push_overlay_skips_fetch_reset_when_analysis_root_already_at_base_sha() {
+        let root = temp_root("sync-skip");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        let head = git_stdout(&root, &["rev-parse", "HEAD"]).unwrap();
+
+        let api = ServeVerdictState::new();
+        let files = vec![(
+            "src/lib.rs".to_string(),
+            "pub fn changed() {}\n".to_string(),
+        )];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some(head),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+        };
+
+        let ack = api.push_overlay_with_options(
+            "/client/wt",
+            "origin/main",
+            &files,
+            None,
+            Some(&options),
+        );
+
+        assert!(
+            ack.accepted,
+            "matching base_sha should avoid `git fetch origin main`; this test repo has no origin"
+        );
+        assert!(api.peek_overlay_for("/client/wt").is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

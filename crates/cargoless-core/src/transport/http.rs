@@ -30,9 +30,9 @@
 //! and audit-able.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread;
 use std::time::Duration;
@@ -54,6 +54,7 @@ use super::{
 /// while fail-closed-bounding a hostile/runaway client.
 pub const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
 // ---- tiny request model -------------------------------------------------
 
@@ -151,6 +152,65 @@ pub struct HttpServer {
     stop: Arc<AtomicBool>,
 }
 
+struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn configured_max_connections() -> usize {
+    std::env::var("CARGOLESS_HTTP_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
+fn try_acquire_connection(
+    active: &Arc<AtomicUsize>,
+    max_connections: usize,
+) -> Option<ConnectionPermit> {
+    let mut current = active.load(Ordering::Relaxed);
+    loop {
+        if current >= max_connections {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                return Some(ConnectionPermit {
+                    active: Arc::clone(active),
+                });
+            }
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn write_busy(mut conn: TcpStream) {
+    let _ = conn.set_nonblocking(false);
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut discard = [0_u8; 1024];
+    let _ = conn.read(&mut discard);
+    let _ = conn.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
+    write_response(
+        &mut conn,
+        503,
+        "Service Unavailable",
+        "text/plain",
+        "cargoless http server is busy; retry shortly",
+    );
+    let _ = conn.shutdown(Shutdown::Both);
+}
+
 impl HttpServer {
     /// Bind `addr` (e.g. `127.0.0.1:0` for an ephemeral test port) and
     /// serve `svc`, gating every request through `auth`. Pass
@@ -190,15 +250,30 @@ impl HttpServer {
         auth: Arc<dyn Authorizer>,
         ready: Arc<AtomicBool>,
     ) -> Result<HttpServer, TransportError> {
+        Self::bind_with_health_and_limit(addr, svc, auth, ready, configured_max_connections())
+    }
+
+    fn bind_with_health_and_limit(
+        addr: &str,
+        svc: Arc<dyn VerdictService>,
+        auth: Arc<dyn Authorizer>,
+        ready: Arc<AtomicBool>,
+        max_connections: usize,
+    ) -> Result<HttpServer, TransportError> {
         let listener = TcpListener::bind(addr)?;
         let bound = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
+        let active = Arc::new(AtomicUsize::new(0));
         thread::spawn(move || {
             while !stop_t.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((conn, _)) => {
+                        let Some(permit) = try_acquire_connection(&active, max_connections) else {
+                            write_busy(conn);
+                            continue;
+                        };
                         // The listener is nonblocking so the accept loop can
                         // poll the stop flag. Some platforms let accepted
                         // streams inherit that mode; body reads must be
@@ -206,7 +281,10 @@ impl HttpServer {
                         // false "short body".
                         let _ = conn.set_nonblocking(false);
                         let (svc_c, auth_c, ready_c) = (svc.clone(), auth.clone(), ready.clone());
-                        thread::spawn(move || handle(conn, svc_c, auth_c, ready_c));
+                        thread::spawn(move || {
+                            let _permit = permit;
+                            handle(conn, svc_c, auth_c, ready_c);
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(std::time::Duration::from_millis(20));
@@ -236,6 +314,8 @@ fn handle(
     auth: Arc<dyn Authorizer>,
     ready: Arc<AtomicBool>,
 ) {
+    let _ = conn.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
+    let _ = conn.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
     let mut writer = match conn.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -1198,6 +1278,37 @@ mod tests {
             code, 401,
             "POST /overlay is bearer-gated (not /healthz-exempt)"
         );
+        drop(s);
+    }
+
+    #[test]
+    fn http_server_refuses_excess_connections_with_503() {
+        let s = HttpServer::bind_with_health_and_limit(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+            Arc::new(AtomicBool::new(true)),
+            1,
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut held = TcpStream::connect(s.addr()).expect("held connect");
+        write!(
+            held,
+            "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        held.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (code, body) = raw_get(s.addr(), "/healthz");
+        assert_eq!(code, 503, "connection cap should fail fast with 503");
+        assert!(
+            body.contains("busy"),
+            "busy response should be actionable, got {body:?}"
+        );
+        drop(held);
         drop(s);
     }
 
