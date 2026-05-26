@@ -145,13 +145,42 @@ pub fn init_telemetry(cfg: &TelemetryConfig) -> ShutdownHandle {
     // Default-disabled: no endpoint ⇒ no SDK init. Zero overhead for
     // local invocations. The single load-bearing predicate from 5b.
     if !cfg.enabled() {
+        // INFRA-54 diagnostic: surface the inert path explicitly so the
+        // operator can distinguish "I never tried to init" from "init
+        // succeeded silently but spans don't reach the collector." The
+        // *zero* eprintln on success that the original 5a design used
+        // turned out to be the diagnostic gap that hid INFRA-54 root
+        // cause from observation. Always-on now (eprintln is cheap and
+        // happens once at startup, not per-span).
+        eprintln!(
+            "[cargoless:telemetry] inert (no endpoint configured — set \
+             OTEL_EXPORTER_OTLP_ENDPOINT to enable). service_name={}",
+            cfg.otel_service_name
+        );
         return ShutdownHandle::inert();
     }
 
     #[cfg(feature = "telemetry")]
     {
         match try_init(cfg) {
-            Ok(handle) => handle,
+            Ok(handle) => {
+                // INFRA-54 diagnostic: the original 5a design left the
+                // success path silent (no eprintln, no info line). When
+                // spans turned up missing on the production rollout we
+                // had no way to tell whether init had run at all vs.
+                // run-and-export-silently-failed. Explicit success log
+                // makes the boundary visible. Includes endpoint +
+                // service name so dashboards-side mismatches are
+                // immediately diagnosable.
+                eprintln!(
+                    "[cargoless:telemetry] init OK \
+                     endpoint={} service={} sampler_arg={}",
+                    cfg.otel_endpoint.as_deref().unwrap_or("(unset)"),
+                    cfg.otel_service_name,
+                    cfg.otel_sampler_arg
+                );
+                handle
+            }
             Err(why) => {
                 // Fail-soft: never wedge the daemon. The stderr-only
                 // `[cargoless:obs]` eprintlns from #247 remain the
