@@ -321,6 +321,10 @@ fn try_init(cfg: &TelemetryConfig) -> Result<ShutdownHandle, String> {
         .with_http()
         .with_endpoint(endpoint)
         .with_protocol(Protocol::HttpBinary)
+        // 10 s cap matches physics telemetry.rs:156. Without this the blocking
+        // reqwest call has no deadline — a slow or wedged in-cluster collector
+        // would stall the verdict-emit path indefinitely (AMEM-49 follow-up).
+        .with_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("OTLP exporter build failed: {e}"))?;
 
