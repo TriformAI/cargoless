@@ -71,23 +71,23 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
 use cargoless_core::activitymgr::ActivityTracker;
-use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
+use cargoless_core::analyzer::{rust_analyzer_command, Supervisor};
 use cargoless_core::cluster::{WorkspaceConfig, WorkspaceConfigHash};
 use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
-use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
+use cargoless_core::clustermgr::{read_workspace_config, ClusterLifecycle, LifecycleAction};
 use cargoless_core::lsp::{InitOpts, LspClient, LspEvent};
 use cargoless_core::multiplex::LspVerb;
 use cargoless_core::multiplex::OverlayMultiplexer;
 use cargoless_core::overlay::OverlaySet;
-use cargoless_core::repo::RepoScope;
 use cargoless_core::repo::watch::{RepoWatchRouter, WtId, WtRouter};
+use cargoless_core::repo::RepoScope;
 
 use crate::orphan::ParentWatch;
 use crate::statusfile::{self, Status, Verdict};
@@ -1307,7 +1307,12 @@ fn spawn_project_checks_hard(
     context: Option<crate::serveapi::ProjectCheckRunContext>,
     api: Arc<crate::serveapi::ServeVerdictState>,
 ) {
+    // `wt` + `api` are moved into the `move` closure, which `spawn` consumes
+    // even when it returns `Err` — so the spawn-failure fallback below cannot
+    // reference them. Keep cheap clones for that path (`api` is an `Arc`).
     let display = wt.display().to_string();
+    let fallback_wt = wt.clone();
+    let fallback_api = Arc::clone(&api);
     if let Err(e) = std::thread::Builder::new()
         .name("cargoless-project-checks-hard".to_string())
         .spawn(move || {
@@ -1327,7 +1332,7 @@ fn spawn_project_checks_hard(
             "[cargoless:obs] project-checks-hard wt={} spawn_error={} — publishing RA-native verdict synchronously",
             display, e
         );
-        publish_verdict(&wt, authoritative_error, &api);
+        publish_verdict(&fallback_wt, authoritative_error, &fallback_api);
     }
 }
 
