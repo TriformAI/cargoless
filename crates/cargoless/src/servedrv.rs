@@ -1071,9 +1071,36 @@ fn exec(
                     spawn_project_checks_warn(wt, project_check_context, Arc::clone(api));
                 }
                 ProjectChecksMode::Hard => {
-                    let project_check_error =
-                        run_project_checks_and_log(&wt, project_check_context, api);
-                    publish_verdict(&wt, authoritative_error || project_check_error, api);
+                    // FIELD FINDING (latency): the prior implementation ran
+                    // `run_project_checks_and_log` SYNCHRONOUSLY here, then
+                    // published. The project-check witness is a real
+                    // `cargo check` of the changed crate's reverse-dependency
+                    // cone (~minutes on a foundational-crate edit). Because the
+                    // serve loop's single owner thread is the SOLE drainer of
+                    // every cluster's RA event stream (`lsp_rx`), the pushed
+                    // overlay channel (`push_rx`), the watcher, and activity
+                    // ticks, a synchronous witness froze the ENTIRE pod — every
+                    // other worktree, across every cluster, stopped getting
+                    // verdicts for the witness's whole duration. (That pod-wide
+                    // stall — "all agents seeing slow checks" — is what forced
+                    // the operator hard→warn revert; the per-pusher latency
+                    // floor is irreducible cargo-check work and is NOT the
+                    // thing being fixed here.)
+                    //
+                    // Fix: run the witness OFF the loop thread (the proven warn
+                    // threading shape) but — unlike warn — DEFER the verdict
+                    // publish to INSIDE the closure, OR'd with the RA-native
+                    // bit. So the gate stays real ("green means the witness
+                    // compiled it"), there is NO early/provisional green (warn
+                    // publishes-then-checks; hard checks-then-publishes), and
+                    // the loop returns immediately so no other worktree is
+                    // blocked. Only the pushing worktree waits for its own gate.
+                    spawn_project_checks_hard(
+                        wt,
+                        authoritative_error,
+                        project_check_context,
+                        Arc::clone(api),
+                    );
                 }
             }
         }
@@ -1260,6 +1287,50 @@ fn spawn_project_checks_warn(
     }
 }
 
+/// Hard-mode gated witness, run OFF the serve-loop thread (see the
+/// `ProjectChecksMode::Hard` arm for the why). Mirrors
+/// [`spawn_project_checks_warn`]'s threading, but the verdict is published
+/// from INSIDE the closure — only after the witness settles — OR'd with the
+/// RA-native `authoritative_error`. This preserves the gate semantics
+/// (`authoritative_error || project_check_error`) byte-for-byte with the prior
+/// synchronous code; the only change is *where* it runs (a detached thread
+/// instead of the loop owner). No early/provisional green is published: the
+/// publish happens once, after the check, so a slow witness leaves the
+/// worktree's prior verdict in place rather than briefly flipping green.
+///
+/// Spawn-failure fallback: if the thread cannot be created, publish the
+/// RA-native verdict synchronously so the worktree is never left without a
+/// verdict (degrades to "RA-native only" for that one push, never to silence).
+fn spawn_project_checks_hard(
+    wt: PathBuf,
+    authoritative_error: bool,
+    context: Option<crate::serveapi::ProjectCheckRunContext>,
+    api: Arc<crate::serveapi::ServeVerdictState>,
+) {
+    let display = wt.display().to_string();
+    if let Err(e) = std::thread::Builder::new()
+        .name("cargoless-project-checks-hard".to_string())
+        .spawn(move || {
+            let project_check_error = run_project_checks_and_log(&wt, context, &api);
+            let gated = authoritative_error || project_check_error;
+            eprintln!(
+                "[cargoless:obs] project-checks-hard wt={} gate=true ra_native_error={} project_check_error={} gated_verdict={}",
+                wt.display(),
+                authoritative_error,
+                project_check_error,
+                if gated { "red" } else { "green" },
+            );
+            publish_verdict(&wt, gated, &api);
+        })
+    {
+        eprintln!(
+            "[cargoless:obs] project-checks-hard wt={} spawn_error={} — publishing RA-native verdict synchronously",
+            display, e
+        );
+        publish_verdict(&wt, authoritative_error, &api);
+    }
+}
+
 fn run_project_checks_and_log(
     wt: &Path,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
@@ -1373,6 +1444,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// Hard mode runs the witness OFF the loop and still gates the verdict.
+    /// With no manifest the witness is a no-op (Green), so the published
+    /// verdict equals the RA-native bit: clean RA ⇒ green, RA error ⇒ red
+    /// (the `authoritative_error || project_check_error` gate). Crucially the
+    /// publish happens from the spawned thread, so we join by polling the
+    /// API the verdict lands in — proving the gate is preserved across the
+    /// sync→async move without an early/provisional green.
+    fn await_verdict(api: &Arc<crate::serveapi::ServeVerdictState>, wt: &str) -> String {
+        // The hard witness publishes from a detached thread; poll briefly.
+        for _ in 0..200 {
+            if let Some(st) = api.get_status(wt) {
+                return st.verdict;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("hard witness never published a verdict for {wt}");
+    }
+
+    #[test]
+    fn hard_witness_publishes_gated_green_when_ra_clean_and_no_checks() {
+        let root = temp_root("hard-green");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        // authoritative_error=false (RA clean) + no manifest (witness green)
+        // ⇒ gated verdict green, published from the spawned thread.
+        spawn_project_checks_hard(root.clone(), false, None, Arc::clone(&api));
+        assert_eq!(await_verdict(&api, &root.to_string_lossy()), "green");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hard_witness_publishes_red_when_ra_native_error_even_if_checks_pass() {
+        let root = temp_root("hard-red");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        // authoritative_error=true (RA flagged a real error) OR'd with a
+        // green/no-op witness ⇒ gated verdict RED. This is the no-false-green
+        // invariant: the gate never downgrades an RA-native red to green.
+        spawn_project_checks_hard(root.clone(), true, None, Arc::clone(&api));
+        assert_eq!(await_verdict(&api, &root.to_string_lossy()), "red");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
