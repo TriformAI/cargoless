@@ -1075,9 +1075,7 @@ fn exec(
             // configured to gate on). `gate` rides on the per-worktree
             // `ProjectCheckRunContext` (set from `PushedOverlay.gate` in the
             // SwitchOverlay arm); absent context ⇒ not a gate push.
-            let gate_requested = project_check_context
-                .as_ref()
-                .is_some_and(|ctx| ctx.gate);
+            let gate_requested = project_check_context.as_ref().is_some_and(|ctx| ctx.gate);
             let effective_mode =
                 effective_project_checks_mode(project_checks_mode(), gate_requested);
             match effective_mode {
