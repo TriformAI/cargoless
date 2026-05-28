@@ -1000,6 +1000,7 @@ fn exec(
                     pushed.base_ref.clone(),
                     pushed.files.clone(),
                     materialize_overlay,
+                    pushed.gate,
                 );
                 pushed.files
             } else {
@@ -1064,7 +1065,22 @@ fn exec(
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
             let project_check_context = api.take_project_check_context(&wt.to_string_lossy());
-            match project_checks_mode() {
+            // warn-fast / witness-gated hybrid: a push that opted in with
+            // `gate: true` (the merge-gate workflow) is promoted to hard-mode
+            // behavior FOR THIS WORKTREE — it runs the witness and publishes
+            // the gated verdict on `/status` even when the daemon default is
+            // `warn`. The fleet's live FS-watch loop and ordinary pushes carry
+            // `gate=false`, so they keep the instant RA-native warn verdict and
+            // pay nothing for the witness. Off mode ignores the bit (no checks
+            // configured to gate on). `gate` rides on the per-worktree
+            // `ProjectCheckRunContext` (set from `PushedOverlay.gate` in the
+            // SwitchOverlay arm); absent context ⇒ not a gate push.
+            let gate_requested = project_check_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.gate);
+            let effective_mode =
+                effective_project_checks_mode(project_checks_mode(), gate_requested);
+            match effective_mode {
                 ProjectChecksMode::Off => publish_verdict(&wt, authoritative_error, api),
                 ProjectChecksMode::Warn => {
                     publish_verdict(&wt, authoritative_error, api);
@@ -1260,6 +1276,21 @@ fn project_checks_mode() -> ProjectChecksMode {
         "off" | "0" | "false" | "disabled" => ProjectChecksMode::Off,
         "warn" => ProjectChecksMode::Warn,
         _ => ProjectChecksMode::Hard,
+    }
+}
+
+/// warn-fast / witness-gated hybrid: a `gate: true` push promotes the daemon's
+/// default mode for THIS worktree's verdict. Warn→Hard so the merge-gate push
+/// gets the authoritative witness verdict while the fleet's fast loop (gate
+/// false) stays warn. Off is never promoted — no checks are configured to
+/// gate on — and Hard is already authoritative. Pure + total ⇒ unit-testable.
+fn effective_project_checks_mode(
+    default: ProjectChecksMode,
+    gate_requested: bool,
+) -> ProjectChecksMode {
+    match (default, gate_requested) {
+        (ProjectChecksMode::Warn, true) => ProjectChecksMode::Hard,
+        (mode, _) => mode,
     }
 }
 
@@ -1481,6 +1512,22 @@ mod tests {
     }
 
     #[test]
+    fn gate_push_promotes_warn_to_hard_only_for_that_push() {
+        use ProjectChecksMode::*;
+        // warn-fast / witness-gated hybrid contract:
+        // a gate push promotes warn→hard (the merge-gate gets the witness);
+        // a non-gate push in warn stays warn (the fleet's fast loop).
+        assert_eq!(effective_project_checks_mode(Warn, true), Hard);
+        assert_eq!(effective_project_checks_mode(Warn, false), Warn);
+        // Off is never promoted (nothing configured to gate on); Hard is
+        // already authoritative regardless of the gate bit.
+        assert_eq!(effective_project_checks_mode(Off, true), Off);
+        assert_eq!(effective_project_checks_mode(Off, false), Off);
+        assert_eq!(effective_project_checks_mode(Hard, true), Hard);
+        assert_eq!(effective_project_checks_mode(Hard, false), Hard);
+    }
+
+    #[test]
     fn hard_witness_publishes_red_when_ra_native_error_even_if_checks_pass() {
         let root = temp_root("hard-red");
         let api = Arc::new(crate::serveapi::ServeVerdictState::new());
@@ -1505,6 +1552,7 @@ mod tests {
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -1530,6 +1578,7 @@ mod tests {
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
             changed_files: Some(vec!["Cargo.toml".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));

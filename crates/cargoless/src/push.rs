@@ -87,6 +87,12 @@ pub struct PushOpts {
     pub await_verdict: bool,
     /// Wall-clock timeout for `await_verdict`.
     pub await_timeout_secs: u64,
+    /// If true, request the authoritative **witness-gated** verdict
+    /// (warn-fast/witness-gated hybrid): the daemon runs the project-check
+    /// compiler witness and publishes the gated verdict even under a `warn`
+    /// default mode. This is what a merge-gate caller wants; the local
+    /// fast-loop leaves it `false` to keep the instant RA-native verdict.
+    pub gate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +225,7 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         } else {
             Some(changed.clone())
         },
+        gate: opts.gate,
         ..PushOverlayOptions::default()
     };
     if let Some(root) = opts.server_root.as_ref() {
@@ -489,6 +496,7 @@ mod tests {
             server_root: None,
             await_verdict: true,
             await_timeout_secs: 10,
+            gate: false,
         };
         // Cheap clone+eq sanity (the v0 CLI Opts shape relies on
         // PartialEq for the parser tests in main.rs).

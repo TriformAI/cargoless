@@ -146,6 +146,15 @@ pub struct PushOverlayOptions {
     /// needed for cluster routing, while project-check triggers should see
     /// only the user diff.
     pub changed_files: Option<Vec<String>>,
+    /// `true` requests the **authoritative, witness-gated** verdict for this
+    /// push: the daemon runs the project-check compiler witness and reports the
+    /// gated (`ra_native || project_check`) verdict on `/status`, even when the
+    /// daemon's default `CARGOLESS_PROJECT_CHECKS_MODE` is `warn`. This is the
+    /// warn-fast/witness-gated hybrid: the live FS-watch loop keeps the instant
+    /// RA-native verdict; only a `gate` push (the merge-gate workflow) pays for
+    /// and waits on the real compile. `false` (default) preserves today's
+    /// behavior exactly — absent on the wire ⇒ `false`.
+    pub gate: bool,
 }
 
 impl PushOverlayOptions {
@@ -162,6 +171,7 @@ impl PushOverlayOptions {
                 .changed_files
                 .as_ref()
                 .is_none_or(|files| files.is_empty())
+            && !self.gate
     }
 }
 
@@ -672,6 +682,9 @@ impl Request {
                             serde_json::Value::String(sha.to_string()),
                         );
                     }
+                    if options.gate {
+                        map.insert("gate".to_string(), serde_json::Value::Bool(true));
+                    }
                     if let Some(changed_files) = options
                         .changed_files
                         .as_ref()
@@ -712,6 +725,10 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty()),
         changed_files: string_array_from_json(v.get("changed_files")),
+        gate: v
+            .get("gate")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -1384,6 +1401,10 @@ mod tests {
                 analysis_root: Some("/workspace/tf-multiverse".into()),
                 base_sha: Some("abc123".into()),
                 changed_files: Some(vec!["src/lib.rs".into()]),
+                // gate=true must survive the wire roundtrip (warn-fast/
+                // witness-gated hybrid: the merge-gate push opts into the
+                // authoritative witness verdict).
+                gate: true,
             },
         };
         assert_eq!(Request::from_json(&req.to_json()), Some(req));

@@ -90,6 +90,11 @@ pub struct PushedOverlay {
     /// repo-scoped daemon accept tf-multiverse's per-invocation
     /// `check-remote` selectors without restarting RA per package.
     pub check_profile: Option<CheckProfile>,
+    /// `true` ⇒ this push requested the authoritative witness-gated verdict
+    /// (warn-fast/witness-gated hybrid). When set, the serve loop runs the
+    /// project-check witness and publishes the gated verdict even if the
+    /// daemon default mode is `warn`. Default `false` preserves warn behavior.
+    pub gate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +104,9 @@ pub(crate) struct ProjectCheckRunContext {
     pub base_ref: String,
     pub overlay_files: Vec<(String, String)>,
     pub materialize_overlay: bool,
+    /// `true` ⇒ the originating push requested the witness-gated verdict; the
+    /// serve loop forces hard-mode behavior for this worktree's verdict.
+    pub gate: bool,
 }
 
 /// The serve-loop's live verdict state, presented as the shipped logical
@@ -253,6 +261,7 @@ impl ServeVerdictState {
         base_ref: String,
         overlay_files: Vec<(String, String)>,
         materialize_overlay: bool,
+        gate: bool,
     ) {
         poisoned(&self.project_check_context).insert(
             worktree.to_string(),
@@ -262,6 +271,7 @@ impl ServeVerdictState {
                 base_ref,
                 overlay_files,
                 materialize_overlay,
+                gate,
             },
         );
     }
@@ -423,8 +433,10 @@ impl VerdictService for ServeVerdictState {
         let mut analysis_root = None;
         let mut base_sha = None;
         let mut changed_files = None;
+        let mut gate = false;
         if let Some(options) = options {
             changed_files = options.changed_files.clone();
+            gate = options.gate;
             analysis_root = options
                 .analysis_root
                 .as_deref()
@@ -472,6 +484,7 @@ impl VerdictService for ServeVerdictState {
             last_push_unix: crate::statusfile::now_unix(),
             changed_files,
             check_profile: check_profile.cloned(),
+            gate,
         };
         poisoned(&self.pushed).insert(worktree.to_string(), pushed);
         // Wake the serve loop (best-effort — see attach_push_signal doc).
@@ -832,6 +845,7 @@ mod tests {
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/lib.rs".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -887,6 +901,7 @@ mod tests {
                 ),
             ],
             materialize_overlay: true,
+            gate: false,
         };
 
         let seen = api
@@ -921,6 +936,7 @@ mod tests {
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
             changed_files: None,
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));

@@ -133,6 +133,11 @@ struct Opts {
     push_await_verdict: bool,
     /// `push --await-timeout-secs <N>` — max wait for fresh verdict.
     push_await_timeout_secs: Option<u64>,
+    /// `push --gate` — request the authoritative witness-gated verdict
+    /// (warn-fast/witness-gated hybrid). The daemon runs the project-check
+    /// compiler witness and publishes the gated verdict even under a `warn`
+    /// default; the merge-gate workflow sets this. Absent ⇒ instant RA-native.
+    push_gate: bool,
     /// `checks list|run|explain`.
     checks_action: Option<String>,
     /// Optional check id for `checks run <id>` / `checks explain <id>`.
@@ -331,6 +336,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 ));
             }
             "--await-verdict" => opts.push_await_verdict = true,
+            "--gate" => opts.push_gate = true,
             "--await-timeout-secs" => {
                 let v = it
                     .next()
@@ -653,6 +659,7 @@ fn main() -> ExitCode {
                 server_root: parsed.opts.push_server_root.clone(),
                 await_verdict: parsed.opts.push_await_verdict,
                 await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
+                gate: parsed.opts.push_gate,
             });
         }
         _ => {}
