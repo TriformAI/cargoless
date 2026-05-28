@@ -253,27 +253,17 @@ impl ServeVerdictState {
             .and_then(|p| p.analysis_root.clone())
     }
 
+    /// Record the per-worktree project-check context the `EmitVerdict` arm
+    /// later consumes. Takes the built [`ProjectCheckRunContext`] by value
+    /// rather than its fields one-by-one — the field set grew past clippy's
+    /// `too_many_arguments` threshold (and a bag of positional args mirroring
+    /// a struct's fields is exactly what that lint warns against).
     pub(crate) fn record_project_check_context(
         &self,
         worktree: &str,
-        root: PathBuf,
-        changed_files: Option<Vec<String>>,
-        base_ref: String,
-        overlay_files: Vec<(String, String)>,
-        materialize_overlay: bool,
-        gate: bool,
+        context: ProjectCheckRunContext,
     ) {
-        poisoned(&self.project_check_context).insert(
-            worktree.to_string(),
-            ProjectCheckRunContext {
-                root,
-                changed_files,
-                base_ref,
-                overlay_files,
-                materialize_overlay,
-                gate,
-            },
-        );
+        poisoned(&self.project_check_context).insert(worktree.to_string(), context);
     }
 
     pub(crate) fn take_project_check_context(

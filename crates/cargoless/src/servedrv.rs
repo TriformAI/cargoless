@@ -995,12 +995,14 @@ fn exec(
                 let materialize_overlay = pushed.analysis_root.is_some();
                 api.record_project_check_context(
                     &wt_key,
-                    project_root,
-                    pushed.changed_files.clone(),
-                    pushed.base_ref.clone(),
-                    pushed.files.clone(),
-                    materialize_overlay,
-                    pushed.gate,
+                    crate::serveapi::ProjectCheckRunContext {
+                        root: project_root,
+                        changed_files: pushed.changed_files.clone(),
+                        base_ref: pushed.base_ref.clone(),
+                        overlay_files: pushed.files.clone(),
+                        materialize_overlay,
+                        gate: pushed.gate,
+                    },
                 );
                 pushed.files
             } else {
@@ -1511,7 +1513,7 @@ mod tests {
 
     #[test]
     fn gate_push_promotes_warn_to_hard_only_for_that_push() {
-        use ProjectChecksMode::*;
+        use ProjectChecksMode::{Hard, Off, Warn};
         // warn-fast / witness-gated hybrid contract:
         // a gate push promotes warn→hard (the merge-gate gets the witness);
         // a non-gate push in warn stays warn (the fleet's fast loop).
