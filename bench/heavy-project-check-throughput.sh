@@ -347,6 +347,8 @@ combined_checks = 0
 solo_checks = 0
 members = 0
 parse_errors = []
+queue_waits = []
+physical_runs = {}
 
 for i in range(requests):
     rc_path = os.path.join(work, f"rc-{i}")
@@ -365,11 +367,25 @@ for i in range(requests):
     verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
     combined_checks += int(report.get("combined_checks", 0) or 0)
     solo_checks += int(report.get("solo_checks", 0) or 0)
+    queue_waits.append(int(report.get("queue_wait_ms", 0) or 0))
+    physical_id = str(report.get("executed_batch_id") or report.get("batch_id") or f"request-{i}")
+    physical_runs.setdefault(physical_id, {
+        "combined_checks": int(report.get("combined_checks", 0) or 0),
+        "solo_checks": int(report.get("solo_checks", 0) or 0),
+        "duration_ms": int(report.get("duration_ms", 0) or 0),
+        "executed_members": int(report.get("executed_members", 0) or 0) or len(report.get("members") or []),
+    })
     for member in report.get("members") or []:
         members += 1
         provenance = member.get("provenance", "unknown")
         provenance_counts[provenance] = provenance_counts.get(provenance, 0) + 1
     # wall_ms is reported in HEAVY_CELL stdout, not duplicated here.
+
+physical_combined_checks = sum(run["combined_checks"] for run in physical_runs.values())
+physical_solo_checks = sum(run["solo_checks"] for run in physical_runs.values())
+physical_members = sum(run["executed_members"] for run in physical_runs.values())
+max_queue_wait_ms = max(queue_waits) if queue_waits else 0
+avg_queue_wait_ms = int(sum(queue_waits) / len(queue_waits)) if queue_waits else 0
 
 parts = [
     f"scenario={scenario}",
@@ -383,8 +399,14 @@ parts = [
     f"green_reports={verdict_counts.get('green',0)}",
     f"red_reports={verdict_counts.get('red',0)}",
     f"indeterminate_reports={verdict_counts.get('indeterminate',0)}",
-    f"combined_checks={combined_checks}",
-    f"solo_checks={solo_checks}",
+    f"report_combined_checks={combined_checks}",
+    f"report_solo_checks={solo_checks}",
+    f"physical_runs={len(physical_runs)}",
+    f"physical_members={physical_members}",
+    f"physical_combined_checks={physical_combined_checks}",
+    f"physical_solo_checks={physical_solo_checks}",
+    f"avg_queue_wait_ms={avg_queue_wait_ms}",
+    f"max_queue_wait_ms={max_queue_wait_ms}",
     f"combined_green={provenance_counts.get('combined_green',0)}",
     f"solo_green={provenance_counts.get('solo_green',0)}",
     f"solo_red={provenance_counts.get('solo_red',0)}",

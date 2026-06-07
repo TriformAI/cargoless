@@ -76,10 +76,16 @@ Record:
 - raw batch report JSON for every run
 - wall-clock duration printed by the harness
 - top-level `verdict`, `combined_checks`, `solo_checks`, and `duration_ms`
+  from each submitter-facing report
 - `queue_wait_ms`, `executed_members`, and `executed_batch_id` from each
   submitter-facing report; these are the AX/tuning fields that answer "how
   long did this agent wait to join the shared run?" and "how many members paid
   for the same physical check?"
+- deduped physical-run totals in `HEAVY_SUMMARY`: `physical_runs`,
+  `physical_members`, `physical_combined_checks`, and
+  `physical_solo_checks`. These are the infrastructure-throughput numbers.
+  Do not sum `combined_checks`/`solo_checks` across sliced reports to infer
+  physical work; coalesced submitters intentionally repeat the shared counters.
 - per-member `verdict`, `provenance`, diagnostics count, and duration
 - daemon project-check log rows, especially `checks=`, `skipped=`,
   `cache_hits=`, `duration_ms=`, and `slowest=`
@@ -134,6 +140,9 @@ or `indeterminate`) plus enough shared-run metadata to explain the wait:
   must not grow past the point where fallback on red makes everyone slower.
 - `executed_batch_id` should let operators correlate several submitter reports
   back to the same daemon log row without teaching agents what a "batch" is.
+- `physical_*` counters, deduped by `executed_batch_id`, are the numbers used
+  to decide whether the window made real checks cheaper. The per-report
+  counters are still useful for each submitter's local explanation.
 
 Only after this matrix is captured should Cargoless make native queueing the
 default behavior for real heavy checks.

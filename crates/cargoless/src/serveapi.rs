@@ -200,6 +200,7 @@ struct BatchCoalescer {
 struct BatchCoalescerState {
     queues: BTreeMap<BatchCoalesceKey, BatchQueue>,
     inflight_runs: u32,
+    next_run_seq: u64,
 }
 
 #[derive(Default)]
@@ -278,11 +279,13 @@ impl BatchCoalescer {
                     .map(|waiter| run_start.duration_since(waiter.enqueued_at).as_millis())
                     .collect();
 
-                {
+                let run_seq = {
                     let mut state = poisoned(&self.state);
                     state.inflight_runs = state.inflight_runs.saturating_add(1);
-                }
-                let combined = combined_request_for(&key, &group);
+                    state.next_run_seq = state.next_run_seq.saturating_add(1);
+                    state.next_run_seq
+                };
+                let combined = combined_request_for(&key, &group, run_seq);
                 let combined_report = run(&combined);
                 {
                     let mut state = poisoned(&self.state);
@@ -430,10 +433,14 @@ fn queue_member_count(queue: &BatchQueue) -> usize {
         .sum()
 }
 
-fn combined_request_for(key: &BatchCoalesceKey, group: &[Arc<BatchWaiter>]) -> BatchCheckRequest {
+fn combined_request_for(
+    key: &BatchCoalesceKey,
+    group: &[Arc<BatchWaiter>],
+    run_seq: u64,
+) -> BatchCheckRequest {
     let first = &group[0].request;
     let mut request = first.clone();
-    request.batch_id = format!("coalesced:{}", key.coalesce_key);
+    request.batch_id = format!("coalesced:{}:run-{}", key.coalesce_key, run_seq);
     request.coalesce_key = None;
     request.members = group
         .iter()
@@ -1734,6 +1741,17 @@ checks:
         run_sizes.sort();
         assert_eq!(run_sizes, vec![1, 2]);
         assert_eq!(reports.len(), 3);
+        let mut executed_ids: Vec<_> = reports
+            .iter()
+            .filter_map(|report| report.executed_batch_id.clone())
+            .collect();
+        executed_ids.sort();
+        executed_ids.dedup();
+        assert_eq!(
+            executed_ids.len(),
+            2,
+            "two physical flushes should have distinct executed_batch_id values"
+        );
         assert!(
             reports
                 .iter()
@@ -2064,6 +2082,19 @@ checks:
         assert_eq!(
             report_b.members[0].provenance,
             BatchProvenance::CombinedGreen
+        );
+        assert_eq!(report_a.executed_members, 2);
+        assert_eq!(report_b.executed_members, 2);
+        assert_eq!(
+            report_a.executed_batch_id, report_b.executed_batch_id,
+            "both submitters should point at the same physical coalesced run"
+        );
+        assert!(
+            report_a
+                .executed_batch_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("coalesced:same-key:run-")),
+            "executed_batch_id should be unique per physical run, not just per key"
         );
         assert_eq!(
             report_a.combined_checks, 1,
