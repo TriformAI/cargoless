@@ -991,6 +991,9 @@ impl TransportClient for HttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::Duration;
 
     use super::super::inproc::testmock::MockService;
@@ -1494,6 +1497,137 @@ mod tests {
         assert_eq!(
             report.members[0].provenance,
             crate::batch::BatchProvenance::Indeterminate
+        );
+        drop(s);
+    }
+
+    #[derive(Default)]
+    struct ConcurrentBatchService {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl ConcurrentBatchService {
+        fn enter(&self) -> ActiveBatchGuard<'_> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = self.max_active.load(Ordering::SeqCst);
+            while active > observed {
+                match self.max_active.compare_exchange(
+                    observed,
+                    active,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+            ActiveBatchGuard { svc: self }
+        }
+    }
+
+    struct ActiveBatchGuard<'a> {
+        svc: &'a ConcurrentBatchService,
+    }
+
+    impl Drop for ActiveBatchGuard<'_> {
+        fn drop(&mut self) {
+            self.svc.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl VerdictService for ConcurrentBatchService {
+        fn get_status(&self, _worktree: &str) -> Option<WorktreeStatus> {
+            None
+        }
+
+        fn get_verdict(&self, _worktree: &str) -> Option<String> {
+            None
+        }
+
+        fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+
+        fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+            Vec::new()
+        }
+
+        fn subscribe(&self) -> Receiver<TransitionEvent> {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            rx
+        }
+
+        fn batch_check(&self, request: &BatchCheckRequest) -> BatchReport {
+            let _guard = self.enter();
+            thread::sleep(Duration::from_millis(150));
+            BatchReport {
+                batch_id: request.batch_id.clone(),
+                verdict: crate::batch::BatchVerdict::Green,
+                members: request
+                    .members
+                    .iter()
+                    .map(|member| crate::batch::BatchMemberResult {
+                        worktree: member.worktree.clone(),
+                        verdict: crate::batch::BatchVerdict::Green,
+                        provenance: crate::batch::BatchProvenance::CombinedGreen,
+                        diagnostics: Vec::new(),
+                        duration_ms: 150,
+                    })
+                    .collect(),
+                combined_checks: 1,
+                solo_checks: 0,
+                duration_ms: 150,
+            }
+        }
+    }
+
+    #[test]
+    fn batch_check_requests_overlap_on_http_server() {
+        let svc = Arc::new(ConcurrentBatchService::default());
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::clone(&svc) as Arc<dyn VerdictService>,
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let remote = format!("http://{}", s.addr());
+        let start = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for idx in 0..8 {
+            let remote = remote.clone();
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                let client = HttpClient::new(&remote).expect("client");
+                let mut request =
+                    BatchCheckRequest::new(format!("http-concurrent-{idx}"), "origin/main");
+                request.members = vec![crate::batch::BatchMember::new(format!("wt-{idx}"))];
+                start.wait();
+                client.batch_check(&request).expect("batch_check")
+            }));
+        }
+
+        let reports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("concurrent http batch thread"))
+            .collect();
+
+        assert_eq!(reports.len(), 8);
+        for idx in 0..8 {
+            assert!(
+                reports
+                    .iter()
+                    .any(|report| report.batch_id == format!("http-concurrent-{idx}")
+                        && report.verdict == crate::batch::BatchVerdict::Green
+                        && report.members.len() == 1),
+                "missing green report for request {idx}"
+            );
+        }
+        assert!(
+            svc.max_active.load(Ordering::SeqCst) > 1,
+            "HTTP server should process overlapping batch_check requests"
         );
         drop(s);
     }

@@ -913,7 +913,8 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::Duration;
 
     use cargoless_core::batch::{BatchMember, BatchProvenance, BatchReport, BatchVerdict};
@@ -1130,6 +1131,11 @@ checks:
         request
     }
 
+    fn http_batch_check_with_client(remote: &str, request: &BatchCheckRequest) -> BatchReport {
+        let client = HttpClient::new(remote).expect("client for batch_check remote");
+        client.batch_check(request).expect("remote batch_check")
+    }
+
     fn http_batch_check(request: &BatchCheckRequest) -> BatchReport {
         let api = Arc::new(ServeVerdictState::new());
         let srv = HttpServer::bind(
@@ -1138,16 +1144,25 @@ checks:
             Arc::new(AllowAll),
         )
         .expect("bind ephemeral");
-        let client =
-            HttpClient::new(&format!("http://{}", srv.addr())).expect("client for ephemeral addr");
+        let remote = format!("http://{}", srv.addr());
         let mut last_err = None;
         let report = (0..20)
-            .find_map(|_| match client.batch_check(request) {
-                Ok(report) => Some(report),
-                Err(err) => {
-                    last_err = Some(err.to_string());
-                    std::thread::sleep(Duration::from_millis(25));
-                    None
+            .find_map(|_| {
+                let client = match HttpClient::new(&remote) {
+                    Ok(client) => client,
+                    Err(err) => {
+                        last_err = Some(err.to_string());
+                        std::thread::sleep(Duration::from_millis(25));
+                        return None;
+                    }
+                };
+                match client.batch_check(request) {
+                    Ok(report) => Some(report),
+                    Err(err) => {
+                        last_err = Some(err.to_string());
+                        std::thread::sleep(Duration::from_millis(25));
+                        None
+                    }
                 }
             })
             .unwrap_or_else(|| {
@@ -1158,6 +1173,15 @@ checks:
             });
         drop(srv);
         report
+    }
+
+    fn assert_overlay_paths_cleaned(root: &Path, rel_paths: &[String]) {
+        for rel_path in rel_paths {
+            assert!(
+                !root.join(rel_path).exists(),
+                "overlay path `{rel_path}` should be removed after batch_check cleanup"
+            );
+        }
     }
 
     fn member_result<'a>(
@@ -1199,6 +1223,7 @@ checks:
     #[test]
     fn batch_check_http_combined_red_falls_back_and_attributes_bad_member() {
         let project = setup_batch_project("batch-http-attribution");
+        let overlay_paths = vec!["src/good.rs".to_string(), "src/bad.rs".to_string()];
         let request = batch_request(
             "http-attribution",
             &project.root,
@@ -1225,6 +1250,61 @@ checks:
                 .iter()
                 .any(|diag| diag.code.as_deref() == Some("batch.fail_token"))
         );
+        assert_overlay_paths_cleaned(&project.root, &overlay_paths);
+    }
+
+    #[test]
+    fn batch_check_http_combined_red_attributes_multiple_bad_members() {
+        let project = setup_batch_project("batch-http-multi-red");
+        let overlay_paths = vec![
+            "src/good_a.rs".to_string(),
+            "src/bad_a.rs".to_string(),
+            "src/good_b.rs".to_string(),
+            "src/bad_b.rs".to_string(),
+        ];
+        let request = batch_request(
+            "http-multi-red",
+            &project.root,
+            vec![
+                batch_member("good-a", "src/good_a.rs", "pub fn good_a() {}\n"),
+                batch_member(
+                    "bad-a",
+                    "src/bad_a.rs",
+                    "pub fn bad_a() { /* FAIL_BATCH */ }\n",
+                ),
+                batch_member("good-b", "src/good_b.rs", "pub fn good_b() {}\n"),
+                batch_member(
+                    "bad-b",
+                    "src/bad_b.rs",
+                    "pub fn bad_b() { /* FAIL_BATCH */ }\n",
+                ),
+            ],
+        );
+
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Red);
+        assert_eq!(report.combined_checks, 1);
+        assert_eq!(report.solo_checks, 4);
+        for worktree in ["/client/good-a", "/client/good-b"] {
+            let result = member_result(&report, worktree);
+            assert_eq!(result.verdict, BatchVerdict::Green);
+            assert_eq!(result.provenance, BatchProvenance::SoloGreen);
+            assert!(result.diagnostics.is_empty());
+        }
+        for worktree in ["/client/bad-a", "/client/bad-b"] {
+            let result = member_result(&report, worktree);
+            assert_eq!(result.verdict, BatchVerdict::Red);
+            assert_eq!(result.provenance, BatchProvenance::SoloRed);
+            assert!(
+                result
+                    .diagnostics
+                    .iter()
+                    .any(|diag| diag.code.as_deref() == Some("batch.fail_token")),
+                "{worktree} should carry the forbidden-pattern diagnostic"
+            );
+        }
+        assert_overlay_paths_cleaned(&project.root, &overlay_paths);
     }
 
     #[test]
@@ -1282,6 +1362,102 @@ checks:
                 && member.provenance == BatchProvenance::CombinedGreen
                 && member.diagnostics.is_empty()
         }));
+    }
+
+    #[test]
+    fn batch_check_http_no_corun_forty_member_batch_runs_all_solos() {
+        let project = setup_batch_project("batch-http-forty-no-corun");
+        let members = (0..40)
+            .map(|idx| {
+                batch_member(
+                    &format!("solo-agent-{idx:02}"),
+                    &format!("src/solo_agent_{idx:02}.rs"),
+                    &format!("pub fn solo_agent_{idx:02}() {{}}\n"),
+                )
+            })
+            .collect();
+        let mut request = batch_request("http-forty-no-corun", &project.root, members);
+        request.corun = false;
+
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Green);
+        assert_eq!(report.members.len(), 40);
+        assert_eq!(report.combined_checks, 0);
+        assert_eq!(
+            report.solo_checks, 40,
+            "no-corun mode should prove every member independently"
+        );
+        assert!(report.members.iter().all(|member| {
+            member.verdict == BatchVerdict::Green
+                && member.provenance == BatchProvenance::SoloGreen
+                && member.diagnostics.is_empty()
+        }));
+    }
+
+    #[test]
+    fn batch_check_http_concurrent_same_root_batches_are_isolated_and_cleaned() {
+        let project = setup_batch_project("batch-http-concurrent");
+        let api = Arc::new(ServeVerdictState::new());
+        let srv = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::clone(&api) as Arc<dyn VerdictService>,
+            Arc::new(AllowAll),
+        )
+        .expect("bind ephemeral");
+        std::thread::sleep(Duration::from_millis(50));
+        let remote = format!("http://{}", srv.addr());
+        let start = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        let mut overlay_paths = Vec::new();
+
+        for request_idx in 0..8 {
+            let members: Vec<BatchMember> = (0..5)
+                .map(|member_idx| {
+                    let rel_path = format!("src/concurrent_{request_idx}_{member_idx}.rs");
+                    overlay_paths.push(rel_path.clone());
+                    batch_member(
+                        &format!("concurrent-{request_idx}-{member_idx}"),
+                        &rel_path,
+                        &format!(
+                            "pub fn concurrent_{request_idx}_{member_idx}() -> usize {{ {} }}\n",
+                            request_idx * 10 + member_idx
+                        ),
+                    )
+                })
+                .collect();
+            let request = batch_request(
+                &format!("http-concurrent-{request_idx}"),
+                &project.root,
+                members,
+            );
+            let remote = remote.clone();
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                http_batch_check_with_client(&remote, &request)
+            }));
+        }
+
+        let reports: Vec<BatchReport> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("concurrent batch thread"))
+            .collect();
+
+        assert_eq!(reports.len(), 8);
+        for report in reports {
+            assert_eq!(report.verdict, BatchVerdict::Green);
+            assert_eq!(report.members.len(), 5);
+            assert_eq!(report.combined_checks, 1);
+            assert_eq!(report.solo_checks, 0);
+            assert!(report.members.iter().all(|member| {
+                member.verdict == BatchVerdict::Green
+                    && member.provenance == BatchProvenance::CombinedGreen
+                    && member.diagnostics.is_empty()
+            }));
+        }
+        assert_overlay_paths_cleaned(&project.root, &overlay_paths);
+        drop(srv);
     }
 
     /// THE Increment-0 GATE differential test: a **remote** read of the

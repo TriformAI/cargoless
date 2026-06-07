@@ -18,6 +18,8 @@
 #   WORK=/tmp/cargoless-batch-throughput
 #   CARGOLESS_AUTH_TOKEN=...
 #   DRY_RUN=1                            # generate JSON only, do not call remote
+#   REQUIRE_FAST_GREEN=1                 # fail green n>1 runs unless they use
+#                                        # one combined check and no solos
 #
 # Output:
 #   BATCH_CELL n=<N> exit=<rc> verdict=<green|red|indeterminate> ...
@@ -38,6 +40,7 @@ BASE_REF="${BASE_REF:-origin/main}"
 NLIST="${NLIST:-1 2 4 8 16 20 40}"
 WORK="${WORK:-/tmp/cargoless-batch-throughput}"
 DRY_RUN="${DRY_RUN:-0}"
+REQUIRE_FAST_GREEN="${REQUIRE_FAST_GREEN:-1}"
 
 say() { printf '[batch-gate %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 blocker() {
@@ -119,6 +122,36 @@ print(" ".join(parts))
 PY
 }
 
+require_fast_green() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+n = int(sys.argv[1])
+path = sys.argv[2]
+report = json.load(open(path, encoding="utf-8"))
+members = report.get("members") or []
+if n <= 1 or report.get("verdict") != "green":
+    sys.exit(0)
+combined = int(report.get("combined_checks", 0) or 0)
+solo = int(report.get("solo_checks", 0) or 0)
+combined_green = sum(1 for m in members if m.get("provenance") == "combined_green")
+ok = (
+    len(members) == n
+    and combined == 1
+    and solo == 0
+    and combined_green == n
+)
+if not ok:
+    print(
+        "fast_path_violation="
+        f"members:{len(members)} expected:{n} "
+        f"combined_checks:{combined} solo_checks:{solo} "
+        f"combined_green:{combined_green}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+}
+
 overall=0
 say "REMOTE=$REMOTE SERVER_ROOT=$SERVER_ROOT BASE_REF=$BASE_REF NLIST=[$NLIST] DRY_RUN=$DRY_RUN"
 for n in $NLIST; do
@@ -138,7 +171,14 @@ for n in $NLIST; do
   end_ns=$(date +%s%N)
   wall_ms=$(( (end_ns - start_ns) / 1000000 ))
   summary="$(summarise_report "$out")"
-  echo "BATCH_CELL n=$n exit=$rc wall_ms=$wall_ms $summary report=$out stderr=$err"
+  fast_rc=0
+  if [ "$REQUIRE_FAST_GREEN" = "1" ] && [ "$rc" -eq 0 ]; then
+    require_fast_green "$n" "$out" 2>>"$err" || fast_rc=$?
+  fi
+  if [ "$fast_rc" -ne 0 ]; then
+    rc=1
+  fi
+  echo "BATCH_CELL n=$n exit=$rc wall_ms=$wall_ms $summary require_fast_green=$REQUIRE_FAST_GREEN report=$out stderr=$err"
   case "$rc" in
     0) ;;
     1) overall=1 ;;

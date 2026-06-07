@@ -411,6 +411,26 @@ mod tests {
     }
 
     #[test]
+    fn forty_member_fast_path_is_one_combined_check() {
+        let checker = MockChecker::default().with_combined(Ok(report(TreeState::Green, "all")));
+        let members: Vec<BatchMember> = (0..40)
+            .map(|idx| BatchMember::new(format!("agent-{idx:02}")))
+            .collect();
+
+        let out = run_batch("b40", &members, &checker, CorunPolicy::Corun);
+
+        assert_eq!(out.verdict, BatchVerdict::Green);
+        assert_eq!(out.members.len(), 40);
+        assert_eq!(out.combined_checks, 1);
+        assert_eq!(out.solo_checks, 0);
+        assert!(
+            out.members.iter().all(|m| m.verdict == BatchVerdict::Green
+                && m.provenance == BatchProvenance::CombinedGreen)
+        );
+        assert_eq!(checker.calls().len(), 1);
+    }
+
+    #[test]
     fn combined_red_falls_back_to_solo_and_attributes_one_culprit() {
         let checker = MockChecker::default()
             .with_combined(Ok(report(TreeState::Red, "combined")))
@@ -433,6 +453,36 @@ mod tests {
         assert_eq!(by["a"], (BatchVerdict::Green, BatchProvenance::SoloGreen));
         assert_eq!(by["b"], (BatchVerdict::Red, BatchProvenance::SoloRed));
         assert_eq!(by["c"], (BatchVerdict::Green, BatchProvenance::SoloGreen));
+    }
+
+    #[test]
+    fn forty_member_red_fallback_preserves_single_culprit_attribution() {
+        let checker = MockChecker::default()
+            .with_combined(Ok(report(TreeState::Red, "combined")))
+            .solo("agent-17", Ok(report(TreeState::Red, "agent-17")));
+        let members: Vec<BatchMember> = (0..40)
+            .map(|idx| BatchMember::new(format!("agent-{idx:02}")))
+            .collect();
+
+        let out = run_batch("b40-red", &members, &checker, CorunPolicy::Corun);
+
+        assert_eq!(out.verdict, BatchVerdict::Red);
+        assert_eq!(out.members.len(), 40);
+        assert_eq!(out.combined_checks, 1);
+        assert_eq!(out.solo_checks, 40);
+        let red_members: Vec<_> = out
+            .members
+            .iter()
+            .filter(|member| member.verdict == BatchVerdict::Red)
+            .collect();
+        assert_eq!(red_members.len(), 1);
+        assert_eq!(red_members[0].worktree, "agent-17");
+        assert_eq!(red_members[0].provenance, BatchProvenance::SoloRed);
+        assert!(out.members.iter().all(|member| {
+            member.worktree == "agent-17"
+                || (member.verdict == BatchVerdict::Green
+                    && member.provenance == BatchProvenance::SoloGreen)
+        }));
     }
 
     #[test]
