@@ -11,20 +11,26 @@ RUN rustup component add rust-analyzer \
 
 FROM registry.triform.cloud/mirror/triform-builder-v2:0.1
 
+ARG KUBECTL_VERSION=v1.35.0
+
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends \
         binutils \
         ca-certificates \
         clang \
+        curl \
         git \
         jq \
-        kubernetes-client \
         libssl-dev \
         lld \
         pkg-config \
         python3-yaml \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSLo /usr/local/bin/kubectl \
+        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    && chmod +x /usr/local/bin/kubectl
 
 COPY --from=builder /src/target/release/cargoless /usr/local/bin/cargoless
 COPY --from=builder /tmp/rust-analyzer /usr/local/bin/rust-analyzer
