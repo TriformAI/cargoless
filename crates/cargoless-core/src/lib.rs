@@ -13,6 +13,7 @@ pub mod activity;
 pub mod activitymgr;
 pub mod analyzer;
 pub mod barrier;
+pub mod batch;
 pub mod build;
 pub mod cache_layout;
 pub mod cluster;
