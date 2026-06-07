@@ -7,8 +7,11 @@
 # `cargoless.checks.yaml` treats as real heavy-check triggers. In
 # tf-multiverse, the defaults hit the actual compiler witnesses:
 #
-#   portal   -> portal/src/**/*.rs      (SSR + WASM compiler witnesses)
-#   isolator -> isolator/src/**/*.rs    (isolator vsock compiler witness)
+#   ssr      -> server/src/**/*.rs        (SSR compiler witness only)
+#   wasm     -> portal/src/**/*.rs        (WASM + SSR; Triform has no
+#                                          WASM-only trigger class)
+#   isolator -> isolator/src/**/*.rs      (isolator vsock compiler witness)
+#   all      -> runtime-types/src/**/*.rs (SSR + WASM + isolator)
 #   mixed    -> alternates every configured path prefix
 #
 # Required:
@@ -19,11 +22,11 @@
 #   CARGOLESS_BIN=./target/release/cargoless
 #   BASE_REF=origin/main
 #   MODE=sweep                           # sweep | concurrent
-#   SCENARIOS="portal isolator mixed"
+#   SCENARIOS="ssr wasm isolator all mixed"
 #   NLIST="1 2 4 8 16 40"                # sweep mode
 #   REQUESTS=4                           # concurrent mode
 #   BATCH_SIZE=10                        # concurrent mode
-#   SCENARIO_PATHS="portal=portal/src/cargoless_heavy_bench isolator=isolator/src/cargoless_heavy_bench"
+#   SCENARIO_PATHS="ssr=server/src/cargoless_heavy_bench wasm=portal/src/cargoless_heavy_bench isolator=isolator/src/cargoless_heavy_bench all=runtime-types/src/cargoless_heavy_bench"
 #   FILE_EXT=rs
 #   WORK=/tmp/cargoless-heavy-project-check
 #   CARGOLESS_AUTH_TOKEN=...
@@ -55,11 +58,11 @@ SERVER_ROOT="${SERVER_ROOT:-}"
 CARGOLESS_BIN="${CARGOLESS_BIN:-cargoless}"
 BASE_REF="${BASE_REF:-origin/main}"
 MODE="${MODE:-sweep}"
-SCENARIOS="${SCENARIOS:-portal isolator mixed}"
+SCENARIOS="${SCENARIOS:-ssr wasm isolator all mixed}"
 NLIST="${NLIST:-1 2 4 8 16 40}"
 REQUESTS="${REQUESTS:-4}"
 BATCH_SIZE="${BATCH_SIZE:-10}"
-SCENARIO_PATHS="${SCENARIO_PATHS:-portal=portal/src/cargoless_heavy_bench isolator=isolator/src/cargoless_heavy_bench runtime=runtime-types/src/cargoless_heavy_bench}"
+SCENARIO_PATHS="${SCENARIO_PATHS:-ssr=server/src/cargoless_heavy_bench wasm=portal/src/cargoless_heavy_bench isolator=isolator/src/cargoless_heavy_bench all=runtime-types/src/cargoless_heavy_bench}"
 FILE_EXT="${FILE_EXT:-rs}"
 WORK="${WORK:-/tmp/cargoless-heavy-project-check}"
 DRY_RUN="${DRY_RUN:-0}"
