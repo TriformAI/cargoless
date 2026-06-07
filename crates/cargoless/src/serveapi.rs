@@ -44,11 +44,14 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use cargoless_core::Diagnostic;
+use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
+use cargoless_core::corun::CorunPolicy;
+use cargoless_core::project_checks::ProjectCheckReport;
 use cargoless_core::transport::{
-    CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions, TransitionEvent,
-    VerdictService, WorktreeStatus, WorktreeSummary,
+    BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions,
+    TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
 };
+use cargoless_core::{Diagnostic, Severity, TreeState};
 
 /// Poison-tolerant lock (same discipline as `model::poisoned` /
 /// `inproc::testmock`): a panicked verdict path must not wedge the read
@@ -498,6 +501,62 @@ impl VerdictService for ServeVerdictState {
         }
     }
 
+    fn batch_check(&self, request: &BatchCheckRequest) -> BatchReport {
+        if self.quiescing() {
+            return batch_indeterminate(request, "daemon is quiescing");
+        }
+
+        let Some(root) = request
+            .options
+            .analysis_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        else {
+            return batch_indeterminate(request, "batch_check v1 requires a shared analysis_root");
+        };
+        let base_ref = request.base_ref.trim();
+        if base_ref.is_empty() {
+            return batch_indeterminate(request, "batch_check requires a non-empty base_ref");
+        }
+        if !root.join(".git").exists() {
+            return batch_indeterminate(
+                request,
+                format!("analysis_root `{}` is not a git checkout", root.display()),
+            );
+        }
+
+        let members =
+            match map_batch_members(&root, request.options.repo_relative, &request.members) {
+                Ok(members) => members,
+                Err(e) => return batch_indeterminate(request, e),
+            };
+
+        {
+            let _guard = poisoned(&self.sync_lock);
+            if let Err(e) = sync_analysis_root(&root, base_ref) {
+                return batch_indeterminate(request, e);
+            }
+        }
+
+        let checker = ServeBatchChecker {
+            api: self,
+            root,
+            base_ref: base_ref.to_string(),
+        };
+        run_batch(
+            request.batch_id.clone(),
+            members,
+            &checker,
+            if request.corun {
+                CorunPolicy::Corun
+            } else {
+                CorunPolicy::NoCorun
+            },
+        )
+    }
+
     fn daemon_activity(&self) -> DaemonActivity {
         self.activity_snapshot()
     }
@@ -508,6 +567,156 @@ impl VerdictService for ServeVerdictState {
             drain.quiescing = true;
         }
         self.activity_snapshot()
+    }
+}
+
+struct ServeBatchChecker<'a> {
+    api: &'a ServeVerdictState,
+    root: PathBuf,
+    base_ref: String,
+}
+
+impl BatchChecker for ServeBatchChecker<'_> {
+    fn check_combined(&self, members: &[BatchMember]) -> Result<ProjectCheckReport, String> {
+        let overlay_files = match union_overlay_files(members) {
+            Ok(files) => files,
+            Err(conflict) => return Ok(batch_red_project_report(&conflict)),
+        };
+        let changed_files = union_changed_files(members);
+        self.run_overlay(overlay_files, changed_files)
+    }
+
+    fn check_solo(&self, member: &BatchMember) -> Result<ProjectCheckReport, String> {
+        let changed_files = member_changed_files(member);
+        self.run_overlay(member.files.clone(), changed_files)
+    }
+}
+
+impl ServeBatchChecker<'_> {
+    fn run_overlay(
+        &self,
+        overlay_files: Vec<(String, String)>,
+        changed_files: Vec<String>,
+    ) -> Result<ProjectCheckReport, String> {
+        let changed_files = (!changed_files.is_empty()).then_some(changed_files);
+        let context = ProjectCheckRunContext {
+            root: self.root.clone(),
+            changed_files: changed_files.clone(),
+            base_ref: self.base_ref.clone(),
+            overlay_files,
+            materialize_overlay: true,
+            gate: true,
+        };
+        self.api
+            .with_project_check_overlay(&context, |root| {
+                cargoless_core::project_checks::run_dev_with_changes(root, changed_files.as_deref())
+            })
+            .and_then(|report| report.map_err(|e| format!("project checks failed: {e}")))
+    }
+}
+
+fn map_batch_members(
+    root: &Path,
+    repo_relative: bool,
+    members: &[BatchMember],
+) -> Result<Vec<BatchMember>, String> {
+    members
+        .iter()
+        .map(|member| {
+            let files = if repo_relative {
+                map_repo_relative_files(root, &member.files)?
+            } else {
+                member.files.clone()
+            };
+            Ok(BatchMember {
+                worktree: member.worktree.clone(),
+                files,
+                changed_files: member.changed_files.clone(),
+            })
+        })
+        .collect()
+}
+
+fn union_overlay_files(members: &[BatchMember]) -> Result<Vec<(String, String)>, String> {
+    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
+    for member in members {
+        for (path, content) in &member.files {
+            match by_path.get(path) {
+                Some(existing) if existing != content => {
+                    return Err(format!(
+                        "batch members carry different content for `{path}`; \
+                         rerun/merge serially or resolve the overlay conflict"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    by_path.insert(path.clone(), content.clone());
+                }
+            }
+        }
+    }
+    Ok(by_path.into_iter().collect())
+}
+
+fn union_changed_files(members: &[BatchMember]) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for member in members {
+        for path in member_changed_files(member) {
+            paths.insert(path);
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn member_changed_files(member: &BatchMember) -> Vec<String> {
+    // Empty changed_files means "unknown" (run all checks). Do not fall back
+    // to mapped overlay paths here: central-daemon overlays are absolute
+    // analysis-root paths, while project-check trigger rules expect the
+    // caller's repo-relative changed-file list.
+    member.changed_files.clone()
+}
+
+fn batch_indeterminate(request: &BatchCheckRequest, why: impl Into<String>) -> BatchReport {
+    let why = why.into();
+    BatchReport {
+        batch_id: request.batch_id.clone(),
+        verdict: BatchVerdict::Indeterminate,
+        members: request
+            .members
+            .iter()
+            .map(|member| cargoless_core::batch::BatchMemberResult {
+                worktree: member.worktree.clone(),
+                verdict: BatchVerdict::Indeterminate,
+                provenance: cargoless_core::batch::BatchProvenance::Indeterminate,
+                diagnostics: vec![batch_diagnostic(&why)],
+                duration_ms: 0,
+            })
+            .collect(),
+        combined_checks: 0,
+        solo_checks: 0,
+        duration_ms: 0,
+    }
+}
+
+fn batch_diagnostic(message: &str) -> Diagnostic {
+    Diagnostic {
+        file_path: PathBuf::from("<cargoless-batch>"),
+        line: 0,
+        col: 0,
+        severity: Severity::Error,
+        code: Some("cargoless.batch".into()),
+        message: message.to_string(),
+        source: Some("cargoless".into()),
+    }
+}
+
+fn batch_red_project_report(message: &str) -> ProjectCheckReport {
+    ProjectCheckReport {
+        tree: TreeState::Red,
+        diagnostics: vec![batch_diagnostic(message)],
+        results: Vec::new(),
+        skipped: Vec::new(),
+        duration_ms: 0,
     }
 }
 
@@ -708,9 +917,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use cargoless_core::batch::{BatchMember, BatchProvenance, BatchVerdict};
     use cargoless_core::transport::http::{HttpClient, HttpServer};
     use cargoless_core::transport::{
-        AllowAll, CargoSubcommand, PushOverlayOptions, TransportClient, VerdictService,
+        AllowAll, BatchCheckRequest, CargoSubcommand, PushOverlayOptions, TransportClient,
+        VerdictService,
     };
 
     use super::*;
@@ -727,6 +938,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn batch_check_without_shared_analysis_root_is_indeterminate_per_member() {
+        let api = ServeVerdictState::new();
+        let mut request = BatchCheckRequest::new("batch-no-root", "origin/main");
+        request.members = vec![
+            BatchMember {
+                worktree: "/client/a".into(),
+                files: vec![("src/a.rs".into(), "pub fn a() {}".into())],
+                changed_files: vec!["src/a.rs".into()],
+            },
+            BatchMember {
+                worktree: "/client/b".into(),
+                files: vec![("src/b.rs".into(), "pub fn b() {}".into())],
+                changed_files: vec!["src/b.rs".into()],
+            },
+        ];
+
+        let report = api.batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Indeterminate);
+        assert_eq!(report.members.len(), 2);
+        assert_eq!(report.combined_checks, 0);
+        assert_eq!(report.solo_checks, 0);
+        for member in report.members {
+            assert_eq!(member.verdict, BatchVerdict::Indeterminate);
+            assert_eq!(member.provenance, BatchProvenance::Indeterminate);
+            assert!(
+                member.diagnostics[0]
+                    .message
+                    .contains("requires a shared analysis_root")
+            );
+        }
+    }
+
+    #[test]
+    fn batch_member_mapping_keeps_repo_relative_paths_inside_analysis_root() {
+        let root = temp_root("batch-map");
+        let members = vec![BatchMember {
+            worktree: "/client/a".into(),
+            files: vec![("src/a.rs".into(), "pub fn a() {}".into())],
+            changed_files: vec!["src/a.rs".into()],
+        }];
+
+        let mapped = map_batch_members(&root, true, &members).unwrap();
+
+        assert_eq!(mapped[0].worktree, "/client/a");
+        assert_eq!(mapped[0].changed_files, vec!["src/a.rs".to_string()]);
+        assert_eq!(
+            mapped[0].files,
+            vec![(
+                root.join("src/a.rs").to_string_lossy().into_owned(),
+                "pub fn a() {}".to_string(),
+            )]
+        );
+
+        let escaping = vec![BatchMember {
+            worktree: "/client/b".into(),
+            files: vec![("../outside.rs".into(), "bad".into())],
+            changed_files: vec![],
+        }];
+        assert!(
+            map_batch_members(&root, true, &escaping)
+                .unwrap_err()
+                .contains("escapes repo root")
+        );
+    }
+
+    #[test]
+    fn batch_overlay_union_dedupes_same_content_and_rejects_conflicts() {
+        let same = vec![
+            BatchMember {
+                worktree: "a".into(),
+                files: vec![("src/lib.rs".into(), "same".into())],
+                changed_files: vec![],
+            },
+            BatchMember {
+                worktree: "b".into(),
+                files: vec![("src/lib.rs".into(), "same".into())],
+                changed_files: vec![],
+            },
+        ];
+        assert_eq!(
+            union_overlay_files(&same).unwrap(),
+            vec![("src/lib.rs".into(), "same".into())]
+        );
+
+        let conflicting = vec![
+            BatchMember {
+                worktree: "a".into(),
+                files: vec![("src/lib.rs".into(), "one".into())],
+                changed_files: vec![],
+            },
+            BatchMember {
+                worktree: "b".into(),
+                files: vec![("src/lib.rs".into(), "two".into())],
+                changed_files: vec![],
+            },
+        ];
+        assert!(
+            union_overlay_files(&conflicting)
+                .unwrap_err()
+                .contains("different content")
+        );
     }
 
     fn git(root: &Path, args: &[&str]) {
