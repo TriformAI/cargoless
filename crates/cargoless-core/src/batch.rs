@@ -403,11 +403,10 @@ mod tests {
         assert_eq!(out.verdict, BatchVerdict::Green);
         assert_eq!(out.combined_checks, 1);
         assert_eq!(out.solo_checks, 0);
-        assert!(out
-            .members
-            .iter()
-            .all(|m| m.verdict == BatchVerdict::Green
-                && m.provenance == BatchProvenance::CombinedGreen));
+        assert!(
+            out.members.iter().all(|m| m.verdict == BatchVerdict::Green
+                && m.provenance == BatchProvenance::CombinedGreen)
+        );
         assert_eq!(checker.calls(), vec!["combined:a+b+c"]);
     }
 
@@ -463,11 +462,10 @@ mod tests {
         assert_eq!(out.members.len(), 40);
         assert_eq!(out.combined_checks, 1);
         assert_eq!(out.solo_checks, 0);
-        assert!(out
-            .members
-            .iter()
-            .all(|m| m.verdict == BatchVerdict::Green
-                && m.provenance == BatchProvenance::CombinedGreen));
+        assert!(
+            out.members.iter().all(|m| m.verdict == BatchVerdict::Green
+                && m.provenance == BatchProvenance::CombinedGreen)
+        );
         assert_eq!(checker.calls().len(), 1);
     }
 
@@ -566,10 +564,11 @@ mod tests {
         assert_eq!(out.verdict, BatchVerdict::Green);
         assert_eq!(out.combined_checks, 0);
         assert_eq!(out.solo_checks, 2);
-        assert!(out
-            .members
-            .iter()
-            .all(|m| m.provenance == BatchProvenance::SoloGreen));
+        assert!(
+            out.members
+                .iter()
+                .all(|m| m.provenance == BatchProvenance::SoloGreen)
+        );
         assert_eq!(checker.calls(), vec!["solo:a", "solo:b"]);
     }
 
@@ -579,11 +578,12 @@ mod tests {
         let out = run_batch("b1", &members(&["a", "b"]), &checker, CorunPolicy::Corun);
 
         assert_eq!(out.verdict, BatchVerdict::Indeterminate);
-        assert!(out
-            .members
-            .iter()
-            .all(|m| m.verdict == BatchVerdict::Indeterminate
-                && m.provenance == BatchProvenance::Indeterminate));
+        assert!(
+            out.members
+                .iter()
+                .all(|m| m.verdict == BatchVerdict::Indeterminate
+                    && m.provenance == BatchProvenance::Indeterminate)
+        );
     }
 
     #[test]

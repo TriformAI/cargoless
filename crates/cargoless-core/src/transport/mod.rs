@@ -46,8 +46,8 @@
 //! a transport failure is surfaced as a typed error, never a panic.
 
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 
 use cargoless_proto::{Diagnostic, Severity};
 
@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(status_from_json(""), None);
         assert_eq!(status_from_json("garbage"), None);
         assert_eq!(status_from_json("{}"), None); // no worktree ⇒ None
-                                                  // Missing scalars default, never panic.
+        // Missing scalars default, never panic.
         let s = status_from_json(r#"{"worktree":"w"}"#).unwrap();
         assert_eq!(s.verdict, "unknown");
         assert_eq!(s.daemon_build_id, "");
@@ -1910,8 +1910,10 @@ mod tests {
         assert_eq!(report.members.len(), 1);
         assert_eq!(report.members[0].worktree, "wt-a");
         assert_eq!(report.members[0].provenance, BatchProvenance::Indeterminate);
-        assert!(report.members[0].diagnostics[0]
-            .message
-            .contains("unsupported"));
+        assert!(
+            report.members[0].diagnostics[0]
+                .message
+                .contains("unsupported")
+        );
     }
 }
