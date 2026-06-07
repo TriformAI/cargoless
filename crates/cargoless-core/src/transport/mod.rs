@@ -866,7 +866,6 @@ fn batch_members_from_json(v: Option<&serde_json::Value>) -> Vec<BatchMember> {
 fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Value {
     let mut value = serde_json::json!({
         "repo_relative": options.repo_relative,
-        "gate": options.gate,
     });
     if let serde_json::Value::Object(ref mut map) = value {
         if let Some(root) = options.analysis_root.as_deref() {
@@ -1569,7 +1568,6 @@ mod tests {
             analysis_root: Some("/workspace/repo".into()),
             base_sha: Some("abc123".into()),
             changed_files: None,
-            gate: true,
         };
         req.corun = false;
 
