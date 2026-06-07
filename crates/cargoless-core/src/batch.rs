@@ -55,6 +55,16 @@ impl BatchVerdict {
             Self::Indeterminate => "indeterminate",
         }
     }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "green" => Some(Self::Green),
+            "red" => Some(Self::Red),
+            "indeterminate" => Some(Self::Indeterminate),
+            _ => None,
+        }
+    }
 }
 
 /// How a member verdict was reached.
@@ -83,6 +93,18 @@ impl BatchProvenance {
             Self::SoloRed => "solo_red",
             Self::InteractionRed => "interaction_red",
             Self::Indeterminate => "indeterminate",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "combined_green" => Some(Self::CombinedGreen),
+            "solo_green" => Some(Self::SoloGreen),
+            "solo_red" => Some(Self::SoloRed),
+            "interaction_red" => Some(Self::InteractionRed),
+            "indeterminate" => Some(Self::Indeterminate),
+            _ => None,
         }
     }
 }

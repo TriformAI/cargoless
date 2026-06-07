@@ -23,8 +23,9 @@ use std::sync::mpsc::{Receiver, channel};
 use cargoless_proto::Diagnostic;
 
 use super::{
-    PushOverlayAck, PushOverlayOptions, Request, TransitionEvent, TransportClient, TransportError,
-    VerdictService, WorktreeStatus, WorktreeSummary, event_from_json, event_to_json,
+    BatchCheckRequest, BatchReport, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
+    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
+    batchreport_from_json, batchreport_to_json, event_from_json, event_to_json,
     pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
     summaries_from_json, summaries_to_json,
 };
@@ -78,6 +79,7 @@ fn dispatch_oneshot(svc: &dyn VerdictService, req: &Request) -> String {
             check_profile.as_ref(),
             Some(options),
         )),
+        Request::BatchCheck(request) => batchreport_to_json(&svc.batch_check(request)),
     }
 }
 
@@ -313,6 +315,12 @@ mod imp {
             let line = self.one_shot(&req)?;
             pushoverlayack_from_json(&line)
                 .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into()))
+        }
+
+        fn batch_check(&self, request: &BatchCheckRequest) -> Result<BatchReport, TransportError> {
+            let line = self.one_shot(&Request::BatchCheck(request.clone()))?;
+            batchreport_from_json(&line)
+                .ok_or_else(|| TransportError::Protocol("malformed batch_check report".into()))
         }
     }
 }
