@@ -76,6 +76,10 @@ Record:
 - raw batch report JSON for every run
 - wall-clock duration printed by the harness
 - top-level `verdict`, `combined_checks`, `solo_checks`, and `duration_ms`
+- `queue_wait_ms`, `executed_members`, and `executed_batch_id` from each
+  submitter-facing report; these are the AX/tuning fields that answer "how
+  long did this agent wait to join the shared run?" and "how many members paid
+  for the same physical check?"
 - per-member `verdict`, `provenance`, diagnostics count, and duration
 - daemon project-check log rows, especially `checks=`, `skipped=`,
   `cache_hits=`, `duration_ms=`, and `slowest=`
@@ -119,6 +123,17 @@ The real data should size the server-side coalescing policy:
   or fallback cost stops improving throughput
 - concurrency: how many heavy batches the infrastructure can handle without
   cache thrash or CPU/memory saturation
+
+The agent-experience target is not just fastest global throughput. A good
+window is one where each submitter sees a terse, local answer (`green`, `red`,
+or `indeterminate`) plus enough shared-run metadata to explain the wait:
+
+- `queue_wait_ms` should stay small relative to the avoided compiler witness
+  time.
+- `executed_members` should rise during bursts (proof the run was shared) but
+  must not grow past the point where fallback on red makes everyone slower.
+- `executed_batch_id` should let operators correlate several submitter reports
+  back to the same daemon log row without teaching agents what a "batch" is.
 
 Only after this matrix is captured should Cargoless make native queueing the
 default behavior for real heavy checks.

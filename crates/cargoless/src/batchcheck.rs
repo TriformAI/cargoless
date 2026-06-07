@@ -97,6 +97,9 @@ mod tests {
             combined_checks: 1,
             solo_checks: 0,
             duration_ms: 42,
+            queue_wait_ms: 0,
+            executed_members: 0,
+            executed_batch_id: Some("batch-cli".into()),
         };
         assert_eq!(
             batchreport_from_json(&batchreport_to_json(&report)),

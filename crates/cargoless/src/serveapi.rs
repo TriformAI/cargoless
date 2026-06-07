@@ -212,6 +212,7 @@ struct BatchQueue {
 
 struct BatchWaiter {
     request: BatchCheckRequest,
+    enqueued_at: Instant,
     result: Mutex<Option<BatchReport>>,
 }
 
@@ -231,6 +232,7 @@ impl BatchCoalescer {
     ) -> BatchReport {
         let waiter = Arc::new(BatchWaiter {
             request: request.clone(),
+            enqueued_at: Instant::now(),
             result: Mutex::new(None),
         });
 
@@ -270,6 +272,11 @@ impl BatchCoalescer {
                     self.finish_leader(&key);
                     continue;
                 }
+                let run_start = Instant::now();
+                let queue_wait_ms: Vec<u128> = group
+                    .iter()
+                    .map(|waiter| run_start.duration_since(waiter.enqueued_at).as_millis())
+                    .collect();
 
                 {
                     let mut state = poisoned(&self.state);
@@ -281,7 +288,7 @@ impl BatchCoalescer {
                     let mut state = poisoned(&self.state);
                     state.inflight_runs = state.inflight_runs.saturating_sub(1);
                 }
-                distribute_combined_report(&group, &combined_report);
+                distribute_combined_report(&group, &combined_report, &queue_wait_ms);
                 self.finish_leader(&key);
                 continue;
             }
@@ -435,9 +442,14 @@ fn combined_request_for(key: &BatchCoalesceKey, group: &[Arc<BatchWaiter>]) -> B
     request
 }
 
-fn distribute_combined_report(group: &[Arc<BatchWaiter>], combined: &BatchReport) {
+fn distribute_combined_report(
+    group: &[Arc<BatchWaiter>],
+    combined: &BatchReport,
+    queue_wait_ms: &[u128],
+) {
     let mut offset = 0usize;
-    for waiter in group {
+    let executed_members = combined.members.len() as u32;
+    for (idx, waiter) in group.iter().enumerate() {
         let count = waiter.request.members.len();
         let end = offset.saturating_add(count).min(combined.members.len());
         let members = combined.members[offset..end].to_vec();
@@ -450,6 +462,9 @@ fn distribute_combined_report(group: &[Arc<BatchWaiter>], combined: &BatchReport
             combined_checks: combined.combined_checks,
             solo_checks: combined.solo_checks,
             duration_ms: combined.duration_ms,
+            queue_wait_ms: queue_wait_ms.get(idx).copied().unwrap_or(0),
+            executed_members,
+            executed_batch_id: Some(combined.batch_id.clone()),
         };
         *poisoned(&waiter.result) = Some(report);
     }
@@ -1026,6 +1041,9 @@ fn batch_indeterminate(request: &BatchCheckRequest, why: impl Into<String>) -> B
         combined_checks: 0,
         solo_checks: 0,
         duration_ms: 0,
+        queue_wait_ms: 0,
+        executed_members: request.members.len() as u32,
+        executed_batch_id: Some(request.batch_id.clone()),
     }
 }
 
@@ -1580,6 +1598,9 @@ checks:
             combined_checks: 1,
             solo_checks: 0,
             duration_ms: 1,
+            queue_wait_ms: 0,
+            executed_members: request.members.len() as u32,
+            executed_batch_id: Some(request.batch_id.clone()),
         }
     }
 

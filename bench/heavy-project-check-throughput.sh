@@ -225,6 +225,9 @@ parts = [
     f"combined_checks={report.get('combined_checks',0)}",
     f"solo_checks={report.get('solo_checks',0)}",
     f"duration_ms_reported={report.get('duration_ms',0)}",
+    f"queue_wait_ms={report.get('queue_wait_ms',0)}",
+    f"executed_members={report.get('executed_members',len(members))}",
+    f"executed_batch_id={report.get('executed_batch_id','')}",
 ]
 for key in ["combined_green", "solo_green", "solo_red", "interaction_red", "indeterminate"]:
     parts.append(f"{key}={counts.get(key,0)}")

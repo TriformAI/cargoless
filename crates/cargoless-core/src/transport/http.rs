@@ -1589,6 +1589,9 @@ mod tests {
                 combined_checks: 1,
                 solo_checks: 0,
                 duration_ms: 150,
+                queue_wait_ms: 0,
+                executed_members: request.members.len() as u32,
+                executed_batch_id: Some(request.batch_id.clone()),
             }
         }
     }

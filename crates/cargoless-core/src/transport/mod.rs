@@ -303,6 +303,9 @@ fn unsupported_batch_report(
         combined_checks: 0,
         solo_checks: 0,
         duration_ms: 0,
+        queue_wait_ms: 0,
+        executed_members: request.members.len() as u32,
+        executed_batch_id: Some(request.batch_id.clone()),
     }
 }
 
@@ -1104,6 +1107,9 @@ pub fn batchreport_to_json(report: &BatchReport) -> String {
         "combined_checks": report.combined_checks,
         "solo_checks": report.solo_checks,
         "duration_ms": report.duration_ms.to_string(),
+        "queue_wait_ms": report.queue_wait_ms.to_string(),
+        "executed_members": report.executed_members,
+        "executed_batch_id": report.executed_batch_id,
     })
     .to_string()
 }
@@ -1113,14 +1119,15 @@ pub fn batchreport_to_json(report: &BatchReport) -> String {
 /// become indeterminate.
 pub fn batchreport_from_json(text: &str) -> Option<BatchReport> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let batch_id = v.get("batch_id")?.as_str()?.to_string();
+    let members = batch_member_results_from_json(v.get("members"));
     Some(BatchReport {
-        batch_id: v.get("batch_id")?.as_str()?.to_string(),
+        batch_id: batch_id.clone(),
         verdict: v
             .get("verdict")
             .and_then(serde_json::Value::as_str)
             .and_then(BatchVerdict::parse)
             .unwrap_or(BatchVerdict::Indeterminate),
-        members: batch_member_results_from_json(v.get("members")),
         combined_checks: v
             .get("combined_checks")
             .and_then(serde_json::Value::as_u64)
@@ -1130,6 +1137,17 @@ pub fn batchreport_from_json(text: &str) -> Option<BatchReport> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
         duration_ms: json_u128(v.get("duration_ms")),
+        queue_wait_ms: json_u128(v.get("queue_wait_ms")),
+        executed_members: v
+            .get("executed_members")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(members.len() as u64) as u32,
+        executed_batch_id: v
+            .get("executed_batch_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(batch_id.clone())),
+        members,
     })
 }
 
@@ -1627,6 +1645,9 @@ mod tests {
             combined_checks: 1,
             solo_checks: 2,
             duration_ms: 99,
+            queue_wait_ms: 11,
+            executed_members: 2,
+            executed_batch_id: Some("shared-batch-red".into()),
         };
 
         assert_eq!(
