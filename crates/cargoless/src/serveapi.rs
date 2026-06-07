@@ -916,7 +916,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use cargoless_core::batch::{BatchMember, BatchProvenance, BatchVerdict};
+    use cargoless_core::batch::{BatchMember, BatchProvenance, BatchReport, BatchVerdict};
     use cargoless_core::transport::http::{HttpClient, HttpServer};
     use cargoless_core::transport::{
         AllowAll, BatchCheckRequest, CargoSubcommand, PushOverlayOptions, TransportClient,
@@ -1057,6 +1057,217 @@ mod tests {
             args,
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    struct BatchProject {
+        root: PathBuf,
+        remote: PathBuf,
+    }
+
+    impl Drop for BatchProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+            let _ = std::fs::remove_dir_all(&self.remote);
+        }
+    }
+
+    fn setup_batch_project(label: &str) -> BatchProject {
+        let root = temp_root(label);
+        let remote = temp_root(&format!("{label}-remote"));
+
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+        std::fs::write(
+            root.join("cargoless.checks.yaml"),
+            r#"
+version: 1
+checks:
+  - id: no-fail-token
+    kind: forbidden_patterns
+    inputs: ["src/*.rs"]
+    patterns:
+      - code: batch.fail_token
+        literal: FAIL_BATCH
+        message: failing batch token present
+"#,
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&root, &["push", "-u", "origin", "HEAD:main"]);
+
+        BatchProject { root, remote }
+    }
+
+    fn batch_member(name: &str, rel_path: &str, content: &str) -> BatchMember {
+        BatchMember {
+            worktree: format!("/client/{name}"),
+            files: vec![(rel_path.to_string(), content.to_string())],
+            changed_files: vec![rel_path.to_string()],
+        }
+    }
+
+    fn batch_request(batch_id: &str, root: &Path, members: Vec<BatchMember>) -> BatchCheckRequest {
+        let mut request = BatchCheckRequest::new(batch_id, "origin/main");
+        request.options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: None,
+            changed_files: None,
+        };
+        request.members = members;
+        request
+    }
+
+    fn http_batch_check(request: &BatchCheckRequest) -> BatchReport {
+        let api = Arc::new(ServeVerdictState::new());
+        let srv = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::clone(&api) as Arc<dyn VerdictService>,
+            Arc::new(AllowAll),
+        )
+        .expect("bind ephemeral");
+        std::thread::sleep(Duration::from_millis(50));
+        let client =
+            HttpClient::new(&format!("http://{}", srv.addr())).expect("client for ephemeral addr");
+        let report = client.batch_check(request).expect("remote batch_check");
+        drop(srv);
+        report
+    }
+
+    fn member_result<'a>(
+        report: &'a BatchReport,
+        worktree: &str,
+    ) -> &'a cargoless_core::batch::BatchMemberResult {
+        report
+            .members
+            .iter()
+            .find(|member| member.worktree == worktree)
+            .unwrap_or_else(|| panic!("missing batch result for {worktree}"))
+    }
+
+    #[test]
+    fn batch_check_http_combined_green_uses_real_project_checks() {
+        let project = setup_batch_project("batch-http-green");
+        let request = batch_request(
+            "http-green",
+            &project.root,
+            vec![
+                batch_member("a", "src/a.rs", "pub fn a() {}\n"),
+                batch_member("b", "src/b.rs", "pub fn b() {}\n"),
+            ],
+        );
+
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Green);
+        assert_eq!(report.combined_checks, 1);
+        assert_eq!(report.solo_checks, 0);
+        assert_eq!(report.members.len(), 2);
+        assert!(report.members.iter().all(|member| {
+            member.verdict == BatchVerdict::Green
+                && member.provenance == BatchProvenance::CombinedGreen
+                && member.diagnostics.is_empty()
+        }));
+    }
+
+    #[test]
+    fn batch_check_http_combined_red_falls_back_and_attributes_bad_member() {
+        let project = setup_batch_project("batch-http-attribution");
+        let request = batch_request(
+            "http-attribution",
+            &project.root,
+            vec![
+                batch_member("good", "src/good.rs", "pub fn good() {}\n"),
+                batch_member("bad", "src/bad.rs", "pub fn bad() { /* FAIL_BATCH */ }\n"),
+            ],
+        );
+
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Red);
+        assert_eq!(report.combined_checks, 1);
+        assert_eq!(report.solo_checks, 2);
+        let good = member_result(&report, "/client/good");
+        assert_eq!(good.verdict, BatchVerdict::Green);
+        assert_eq!(good.provenance, BatchProvenance::SoloGreen);
+        assert!(good.diagnostics.is_empty());
+        let bad = member_result(&report, "/client/bad");
+        assert_eq!(bad.verdict, BatchVerdict::Red);
+        assert_eq!(bad.provenance, BatchProvenance::SoloRed);
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|diag| diag.code.as_deref() == Some("batch.fail_token"))
+        );
+    }
+
+    #[test]
+    fn batch_check_http_overlay_conflict_reports_interaction_red_not_false_culprit() {
+        let project = setup_batch_project("batch-http-interaction");
+        let request = batch_request(
+            "http-interaction",
+            &project.root,
+            vec![
+                batch_member("one", "src/shared.rs", "pub fn one() {}\n"),
+                batch_member("two", "src/shared.rs", "pub fn two() {}\n"),
+            ],
+        );
+
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Red);
+        assert_eq!(report.combined_checks, 1);
+        assert_eq!(report.solo_checks, 2);
+        assert!(report.members.iter().all(|member| {
+            member.verdict == BatchVerdict::Red
+                && member.provenance == BatchProvenance::InteractionRed
+                && member
+                    .diagnostics
+                    .iter()
+                    .any(|diag| diag.message.contains("different content"))
+        }));
+    }
+
+    #[test]
+    fn batch_check_http_forty_member_green_batch_stays_one_combined_check() {
+        let project = setup_batch_project("batch-http-forty");
+        let members = (0..40)
+            .map(|idx| {
+                batch_member(
+                    &format!("agent-{idx:02}"),
+                    &format!("src/agent_{idx:02}.rs"),
+                    &format!("pub fn agent_{idx:02}() {{}}\n"),
+                )
+            })
+            .collect();
+        let request = batch_request("http-forty", &project.root, members);
+
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Green);
+        assert_eq!(report.members.len(), 40);
+        assert_eq!(
+            report.combined_checks, 1,
+            "a 40-agent green batch should amortize to one combined check"
+        );
+        assert_eq!(report.solo_checks, 0);
+        assert!(report.members.iter().all(|member| {
+            member.verdict == BatchVerdict::Green
+                && member.provenance == BatchProvenance::CombinedGreen
+                && member.diagnostics.is_empty()
+        }));
     }
 
     /// THE Increment-0 GATE differential test: a **remote** read of the
