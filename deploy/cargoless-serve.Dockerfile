@@ -18,6 +18,7 @@ RUN apt-get update -qq \
         clang \
         git \
         jq \
+        kubernetes-client \
         libssl-dev \
         lld \
         pkg-config \

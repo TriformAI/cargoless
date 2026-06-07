@@ -8,4 +8,6 @@ PLATFORM="${CARGOLESS_SERVE_PLATFORM:-linux/amd64}"
 
 cd "$ROOT"
 docker build --platform "$PLATFORM" -f deploy/cargoless-serve.Dockerfile -t "$IMAGE" .
+docker run --rm --entrypoint bash "$IMAGE" -lc \
+  'command -v kubectl >/dev/null && kubectl version --client=true >/dev/null && kubectl kustomize --help >/dev/null'
 docker push "$IMAGE"
