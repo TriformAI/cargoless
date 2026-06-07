@@ -1138,10 +1138,24 @@ checks:
             Arc::new(AllowAll),
         )
         .expect("bind ephemeral");
-        std::thread::sleep(Duration::from_millis(50));
         let client =
             HttpClient::new(&format!("http://{}", srv.addr())).expect("client for ephemeral addr");
-        let report = client.batch_check(request).expect("remote batch_check");
+        let mut last_err = None;
+        let report = (0..20)
+            .find_map(|_| match client.batch_check(request) {
+                Ok(report) => Some(report),
+                Err(err) => {
+                    last_err = Some(err.to_string());
+                    std::thread::sleep(Duration::from_millis(25));
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "remote batch_check did not become ready: {}",
+                    last_err.unwrap_or_else(|| "no attempts made".into())
+                )
+            });
         drop(srv);
         report
     }
