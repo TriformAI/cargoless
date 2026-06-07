@@ -18,16 +18,16 @@
 // `use super::*`; the non-unix stub gets its own `Arc` (cfg'd below) so
 // the un-cfg'd surface carries no import that is unused on the unix CI
 // target.
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{channel, Receiver};
 
 use cargoless_proto::Diagnostic;
 
 use super::{
-    BatchCheckRequest, BatchReport, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
-    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
     batchreport_from_json, batchreport_to_json, event_from_json, event_to_json,
     pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
-    summaries_from_json, summaries_to_json,
+    summaries_from_json, summaries_to_json, BatchCheckRequest, BatchReport, PushOverlayAck,
+    PushOverlayOptions, Request, TransitionEvent, TransportClient, TransportError, VerdictService,
+    WorktreeStatus, WorktreeSummary,
 };
 
 /// Response framing shared with the request side. A logical reply is one
@@ -88,8 +88,8 @@ mod imp {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
 
     use super::*;
@@ -386,8 +386,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::BatchCheckRequest;
     use super::super::inproc::testmock::MockService;
+    use super::super::BatchCheckRequest;
     use super::*;
 
     fn tmp_sock(tag: &str) -> std::path::PathBuf {

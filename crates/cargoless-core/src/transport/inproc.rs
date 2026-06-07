@@ -6,8 +6,8 @@
 //! Unix/HTTP adapters are validated against (same logical results, just
 //! a wire in between).
 
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 use cargoless_proto::Diagnostic;
 
@@ -102,8 +102,8 @@ pub(crate) mod testmock {
     //! the abstraction is that the transport must not change the answer.
 
     use std::path::PathBuf;
+    use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::Mutex;
-    use std::sync::mpsc::{Receiver, Sender, channel};
 
     use cargoless_proto::{Diagnostic, Severity};
 
@@ -210,7 +210,7 @@ pub(crate) mod testmock {
 
 #[cfg(test)]
 mod tests {
-    use super::testmock::{MockService, red_diag};
+    use super::testmock::{red_diag, MockService};
     use super::*;
     use crate::transport::{BatchCheckRequest, TransitionEvent};
 
