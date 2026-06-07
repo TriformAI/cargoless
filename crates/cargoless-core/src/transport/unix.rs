@@ -23,8 +23,9 @@ use std::sync::mpsc::{Receiver, channel};
 use cargoless_proto::Diagnostic;
 
 use super::{
-    PushOverlayAck, PushOverlayOptions, Request, TransitionEvent, TransportClient, TransportError,
-    VerdictService, WorktreeStatus, WorktreeSummary, event_from_json, event_to_json,
+    BatchCheckRequest, BatchReport, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
+    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
+    batchreport_from_json, batchreport_to_json, event_from_json, event_to_json,
     pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
     summaries_from_json, summaries_to_json,
 };
@@ -78,6 +79,7 @@ fn dispatch_oneshot(svc: &dyn VerdictService, req: &Request) -> String {
             check_profile.as_ref(),
             Some(options),
         )),
+        Request::BatchCheck(request) => batchreport_to_json(&svc.batch_check(request)),
     }
 }
 
@@ -314,6 +316,12 @@ mod imp {
             pushoverlayack_from_json(&line)
                 .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into()))
         }
+
+        fn batch_check(&self, request: &BatchCheckRequest) -> Result<BatchReport, TransportError> {
+            let line = self.one_shot(&Request::BatchCheck(request.clone()))?;
+            batchreport_from_json(&line)
+                .ok_or_else(|| TransportError::Protocol("malformed batch_check report".into()))
+        }
     }
 }
 
@@ -378,6 +386,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::super::BatchCheckRequest;
     use super::super::inproc::testmock::MockService;
     use super::*;
 
@@ -414,6 +423,27 @@ mod tests {
         assert_eq!(c.get_diagnostics("red-wt").unwrap().len(), 1);
         assert!(c.get_diagnostics("green-wt").unwrap().is_empty());
         assert_eq!(c.list_worktrees().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn batch_check_roundtrips_over_unix_socket() {
+        let svc = Arc::new(MockService::new());
+        let path = tmp_sock("batch");
+        let srv = UnixServer::bind(&path, svc).expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let c = UnixClient::new(srv.path());
+        let mut request = BatchCheckRequest::new("batch-unix", "origin/main");
+        request.members = vec![crate::batch::BatchMember::new("wt-a")];
+
+        let report = c.batch_check(&request).unwrap();
+
+        assert_eq!(report.batch_id, "batch-unix");
+        assert_eq!(report.members.len(), 1);
+        assert_eq!(report.members[0].worktree, "wt-a");
+        assert_eq!(
+            report.members[0].provenance,
+            crate::batch::BatchProvenance::Indeterminate
+        );
     }
 
     #[test]

@@ -45,11 +45,13 @@
 //! ignore are all hand-rolled in-crate already). Best-effort throughout:
 //! a transport failure is surfaced as a typed error, never a panic.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-use cargoless_proto::Diagnostic;
+use cargoless_proto::{Diagnostic, Severity};
 
+use crate::batch::{BatchMember, BatchMemberResult, BatchProvenance, BatchReport, BatchVerdict};
 use crate::config::{FleetConfig, FleetConfigError};
 
 pub mod discovery;
@@ -165,6 +167,39 @@ impl PushOverlayOptions {
     }
 }
 
+/// A native batch gate request.
+///
+/// All members share one base/check profile/options block. v1 is deliberately
+/// shaped for the central daemon path: many submitter overlays over one
+/// server-side analysis root. Same-host multi-root batching can be layered on
+/// later without changing the attribution report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchCheckRequest {
+    pub batch_id: String,
+    pub base_ref: String,
+    pub members: Vec<BatchMember>,
+    pub check_profile: Option<CheckProfile>,
+    pub options: PushOverlayOptions,
+    /// `true` (default) checks the union first and only falls back to solos on
+    /// a combined red. `false` forces solo checks, useful for debugging and
+    /// for wrappers that need per-submit proof.
+    pub corun: bool,
+}
+
+impl BatchCheckRequest {
+    #[must_use]
+    pub fn new(batch_id: impl Into<String>, base_ref: impl Into<String>) -> Self {
+        Self {
+            batch_id: batch_id.into(),
+            base_ref: base_ref.into(),
+            members: Vec::new(),
+            check_profile: None,
+            options: PushOverlayOptions::default(),
+            corun: true,
+        }
+    }
+}
+
 /// Transport-agnostic worktree status (the `get_status` payload, §10.1).
 /// `crates` empty ⇒ no trustworthy per-crate breakdown (single-crate, or
 /// the #9 unattributable-error honesty case); `verdict` is **always** the
@@ -228,6 +263,39 @@ pub struct DaemonActivity {
     pub quiescing: bool,
     pub active_worktrees: u32,
     pub pending_pushes: u32,
+}
+
+fn unsupported_batch_report(
+    request: &BatchCheckRequest,
+    message: impl Into<String>,
+) -> BatchReport {
+    let message = message.into();
+    BatchReport {
+        batch_id: request.batch_id.clone(),
+        verdict: BatchVerdict::Indeterminate,
+        members: request
+            .members
+            .iter()
+            .map(|member| BatchMemberResult {
+                worktree: member.worktree.clone(),
+                verdict: BatchVerdict::Indeterminate,
+                provenance: BatchProvenance::Indeterminate,
+                diagnostics: vec![Diagnostic {
+                    file_path: PathBuf::from("<cargoless-batch>"),
+                    line: 0,
+                    col: 0,
+                    severity: Severity::Error,
+                    code: Some("cargoless.batch.unsupported".into()),
+                    message: message.clone(),
+                    source: Some("cargoless".into()),
+                }],
+                duration_ms: 0,
+            })
+            .collect(),
+        combined_checks: 0,
+        solo_checks: 0,
+        duration_ms: 0,
+    }
 }
 
 /// The single logical API (§10.1). The Stream-B serve loop implements
@@ -304,6 +372,13 @@ pub trait VerdictService: Send + Sync {
         self.push_overlay_with_profile(worktree, base_ref, files, check_profile)
     }
 
+    /// Native batch gate: check several pushed overlays together and return
+    /// per-member attribution. Default is an honest indeterminate report so
+    /// older/mock services remain source-compatible but never claim green.
+    fn batch_check(&self, request: &BatchCheckRequest) -> BatchReport {
+        unsupported_batch_report(request, "batch_check unsupported by this service")
+    }
+
     /// Admin read: current drain/quiesce state. Default keeps older/mock
     /// services source-compatible and reports "idle, not quiescing".
     fn daemon_activity(&self) -> DaemonActivity {
@@ -376,6 +451,14 @@ pub trait TransportClient {
         _options: Option<&PushOverlayOptions>,
     ) -> Result<PushOverlayAck, TransportError> {
         self.push_overlay_with_profile(worktree, base_ref, files, check_profile)
+    }
+
+    /// Native batch gate. Default is unsupported for transports that have not
+    /// opted into the batch wire yet.
+    fn batch_check(&self, _request: &BatchCheckRequest) -> Result<BatchReport, TransportError> {
+        Err(TransportError::Protocol(
+            "batch_check unsupported by this transport".into(),
+        ))
     }
 }
 
@@ -580,6 +663,10 @@ pub enum Request {
         check_profile: Option<CheckProfile>,
         options: PushOverlayOptions,
     },
+    /// Native batch gate. The request checks several submitter overlays as
+    /// one candidate merge set, then falls back to solo checks only when the
+    /// combined set is red.
+    BatchCheck(BatchCheckRequest),
 }
 
 impl Request {
@@ -632,6 +719,7 @@ impl Request {
                     })
                 }
             }
+            "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(&v))),
             _ => None,
         }
     }
@@ -703,9 +791,112 @@ impl Request {
                 }
                 v
             }
+            Request::BatchCheck(request) => batch_check_request_to_json(request),
         };
         v.to_string()
     }
+}
+
+fn batch_check_request_to_json(request: &BatchCheckRequest) -> serde_json::Value {
+    serde_json::json!({
+        "op": "batch_check",
+        "batch_id": request.batch_id,
+        "base_ref": request.base_ref,
+        "members": batch_members_to_json(&request.members),
+        "check_profile": check_profile_json(request.check_profile.as_ref()),
+        "options": push_overlay_options_to_json(&request.options),
+        "corun": request.corun,
+    })
+}
+
+fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
+    BatchCheckRequest {
+        batch_id: v
+            .get("batch_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        base_ref: v
+            .get("base_ref")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        members: batch_members_from_json(v.get("members")),
+        check_profile: check_profile_from_json(v.get("check_profile")),
+        options: push_overlay_options_from_json(v.get("options").unwrap_or(v)),
+        corun: v
+            .get("corun")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+    }
+}
+
+fn batch_members_to_json(members: &[BatchMember]) -> serde_json::Value {
+    serde_json::Value::Array(
+        members
+            .iter()
+            .map(|member| {
+                serde_json::json!({
+                    "worktree": member.worktree,
+                    "files": overlay_files_to_json(&member.files),
+                    "changed_files": member.changed_files,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn batch_members_from_json(v: Option<&serde_json::Value>) -> Vec<BatchMember> {
+    let Some(serde_json::Value::Array(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            Some(BatchMember {
+                worktree: item.get("worktree")?.as_str()?.to_string(),
+                files: overlay_files_from_json(item.get("files")),
+                changed_files: string_array_from_json(item.get("changed_files"))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "repo_relative": options.repo_relative,
+    });
+    if let serde_json::Value::Object(ref mut map) = value {
+        if let Some(root) = options.analysis_root.as_deref() {
+            map.insert(
+                "analysis_root".to_string(),
+                serde_json::Value::String(root.to_string()),
+            );
+        }
+        if let Some(sha) = options.base_sha.as_deref() {
+            map.insert(
+                "base_sha".to_string(),
+                serde_json::Value::String(sha.to_string()),
+            );
+        }
+        if let Some(changed_files) = options
+            .changed_files
+            .as_ref()
+            .filter(|files| !files.is_empty())
+        {
+            map.insert(
+                "changed_files".to_string(),
+                serde_json::Value::Array(
+                    changed_files
+                        .iter()
+                        .map(|path| serde_json::Value::String(path.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    value
 }
 
 fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
@@ -887,6 +1078,101 @@ pub fn pushoverlayack_from_json(text: &str) -> Option<PushOverlayAck> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
     })
+}
+
+/// Serialise a native batch attribution report to wire JSON.
+pub fn batchreport_to_json(report: &BatchReport) -> String {
+    serde_json::json!({
+        "batch_id": report.batch_id,
+        "verdict": report.verdict.as_str(),
+        "members": report.members.iter().map(batch_member_result_to_json).collect::<Vec<_>>(),
+        "combined_checks": report.combined_checks,
+        "solo_checks": report.solo_checks,
+        "duration_ms": report.duration_ms.to_string(),
+    })
+    .to_string()
+}
+
+/// Parse a native batch attribution report from wire JSON. Best-effort:
+/// malformed member rows are skipped, and unknown verdict/provenance strings
+/// become indeterminate.
+pub fn batchreport_from_json(text: &str) -> Option<BatchReport> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(BatchReport {
+        batch_id: v.get("batch_id")?.as_str()?.to_string(),
+        verdict: v
+            .get("verdict")
+            .and_then(serde_json::Value::as_str)
+            .and_then(BatchVerdict::parse)
+            .unwrap_or(BatchVerdict::Indeterminate),
+        members: batch_member_results_from_json(v.get("members")),
+        combined_checks: v
+            .get("combined_checks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        solo_checks: v
+            .get("solo_checks")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32,
+        duration_ms: json_u128(v.get("duration_ms")),
+    })
+}
+
+fn batch_member_result_to_json(result: &BatchMemberResult) -> serde_json::Value {
+    serde_json::json!({
+        "worktree": result.worktree,
+        "verdict": result.verdict.as_str(),
+        "provenance": result.provenance.as_str(),
+        "diagnostics": diagnostics_to_json(&result.diagnostics),
+        "duration_ms": result.duration_ms.to_string(),
+    })
+}
+
+fn batch_member_results_from_json(v: Option<&serde_json::Value>) -> Vec<BatchMemberResult> {
+    let Some(serde_json::Value::Array(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            Some(BatchMemberResult {
+                worktree: item.get("worktree")?.as_str()?.to_string(),
+                verdict: item
+                    .get("verdict")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(BatchVerdict::parse)
+                    .unwrap_or(BatchVerdict::Indeterminate),
+                provenance: item
+                    .get("provenance")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(BatchProvenance::parse)
+                    .unwrap_or(BatchProvenance::Indeterminate),
+                diagnostics: diagnostics_from_value(item.get("diagnostics")),
+                duration_ms: json_u128(item.get("duration_ms")),
+            })
+        })
+        .collect()
+}
+
+fn diagnostics_to_json(diags: &[Diagnostic]) -> serde_json::Value {
+    serde_json::from_str(&crate::diagnostics_store::serialize(diags))
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+fn diagnostics_from_value(v: Option<&serde_json::Value>) -> Vec<Diagnostic> {
+    v.map(serde_json::Value::to_string)
+        .map(|text| crate::diagnostics_store::deserialize(&text))
+        .unwrap_or_default()
+}
+
+fn json_u128(v: Option<&serde_json::Value>) -> u128 {
+    v.and_then(serde_json::Value::as_u64)
+        .map(u128::from)
+        .or_else(|| {
+            v.and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse::<u128>().ok())
+        })
+        .unwrap_or(0)
 }
 
 fn crate_verdicts_json(crates: &[CrateVerdict]) -> serde_json::Value {
@@ -1254,6 +1540,86 @@ mod tests {
     }
 
     #[test]
+    fn batch_check_request_roundtrips_with_members_and_options() {
+        let mut req = BatchCheckRequest::new("batch-42", "origin/dev");
+        req.members = vec![
+            BatchMember {
+                worktree: "/client/wt-a".into(),
+                files: vec![("src/a.rs".into(), "pub fn a() {}".into())],
+                changed_files: vec!["src/a.rs".into()],
+            },
+            BatchMember {
+                worktree: "/client/wt-b".into(),
+                files: vec![("src/b.rs".into(), "pub fn b() {}".into())],
+                changed_files: vec!["src/b.rs".into()],
+            },
+        ];
+        req.check_profile = Some(CheckProfile {
+            subcommand: CargoSubcommand::Clippy,
+            package: Some("cargoless".into()),
+            target: None,
+            features: vec!["daemon".into()],
+            no_default_features: false,
+            release: false,
+            extra_args: vec!["--all-targets".into()],
+        });
+        req.options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some("/workspace/repo".into()),
+            base_sha: Some("abc123".into()),
+            changed_files: None,
+        };
+        req.corun = false;
+
+        let request = Request::BatchCheck(req);
+        assert_eq!(
+            Request::from_json(&request.to_json()),
+            Some(request.clone()),
+            "batch_check request must roundtrip exactly"
+        );
+    }
+
+    #[test]
+    fn batch_report_roundtrips_diagnostics_and_provenance() {
+        let report = BatchReport {
+            batch_id: "batch-red".into(),
+            verdict: BatchVerdict::Red,
+            members: vec![
+                BatchMemberResult {
+                    worktree: "wt-green".into(),
+                    verdict: BatchVerdict::Green,
+                    provenance: BatchProvenance::SoloGreen,
+                    diagnostics: Vec::new(),
+                    duration_ms: 12,
+                },
+                BatchMemberResult {
+                    worktree: "wt-red".into(),
+                    verdict: BatchVerdict::Red,
+                    provenance: BatchProvenance::SoloRed,
+                    diagnostics: vec![Diagnostic {
+                        file_path: PathBuf::from("src/lib.rs"),
+                        line: 7,
+                        col: 3,
+                        severity: Severity::Error,
+                        code: Some("E0382".into()),
+                        message: "borrow of moved value".into(),
+                        source: Some("rustc".into()),
+                    }],
+                    duration_ms: 34,
+                },
+            ],
+            combined_checks: 1,
+            solo_checks: 2,
+            duration_ms: 99,
+        };
+
+        assert_eq!(
+            batchreport_from_json(&batchreport_to_json(&report)),
+            Some(report)
+        );
+    }
+
+    #[test]
     fn status_roundtrips_including_empty_crates_honesty_case() {
         // The #9/#11 sidecar invariant carried into the wire: empty
         // `crates` (untrustworthy / single-crate) must roundtrip as
@@ -1513,6 +1879,25 @@ mod tests {
                 accepted: false,
                 applied_files: 0,
             }
+        );
+    }
+
+    #[test]
+    fn verdict_service_default_batch_check_is_indeterminate_not_green() {
+        use super::inproc::testmock::MockService;
+        let mut request = BatchCheckRequest::new("batch-default", "origin/main");
+        request.members = vec![BatchMember::new("wt-a")];
+
+        let report = MockService::new().batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Indeterminate);
+        assert_eq!(report.members.len(), 1);
+        assert_eq!(report.members[0].worktree, "wt-a");
+        assert_eq!(report.members[0].provenance, BatchProvenance::Indeterminate);
+        assert!(
+            report.members[0].diagnostics[0]
+                .message
+                .contains("unsupported")
         );
     }
 }

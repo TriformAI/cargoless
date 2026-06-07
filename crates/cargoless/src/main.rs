@@ -23,6 +23,7 @@ use std::process::ExitCode;
 
 use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 
+mod batchcheck;
 mod build;
 mod check;
 mod checks;
@@ -53,6 +54,9 @@ enum Cmd {
     /// #240/2c: thin push-client — push a local overlay-set to a remote
     /// `serve --repo --bind` daemon via `POST /overlay`.
     Push,
+    /// Native batch gate client — POST `/batch-check` and print the
+    /// machine-readable attribution report.
+    BatchCheck,
     Help,
     Version,
 }
@@ -133,6 +137,9 @@ struct Opts {
     push_await_verdict: bool,
     /// `push --await-timeout-secs <N>` — max wait for fresh verdict.
     push_await_timeout_secs: Option<u64>,
+    /// `batch-check --request-json <PATH>` — native batch_check transport
+    /// request body to send to a remote daemon.
+    batch_request_json: Option<PathBuf>,
     /// `checks list|run|explain`.
     checks_action: Option<String>,
     /// Optional check id for `checks run <id>` / `checks explain <id>`.
@@ -179,6 +186,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "checks" => Cmd::Checks,
         "serve" => Cmd::Serve,
         "push" => Cmd::Push,
+        "batch-check" => Cmd::BatchCheck,
         "help" | "-h" | "--help" => Cmd::Help,
         "version" | "-V" | "--version" => Cmd::Version,
         other => return Err(ParseError::UnknownCommand(other.to_string())),
@@ -331,6 +339,12 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 ));
             }
             "--await-verdict" => opts.push_await_verdict = true,
+            "--request-json" => {
+                opts.batch_request_json = Some(PathBuf::from(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--request-json"))?,
+                ));
+            }
             "--await-timeout-secs" => {
                 let v = it
                     .next()
@@ -377,6 +391,8 @@ fn usage() {
     println!("                        Inspect or run cargoless.checks.yaml project checks");
     println!("  serve --repo <DIR>    Model R repo-scoped daemon: auto-discovers");
     println!("                        worktrees, one shared daemon for the fleet");
+    println!("  batch-check --remote <URL> --request-json <PATH>");
+    println!("                        Native optimistic batch gate; prints report JSON");
     println!();
     println!("FLAGS:");
     println!("  --root <DIR>          Project root (default: current directory)");
@@ -420,6 +436,7 @@ fn usage() {
     println!("  --allow-existing-red  checks: allow reds already present at --base");
     println!("  --report-json <PATH>  checks: write machine-readable check decision data");
     println!("  --server-root <DIR>   push: server-side repo root for central daemon mode");
+    println!("  --request-json <PATH> batch-check: transport batch_check request JSON");
     println!("  -h, --help            Show this help");
     println!("  -V, --version         Show the build identifier");
     println!();
@@ -655,6 +672,21 @@ fn main() -> ExitCode {
                 await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
             });
         }
+        Cmd::BatchCheck => {
+            let Some(remote) = parsed.opts.remote.clone() else {
+                ui::error("batch-check: --remote <url> is required");
+                return ExitCode::from(2);
+            };
+            let Some(request_json) = parsed.opts.batch_request_json.clone() else {
+                ui::error("batch-check: --request-json <path> is required");
+                return ExitCode::from(2);
+            };
+            return batchcheck::run(&batchcheck::BatchCheckOpts {
+                remote,
+                auth_token: auth_token_for_push(parsed.opts.auth_token.clone()),
+                request_json,
+            });
+        }
         _ => {}
     }
 
@@ -690,7 +722,9 @@ fn main() -> ExitCode {
             parsed.opts.checks_report_json.as_deref(),
         ),
         Cmd::Clean => clean::run(&cfg),
-        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push => unreachable!("handled above"),
+        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push | Cmd::BatchCheck => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -939,6 +973,35 @@ mod tests {
             Some(std::path::Path::new("checks.json"))
         );
         assert!(p.opts.cargo_extra_args.is_empty());
+    }
+
+    #[test]
+    fn batch_check_command_parses_remote_auth_and_request_json() {
+        let p = parse(&v(&[
+            "batch-check",
+            "--remote",
+            "http://127.0.0.1:8080",
+            "--auth-token",
+            "secret",
+            "--request-json",
+            "batch.json",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::BatchCheck);
+        assert_eq!(p.opts.remote.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(p.opts.auth_token.as_deref(), Some("secret"));
+        assert_eq!(
+            p.opts.batch_request_json.as_deref(),
+            Some(std::path::Path::new("batch.json"))
+        );
+    }
+
+    #[test]
+    fn batch_check_request_json_requires_value() {
+        assert_eq!(
+            parse(&v(&["batch-check", "--request-json"])),
+            Err(ParseError::MissingValue("--request-json"))
+        );
     }
 
     #[test]

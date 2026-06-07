@@ -16,6 +16,7 @@
 //! * `GET /admin/active`                     → quiesce/drain counters
 //! * `POST /admin/quiesce`                   → refuse new pushes, drain,
 //!   then let the daemon exit cleanly for restart
+//! * `POST /batch-check`                     → native batch gate report
 //!
 //! **Auth (#14 seam, NOT policy):** every request is gated by an
 //! [`Authorizer`]; the default is [`AllowAll`] (the #10 posture —
@@ -40,10 +41,11 @@ use std::time::Duration;
 use cargoless_proto::Diagnostic;
 
 use super::{
-    Authorizer, DaemonActivity, PushOverlayAck, PushOverlayOptions, Request, TransitionEvent,
-    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
-    event_from_json, event_to_json, pushoverlayack_from_json, pushoverlayack_to_json,
-    status_from_json, status_to_json, summaries_from_json, summaries_to_json,
+    Authorizer, BatchCheckRequest, BatchReport, DaemonActivity, PushOverlayAck, PushOverlayOptions,
+    Request, TransitionEvent, TransportClient, TransportError, VerdictService, WorktreeStatus,
+    WorktreeSummary, batchreport_from_json, batchreport_to_json, event_from_json, event_to_json,
+    pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
+    summaries_from_json, summaries_to_json,
 };
 
 /// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
@@ -472,6 +474,68 @@ fn handle(
         return;
     }
 
+    // ── POST /batch-check — native optimistic batch gate ──
+    // Same bounded body discipline as `/overlay`: exact capped
+    // Content-Length, authenticated by the shared #14 seam.
+    if req.method == "POST" && req.path == "/batch-check" {
+        let body = match req.content_length {
+            None => {
+                write_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    "POST /batch-check requires a numeric Content-Length",
+                );
+                return;
+            }
+            Some(n) if n > MAX_OVERLAY_BYTES => {
+                write_response(
+                    &mut writer,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    "batch-check payload exceeds the size cap",
+                );
+                return;
+            }
+            Some(n) => {
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() {
+                    write_response(
+                        &mut writer,
+                        400,
+                        "Bad Request",
+                        "text/plain",
+                        "batch-check body shorter than its Content-Length",
+                    );
+                    return;
+                }
+                buf
+            }
+        };
+        match Request::from_json(&String::from_utf8_lossy(&body)) {
+            Some(Request::BatchCheck(request)) => {
+                let report = svc.batch_check(&request);
+                write_response(
+                    &mut writer,
+                    200,
+                    "OK",
+                    "application/json",
+                    &batchreport_to_json(&report),
+                );
+            }
+            _ => write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "text/plain",
+                "body is not a valid batch_check request",
+            ),
+        }
+        return;
+    }
+
     // SSE stream route.
     if req.path == "/events" {
         let _ = write!(
@@ -873,6 +937,56 @@ impl TransportClient for HttpClient {
             ))),
         }
     }
+
+    fn batch_check(&self, request: &BatchCheckRequest) -> Result<BatchReport, TransportError> {
+        let body = Request::BatchCheck(request.clone()).to_json();
+        if body.len() > MAX_OVERLAY_BYTES {
+            return Err(TransportError::Protocol(format!(
+                "batch_check payload too large ({} bytes > {} byte limit)",
+                body.len(),
+                MAX_OVERLAY_BYTES
+            )));
+        }
+        let mut req = format!(
+            "POST /batch-check HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            self.host,
+            body.len()
+        )
+        .into_bytes();
+        if let Some(tok) = &self.token {
+            req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        req.extend_from_slice(body.as_bytes());
+
+        let mut stream = self.connect()?;
+        stream.write_all(&req)?;
+        stream.flush()?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw)?;
+        let (head, resp) = raw
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
+        match code {
+            200 => batchreport_from_json(resp)
+                .ok_or_else(|| TransportError::Protocol("malformed batch_check report".into())),
+            401 => Err(TransportError::Unauthorized),
+            413 => Err(TransportError::Protocol(
+                "batch_check payload too large (413)".into(),
+            )),
+            c => Err(TransportError::Protocol(format!(
+                "batch_check HTTP {c}: {}",
+                resp.trim()
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -880,7 +994,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::inproc::testmock::MockService;
-    use super::super::{AllowAll, BearerToken};
+    use super::super::{AllowAll, BatchCheckRequest, BearerToken};
     use super::*;
 
     fn server() -> HttpServer {
@@ -1354,5 +1468,33 @@ mod tests {
                     && msg.contains(&MAX_OVERLAY_BYTES.to_string())),
             "oversized push must fail locally with the HTTP cap message, got {err:?}"
         );
+    }
+
+    #[test]
+    fn http_client_batch_check_roundtrips_over_the_wire() {
+        // The HttpClient write path end-to-end: POST /batch-check →
+        // structured attribution report. MockService uses the trait default
+        // indeterminate report; the wire is what this test pins.
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let c = client_for(&s);
+        let mut request = BatchCheckRequest::new("batch-http", "origin/main");
+        request.members = vec![crate::batch::BatchMember::new("wt-a")];
+
+        let report = c.batch_check(&request).expect("batch_check ok");
+
+        assert_eq!(report.batch_id, "batch-http");
+        assert_eq!(report.members.len(), 1);
+        assert_eq!(report.members[0].worktree, "wt-a");
+        assert_eq!(
+            report.members[0].provenance,
+            crate::batch::BatchProvenance::Indeterminate
+        );
+        drop(s);
     }
 }
