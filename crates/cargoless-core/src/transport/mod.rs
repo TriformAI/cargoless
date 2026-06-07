@@ -1850,4 +1850,23 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn verdict_service_default_batch_check_is_indeterminate_not_green() {
+        use super::inproc::testmock::MockService;
+        let mut request = BatchCheckRequest::new("batch-default", "origin/main");
+        request.members = vec![BatchMember::new("wt-a")];
+
+        let report = MockService::new().batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Indeterminate);
+        assert_eq!(report.members.len(), 1);
+        assert_eq!(report.members[0].worktree, "wt-a");
+        assert_eq!(report.members[0].provenance, BatchProvenance::Indeterminate);
+        assert!(
+            report.members[0].diagnostics[0]
+                .message
+                .contains("unsupported")
+        );
+    }
 }

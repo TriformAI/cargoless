@@ -210,7 +210,7 @@ pub(crate) mod testmock {
 mod tests {
     use super::testmock::{MockService, red_diag};
     use super::*;
-    use crate::transport::TransitionEvent;
+    use crate::transport::{BatchCheckRequest, TransitionEvent};
 
     fn client() -> InProcClient {
         InProcClient::new(Arc::new(MockService::new()))
@@ -244,5 +244,22 @@ mod tests {
         };
         svc.emit(ev.clone());
         assert_eq!(rx.recv().unwrap(), ev);
+    }
+
+    #[test]
+    fn batch_check_forwards_to_service() {
+        let c = client();
+        let mut request = BatchCheckRequest::new("batch-inproc", "origin/main");
+        request.members = vec![crate::batch::BatchMember::new("wt-a")];
+
+        let report = c.batch_check(&request).unwrap();
+
+        assert_eq!(report.batch_id, "batch-inproc");
+        assert_eq!(report.members.len(), 1);
+        assert_eq!(report.members[0].worktree, "wt-a");
+        assert_eq!(
+            report.members[0].provenance,
+            crate::batch::BatchProvenance::Indeterminate
+        );
     }
 }
