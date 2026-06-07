@@ -605,7 +605,6 @@ impl ServeBatchChecker<'_> {
             base_ref: self.base_ref.clone(),
             overlay_files,
             materialize_overlay: true,
-            gate: true,
         };
         self.api
             .with_project_check_overlay(&context, |root| {
