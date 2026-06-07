@@ -716,7 +716,7 @@ impl Request {
                     })
                 }
             }
-            "batch_check" => batch_check_request_from_value(&v).map(Request::BatchCheck),
+            "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(&v))),
             _ => None,
         }
     }
@@ -809,8 +809,8 @@ fn batch_check_request_to_json(request: &BatchCheckRequest) -> serde_json::Value
     })
 }
 
-fn batch_check_request_from_value(v: &serde_json::Value) -> Option<BatchCheckRequest> {
-    Some(BatchCheckRequest {
+fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
+    BatchCheckRequest {
         batch_id: v
             .get("batch_id")
             .and_then(serde_json::Value::as_str)
@@ -828,7 +828,7 @@ fn batch_check_request_from_value(v: &serde_json::Value) -> Option<BatchCheckReq
             .get("corun")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true),
-    })
+    }
 }
 
 fn batch_members_to_json(members: &[BatchMember]) -> serde_json::Value {

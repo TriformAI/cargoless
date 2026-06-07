@@ -537,7 +537,7 @@ impl VerdictService for ServeVerdictState {
         };
         run_batch(
             request.batch_id.clone(),
-            members,
+            &members,
             &checker,
             if request.corun {
                 CorunPolicy::Corun
