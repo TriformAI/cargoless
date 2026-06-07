@@ -722,7 +722,9 @@ fn main() -> ExitCode {
             parsed.opts.checks_report_json.as_deref(),
         ),
         Cmd::Clean => clean::run(&cfg),
-        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push => unreachable!("handled above"),
+        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push | Cmd::BatchCheck => {
+            unreachable!("handled above")
+        }
     }
 }
 
