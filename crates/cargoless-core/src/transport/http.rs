@@ -994,7 +994,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::inproc::testmock::MockService;
-    use super::super::{AllowAll, BearerToken};
+    use super::super::{AllowAll, BatchCheckRequest, BearerToken};
     use super::*;
 
     fn server() -> HttpServer {
@@ -1468,5 +1468,33 @@ mod tests {
                     && msg.contains(&MAX_OVERLAY_BYTES.to_string())),
             "oversized push must fail locally with the HTTP cap message, got {err:?}"
         );
+    }
+
+    #[test]
+    fn http_client_batch_check_roundtrips_over_the_wire() {
+        // The HttpClient write path end-to-end: POST /batch-check →
+        // structured attribution report. MockService uses the trait default
+        // indeterminate report; the wire is what this test pins.
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let c = client_for(&s);
+        let mut request = BatchCheckRequest::new("batch-http", "origin/main");
+        request.members = vec![crate::batch::BatchMember::new("wt-a")];
+
+        let report = c.batch_check(&request).expect("batch_check ok");
+
+        assert_eq!(report.batch_id, "batch-http");
+        assert_eq!(report.members.len(), 1);
+        assert_eq!(report.members[0].worktree, "wt-a");
+        assert_eq!(
+            report.members[0].provenance,
+            crate::batch::BatchProvenance::Indeterminate
+        );
+        drop(s);
     }
 }
