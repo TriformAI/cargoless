@@ -12,8 +12,8 @@ use std::sync::mpsc::Receiver;
 use cargoless_proto::Diagnostic;
 
 use super::{
-    PushOverlayAck, PushOverlayOptions, TransitionEvent, TransportClient, TransportError,
-    VerdictService, WorktreeStatus, WorktreeSummary,
+    BatchCheckRequest, BatchReport, PushOverlayAck, PushOverlayOptions, TransitionEvent,
+    TransportClient, TransportError, VerdictService, WorktreeStatus, WorktreeSummary,
 };
 
 /// Wraps any [`VerdictService`] and presents it as a [`TransportClient`].
@@ -87,6 +87,10 @@ impl TransportClient for InProcClient {
             check_profile,
             options,
         ))
+    }
+
+    fn batch_check(&self, request: &BatchCheckRequest) -> Result<BatchReport, TransportError> {
+        Ok(self.service.batch_check(request))
     }
 }
 
