@@ -403,11 +403,51 @@ mod tests {
         assert_eq!(out.verdict, BatchVerdict::Green);
         assert_eq!(out.combined_checks, 1);
         assert_eq!(out.solo_checks, 0);
-        assert!(
-            out.members.iter().all(|m| m.verdict == BatchVerdict::Green
-                && m.provenance == BatchProvenance::CombinedGreen)
-        );
+        assert!(out
+            .members
+            .iter()
+            .all(|m| m.verdict == BatchVerdict::Green
+                && m.provenance == BatchProvenance::CombinedGreen));
         assert_eq!(checker.calls(), vec!["combined:a+b+c"]);
+    }
+
+    #[test]
+    fn run_batch_preserves_member_order_for_combined_green_and_fallback() {
+        let checker = MockChecker::default().with_combined(Ok(report(TreeState::Green, "all")));
+        let out = run_batch(
+            "order-green",
+            &members(&["first", "second", "third"]),
+            &checker,
+            CorunPolicy::Corun,
+        );
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.worktree.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+
+        let checker = MockChecker::default()
+            .with_combined(Ok(report(TreeState::Red, "combined")))
+            .solo("second", Ok(report(TreeState::Red, "second")));
+        let out = run_batch(
+            "order-fallback",
+            &members(&["first", "second", "third"]),
+            &checker,
+            CorunPolicy::Corun,
+        );
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| (member.worktree.as_str(), member.provenance))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first", BatchProvenance::SoloGreen),
+                ("second", BatchProvenance::SoloRed),
+                ("third", BatchProvenance::SoloGreen),
+            ]
+        );
     }
 
     #[test]
@@ -423,10 +463,11 @@ mod tests {
         assert_eq!(out.members.len(), 40);
         assert_eq!(out.combined_checks, 1);
         assert_eq!(out.solo_checks, 0);
-        assert!(
-            out.members.iter().all(|m| m.verdict == BatchVerdict::Green
-                && m.provenance == BatchProvenance::CombinedGreen)
-        );
+        assert!(out
+            .members
+            .iter()
+            .all(|m| m.verdict == BatchVerdict::Green
+                && m.provenance == BatchProvenance::CombinedGreen));
         assert_eq!(checker.calls().len(), 1);
     }
 
@@ -525,11 +566,10 @@ mod tests {
         assert_eq!(out.verdict, BatchVerdict::Green);
         assert_eq!(out.combined_checks, 0);
         assert_eq!(out.solo_checks, 2);
-        assert!(
-            out.members
-                .iter()
-                .all(|m| m.provenance == BatchProvenance::SoloGreen)
-        );
+        assert!(out
+            .members
+            .iter()
+            .all(|m| m.provenance == BatchProvenance::SoloGreen));
         assert_eq!(checker.calls(), vec!["solo:a", "solo:b"]);
     }
 
@@ -539,12 +579,11 @@ mod tests {
         let out = run_batch("b1", &members(&["a", "b"]), &checker, CorunPolicy::Corun);
 
         assert_eq!(out.verdict, BatchVerdict::Indeterminate);
-        assert!(
-            out.members
-                .iter()
-                .all(|m| m.verdict == BatchVerdict::Indeterminate
-                    && m.provenance == BatchProvenance::Indeterminate)
-        );
+        assert!(out
+            .members
+            .iter()
+            .all(|m| m.verdict == BatchVerdict::Indeterminate
+                && m.provenance == BatchProvenance::Indeterminate));
     }
 
     #[test]

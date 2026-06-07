@@ -46,8 +46,8 @@
 //! a transport failure is surfaced as a typed error, never a panic.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 use cargoless_proto::{Diagnostic, Severity};
 
@@ -176,6 +176,10 @@ impl PushOverlayOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchCheckRequest {
     pub batch_id: String,
+    /// Optional server-side coalescing bucket. Absent keeps the historical
+    /// one-request/one-batch semantics. Present makes the daemon eligible to
+    /// merge compatible simultaneous requests before calling `run_batch`.
+    pub coalesce_key: Option<String>,
     pub base_ref: String,
     pub members: Vec<BatchMember>,
     pub check_profile: Option<CheckProfile>,
@@ -191,6 +195,7 @@ impl BatchCheckRequest {
     pub fn new(batch_id: impl Into<String>, base_ref: impl Into<String>) -> Self {
         Self {
             batch_id: batch_id.into(),
+            coalesce_key: None,
             base_ref: base_ref.into(),
             members: Vec::new(),
             check_profile: None,
@@ -263,6 +268,9 @@ pub struct DaemonActivity {
     pub quiescing: bool,
     pub active_worktrees: u32,
     pub pending_pushes: u32,
+    pub pending_batch_waiters: u32,
+    pub pending_batch_members: u32,
+    pub inflight_batch_runs: u32,
 }
 
 fn unsupported_batch_report(
@@ -801,6 +809,7 @@ fn batch_check_request_to_json(request: &BatchCheckRequest) -> serde_json::Value
     serde_json::json!({
         "op": "batch_check",
         "batch_id": request.batch_id,
+        "coalesce_key": request.coalesce_key,
         "base_ref": request.base_ref,
         "members": batch_members_to_json(&request.members),
         "check_profile": check_profile_json(request.check_profile.as_ref()),
@@ -816,6 +825,12 @@ fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string(),
+        coalesce_key: v
+            .get("coalesce_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         base_ref: v
             .get("base_ref")
             .and_then(serde_json::Value::as_str)
@@ -1570,6 +1585,7 @@ mod tests {
             changed_files: None,
         };
         req.corun = false;
+        req.coalesce_key = Some("tf-multiverse:origin/dev:project-checks".into());
 
         let request = Request::BatchCheck(req);
         assert_eq!(
@@ -1664,7 +1680,7 @@ mod tests {
         assert_eq!(status_from_json(""), None);
         assert_eq!(status_from_json("garbage"), None);
         assert_eq!(status_from_json("{}"), None); // no worktree ⇒ None
-        // Missing scalars default, never panic.
+                                                  // Missing scalars default, never panic.
         let s = status_from_json(r#"{"worktree":"w"}"#).unwrap();
         assert_eq!(s.verdict, "unknown");
         assert_eq!(s.daemon_build_id, "");
@@ -1894,10 +1910,8 @@ mod tests {
         assert_eq!(report.members.len(), 1);
         assert_eq!(report.members[0].worktree, "wt-a");
         assert_eq!(report.members[0].provenance, BatchProvenance::Indeterminate);
-        assert!(
-            report.members[0].diagnostics[0]
-                .message
-                .contains("unsupported")
-        );
+        assert!(report.members[0].diagnostics[0]
+            .message
+            .contains("unsupported"));
     }
 }

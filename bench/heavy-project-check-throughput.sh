@@ -31,6 +31,9 @@
 #   WORK=/tmp/cargoless-heavy-project-check
 #   CARGOLESS_AUTH_TOKEN=...
 #   DRY_RUN=1                            # generate JSON only; do not call remote
+#   COALESCE_KEY='tf-heavy:{scenario}:origin-dev'
+#                                        # opt into daemon-side coalescing;
+#                                        # {scenario} is replaced per request
 #   EXPECT=green                         # green | red | any
 #   REQUIRE_FAST_GREEN=1                 # green multi-member batches must be
 #                                        # one combined check, zero solos
@@ -66,6 +69,7 @@ SCENARIO_PATHS="${SCENARIO_PATHS:-ssr=server/src/cargoless_heavy_bench wasm=port
 FILE_EXT="${FILE_EXT:-rs}"
 WORK="${WORK:-/tmp/cargoless-heavy-project-check}"
 DRY_RUN="${DRY_RUN:-0}"
+COALESCE_KEY="${COALESCE_KEY:-}"
 EXPECT="${EXPECT:-green}"
 REQUIRE_FAST_GREEN="${REQUIRE_FAST_GREEN:-1}"
 FAIL_SCENARIO="${FAIL_SCENARIO:-green}"
@@ -114,7 +118,8 @@ fi
 make_request() {
   local scenario="$1" n="$2" request_idx="$3" out="$4"
   python3 - "$scenario" "$n" "$request_idx" "$out" "$SERVER_ROOT" "$BASE_REF" \
-    "$SCENARIO_PATHS" "$FILE_EXT" "$FAIL_SCENARIO" "$RED_MEMBER" "$RED_PATH" <<'PY'
+    "$SCENARIO_PATHS" "$FILE_EXT" "$FAIL_SCENARIO" "$RED_MEMBER" "$RED_PATH" \
+    "$COALESCE_KEY" <<'PY'
 import json
 import re
 import sys
@@ -130,6 +135,7 @@ file_ext = sys.argv[8].lstrip(".")
 fail_scenario = sys.argv[9]
 red_member = int(sys.argv[10])
 red_path = sys.argv[11]
+coalesce_key_template = sys.argv[12]
 
 def slug(s):
     return re.sub(r"[^A-Za-z0-9_]", "_", s)
@@ -192,6 +198,8 @@ body = {
     },
     "corun": True,
 }
+if coalesce_key_template.strip():
+    body["coalesce_key"] = coalesce_key_template.replace("{scenario}", scenario)
 with open(out, "w", encoding="utf-8") as f:
     json.dump(body, f, separators=(",", ":"))
 PY

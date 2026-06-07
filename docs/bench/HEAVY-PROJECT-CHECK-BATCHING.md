@@ -40,9 +40,17 @@ Concurrent dry-run:
 DRY_RUN=1 MODE=concurrent REMOTE=http://127.0.0.1:9 SERVER_ROOT=/workspace/tf-multiverse REQUESTS=4 BATCH_SIZE=10 bench/heavy-project-check-throughput.sh
 ```
 
+Daemon-side coalescing dry-run:
+
+```bash
+DRY_RUN=1 MODE=concurrent REMOTE=http://127.0.0.1:9 SERVER_ROOT=/workspace/tf-multiverse REQUESTS=40 BATCH_SIZE=1 COALESCE_KEY='tf-heavy:{scenario}:origin-dev' bench/heavy-project-check-throughput.sh
+```
+
 Inspect the generated JSON under `$WORK` and confirm:
 
 - `op=batch_check`
+- `coalesce_key` is absent for explicit preassembled batch tests, or present
+  and scenario-scoped for daemon-side coalescing tests
 - `options.repo_relative=true`
 - `options.analysis_root` points to the daemon-side checkout
 - each member has both `files[].path/content` and matching `changed_files`
@@ -57,6 +65,7 @@ Minimum matrix:
 
 - Sweep mode: `NLIST='1 2 4 8 16 40'`
 - Concurrent mode: `(REQUESTS,BATCH_SIZE)` of `(40,1)`, `(8,5)`, `(4,10)`, `(1,40)`
+- Queue mode: repeat concurrent `(40,1)` with `COALESCE_KEY='tf-heavy:{scenario}:origin-dev'`
 - Scenarios: `ssr wasm isolator all mixed`
 - Red attribution probe: `FAIL_SCENARIO=one-red` with a compiled file path
   such as `RED_PATH=server/src/main.rs` or another scenario-appropriate file

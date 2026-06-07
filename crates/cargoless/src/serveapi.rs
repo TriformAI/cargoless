@@ -38,13 +38,14 @@
 //! already emits keeps the read-plane consistent with the write-plane
 //! rather than fabricating detail the loop does not yet compute.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
+use cargoless_core::batch::{run_batch, BatchChecker, BatchMember, BatchReport, BatchVerdict};
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::project_checks::ProjectCheckReport;
 use cargoless_core::transport::{
@@ -150,12 +151,324 @@ pub struct ServeVerdictState {
     /// changed-file trigger set and central-daemon analysis root need a
     /// small handoff store keyed by the client-visible worktree.
     project_check_context: Mutex<BTreeMap<String, ProjectCheckRunContext>>,
+    /// Optional server-side coalescing for explicit `coalesce_key`
+    /// batch-check requests. Absent key keeps historical immediate behavior.
+    batch_coalescer: BatchCoalescer,
 }
 
 #[derive(Default)]
 struct DrainState {
     quiescing: bool,
     active_worktrees: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BatchCoalesceKey {
+    coalesce_key: String,
+    base_ref: String,
+    analysis_root: Option<String>,
+    repo_relative: bool,
+    check_profile: String,
+    corun: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchCoalesceConfig {
+    debounce: Duration,
+    max_wait: Duration,
+    max_members: usize,
+}
+
+impl Default for BatchCoalesceConfig {
+    fn default() -> Self {
+        Self {
+            debounce: configured_batch_duration("CARGOLESS_BATCH_DEBOUNCE_MS", 250),
+            max_wait: configured_batch_duration("CARGOLESS_BATCH_MAX_WAIT_MS", 1000),
+            max_members: configured_batch_usize("CARGOLESS_BATCH_MAX_MEMBERS", 40),
+        }
+    }
+}
+
+#[derive(Default)]
+struct BatchCoalescer {
+    state: Mutex<BatchCoalescerState>,
+    cv: Condvar,
+    config: BatchCoalesceConfig,
+}
+
+#[derive(Default)]
+struct BatchCoalescerState {
+    queues: BTreeMap<BatchCoalesceKey, BatchQueue>,
+    inflight_runs: u32,
+}
+
+#[derive(Default)]
+struct BatchQueue {
+    waiters: VecDeque<Arc<BatchWaiter>>,
+    leader_active: bool,
+    first_at: Option<Instant>,
+    last_at: Option<Instant>,
+}
+
+struct BatchWaiter {
+    request: BatchCheckRequest,
+    result: Mutex<Option<BatchReport>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchQueueCounts {
+    waiters: u32,
+    members: u32,
+    inflight_runs: u32,
+}
+
+impl BatchCoalescer {
+    fn submit(
+        &self,
+        key: BatchCoalesceKey,
+        request: &BatchCheckRequest,
+        run: impl Fn(&BatchCheckRequest) -> BatchReport,
+    ) -> BatchReport {
+        let waiter = Arc::new(BatchWaiter {
+            request: request.clone(),
+            result: Mutex::new(None),
+        });
+
+        {
+            let mut state = poisoned(&self.state);
+            let queue = state.queues.entry(key.clone()).or_default();
+            let now = Instant::now();
+            if queue.waiters.is_empty() {
+                queue.first_at = Some(now);
+            }
+            queue.last_at = Some(now);
+            queue.waiters.push_back(Arc::clone(&waiter));
+            self.cv.notify_all();
+        }
+
+        loop {
+            if let Some(report) = poisoned(&waiter.result).clone() {
+                return report;
+            }
+
+            let mut state = poisoned(&self.state);
+            let Some(queue) = state.queues.get_mut(&key) else {
+                state = self
+                    .cv
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(state);
+                continue;
+            };
+            if !queue.leader_active {
+                queue.leader_active = true;
+                drop(state);
+
+                self.wait_until_flush(&key);
+                let group = self.drain_group(&key);
+                if group.is_empty() {
+                    self.finish_leader(&key);
+                    continue;
+                }
+
+                {
+                    let mut state = poisoned(&self.state);
+                    state.inflight_runs = state.inflight_runs.saturating_add(1);
+                }
+                let combined = combined_request_for(&key, &group);
+                let combined_report = run(&combined);
+                {
+                    let mut state = poisoned(&self.state);
+                    state.inflight_runs = state.inflight_runs.saturating_sub(1);
+                }
+                distribute_combined_report(&group, &combined_report);
+                self.finish_leader(&key);
+                continue;
+            }
+
+            let state = self
+                .cv
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(state);
+        }
+    }
+
+    fn wait_until_flush(&self, key: &BatchCoalesceKey) {
+        loop {
+            let state = poisoned(&self.state);
+            let Some(queue) = state.queues.get(key) else {
+                return;
+            };
+            let now = Instant::now();
+            let first_at = queue.first_at.unwrap_or(now);
+            let last_at = queue.last_at.unwrap_or(now);
+            let members = queue_member_count(queue);
+            if members >= self.config.max_members
+                || now.duration_since(first_at) >= self.config.max_wait
+                || now.duration_since(last_at) >= self.config.debounce
+            {
+                return;
+            }
+            let until_quiet = self
+                .config
+                .debounce
+                .saturating_sub(now.duration_since(last_at));
+            let until_max = self
+                .config
+                .max_wait
+                .saturating_sub(now.duration_since(first_at));
+            let wait_for = until_quiet.min(until_max);
+            let (_state, _timeout) = self
+                .cv
+                .wait_timeout(state, wait_for)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn drain_group(&self, key: &BatchCoalesceKey) -> Vec<Arc<BatchWaiter>> {
+        let mut state = poisoned(&self.state);
+        let Some(queue) = state.queues.get_mut(key) else {
+            return Vec::new();
+        };
+        let mut group = Vec::new();
+        let mut member_count = 0usize;
+        while let Some(next) = queue.waiters.front() {
+            let next_members = next.request.members.len().max(1);
+            if !group.is_empty() && member_count + next_members > self.config.max_members {
+                break;
+            }
+            let next = queue.waiters.pop_front().expect("front existed");
+            member_count += next_members;
+            group.push(next);
+        }
+        if queue.waiters.is_empty() {
+            queue.first_at = None;
+            queue.last_at = None;
+        } else {
+            let now = Instant::now();
+            queue.first_at = Some(now);
+            queue.last_at = Some(now);
+        }
+        group
+    }
+
+    fn finish_leader(&self, key: &BatchCoalesceKey) {
+        let mut state = poisoned(&self.state);
+        let should_remove = if let Some(queue) = state.queues.get_mut(key) {
+            queue.leader_active = false;
+            queue.waiters.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            state.queues.remove(key);
+        }
+        self.cv.notify_all();
+    }
+
+    fn counts(&self) -> BatchQueueCounts {
+        let state = poisoned(&self.state);
+        let mut counts = BatchQueueCounts {
+            inflight_runs: state.inflight_runs,
+            ..BatchQueueCounts::default()
+        };
+        for queue in state.queues.values() {
+            counts.waiters += queue.waiters.len() as u32;
+            counts.members += queue_member_count(queue) as u32;
+        }
+        counts
+    }
+}
+
+fn configured_batch_duration(name: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(default_ms),
+    )
+}
+
+fn configured_batch_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn batch_coalesce_key(request: &BatchCheckRequest) -> Option<BatchCoalesceKey> {
+    let coalesce_key = request
+        .coalesce_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())?
+        .to_string();
+    Some(BatchCoalesceKey {
+        coalesce_key,
+        base_ref: request.base_ref.clone(),
+        analysis_root: request.options.analysis_root.clone(),
+        repo_relative: request.options.repo_relative,
+        check_profile: format!("{:?}", request.check_profile),
+        corun: request.corun,
+    })
+}
+
+fn queue_member_count(queue: &BatchQueue) -> usize {
+    queue
+        .waiters
+        .iter()
+        .map(|waiter| waiter.request.members.len().max(1))
+        .sum()
+}
+
+fn combined_request_for(key: &BatchCoalesceKey, group: &[Arc<BatchWaiter>]) -> BatchCheckRequest {
+    let first = &group[0].request;
+    let mut request = first.clone();
+    request.batch_id = format!("coalesced:{}", key.coalesce_key);
+    request.coalesce_key = None;
+    request.members = group
+        .iter()
+        .flat_map(|waiter| waiter.request.members.clone())
+        .collect();
+    request
+}
+
+fn distribute_combined_report(group: &[Arc<BatchWaiter>], combined: &BatchReport) {
+    let mut offset = 0usize;
+    for waiter in group {
+        let count = waiter.request.members.len();
+        let end = offset.saturating_add(count).min(combined.members.len());
+        let members = combined.members[offset..end].to_vec();
+        offset = end;
+        let verdict = verdict_for_members(&members);
+        let report = BatchReport {
+            batch_id: waiter.request.batch_id.clone(),
+            verdict,
+            members,
+            combined_checks: combined.combined_checks,
+            solo_checks: combined.solo_checks,
+            duration_ms: combined.duration_ms,
+        };
+        *poisoned(&waiter.result) = Some(report);
+    }
+}
+
+fn verdict_for_members(members: &[cargoless_core::batch::BatchMemberResult]) -> BatchVerdict {
+    if members
+        .iter()
+        .any(|member| member.verdict == cargoless_core::batch::BatchVerdict::Indeterminate)
+    {
+        BatchVerdict::Indeterminate
+    } else if members
+        .iter()
+        .any(|member| member.verdict == cargoless_core::batch::BatchVerdict::Red)
+    {
+        BatchVerdict::Red
+    } else {
+        BatchVerdict::Green
+    }
 }
 
 impl ServeVerdictState {
@@ -318,7 +631,12 @@ impl ServeVerdictState {
 
     pub fn drain_complete(&self) -> bool {
         let drain = poisoned(&self.drain);
-        drain.quiescing && drain.active_worktrees.is_empty() && poisoned(&self.pushed).is_empty()
+        let batch_counts = self.batch_coalescer.counts();
+        drain.quiescing
+            && drain.active_worktrees.is_empty()
+            && poisoned(&self.pushed).is_empty()
+            && batch_counts.waiters == 0
+            && batch_counts.inflight_runs == 0
     }
 
     fn mark_push_active(&self, worktree: &str) -> bool {
@@ -336,11 +654,71 @@ impl ServeVerdictState {
 
     fn activity_snapshot(&self) -> DaemonActivity {
         let drain = poisoned(&self.drain);
+        let batch_counts = self.batch_coalescer.counts();
         DaemonActivity {
             quiescing: drain.quiescing,
             active_worktrees: drain.active_worktrees.len() as u32,
             pending_pushes: poisoned(&self.pushed).len() as u32,
+            pending_batch_waiters: batch_counts.waiters,
+            pending_batch_members: batch_counts.members,
+            inflight_batch_runs: batch_counts.inflight_runs,
         }
+    }
+
+    fn run_batch_check_now(&self, request: &BatchCheckRequest) -> BatchReport {
+        if self.quiescing() {
+            return batch_indeterminate(request, "daemon is quiescing");
+        }
+
+        let Some(root) = request
+            .options
+            .analysis_root
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        else {
+            return batch_indeterminate(request, "batch_check v1 requires a shared analysis_root");
+        };
+        let base_ref = request.base_ref.trim();
+        if base_ref.is_empty() {
+            return batch_indeterminate(request, "batch_check requires a non-empty base_ref");
+        }
+        if !root.join(".git").exists() {
+            return batch_indeterminate(
+                request,
+                format!("analysis_root `{}` is not a git checkout", root.display()),
+            );
+        }
+
+        let members =
+            match map_batch_members(&root, request.options.repo_relative, &request.members) {
+                Ok(members) => members,
+                Err(e) => return batch_indeterminate(request, e),
+            };
+
+        {
+            let _guard = poisoned(&self.sync_lock);
+            if let Err(e) = sync_analysis_root(&root, base_ref) {
+                return batch_indeterminate(request, e);
+            }
+        }
+
+        let checker = ServeBatchChecker {
+            api: self,
+            root,
+            base_ref: base_ref.to_string(),
+        };
+        run_batch(
+            request.batch_id.clone(),
+            &members,
+            &checker,
+            if request.corun {
+                CorunPolicy::Corun
+            } else {
+                CorunPolicy::NoCorun
+            },
+        )
     }
 }
 
@@ -502,59 +880,12 @@ impl VerdictService for ServeVerdictState {
     }
 
     fn batch_check(&self, request: &BatchCheckRequest) -> BatchReport {
-        if self.quiescing() {
-            return batch_indeterminate(request, "daemon is quiescing");
+        if let Some(key) = batch_coalesce_key(request) {
+            self.batch_coalescer
+                .submit(key, request, |combined| self.run_batch_check_now(combined))
+        } else {
+            self.run_batch_check_now(request)
         }
-
-        let Some(root) = request
-            .options
-            .analysis_root
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-        else {
-            return batch_indeterminate(request, "batch_check v1 requires a shared analysis_root");
-        };
-        let base_ref = request.base_ref.trim();
-        if base_ref.is_empty() {
-            return batch_indeterminate(request, "batch_check requires a non-empty base_ref");
-        }
-        if !root.join(".git").exists() {
-            return batch_indeterminate(
-                request,
-                format!("analysis_root `{}` is not a git checkout", root.display()),
-            );
-        }
-
-        let members =
-            match map_batch_members(&root, request.options.repo_relative, &request.members) {
-                Ok(members) => members,
-                Err(e) => return batch_indeterminate(request, e),
-            };
-
-        {
-            let _guard = poisoned(&self.sync_lock);
-            if let Err(e) = sync_analysis_root(&root, base_ref) {
-                return batch_indeterminate(request, e);
-            }
-        }
-
-        let checker = ServeBatchChecker {
-            api: self,
-            root,
-            base_ref: base_ref.to_string(),
-        };
-        run_batch(
-            request.batch_id.clone(),
-            &members,
-            &checker,
-            if request.corun {
-                CorunPolicy::Corun
-            } else {
-                CorunPolicy::NoCorun
-            },
-        )
     }
 
     fn daemon_activity(&self) -> DaemonActivity {
@@ -566,6 +897,7 @@ impl VerdictService for ServeVerdictState {
             let mut drain = poisoned(&self.drain);
             drain.quiescing = true;
         }
+        self.batch_coalescer.cv.notify_all();
         self.activity_snapshot()
     }
 }
@@ -966,11 +1298,9 @@ mod tests {
         for member in report.members {
             assert_eq!(member.verdict, BatchVerdict::Indeterminate);
             assert_eq!(member.provenance, BatchProvenance::Indeterminate);
-            assert!(
-                member.diagnostics[0]
-                    .message
-                    .contains("requires a shared analysis_root")
-            );
+            assert!(member.diagnostics[0]
+                .message
+                .contains("requires a shared analysis_root"));
         }
     }
 
@@ -1000,11 +1330,9 @@ mod tests {
             files: vec![("../outside.rs".into(), "bad".into())],
             changed_files: vec![],
         }];
-        assert!(
-            map_batch_members(&root, true, &escaping)
-                .unwrap_err()
-                .contains("escapes repo root")
-        );
+        assert!(map_batch_members(&root, true, &escaping)
+            .unwrap_err()
+            .contains("escapes repo root"));
     }
 
     #[test]
@@ -1038,11 +1366,9 @@ mod tests {
                 changed_files: vec![],
             },
         ];
-        assert!(
-            union_overlay_files(&conflicting)
-                .unwrap_err()
-                .contains("different content")
-        );
+        assert!(union_overlay_files(&conflicting)
+            .unwrap_err()
+            .contains("different content"));
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -1195,6 +1521,197 @@ checks:
             .unwrap_or_else(|| panic!("missing batch result for {worktree}"))
     }
 
+    fn test_coalescer() -> BatchCoalescer {
+        BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            config: BatchCoalesceConfig {
+                debounce: Duration::from_millis(50),
+                max_wait: Duration::from_millis(300),
+                max_members: 40,
+            },
+        }
+    }
+
+    fn test_batch_key(name: &str) -> BatchCoalesceKey {
+        BatchCoalesceKey {
+            coalesce_key: name.to_string(),
+            base_ref: "origin/main".into(),
+            analysis_root: Some("/workspace/repo".into()),
+            repo_relative: true,
+            check_profile: "None".into(),
+            corun: true,
+        }
+    }
+
+    fn coalescer_request(batch_id: &str, member: &str) -> BatchCheckRequest {
+        let mut request = BatchCheckRequest::new(batch_id, "origin/main");
+        request.options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some("/workspace/repo".into()),
+            base_sha: None,
+            changed_files: None,
+        };
+        request.members = vec![BatchMember::new(member)];
+        request
+    }
+
+    fn green_report_for(request: &BatchCheckRequest) -> BatchReport {
+        BatchReport {
+            batch_id: request.batch_id.clone(),
+            verdict: BatchVerdict::Green,
+            members: request
+                .members
+                .iter()
+                .map(|member| cargoless_core::batch::BatchMemberResult {
+                    worktree: member.worktree.clone(),
+                    verdict: BatchVerdict::Green,
+                    provenance: BatchProvenance::CombinedGreen,
+                    diagnostics: Vec::new(),
+                    duration_ms: 1,
+                })
+                .collect(),
+            combined_checks: 1,
+            solo_checks: 0,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn batch_coalescer_groups_same_key_requests() {
+        let coalescer = Arc::new(test_coalescer());
+        let key = test_batch_key("same");
+        let start = Arc::new(Barrier::new(2));
+        let runs = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut handles = Vec::new();
+
+        for (batch_id, member) in [("batch-a", "member-a"), ("batch-b", "member-b")] {
+            let coalescer = Arc::clone(&coalescer);
+            let key = key.clone();
+            let start = Arc::clone(&start);
+            let runs = Arc::clone(&runs);
+            let request = coalescer_request(batch_id, member);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                coalescer.submit(key, &request, |combined| {
+                    poisoned(&runs).push(
+                        combined
+                            .members
+                            .iter()
+                            .map(|member| member.worktree.clone())
+                            .collect(),
+                    );
+                    green_report_for(combined)
+                })
+            }));
+        }
+
+        let reports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("coalescer thread"))
+            .collect();
+
+        let mut runs = poisoned(&runs).clone();
+        assert_eq!(runs.len(), 1);
+        runs[0].sort();
+        assert_eq!(runs[0], vec!["member-a", "member-b"]);
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.batch_id == "batch-a"
+                    && report.members[0].worktree == "member-a")
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.batch_id == "batch-b"
+                    && report.members[0].worktree == "member-b")
+        );
+    }
+
+    #[test]
+    fn batch_coalescer_keeps_different_keys_separate() {
+        let coalescer = Arc::new(test_coalescer());
+        let start = Arc::new(Barrier::new(2));
+        let runs = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut handles = Vec::new();
+
+        for (key_name, batch_id, member) in [
+            ("key-a", "batch-a", "member-a"),
+            ("key-b", "batch-b", "member-b"),
+        ] {
+            let coalescer = Arc::clone(&coalescer);
+            let key = test_batch_key(key_name);
+            let start = Arc::clone(&start);
+            let runs = Arc::clone(&runs);
+            let request = coalescer_request(batch_id, member);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                coalescer.submit(key, &request, |combined| {
+                    poisoned(&runs).push(
+                        combined
+                            .members
+                            .iter()
+                            .map(|member| member.worktree.clone())
+                            .collect(),
+                    );
+                    green_report_for(combined)
+                })
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("coalescer thread");
+        }
+        let mut runs = poisoned(&runs).clone();
+        runs.sort();
+        assert_eq!(runs, vec![vec!["member-a"], vec!["member-b"]]);
+    }
+
+    #[test]
+    fn batch_coalescer_splits_at_max_members_without_losing_waiters() {
+        let coalescer = Arc::new(BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            config: BatchCoalesceConfig {
+                debounce: Duration::from_millis(50),
+                max_wait: Duration::from_millis(300),
+                max_members: 2,
+            },
+        });
+        let key = test_batch_key("max-members");
+        let start = Arc::new(Barrier::new(3));
+        let runs = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let mut handles = Vec::new();
+
+        for idx in 0..3 {
+            let coalescer = Arc::clone(&coalescer);
+            let key = key.clone();
+            let start = Arc::clone(&start);
+            let runs = Arc::clone(&runs);
+            let request = coalescer_request(&format!("batch-{idx}"), &format!("member-{idx}"));
+            handles.push(thread::spawn(move || {
+                start.wait();
+                coalescer.submit(key, &request, |combined| {
+                    poisoned(&runs).push(combined.members.len());
+                    green_report_for(combined)
+                })
+            }));
+        }
+
+        let reports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("coalescer thread"))
+            .collect();
+        let mut run_sizes = poisoned(&runs).clone();
+        run_sizes.sort();
+        assert_eq!(run_sizes, vec![1, 2]);
+        assert_eq!(reports.len(), 3);
+        assert!(reports
+            .iter()
+            .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1));
+    }
+
     #[test]
     fn batch_check_http_combined_green_uses_real_project_checks() {
         let project = setup_batch_project("batch-http-green");
@@ -1245,11 +1762,10 @@ checks:
         let bad = member_result(&report, "/client/bad");
         assert_eq!(bad.verdict, BatchVerdict::Red);
         assert_eq!(bad.provenance, BatchProvenance::SoloRed);
-        assert!(
-            bad.diagnostics
-                .iter()
-                .any(|diag| diag.code.as_deref() == Some("batch.fail_token"))
-        );
+        assert!(bad
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code.as_deref() == Some("batch.fail_token")));
         assert_overlay_paths_cleaned(&project.root, &overlay_paths);
     }
 
@@ -1457,6 +1973,78 @@ checks:
             }));
         }
         assert_overlay_paths_cleaned(&project.root, &overlay_paths);
+        drop(srv);
+    }
+
+    #[test]
+    fn batch_check_coalesces_same_key_requests_and_slices_reports() {
+        let project = setup_batch_project("batch-coalesce-same-key");
+        let api = Arc::new(ServeVerdictState::new());
+        let srv = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::clone(&api) as Arc<dyn VerdictService>,
+            Arc::new(AllowAll),
+        )
+        .expect("bind ephemeral");
+        std::thread::sleep(Duration::from_millis(50));
+        let remote = format!("http://{}", srv.addr());
+        let start = Arc::new(Barrier::new(2));
+
+        let mut request_a = batch_request(
+            "request-a",
+            &project.root,
+            vec![batch_member("a", "src/coalesce_a.rs", "pub fn a() {}\n")],
+        );
+        request_a.coalesce_key = Some("same-key".into());
+        let mut request_b = batch_request(
+            "request-b",
+            &project.root,
+            vec![batch_member("b", "src/coalesce_b.rs", "pub fn b() {}\n")],
+        );
+        request_b.coalesce_key = Some("same-key".into());
+
+        let remote_a = remote.clone();
+        let start_a = Arc::clone(&start);
+        let handle_a = thread::spawn(move || {
+            start_a.wait();
+            http_batch_check_with_client(&remote_a, &request_a)
+        });
+        let remote_b = remote.clone();
+        let start_b = Arc::clone(&start);
+        let handle_b = thread::spawn(move || {
+            start_b.wait();
+            http_batch_check_with_client(&remote_b, &request_b)
+        });
+
+        let report_a = handle_a.join().expect("request a thread");
+        let report_b = handle_b.join().expect("request b thread");
+
+        assert_eq!(report_a.batch_id, "request-a");
+        assert_eq!(report_b.batch_id, "request-b");
+        assert_eq!(report_a.verdict, BatchVerdict::Green);
+        assert_eq!(report_b.verdict, BatchVerdict::Green);
+        assert_eq!(report_a.members.len(), 1);
+        assert_eq!(report_b.members.len(), 1);
+        assert_eq!(report_a.members[0].worktree, "/client/a");
+        assert_eq!(report_b.members[0].worktree, "/client/b");
+        assert_eq!(
+            report_a.members[0].provenance,
+            BatchProvenance::CombinedGreen
+        );
+        assert_eq!(
+            report_b.members[0].provenance,
+            BatchProvenance::CombinedGreen
+        );
+        assert_eq!(
+            report_a.combined_checks, 1,
+            "request A should see the shared combined run"
+        );
+        assert_eq!(
+            report_b.combined_checks, 1,
+            "request B should see the shared combined run"
+        );
+        assert_eq!(report_a.solo_checks, 0);
+        assert_eq!(report_b.solo_checks, 0);
         drop(srv);
     }
 
@@ -1863,7 +2451,7 @@ checks:
     /// content) would flip exactly this assertion.
     #[test]
     fn composing_equivalence_pushed_vs_fs_pairs_yield_identical_overlay_ops() {
-        use cargoless_core::overlay::{OverlaySet, diff};
+        use cargoless_core::overlay::{diff, OverlaySet};
 
         let prev = OverlaySet::from_pairs(vec![(
             "/wt-a/src/old.rs".to_string(),
@@ -1993,6 +2581,7 @@ checks:
                 quiescing: false,
                 active_worktrees: 1,
                 pending_pushes: 1,
+                ..DaemonActivity::default()
             }
         );
 
@@ -2023,6 +2612,7 @@ checks:
                 quiescing: true,
                 active_worktrees: 0,
                 pending_pushes: 0,
+                ..DaemonActivity::default()
             }
         );
         assert!(api.drain_complete());
