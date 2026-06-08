@@ -24,7 +24,57 @@ canonical, in this order):
 
 ## [Unreleased]
 
-_Nothing yet — all pre-tag work is captured in [0.2.0] below._
+_Nothing yet._
+
+## [0.3.0] - 2026-06-08
+
+The shared-daemon push/verdict path matures: honest verdicts, native batch
+project-check coalescing, changed-file scoping, load hardening, and OTEL
+telemetry. The verdict-read contract changed — clients at 0.2.0 cannot read
+a 0.3.0 server's verdict (0.2.0 polled a status path this release supersedes),
+so client and daemon must be on 0.3.0 together.
+
+### Added
+
+- **Native batch project-check gate** — the serve loop coalesces concurrent
+  project-check requests through a `BatchCoalescer` and executes them against
+  the analysis root, amortizing heavy checks; exposed via a native batch-check
+  transport API and a `cargoless batch-check` CLI command with per-request
+  attribution.
+- **Changed-file project-check scoping** — push-path project checks prune to the
+  files changed against the diff base and classify inherited (pre-existing)
+  project reds distinctly from new ones.
+- **Thin push client** — `cargoless push --remote <url>` sends only the changed
+  overlay bodies to a remote `serve --bind` daemon (PushOverlay transport
+  contract), with `servedrv` consuming the override and draining it in the serve
+  loop.
+- **OTEL/SigNoz telemetry** — `TelemetryConfig` in cargoless-core plus keystone
+  spans and init/shutdown wiring in `serve`.
+- **Native-Rust workspaces** — de-WASM-gated so non-Leptos/native workspaces are
+  accepted by the daemon.
+- **fsn cargoless serve shards** + an unauthenticated `/healthz` readiness route.
+
+### Changed
+
+- **Honest verdicts** — the daemon emits `Verdict::Unknown` instead of a
+  misleading "red, 0 diagnostics" when it cannot produce a trustworthy verdict
+  (INFRA-36). This is the verdict-read contract change that makes 0.3.0 clients
+  and daemons mutually required.
+- Project checks run with a modern kubectl available for kustomize checks; the
+  serve image is equipped for project checks and the direct cargo execution path
+  was removed in favor of the daemon path.
+
+### Fixed
+
+- **Process-tree kill on project-check timeout** — a timed-out check command now
+  kills its whole process group, preventing orphaned children.
+- **Push overlay minimalism** — send only changed overlay bodies; avoid non-Rust
+  and cargo-selector payload bloat; harden minimal overlay payloads; materialize
+  pushed overlays before running project checks.
+- **Remote status auth** — send the auth token on remote status reads; unblock
+  push-only RA-native verdicts.
+- **Telemetry robustness** — 10s timeout on the OTLP exporter builder (AMEM-49);
+  reqwest-blocking client + SimpleSpanProcessor for OTLP HTTP (INFRA-49).
 
 ## [0.2.0] - 2026-05-19
 

@@ -11,8 +11,8 @@ description = "The cargoless daemon: filesystem watcher, rust-analyzer wrapper, 
 workspace = true
 
 [dependencies]
-cargoless-proto = { path = "../cargoless-proto", version = "0.2.0" }  # publish-ready
-cargoless-cas = { path = "../cargoless-cas", version = "0.2.0" }      # publish-ready
+cargoless-proto = { path = "../cargoless-proto", version = "0.3.0" }  # publish-ready
+cargoless-cas = { path = "../cargoless-cas", version = "0.3.0" }      # publish-ready
 # Owner-added (daemon-core, Epic 2). notify 6.x: stable cross-platform FS
 # backend (inotify/FSEvents/kqueue/ReadDirectoryChangesW), MSRV well under
 # 1.85. Debounce + ignore are implemented in-crate (pure, unit-tested) rather
