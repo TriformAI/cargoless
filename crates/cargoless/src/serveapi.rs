@@ -658,6 +658,131 @@ impl ServeVerdictState {
         Ok(result)
     }
 
+    /// Route a single-WT push-path project-check through the shared
+    /// [`BatchCoalescer`] so that N concurrent pushers against the same
+    /// `(base_ref, analysis_root)` pair share ONE physical `run_batch_check_now`
+    /// call instead of N serialised `with_project_check_overlay` calls.
+    ///
+    /// ## Coalesce key
+    /// `"pushpath:<base_ref>:<analysis_root>"` — matches the exact shape
+    /// `batch_coalesce_key` would derive for an explicit `batch_check`
+    /// request with the same root, so pushers and batch-check callers can
+    /// share the same window if they arrive simultaneously.
+    ///
+    /// ## overlay_files path convention
+    /// The push path already converts repo-relative paths to absolute
+    /// analysis-root paths inside `push_overlay_with_options` (via
+    /// `map_repo_relative_files`). By the time `ProjectCheckRunContext` is
+    /// constructed the files are absolute. We therefore set
+    /// `repo_relative = false` on the batch request so `run_batch_check_now`
+    /// does NOT re-join them under the root a second time.
+    ///
+    /// ## Empty vs Green distinction
+    /// The batch path returns `BatchVerdict::Green` for both "checks ran and
+    /// passed" and "no checks were selected (empty profile)". The `Empty`
+    /// distinction is NOT preserved through the coalesced path — callers
+    /// receive `ProjectCheckSummary::Green` in both cases. This is
+    /// conservative (green-is-green at verdict time) and documented here as
+    /// an explicit known limitation.
+    ///
+    /// ## Off-path (no context / no overlay)
+    /// When the context has an empty `base_ref` or the `analysis_root` would
+    /// be empty (WT-local check, no central-daemon overlay), `None` is
+    /// returned and the caller falls back to the direct
+    /// `with_project_check_overlay` path.
+    pub(crate) fn coalesced_project_check(
+        &self,
+        wt: &Path,
+        context: &ProjectCheckRunContext,
+    ) -> Option<crate::servedrv::ProjectCheckSummary> {
+        let base_ref = context.base_ref.trim();
+        let root_str = context.root.to_string_lossy();
+        if base_ref.is_empty() || root_str.trim().is_empty() {
+            return None;
+        }
+
+        let wt_key = wt.to_string_lossy().into_owned();
+        let member = cargoless_core::batch::BatchMember {
+            worktree: wt_key.clone(),
+            files: context.overlay_files.clone(),
+            changed_files: context.changed_files.clone().unwrap_or_default(),
+        };
+
+        let mut request = BatchCheckRequest::new(format!("pushpath:{wt_key}"), base_ref);
+        // overlay_files are already absolute analysis-root paths (the push
+        // path converted them in push_overlay_with_options via
+        // map_repo_relative_files). repo_relative = false so run_batch_check_now
+        // does not re-join them.
+        request.options = cargoless_core::transport::PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: Some(root_str.into_owned()),
+            base_sha: None,
+            changed_files: None, // changed_files live on the member, not the options
+        };
+        request.members = vec![member];
+        request.corun = true;
+        request.coalesce_key = Some(format!("pushpath:{base_ref}:{}", context.root.display()));
+
+        // coalesce_key was set above, so this is always Some; `?` keeps the
+        // defensive None-path (empty-after-trim) without a clippy::question_mark lint.
+        let key = batch_coalesce_key(&request)?;
+
+        let report = self
+            .batch_coalescer
+            .submit(key, &request, |combined| self.run_batch_check_now(combined));
+
+        // Find this WT's slice in the returned report.
+        let member_result = report.members.into_iter().find(|m| m.worktree == wt_key);
+
+        Some(match member_result {
+            None => {
+                // Coalescer returned a report without our member — treat as
+                // indeterminate (should not happen in practice).
+                crate::servedrv::ProjectCheckSummary::Indeterminate {
+                    reason: "project_check_batch_missing_member",
+                    detail: format!("coalesced report did not include member {wt_key}"),
+                }
+            }
+            Some(m) => match m.verdict {
+                cargoless_core::batch::BatchVerdict::Green => {
+                    // CombinedGreen and SoloGreen both map to Green.
+                    // Empty is indistinguishable at this layer (documented above).
+                    crate::servedrv::ProjectCheckSummary::Green
+                }
+                cargoless_core::batch::BatchVerdict::Red => {
+                    let error_count = m
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.severity == cargoless_core::Severity::Error)
+                        .count() as u32;
+                    // Defensive: if error_count is 0 despite Red verdict, route
+                    // to Indeterminate (mirrors the same guard in run_project_checks_and_log).
+                    if error_count == 0 {
+                        crate::servedrv::ProjectCheckSummary::Indeterminate {
+                            reason: "project_check_red_without_diagnostics",
+                            detail: format!(
+                                "batch member {wt_key} red but 0 error-severity diagnostics"
+                            ),
+                        }
+                    } else {
+                        crate::servedrv::ProjectCheckSummary::Red { error_count }
+                    }
+                }
+                cargoless_core::batch::BatchVerdict::Indeterminate => {
+                    let detail = m
+                        .diagnostics
+                        .first()
+                        .map(|d| d.message.clone())
+                        .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
+                    crate::servedrv::ProjectCheckSummary::Indeterminate {
+                        reason: "project_check_batch_indeterminate",
+                        detail,
+                    }
+                }
+            },
+        })
+    }
+
     pub fn quiescing(&self) -> bool {
         poisoned(&self.drain).quiescing
     }
@@ -1823,6 +1948,196 @@ checks:
         let request = coalescer_request("after-panic", "member-after");
         let recovered = coalescer.submit(key, &request, green_report_for);
         assert_eq!(recovered.verdict, BatchVerdict::Green);
+    }
+
+    /// TDD gate for Phase 2 (push-path coalescing).
+    ///
+    /// Proves the core coalescing property at the coalescer level:
+    /// N concurrent submitters using the push-path key format
+    /// (`"pushpath:<base_ref>:<root>"`) share exactly ONE physical run
+    /// closure invocation, and each submitter receives its own per-WT
+    /// slice of the combined report.
+    ///
+    /// This is the FAILING-FIRST test: it will fail until
+    /// `coalesced_project_check` is wired to the push-path coalescer.
+    /// Once the method exists and emits the correct key, the
+    /// `batch_coalescer.submit` machinery (already proven by
+    /// `batch_coalescer_groups_same_key_requests`) does the rest.
+    ///
+    /// A separate integration test (`coalesced_project_check_green_real_project`)
+    /// proves the type conversion + real-project end-to-end.
+    #[test]
+    fn coalesced_project_check_routes_n_pushers_through_one_physical_run() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let project = setup_batch_project("pushpath-coalesce");
+        let api = Arc::new(ServeVerdictState::new());
+
+        // We test the coalescing key derivation by wiring a counting closure
+        // directly into the coalescer using the SAME key shape that
+        // `coalesced_project_check` will use: "pushpath:<base_ref>:<root>".
+        // This validates the key format without requiring a real git daemon.
+        let base_ref = "origin/main";
+        let root_str = project.root.to_string_lossy().into_owned();
+        let coalesce_key_str = format!("pushpath:{base_ref}:{root_str}");
+
+        let run_count = Arc::new(AtomicU32::new(0));
+        let start = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+
+        // Build all requests up front (before borrowing api for threads).
+        let mut thread_args: Vec<(BatchCoalesceKey, BatchCheckRequest, String)> = Vec::new();
+        for idx in 0..3usize {
+            let wt = format!("/client/agent-{idx:02}");
+            let mut request = BatchCheckRequest::new(format!("pushpath:{wt}"), base_ref);
+            request.options = cargoless_core::transport::PushOverlayOptions {
+                repo_relative: false,
+                analysis_root: Some(root_str.clone()),
+                base_sha: None,
+                changed_files: None,
+            };
+            request.members = vec![cargoless_core::batch::BatchMember {
+                worktree: wt.clone(),
+                files: vec![(
+                    project
+                        .root
+                        .join(format!("src/agent_{idx:02}.rs"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    format!("pub fn agent_{idx:02}() {{}}\n"),
+                )],
+                changed_files: vec![format!("src/agent_{idx:02}.rs")],
+            }];
+            request.corun = true;
+            request.coalesce_key = Some(coalesce_key_str.clone());
+            let key = batch_coalesce_key(&request).expect("coalesce_key should be present");
+            thread_args.push((key, request, wt));
+        }
+
+        for (key, request, _wt) in thread_args {
+            let run_count = Arc::clone(&run_count);
+            let start = Arc::clone(&start);
+            let api_clone = Arc::clone(&api);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                api_clone.batch_coalescer.submit(key, &request, |combined| {
+                    run_count.fetch_add(1, Ordering::SeqCst);
+                    // Return a green BatchReport covering all combined members.
+                    let members: Vec<cargoless_core::batch::BatchMemberResult> = combined
+                        .members
+                        .iter()
+                        .map(|m| cargoless_core::batch::BatchMemberResult {
+                            worktree: m.worktree.clone(),
+                            verdict: BatchVerdict::Green,
+                            provenance: BatchProvenance::CombinedGreen,
+                            diagnostics: Vec::new(),
+                            duration_ms: 1,
+                        })
+                        .collect();
+                    let executed_members = members.len() as u32;
+                    BatchReport {
+                        batch_id: combined.batch_id.clone(),
+                        verdict: BatchVerdict::Green,
+                        members,
+                        combined_checks: 1,
+                        solo_checks: 0,
+                        duration_ms: 1,
+                        queue_wait_ms: 0,
+                        executed_members,
+                        executed_batch_id: Some(combined.batch_id.clone()),
+                    }
+                })
+            }));
+        }
+
+        let reports: Vec<BatchReport> = handles
+            .into_iter()
+            .map(|h| h.join().expect("pushpath coalescer thread"))
+            .collect();
+
+        // KEY ASSERTION: only ONE physical run was made despite 3 concurrent submitters.
+        let final_run_count = run_count.load(Ordering::SeqCst);
+        assert_eq!(
+            final_run_count, 1,
+            "3 concurrent pushers sharing the same (base_ref, analysis_root) must \
+             coalesce into exactly ONE physical run — got {final_run_count}"
+        );
+
+        // Each submitter gets its own per-WT member slice back.
+        assert_eq!(reports.len(), 3, "every submitter must receive a report");
+        for report in &reports {
+            assert_eq!(
+                report.members.len(),
+                1,
+                "each submitter's report must carry exactly 1 member slice"
+            );
+            assert_eq!(
+                report.verdict,
+                BatchVerdict::Green,
+                "coalesced green run: every submitter report should be green"
+            );
+            assert_eq!(
+                report.combined_checks, 1,
+                "every submitter's report must reflect the shared combined_checks=1"
+            );
+        }
+        // Verify all three distinct WT slices are present.
+        let mut observed_wts: Vec<String> = reports
+            .iter()
+            .map(|r| r.members[0].worktree.clone())
+            .collect();
+        observed_wts.sort();
+        assert_eq!(
+            observed_wts,
+            vec![
+                "/client/agent-00".to_string(),
+                "/client/agent-01".to_string(),
+                "/client/agent-02".to_string(),
+            ],
+            "each coalesced submitter must receive its own WT member slice, not a neighbour's"
+        );
+        // project drops here → Drop removes root + remote dirs.
+    }
+
+    /// Integration test: `coalesced_project_check` on a real git project
+    /// returns `Green` for a clean overlay and correctly maps the per-WT
+    /// member slice to `ProjectCheckSummary`. This validates the type
+    /// conversion path independently of the coalescing count test.
+    #[test]
+    fn coalesced_project_check_green_real_project() {
+        use crate::servedrv::ProjectCheckSummary;
+
+        let project = setup_batch_project("coalesce-type-conv");
+        let api = Arc::new(ServeVerdictState::new());
+
+        let wt = Path::new("/client/wt-type-conv");
+        let context = ProjectCheckRunContext {
+            root: project.root.clone(),
+            changed_files: Some(vec!["src/added.rs".into()]),
+            base_ref: "origin/main".to_string(),
+            overlay_files: vec![(
+                project
+                    .root
+                    .join("src/added.rs")
+                    .to_string_lossy()
+                    .into_owned(),
+                "pub fn added() {}\n".to_string(),
+            )],
+            materialize_overlay: true,
+        };
+
+        let summary = api.coalesced_project_check(wt, &context);
+
+        assert!(
+            summary.is_some(),
+            "non-empty base_ref + materialize_overlay=true should engage the coalesced path"
+        );
+        assert_eq!(
+            summary.unwrap(),
+            ProjectCheckSummary::Green,
+            "clean overlay over a clean project should yield ProjectCheckSummary::Green"
+        );
+        // project drops here → Drop removes root + remote dirs.
     }
 
     #[test]

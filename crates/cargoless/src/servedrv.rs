@@ -1440,7 +1440,7 @@ fn try_acquire_project_checks_warn_slot_with_max(
 /// separate "the gate is doing its job" from "the daemon couldn't
 /// run the gate at all".
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ProjectCheckSummary {
+pub(crate) enum ProjectCheckSummary {
     /// Checks ran cleanly and the tree is green.
     Green,
     /// Checks ran and at least one required check failed; `error_count`
@@ -1464,6 +1464,37 @@ fn run_project_checks_and_log(
     context: Option<crate::serveapi::ProjectCheckRunContext>,
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) -> ProjectCheckSummary {
+    // Fast-path: when the context carries a non-empty base_ref and the
+    // overlay needs materializing (central-daemon push mode), route through
+    // the BatchCoalescer so that N concurrent pushers against the same
+    // (base_ref, analysis_root) share ONE physical check run instead of N
+    // serialised sync_lock acquisitions. The coalescer is the existing
+    // batch_check surface; we submit a single-member request and extract
+    // this WT's slice on return.
+    //
+    // Invariant: `ProjectChecksMode::Off` never reaches this function (the
+    // EmitVerdict arm guards it), so the coalesced path is only reachable in
+    // Warn or Hard mode — consistent with the Off-does-nothing invariant.
+    if let Some(ctx) = context.as_ref() {
+        if ctx.materialize_overlay && !ctx.base_ref.trim().is_empty() {
+            if let Some(summary) = api.coalesced_project_check(wt, ctx) {
+                // Log the coalesced outcome in the same obs format the direct
+                // path uses so SigNoz dashboards stay comparable.
+                eprintln!(
+                    "[cargoless:obs] project-checks wt={} root={} verdict={} source=coalesced",
+                    wt.display(),
+                    ctx.root.display(),
+                    match &summary {
+                        ProjectCheckSummary::Green | ProjectCheckSummary::Empty => "green",
+                        ProjectCheckSummary::Red { .. } => "red",
+                        ProjectCheckSummary::Indeterminate { .. } => "unknown",
+                    }
+                );
+                return summary;
+            }
+        }
+    }
+
     let root = context.as_ref().map(|ctx| ctx.root.as_path()).unwrap_or(wt);
     let changed_files = context
         .as_ref()
