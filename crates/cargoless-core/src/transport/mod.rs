@@ -176,6 +176,10 @@ impl PushOverlayOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchCheckRequest {
     pub batch_id: String,
+    /// Optional server-side coalescing bucket. Absent keeps the historical
+    /// one-request/one-batch semantics. Present makes the daemon eligible to
+    /// merge compatible simultaneous requests before calling `run_batch`.
+    pub coalesce_key: Option<String>,
     pub base_ref: String,
     pub members: Vec<BatchMember>,
     pub check_profile: Option<CheckProfile>,
@@ -191,6 +195,7 @@ impl BatchCheckRequest {
     pub fn new(batch_id: impl Into<String>, base_ref: impl Into<String>) -> Self {
         Self {
             batch_id: batch_id.into(),
+            coalesce_key: None,
             base_ref: base_ref.into(),
             members: Vec::new(),
             check_profile: None,
@@ -263,6 +268,9 @@ pub struct DaemonActivity {
     pub quiescing: bool,
     pub active_worktrees: u32,
     pub pending_pushes: u32,
+    pub pending_batch_waiters: u32,
+    pub pending_batch_members: u32,
+    pub inflight_batch_runs: u32,
 }
 
 fn unsupported_batch_report(
@@ -295,6 +303,9 @@ fn unsupported_batch_report(
         combined_checks: 0,
         solo_checks: 0,
         duration_ms: 0,
+        queue_wait_ms: 0,
+        executed_members: request.members.len() as u32,
+        executed_batch_id: Some(request.batch_id.clone()),
     }
 }
 
@@ -801,6 +812,7 @@ fn batch_check_request_to_json(request: &BatchCheckRequest) -> serde_json::Value
     serde_json::json!({
         "op": "batch_check",
         "batch_id": request.batch_id,
+        "coalesce_key": request.coalesce_key,
         "base_ref": request.base_ref,
         "members": batch_members_to_json(&request.members),
         "check_profile": check_profile_json(request.check_profile.as_ref()),
@@ -816,6 +828,12 @@ fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string(),
+        coalesce_key: v
+            .get("coalesce_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         base_ref: v
             .get("base_ref")
             .and_then(serde_json::Value::as_str)
@@ -1089,6 +1107,9 @@ pub fn batchreport_to_json(report: &BatchReport) -> String {
         "combined_checks": report.combined_checks,
         "solo_checks": report.solo_checks,
         "duration_ms": report.duration_ms.to_string(),
+        "queue_wait_ms": report.queue_wait_ms.to_string(),
+        "executed_members": report.executed_members,
+        "executed_batch_id": report.executed_batch_id,
     })
     .to_string()
 }
@@ -1098,14 +1119,15 @@ pub fn batchreport_to_json(report: &BatchReport) -> String {
 /// become indeterminate.
 pub fn batchreport_from_json(text: &str) -> Option<BatchReport> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let batch_id = v.get("batch_id")?.as_str()?.to_string();
+    let members = batch_member_results_from_json(v.get("members"));
     Some(BatchReport {
-        batch_id: v.get("batch_id")?.as_str()?.to_string(),
+        batch_id: batch_id.clone(),
         verdict: v
             .get("verdict")
             .and_then(serde_json::Value::as_str)
             .and_then(BatchVerdict::parse)
             .unwrap_or(BatchVerdict::Indeterminate),
-        members: batch_member_results_from_json(v.get("members")),
         combined_checks: v
             .get("combined_checks")
             .and_then(serde_json::Value::as_u64)
@@ -1115,6 +1137,17 @@ pub fn batchreport_from_json(text: &str) -> Option<BatchReport> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
         duration_ms: json_u128(v.get("duration_ms")),
+        queue_wait_ms: json_u128(v.get("queue_wait_ms")),
+        executed_members: v
+            .get("executed_members")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(members.len() as u64) as u32,
+        executed_batch_id: v
+            .get("executed_batch_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(batch_id.clone())),
+        members,
     })
 }
 
@@ -1570,6 +1603,7 @@ mod tests {
             changed_files: None,
         };
         req.corun = false;
+        req.coalesce_key = Some("tf-multiverse:origin/dev:project-checks".into());
 
         let request = Request::BatchCheck(req);
         assert_eq!(
@@ -1611,6 +1645,9 @@ mod tests {
             combined_checks: 1,
             solo_checks: 2,
             duration_ms: 99,
+            queue_wait_ms: 11,
+            executed_members: 2,
+            executed_batch_id: Some("shared-batch-red".into()),
         };
 
         assert_eq!(

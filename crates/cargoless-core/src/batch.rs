@@ -127,7 +127,21 @@ pub struct BatchReport {
     pub members: Vec<BatchMemberResult>,
     pub combined_checks: u32,
     pub solo_checks: u32,
+    /// Wall-clock execution time for the physical check run that produced
+    /// this report. For sliced daemon-coalesced responses this is the shared
+    /// run duration, not just the caller's member slice.
     pub duration_ms: u128,
+    /// Time this request spent waiting in a server-side coalescing window
+    /// before the physical run started. Zero for direct/non-coalesced batches.
+    pub queue_wait_ms: u128,
+    /// Number of members in the physical run that produced this report. This
+    /// can be larger than `members.len()` when a daemon coalesces several
+    /// separate submitter requests and slices the shared result back out.
+    pub executed_members: u32,
+    /// Identifier of the physical run that produced this report. For direct
+    /// batches this is the same as `batch_id`; for daemon-coalesced requests it
+    /// is the shared coalesced batch id.
+    pub executed_batch_id: Option<String>,
 }
 
 /// The execution seam: given the union of N members or one member alone,
@@ -155,12 +169,15 @@ pub fn run_batch(
     let batch_id = batch_id.into();
     if members.is_empty() {
         return BatchReport {
-            batch_id,
+            batch_id: batch_id.clone(),
             verdict: BatchVerdict::Green,
             members: Vec::new(),
             combined_checks: 0,
             solo_checks: 0,
             duration_ms: started.elapsed().as_millis(),
+            queue_wait_ms: 0,
+            executed_members: 0,
+            executed_batch_id: Some(batch_id),
         };
     }
 
@@ -177,23 +194,29 @@ pub fn run_batch(
     }
 
     match checker.check_combined(members) {
-        Ok(report) if report.tree == TreeState::Green => BatchReport {
-            batch_id,
-            verdict: BatchVerdict::Green,
-            members: members
-                .iter()
-                .map(|member| BatchMemberResult {
-                    worktree: member.worktree.clone(),
-                    verdict: BatchVerdict::Green,
-                    provenance: BatchProvenance::CombinedGreen,
-                    diagnostics: Vec::new(),
-                    duration_ms: report.duration_ms,
-                })
-                .collect(),
-            combined_checks: 1,
-            solo_checks: 0,
-            duration_ms: started.elapsed().as_millis(),
-        },
+        Ok(report) if report.tree == TreeState::Green => {
+            let executed_members = members.len() as u32;
+            BatchReport {
+                batch_id: batch_id.clone(),
+                verdict: BatchVerdict::Green,
+                members: members
+                    .iter()
+                    .map(|member| BatchMemberResult {
+                        worktree: member.worktree.clone(),
+                        verdict: BatchVerdict::Green,
+                        provenance: BatchProvenance::CombinedGreen,
+                        diagnostics: Vec::new(),
+                        duration_ms: report.duration_ms,
+                    })
+                    .collect(),
+                combined_checks: 1,
+                solo_checks: 0,
+                duration_ms: started.elapsed().as_millis(),
+                queue_wait_ms: 0,
+                executed_members,
+                executed_batch_id: Some(batch_id),
+            }
+        }
         Ok(combined_red) => {
             let outcomes: Vec<SoloOutcome> = members
                 .iter()
@@ -216,23 +239,29 @@ pub fn run_batch(
             }
             report
         }
-        Err(message) => BatchReport {
-            batch_id,
-            verdict: BatchVerdict::Indeterminate,
-            members: members
-                .iter()
-                .map(|member| BatchMemberResult {
-                    worktree: member.worktree.clone(),
-                    verdict: BatchVerdict::Indeterminate,
-                    provenance: BatchProvenance::Indeterminate,
-                    diagnostics: vec![indeterminate_diagnostic(&member.worktree, &message)],
-                    duration_ms: 0,
-                })
-                .collect(),
-            combined_checks: 1,
-            solo_checks: 0,
-            duration_ms: started.elapsed().as_millis(),
-        },
+        Err(message) => {
+            let executed_members = members.len() as u32;
+            BatchReport {
+                batch_id: batch_id.clone(),
+                verdict: BatchVerdict::Indeterminate,
+                members: members
+                    .iter()
+                    .map(|member| BatchMemberResult {
+                        worktree: member.worktree.clone(),
+                        verdict: BatchVerdict::Indeterminate,
+                        provenance: BatchProvenance::Indeterminate,
+                        diagnostics: vec![indeterminate_diagnostic(&member.worktree, &message)],
+                        duration_ms: 0,
+                    })
+                    .collect(),
+                combined_checks: 1,
+                solo_checks: 0,
+                duration_ms: started.elapsed().as_millis(),
+                queue_wait_ms: 0,
+                executed_members,
+                executed_batch_id: Some(batch_id),
+            }
+        }
     }
 }
 
@@ -276,8 +305,9 @@ fn report_from_solos(
             }
         })
         .collect();
+    let executed_members = members.len() as u32;
     BatchReport {
-        batch_id,
+        batch_id: batch_id.clone(),
         verdict: if any_indeterminate {
             BatchVerdict::Indeterminate
         } else if any_red {
@@ -289,6 +319,9 @@ fn report_from_solos(
         combined_checks,
         members,
         duration_ms: started.elapsed().as_millis(),
+        queue_wait_ms: 0,
+        executed_members,
+        executed_batch_id: Some(batch_id),
     }
 }
 
@@ -408,6 +441,45 @@ mod tests {
                 && m.provenance == BatchProvenance::CombinedGreen)
         );
         assert_eq!(checker.calls(), vec!["combined:a+b+c"]);
+    }
+
+    #[test]
+    fn run_batch_preserves_member_order_for_combined_green_and_fallback() {
+        let checker = MockChecker::default().with_combined(Ok(report(TreeState::Green, "all")));
+        let out = run_batch(
+            "order-green",
+            &members(&["first", "second", "third"]),
+            &checker,
+            CorunPolicy::Corun,
+        );
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.worktree.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+
+        let checker = MockChecker::default()
+            .with_combined(Ok(report(TreeState::Red, "combined")))
+            .solo("second", Ok(report(TreeState::Red, "second")));
+        let out = run_batch(
+            "order-fallback",
+            &members(&["first", "second", "third"]),
+            &checker,
+            CorunPolicy::Corun,
+        );
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| (member.worktree.as_str(), member.provenance))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first", BatchProvenance::SoloGreen),
+                ("second", BatchProvenance::SoloRed),
+                ("third", BatchProvenance::SoloGreen),
+            ]
+        );
     }
 
     #[test]

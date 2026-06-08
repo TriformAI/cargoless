@@ -56,6 +56,7 @@ use super::{
 /// while fail-closed-bounding a hostile/runaway client.
 pub const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const BATCH_CHECK_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
 // ---- tiny request model -------------------------------------------------
@@ -141,6 +142,9 @@ fn daemon_activity_to_json(activity: &DaemonActivity) -> String {
         "quiescing": activity.quiescing,
         "active_worktrees": activity.active_worktrees,
         "pending_pushes": activity.pending_pushes,
+        "pending_batch_waiters": activity.pending_batch_waiters,
+        "pending_batch_members": activity.pending_batch_members,
+        "inflight_batch_runs": activity.inflight_batch_runs,
     })
     .to_string()
 }
@@ -708,12 +712,19 @@ impl HttpClient {
     }
 
     fn connect(&self) -> Result<TcpStream, TransportError> {
+        self.connect_with_read_timeout(CLIENT_IO_TIMEOUT)
+    }
+
+    fn connect_with_read_timeout(
+        &self,
+        read_timeout: Duration,
+    ) -> Result<TcpStream, TransportError> {
         let mut addrs = (self.host.as_str(), self.port).to_socket_addrs()?;
         let addr = addrs
             .next()
             .ok_or_else(|| TransportError::Protocol("remote resolved to no addresses".into()))?;
         let stream = TcpStream::connect_timeout(&addr, CLIENT_IO_TIMEOUT)?;
-        stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT))?;
+        stream.set_read_timeout(Some(read_timeout))?;
         stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
         Ok(stream)
     }
@@ -960,7 +971,7 @@ impl TransportClient for HttpClient {
         req.extend_from_slice(b"\r\n");
         req.extend_from_slice(body.as_bytes());
 
-        let mut stream = self.connect()?;
+        let mut stream = self.connect_with_read_timeout(BATCH_CHECK_READ_TIMEOUT)?;
         stream.write_all(&req)?;
         stream.flush()?;
         let mut raw = String::new();
@@ -1578,6 +1589,9 @@ mod tests {
                 combined_checks: 1,
                 solo_checks: 0,
                 duration_ms: 150,
+                queue_wait_ms: 0,
+                executed_members: request.members.len() as u32,
+                executed_batch_id: Some(request.batch_id.clone()),
             }
         }
     }
