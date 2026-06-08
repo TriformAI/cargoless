@@ -879,6 +879,63 @@ fn check_file_exists(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResul
     result_from_diags(check, diagnostics, 0)
 }
 
+/// SIGKILL a timed-out command's ENTIRE process tree, not just the immediate
+/// child. `check_command` spawns the command (e.g. `cargo check`) as its own
+/// process-group + session leader; on timeout this kills `-pgid` (every
+/// descendant that inherited the group — the common case: `cargo`'s `rustc`
+/// children) then sweeps the session for any `setpgid` escapees. Mirrors the
+/// proven reaper in `analyzer::ReapOnDrop`. Without this, a timed-out `cargo`
+/// leaks `rustc` grandchildren that reparent to init and keep compiling past
+/// the deadline (the leak the live warn soak surfaced 2026-06-08).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // Snapshot session members BEFORE killing (the child is a session
+        // leader via setsid, so sid == pid). Missing pgrep degrades to a
+        // no-op here; the pgid kill below still runs.
+        let session_members = command_session_members(pid);
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            const SIGKILL: i32 = 9;
+            // Fast path: SIGKILL the whole process group (negative pid).
+            let _ = kill(-pid, SIGKILL);
+            // Defense in depth: SIGKILL setpgid escapees still in the session.
+            for m in session_members {
+                if m != pid {
+                    let _ = kill(m, SIGKILL);
+                }
+            }
+        }
+    }
+    // Belt-and-braces: also kill the immediate child directly (on non-unix
+    // this is the only step; on unix the SIGKILL above usually already did it).
+    let _ = child.kill();
+}
+
+/// Every PID in `sid`'s session via `pgrep -s`. Empty on any failure (pgrep
+/// missing / non-zero / no output) — all safe degradations since the pgid
+/// SIGKILL in [`kill_process_tree`] is the load-bearing step.
+#[cfg(unix)]
+fn command_session_members(sid: i32) -> Vec<i32> {
+    let Ok(output) = Command::new("pgrep")
+        .arg("-s")
+        .arg(sid.to_string())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .collect()
+}
+
 fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
     if ctx.profile_name == "dev" && !check.read_only {
         return result_from_diags(
@@ -910,8 +967,8 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             0,
         );
     }
-    let mut child = match Command::new(&check.command[0])
-        .args(&check.command[1..])
+    let mut cmd = Command::new(&check.command[0]);
+    cmd.args(&check.command[1..])
         .current_dir(&ctx.root)
         .env("CARGOLESS", "1")
         .env("CARGOLESS_CHECK_ID", &check.id)
@@ -925,9 +982,31 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
                 .unwrap_or_default(),
         )
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Run the command (e.g. `cargo check`) as the leader of its own process
+    // GROUP + SESSION so a timeout can SIGKILL the WHOLE tree, not just the
+    // immediate child. Without this, a timed-out `cargo` leaves its `rustc`
+    // grandchildren reparented to init (ppid=1), still compiling for minutes
+    // past the deadline — the leak the live warn soak surfaced (2026-06-08).
+    // Mirrors `analyzer::rust_analyzer_command`'s proven pgid+setsid setup.
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+        // SAFETY: pre_exec runs post-fork/pre-exec in a single-threaded child;
+        // setsid(2) is async-signal-safe. EPERM (already a session leader) is
+        // swallowed — process_group(0) above is the load-bearing line.
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return result_from_diags(
@@ -954,7 +1033,12 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                // Kill the whole process tree, not just the immediate child:
+                // SIGKILL the process group, then sweep any setpgid escapees
+                // still in our session. `child.kill()` alone leaks `rustc`
+                // grandchildren (the warn-soak leak). Falls back to a plain
+                // child kill on non-unix.
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 break Err("command timed out".to_string());
             }
@@ -2571,6 +2655,64 @@ checks:
         assert_eq!(
             diagnostics[0].source.as_deref(),
             Some("cargoless-check:generated-fast")
+        );
+    }
+
+    /// Regression for the warn-soak leak (2026-06-08): a timed-out command
+    /// must kill its ENTIRE process tree, not just the immediate child. The
+    /// command backgrounds a grandchild that appends to a marker file every
+    /// 100ms; after the check times out we record the marker size, wait, and
+    /// assert it stopped growing (the grandchild was reaped, not orphaned).
+    /// Driven through `run_profile` so it exercises the real spawn path
+    /// (process_group + setsid) and `kill_process_tree`.
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_command_kills_the_whole_process_tree() {
+        let root = scratch("tree-kill");
+        fs::write(root.join("Cargo.toml"), "[package]\nname='x'\n").unwrap();
+        let marker = root.join("grandchild.marker");
+        let marker_str = marker.to_string_lossy().into_owned();
+        // Outer sh backgrounds a grandchild loop, then sleeps long. The
+        // grandchild keeps writing until SIGKILL'd — if only the immediate
+        // child (outer sh) were killed, it would survive and keep appending.
+        let script = format!(
+            "( while true; do echo x >> '{m}'; sleep 0.1; done ) & sleep 600",
+            m = marker_str
+        );
+        fs::write(
+            root.join(MANIFEST_NAME),
+            format!(
+                r#"
+version: 1
+checks:
+  - id: tree-kill
+    kind: command
+    read_only: true
+    timeout_ms: 600
+    command: ["sh", "-c", "{script}"]
+"#,
+                script = script.replace('"', "\\\"")
+            ),
+        )
+        .unwrap();
+
+        let report = run_profile(&root, "dev", Some("tree-kill")).unwrap();
+        // It timed out → red with a timeout diagnostic.
+        assert_eq!(report.tree, TreeState::Red);
+        assert!(
+            has_timeout_diagnostic(&report.diagnostics),
+            "expected a timeout diagnostic, got: {:?}",
+            report.diagnostics
+        );
+        // Record marker size right after the kill, wait well past the
+        // grandchild's 100ms cadence, and confirm it did NOT grow.
+        let size_after_kill = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        thread::sleep(Duration::from_millis(800));
+        let size_later = fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            size_after_kill, size_later,
+            "grandchild kept writing after timeout — process tree NOT killed \
+             (orphan leak): {size_after_kill} -> {size_later}"
         );
     }
 }
