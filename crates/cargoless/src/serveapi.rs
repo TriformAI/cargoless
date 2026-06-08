@@ -41,11 +41,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
+use cargoless_core::batch::{run_batch, BatchChecker, BatchMember, BatchReport, BatchVerdict};
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::project_checks::ProjectCheckReport;
 use cargoless_core::transport::{
@@ -286,7 +286,18 @@ impl BatchCoalescer {
                     state.next_run_seq
                 };
                 let combined = combined_request_for(&key, &group, run_seq);
-                let combined_report = run(&combined);
+                // A panic in the physical run (e.g. OOM compiling the union)
+                // must NOT leave the already-drained non-leader waiters parked
+                // forever. Catch it, fan out an indeterminate report to the whole
+                // group, and still release the leader slot so the queue recovers.
+                let combined_report =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&combined)))
+                        .unwrap_or_else(|_| {
+                            batch_indeterminate(
+                                &combined,
+                                "coalesced batch run panicked; resubmit to retry",
+                            )
+                        });
                 {
                     let mut state = poisoned(&self.state);
                     state.inflight_runs = state.inflight_runs.saturating_sub(1);
@@ -1323,11 +1334,9 @@ mod tests {
         for member in report.members {
             assert_eq!(member.verdict, BatchVerdict::Indeterminate);
             assert_eq!(member.provenance, BatchProvenance::Indeterminate);
-            assert!(
-                member.diagnostics[0]
-                    .message
-                    .contains("requires a shared analysis_root")
-            );
+            assert!(member.diagnostics[0]
+                .message
+                .contains("requires a shared analysis_root"));
         }
     }
 
@@ -1357,11 +1366,9 @@ mod tests {
             files: vec![("../outside.rs".into(), "bad".into())],
             changed_files: vec![],
         }];
-        assert!(
-            map_batch_members(&root, true, &escaping)
-                .unwrap_err()
-                .contains("escapes repo root")
-        );
+        assert!(map_batch_members(&root, true, &escaping)
+            .unwrap_err()
+            .contains("escapes repo root"));
     }
 
     #[test]
@@ -1395,11 +1402,9 @@ mod tests {
                 changed_files: vec![],
             },
         ];
-        assert!(
-            union_overlay_files(&conflicting)
-                .unwrap_err()
-                .contains("different content")
-        );
+        assert!(union_overlay_files(&conflicting)
+            .unwrap_err()
+            .contains("different content"));
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -1752,11 +1757,64 @@ checks:
             2,
             "two physical flushes should have distinct executed_batch_id values"
         );
+        assert!(reports
+            .iter()
+            .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1));
+    }
+
+    #[test]
+    fn batch_coalescer_panic_in_run_does_not_wedge_group() {
+        // GAP-1 regression: if the leader's physical run panics, every
+        // already-drained non-leader waiter must still get a result instead of
+        // parking on the condvar forever. Without the catch_unwind in submit(),
+        // this test deadlocks (the two non-leaders never wake). Three same-key
+        // submitters coalesce into one group; the leader's closure panics.
+        let coalescer = Arc::new(test_coalescer());
+        let key = test_batch_key("panic-group");
+        let start = Arc::new(Barrier::new(3));
+        let panics = Arc::new(Mutex::new(0u32));
+        let mut handles = Vec::new();
+
+        for idx in 0..3 {
+            let coalescer = Arc::clone(&coalescer);
+            let key = key.clone();
+            let start = Arc::clone(&start);
+            let panics = Arc::clone(&panics);
+            let request = coalescer_request(&format!("batch-{idx}"), &format!("member-{idx}"));
+            handles.push(thread::spawn(move || {
+                start.wait();
+                coalescer.submit(key, &request, |_combined| {
+                    // Only the elected leader ever invokes `run`; one panic must
+                    // fan out an indeterminate result to the whole drained group.
+                    *poisoned(&panics) += 1;
+                    panic!("simulated heavy-run crash (e.g. OOM compiling the union)");
+                })
+            }));
+        }
+
+        let reports: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("coalescer thread must not panic out"))
+            .collect();
+
+        // Exactly one physical run was attempted (one leader), and it panicked.
+        assert_eq!(*poisoned(&panics), 1, "only the leader should invoke run");
+        assert_eq!(reports.len(), 3);
         assert!(
             reports
                 .iter()
-                .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1)
+                .all(|report| report.verdict == BatchVerdict::Indeterminate),
+            "every coalesced submitter must see indeterminate after a run panic, not hang"
         );
+        // Each submitter still gets its own member sliced back, in order.
+        for (idx, report) in reports.iter().enumerate() {
+            assert_eq!(report.members.len(), 1, "report {idx} keeps its own member");
+            assert_eq!(report.members[0].provenance, BatchProvenance::Indeterminate);
+        }
+        // The coalescer is reusable after a panic: a fresh green submit works.
+        let request = coalescer_request("after-panic", "member-after");
+        let recovered = coalescer.submit(key, &request, green_report_for);
+        assert_eq!(recovered.verdict, BatchVerdict::Green);
     }
 
     #[test]
@@ -1809,11 +1867,10 @@ checks:
         let bad = member_result(&report, "/client/bad");
         assert_eq!(bad.verdict, BatchVerdict::Red);
         assert_eq!(bad.provenance, BatchProvenance::SoloRed);
-        assert!(
-            bad.diagnostics
-                .iter()
-                .any(|diag| diag.code.as_deref() == Some("batch.fail_token"))
-        );
+        assert!(bad
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code.as_deref() == Some("batch.fail_token")));
         assert_overlay_paths_cleaned(&project.root, &overlay_paths);
     }
 
@@ -2512,7 +2569,7 @@ checks:
     /// content) would flip exactly this assertion.
     #[test]
     fn composing_equivalence_pushed_vs_fs_pairs_yield_identical_overlay_ops() {
-        use cargoless_core::overlay::{OverlaySet, diff};
+        use cargoless_core::overlay::{diff, OverlaySet};
 
         let prev = OverlaySet::from_pairs(vec![(
             "/wt-a/src/old.rs".to_string(),
