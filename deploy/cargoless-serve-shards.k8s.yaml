@@ -1,5 +1,9 @@
 # Additional FSN Cargoless serve shards for local-agent fan-out.
 #
+# ⚠️ REFERENCE COPY — NOT the deployed source of truth. Flux reconciles these
+#   shards from the tf-multiverse repo (deployment/cargoless-builder/shards.yaml).
+#   This file is NOT read by Flux; edit the tf-multiverse manifest to change live.
+#
 # The canonical `cargoless-serve` Deployment remains shard 0 and keeps the
 # stable Service name used by existing clients. These shard pods are addressed
 # directly by local `scripts/cargoless-cluster-bridge` port-forwards:
@@ -134,7 +138,9 @@ spec:
             - { name: RUSTUP_TOOLCHAIN, value: "1.93.1-x86_64-unknown-linux-gnu" }
             - { name: CARGO_TARGET_DIR, value: "/workspace/target" }
             - { name: CARGO_INCREMENTAL, value: "0" }
-            - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "hard" }
+            # Matches live (Flux-authoritative tf-multiverse manifest); see the
+            # serve manifest + docs/SERVE-IMAGE-BUILD.md § activation ladder.
+            - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "off" }
             - { name: CARGOLESS_REMOTE_PROJECT_CHECKS, value: "1" }
           ports:
             - name: http

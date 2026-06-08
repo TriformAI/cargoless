@@ -1,0 +1,76 @@
+# Build + push the cargoless-serve image IN-CLUSTER (no Docker host needed).
+#
+# WHY: cargoless-serve previously had no automated build path — the only way to
+#   produce a new image was `scripts/build-cargoless-serve-image` on a laptop
+#   with Docker. Agents and headless envs have no Docker; the builder pod ships
+#   no image tooling; CI builds only release binaries. This Job closes that gap
+#   using kaniko (no privileged daemon, no Docker socket). Full design:
+#   docs/SERVE-IMAGE-BUILD.md.
+#
+# ONE-TIME PREREQ (operator): a PUSH-scoped registry secret in this namespace.
+#   The existing `registry-pull` secret is pull-only and cannot push.
+#     kubectl -n cargoless-builder create secret docker-registry registry-push \
+#       --docker-server=registry.triform.cloud \
+#       --docker-username=<robot-user> --docker-password=<robot-token>
+#
+# USAGE (manual; SOURCE_REF + IMAGE_TAG must be injected — a raw apply fails
+#   closed, mirroring deployment/isolation/jobs/build-artifacts.yaml):
+#     sed -e "s|__SOURCE_REF__|<full-sha>|" -e "s|__IMAGE_TAG__|0.2.x-<sha>|" \
+#       deploy/jobs/build-serve-image.yaml | kubectl apply -f -
+#     kubectl -n cargoless-builder logs -f job/build-cargoless-serve-image
+#
+#   Then bump the image tag in the Flux-authoritative manifest
+#   (tf-multiverse: deployment/cargoless-builder/{serve,shards}.yaml) — that
+#   commit is what actually rolls the daemon. Building != deploying.
+#
+# Duration: ~10-15 min cold (release cargo build is the bottleneck); kaniko
+#   layer cache (--cache=true) makes warm rebuilds much faster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-cargoless-serve-image
+  namespace: cargoless-builder
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: cargoless-serve-image-builder
+    spec:
+      restartPolicy: Never
+      # Any healthy node — do NOT pin (a pinned node in DiskPressure wedges the
+      # build, the lesson from the isolation artifact Job).
+      imagePullSecrets:
+        - name: registry-pull
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - "--context=git://github.com/TriformAI/cargoless.git#__SOURCE_REF__"
+            - "--dockerfile=deploy/cargoless-serve.Dockerfile"
+            - "--destination=registry.triform.cloud/cargoless/cargoless-serve:__IMAGE_TAG__"
+            - "--cache=true"
+            - "--cache-repo=registry.triform.cloud/cargoless/cargoless-serve-cache"
+            - "--snapshot-mode=redo"
+            - "--use-new-run"
+          env:
+            # kaniko reads BOTH pull (base image) and push (destination) creds
+            # from this merged docker config. Mount pull + push secrets and
+            # point at the directory; see the prereq note in the header.
+            - { name: DOCKER_CONFIG, value: "/kaniko/.docker" }
+          volumeMounts:
+            - { name: docker-config, mountPath: /kaniko/.docker }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits: { cpu: "12", memory: "24Gi" }
+      volumes:
+        # Project both registry secrets into one config.json kaniko can use for
+        # pull (base) AND push (destination).
+        - name: docker-config
+          projected:
+            sources:
+              - secret:
+                  name: registry-push
+                  items:
+                    - { key: .dockerconfigjson, path: config.json }

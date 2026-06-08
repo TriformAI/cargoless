@@ -1,5 +1,13 @@
 # Central cargoless daemon for tf-multiverse.
 #
+# ⚠️ REFERENCE COPY — NOT the deployed source of truth.
+#   Flux reconciles cargoless-serve from the *tf-multiverse* repo at
+#   `deployment/cargoless-builder/{serve,shards}.yaml` (Kustomization
+#   `cargoless-builder`, flux-system). This file is NOT read by Flux.
+#   To change the LIVE daemon (image tag, PROJECT_CHECKS_MODE, batch env),
+#   edit the tf-multiverse manifest. Keep this copy's env in sync with live to
+#   avoid misleading readers (see docs/SERVE-IMAGE-BUILD.md § two-repo drift).
+#
 # This is the active service counterpart to cargoless-builder.k8s.yaml:
 # - cargoless-builder is a passive sleep pod for legacy kubectl-exec cargo runs.
 # - cargoless-serve is a long-lived `cargoless serve` daemon with one warm
@@ -148,7 +156,11 @@ spec:
             - { name: RUSTUP_TOOLCHAIN, value: "1.93.1-x86_64-unknown-linux-gnu" }
             - { name: CARGO_TARGET_DIR, value: "/workspace/target" }
             - { name: CARGO_INCREMENTAL, value: "0" }
-            - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "hard" }
+            # Matches live (Flux-authoritative tf-multiverse manifest): heavy
+            # witnesses stay OFF in the serve path until the batch-coalescing
+            # throughput proof gates them on (off → warn → hard). See
+            # docs/SERVE-IMAGE-BUILD.md § activation ladder.
+            - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "off" }
             - { name: CARGOLESS_REMOTE_PROJECT_CHECKS, value: "1" }
           ports:
             - name: http
