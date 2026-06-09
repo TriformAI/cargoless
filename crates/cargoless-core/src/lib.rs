@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod activitymgr;
 pub mod analyzer;
+pub mod attribution;
 pub mod barrier;
 pub mod batch;
 pub mod build;

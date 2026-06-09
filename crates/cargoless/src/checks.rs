@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::Config;
 use crate::ui;
 use cargoless_core::project_checks::{ProjectCheckReport, ProjectCheckResult};
-use cargoless_core::{Diagnostic, Severity, TreeState};
+use cargoless_core::{Diagnostic, TreeState};
 
 pub fn run(
     cfg: &Config,
@@ -297,16 +297,21 @@ fn classify_required_reds_at_base(
             .results
             .iter()
             .find(|r| r.id == red.id && r.required && r.tree == TreeState::Red);
-        let current_fingerprints = diagnostic_fingerprints(root, &red.diagnostics);
+        let current_fingerprints =
+            cargoless_core::attribution::fingerprint_counts(root, &red.diagnostics);
         let base_fingerprints = base_result
-            .map(|r| diagnostic_fingerprints(&worktree.path, &r.diagnostics))
+            .map(|r| {
+                cargoless_core::attribution::fingerprint_counts(&worktree.path, &r.diagnostics)
+            })
             .unwrap_or_default();
-        let classification =
-            if fingerprints_are_inherited(&current_fingerprints, &base_fingerprints) {
-                RedClass::Existing
-            } else {
-                RedClass::New
-            };
+        let classification = if cargoless_core::attribution::are_inherited(
+            &current_fingerprints,
+            &base_fingerprints,
+        ) {
+            RedClass::Existing
+        } else {
+            RedClass::New
+        };
         out.push(RedClassification {
             id: red.id.clone(),
             title: red.title.clone(),
@@ -316,51 +321,6 @@ fn classify_required_reds_at_base(
         });
     }
     Ok(out)
-}
-
-fn fingerprints_are_inherited(
-    current: &BTreeMap<String, usize>,
-    base: &BTreeMap<String, usize>,
-) -> bool {
-    !current.is_empty()
-        && current
-            .iter()
-            .all(|(fingerprint, count)| base.get(fingerprint).copied().unwrap_or(0) >= *count)
-}
-
-fn diagnostic_fingerprints(root: &Path, diagnostics: &[Diagnostic]) -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
-    for diagnostic in diagnostics.iter().filter(|d| d.severity == Severity::Error) {
-        let fingerprint = diagnostic_fingerprint(root, diagnostic);
-        *out.entry(fingerprint).or_insert(0) += 1;
-    }
-    out
-}
-
-fn diagnostic_fingerprint(root: &Path, diagnostic: &Diagnostic) -> String {
-    let source = diagnostic.source.as_deref().unwrap_or("unknown");
-    let code = diagnostic.code.as_deref().unwrap_or("unknown");
-    let rel = diagnostic_rel_path(root, diagnostic);
-    let message = normalize_message(root, &diagnostic.message);
-    format!("{source}|{code}|{rel}|{message}")
-}
-
-fn diagnostic_rel_path(root: &Path, diagnostic: &Diagnostic) -> String {
-    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let file_path =
-        fs::canonicalize(&diagnostic.file_path).unwrap_or_else(|_| diagnostic.file_path.clone());
-    file_path
-        .strip_prefix(&root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| file_path.to_string_lossy().replace('\\', "/"))
-}
-
-fn normalize_message(root: &Path, message: &str) -> String {
-    let mut out = message.replace(&root.to_string_lossy().to_string(), "$ROOT");
-    if let Ok(canon) = fs::canonicalize(root) {
-        out = out.replace(&canon.to_string_lossy().to_string(), "$ROOT");
-    }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 struct BaseWorktree {
