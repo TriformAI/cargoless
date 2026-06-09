@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,17 @@ pub struct CheckExplanation {
     pub inputs: Vec<String>,
     pub timeout_ms: u64,
     pub cache: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCheckPlan {
+    pub fingerprint: String,
+    pub manifest_hash: String,
+    pub profile_name: String,
+    pub selected: Vec<CheckSummary>,
+    pub skipped: Vec<CheckSummary>,
+    pub coalesceable: bool,
+    pub non_coalesce_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +344,60 @@ pub fn run_profile(
     run_profile_with_changes(root, profile_name, only_id, None)
 }
 
+pub fn plan_dev_with_changes(
+    root: &Path,
+    changed_files: Option<&[String]>,
+) -> io::Result<ProjectCheckPlan> {
+    plan_profile_with_changes(root, "dev", None, changed_files)
+}
+
+pub fn plan_profile_with_changes(
+    root: &Path,
+    profile_name: &str,
+    only_id: Option<&str>,
+    changed_files: Option<&[String]>,
+) -> io::Result<ProjectCheckPlan> {
+    let root = fs::canonicalize(root)?;
+    let manifest = load_manifest(&root).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}:{}: {}", e.path.display(), e.line, e.message),
+        )
+    })?;
+    let Some(manifest) = manifest else {
+        let fingerprint =
+            sha256_hex(format!("{ENGINE_VERSION}\nempty\n{profile_name}\n").as_bytes());
+        return Ok(ProjectCheckPlan {
+            fingerprint,
+            manifest_hash: String::new(),
+            profile_name: profile_name.to_string(),
+            selected: Vec::new(),
+            skipped: Vec::new(),
+            coalesceable: true,
+            non_coalesce_reason: None,
+        });
+    };
+    let profile = profile_for(&manifest, profile_name);
+    let profile_selected = checks_for_profile(&manifest, &profile, profile_name, only_id);
+    let manifest_changed = changed_files
+        .map(|files| normalize_changed_files(&root, files))
+        .is_some_and(|changed| changed.iter().any(|p| p == MANIFEST_NAME));
+    let (selected, skipped) = select_for_changes(&root, profile_selected, only_id, changed_files);
+    let selected_summaries = selected.iter().map(check_summary).collect::<Vec<_>>();
+    let fingerprint =
+        project_check_plan_fingerprint(&manifest.manifest_hash, profile_name, only_id, &selected);
+    Ok(ProjectCheckPlan {
+        fingerprint,
+        manifest_hash: manifest.manifest_hash,
+        profile_name: profile_name.to_string(),
+        selected: selected_summaries,
+        skipped,
+        coalesceable: !manifest_changed,
+        non_coalesce_reason: manifest_changed
+            .then(|| format!("{MANIFEST_NAME} changed; plan must be evaluated after overlay")),
+    })
+}
+
 pub fn run_profile_with_changes(
     root: &Path,
     profile_name: &str,
@@ -372,22 +437,8 @@ pub fn run_profile_with_changes(
         }
     };
 
-    let profile = match manifest.profiles.get(profile_name) {
-        Some(v) => v.clone(),
-        None => ProfileConfig {
-            include: vec!["*".to_string()],
-            timeout_ms: 12_000,
-            max_parallel: 8,
-            on_timeout: "red".to_string(),
-        },
-    };
-    let selected: Vec<CheckConfig> = manifest
-        .checks
-        .iter()
-        .filter(|c| only_id.is_none_or(|id| c.id == id))
-        .filter(|c| profile_includes(&profile, c, profile_name))
-        .cloned()
-        .collect();
+    let profile = profile_for(&manifest, profile_name);
+    let selected = checks_for_profile(&manifest, &profile, profile_name, only_id);
     let (selected, skipped) = select_for_changes(&root, selected, only_id, changed_files);
     let snapshot = Arc::new(RepoSnapshot::build(&root)?);
     let ctx = Arc::new(RunContext {
@@ -422,6 +473,61 @@ pub fn run_profile_with_changes(
         skipped,
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+fn profile_for(manifest: &ProjectChecksManifest, profile_name: &str) -> ProfileConfig {
+    match manifest.profiles.get(profile_name) {
+        Some(v) => v.clone(),
+        None => ProfileConfig {
+            include: vec!["*".to_string()],
+            timeout_ms: 12_000,
+            max_parallel: 8,
+            on_timeout: "red".to_string(),
+        },
+    }
+}
+
+fn checks_for_profile(
+    manifest: &ProjectChecksManifest,
+    profile: &ProfileConfig,
+    profile_name: &str,
+    only_id: Option<&str>,
+) -> Vec<CheckConfig> {
+    manifest
+        .checks
+        .iter()
+        .filter(|c| only_id.is_none_or(|id| c.id == id))
+        .filter(|c| profile_includes(profile, c, profile_name))
+        .cloned()
+        .collect()
+}
+
+fn project_check_plan_fingerprint(
+    manifest_hash: &str,
+    profile_name: &str,
+    only_id: Option<&str>,
+    selected: &[CheckConfig],
+) -> String {
+    let mut preimage = String::new();
+    preimage.push_str(ENGINE_VERSION);
+    preimage.push('\n');
+    preimage.push_str(manifest_hash);
+    preimage.push('\n');
+    preimage.push_str(profile_name);
+    preimage.push('\n');
+    preimage.push_str(only_id.unwrap_or("*"));
+    preimage.push('\n');
+    for check in selected {
+        preimage.push_str(&check.id);
+        preimage.push('\0');
+        preimage.push_str(&check_config_hash(check));
+        preimage.push('\n');
+    }
+    sha256_hex(preimage.as_bytes())
+}
+
+fn check_config_hash(check: &CheckConfig) -> String {
+    sha256_hex(format!("{check:?}").as_bytes())
 }
 
 fn select_for_changes(
@@ -2510,6 +2616,82 @@ checks:
     }
 
     #[test]
+    fn project_check_plan_fingerprint_tracks_selected_checks() {
+        let root = scratch("plan-fingerprint");
+        fs::create_dir_all(root.join("portal/src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("portal/src/lib.rs"), "ok").unwrap();
+        fs::write(root.join("docs/readme.md"), "ok").unwrap();
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: portal
+    kind: required_patterns
+    inputs: ["portal/**/*.rs"]
+    patterns:
+      - code: portal.ok
+        literal: ok
+        message: missing ok
+  - id: docs
+    kind: required_patterns
+    inputs: ["docs/**/*.md"]
+    patterns:
+      - code: docs.ok
+        literal: ok
+        message: missing ok
+"#,
+        )
+        .unwrap();
+
+        let docs_change = vec!["docs/readme.md".to_string()];
+        let docs_again = vec!["./docs/readme.md".to_string()];
+        let portal_change = vec!["portal/src/lib.rs".to_string()];
+        let docs = plan_dev_with_changes(&root, Some(&docs_change)).unwrap();
+        let docs_same = plan_dev_with_changes(&root, Some(&docs_again)).unwrap();
+        let portal = plan_dev_with_changes(&root, Some(&portal_change)).unwrap();
+
+        assert_eq!(docs.fingerprint, docs_same.fingerprint);
+        assert_ne!(docs.fingerprint, portal.fingerprint);
+        assert_eq!(
+            docs.selected.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            vec!["docs"]
+        );
+        assert!(docs.coalesceable);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_check_plan_marks_manifest_edits_non_coalesceable() {
+        let root = scratch("plan-manifest-edit");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "ok").unwrap();
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: required
+    kind: required_patterns
+    inputs: ["src/*.rs"]
+    patterns:
+      - code: required.ok
+        literal: ok
+        message: missing ok
+"#,
+        )
+        .unwrap();
+
+        let changed = vec![MANIFEST_NAME.to_string()];
+        let plan = plan_dev_with_changes(&root, Some(&changed)).unwrap();
+        assert!(!plan.coalesceable);
+        assert_eq!(plan.selected[0].id, "required");
+        assert!(plan.non_coalesce_reason.unwrap().contains(MANIFEST_NAME));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn triggers_override_inputs_for_changed_file_selection() {
         let root = scratch("changed-triggers");
         fs::create_dir_all(root.join("portal/src")).unwrap();
@@ -2596,11 +2778,10 @@ checks:
 "#,
         )
         .unwrap();
-        let changed = vec![
-            root.join("portal/src/lib.rs")
-                .to_string_lossy()
-                .into_owned(),
-        ];
+        let changed = vec![root
+            .join("portal/src/lib.rs")
+            .to_string_lossy()
+            .into_owned()];
         let report = run_profile_with_changes(&root, "dev", None, Some(&changed)).unwrap();
         assert_eq!(report.tree, TreeState::Green);
         assert_eq!(
@@ -2647,11 +2828,9 @@ checks:
         assert_eq!(diagnostics[0].col, 3);
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert_eq!(diagnostics[0].code.as_deref(), Some("generated.drift"));
-        assert!(
-            diagnostics[0]
-                .message
-                .contains("run ./scripts/devctl codegen")
-        );
+        assert!(diagnostics[0]
+            .message
+            .contains("run ./scripts/devctl codegen"));
         assert_eq!(
             diagnostics[0].source.as_deref(),
             Some("cargoless-check:generated-fast")
