@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2778,10 +2778,11 @@ checks:
 "#,
         )
         .unwrap();
-        let changed = vec![root
-            .join("portal/src/lib.rs")
-            .to_string_lossy()
-            .into_owned()];
+        let changed = vec![
+            root.join("portal/src/lib.rs")
+                .to_string_lossy()
+                .into_owned(),
+        ];
         let report = run_profile_with_changes(&root, "dev", None, Some(&changed)).unwrap();
         assert_eq!(report.tree, TreeState::Green);
         assert_eq!(
@@ -2828,9 +2829,11 @@ checks:
         assert_eq!(diagnostics[0].col, 3);
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert_eq!(diagnostics[0].code.as_deref(), Some("generated.drift"));
-        assert!(diagnostics[0]
-            .message
-            .contains("run ./scripts/devctl codegen"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("run ./scripts/devctl codegen")
+        );
         assert_eq!(
             diagnostics[0].source.as_deref(),
             Some("cargoless-check:generated-fast")

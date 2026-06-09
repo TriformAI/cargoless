@@ -42,13 +42,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use cargoless_core::batch::{run_batch, BatchChecker, BatchMember, BatchReport, BatchVerdict};
+use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
-use cargoless_core::project_checks::{plan_dev_with_changes, ProjectCheckReport};
+use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::transport::{
     BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions,
     TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
@@ -1645,9 +1645,11 @@ mod tests {
         for member in report.members {
             assert_eq!(member.verdict, BatchVerdict::Indeterminate);
             assert_eq!(member.provenance, BatchProvenance::Indeterminate);
-            assert!(member.diagnostics[0]
-                .message
-                .contains("requires a shared analysis_root"));
+            assert!(
+                member.diagnostics[0]
+                    .message
+                    .contains("requires a shared analysis_root")
+            );
         }
     }
 
@@ -1677,9 +1679,11 @@ mod tests {
             files: vec![("../outside.rs".into(), "bad".into())],
             changed_files: vec![],
         }];
-        assert!(map_batch_members(&root, true, &escaping)
-            .unwrap_err()
-            .contains("escapes repo root"));
+        assert!(
+            map_batch_members(&root, true, &escaping)
+                .unwrap_err()
+                .contains("escapes repo root")
+        );
     }
 
     #[test]
@@ -1713,9 +1717,11 @@ mod tests {
                 changed_files: vec![],
             },
         ];
-        assert!(union_overlay_files(&conflicting)
-            .unwrap_err()
-            .contains("different content"));
+        assert!(
+            union_overlay_files(&conflicting)
+                .unwrap_err()
+                .contains("different content")
+        );
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -2068,9 +2074,11 @@ checks:
             2,
             "two physical flushes should have distinct executed_batch_id values"
         );
-        assert!(reports
-            .iter()
-            .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1));
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1)
+        );
     }
 
     #[test]
@@ -2397,10 +2405,11 @@ checks:
         let bad = member_result(&report, "/client/bad");
         assert_eq!(bad.verdict, BatchVerdict::Red);
         assert_eq!(bad.provenance, BatchProvenance::SoloRed);
-        assert!(bad
-            .diagnostics
-            .iter()
-            .any(|diag| diag.code.as_deref() == Some("batch.fail_token")));
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|diag| diag.code.as_deref() == Some("batch.fail_token"))
+        );
         assert_overlay_paths_cleaned(&project.root, &overlay_paths);
     }
 
@@ -3154,7 +3163,7 @@ checks:
     /// content) would flip exactly this assertion.
     #[test]
     fn composing_equivalence_pushed_vs_fs_pairs_yield_identical_overlay_ops() {
-        use cargoless_core::overlay::{diff, OverlaySet};
+        use cargoless_core::overlay::{OverlaySet, diff};
 
         let prev = OverlaySet::from_pairs(vec![(
             "/wt-a/src/old.rs".to_string(),
