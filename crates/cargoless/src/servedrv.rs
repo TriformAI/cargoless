@@ -295,7 +295,10 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // already resolved `--bind`/`--auth-token` into the FleetConfig and
     // ran `security_check`; THIS is #10's actual binding (the serve.rs
     // module-doc "Stream E #10 binds it; #3 only resolves+carries" seam).
-    let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+    let api = Arc::new(
+        crate::serveapi::ServeVerdictState::new()
+            .with_project_check_state_dir(scope.fleet.state_dir_abs(&scope.repo_root)),
+    );
 
     // #240/2b — overlay-push ingest signal channel. Wired BEFORE
     // `HttpServer::bind` so no `POST /overlay` from a client can race
@@ -1466,11 +1469,11 @@ fn run_project_checks_and_log(
 ) -> ProjectCheckSummary {
     // Fast-path: when the context carries a non-empty base_ref and the
     // overlay needs materializing (central-daemon push mode), route through
-    // the BatchCoalescer so that N concurrent pushers against the same
-    // (base_ref, analysis_root) share ONE physical check run instead of N
-    // serialised sync_lock acquisitions. The coalescer is the existing
-    // batch_check surface; we submit a single-member request and extract
-    // this WT's slice on return.
+    // the BatchCoalescer so that N concurrent pushers with the same
+    // daemon-derived project-check plan share ONE physical check run
+    // instead of N serialised overlay executions. The coalescer is the
+    // existing batch_check surface; we submit a single-member request and
+    // extract this WT's slice on return.
     //
     // Invariant: `ProjectChecksMode::Off` never reaches this function (the
     // EmitVerdict arm guards it), so the coalesced path is only reachable in

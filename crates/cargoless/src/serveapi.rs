@@ -41,13 +41,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
-use cargoless_core::project_checks::ProjectCheckReport;
+use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::transport::{
     BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions,
     TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
@@ -60,6 +61,9 @@ use cargoless_core::{Diagnostic, Severity, TreeState};
 fn poisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+static PROJECT_CHECK_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(1);
+const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 
 /// A pushed overlay set carried in `ServeVerdictState::pushed`. Stored
 /// pair-shape (`Vec<(String, String)>`) instead of [`OverlaySet`] so the
@@ -154,6 +158,10 @@ pub struct ServeVerdictState {
     /// Optional server-side coalescing for explicit `coalesce_key`
     /// batch-check requests. Absent key keeps historical immediate behavior.
     batch_coalescer: BatchCoalescer,
+    /// Server-local state directory used for transient project-check
+    /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
+    /// and embedded callers that do not have a resolved fleet config.
+    project_check_state_dir: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -436,6 +444,62 @@ fn batch_coalesce_key(request: &BatchCheckRequest) -> Option<BatchCoalesceKey> {
     })
 }
 
+fn project_check_plan_coalesce_token(root: &Path, request: &BatchCheckRequest) -> Option<String> {
+    if request_overlay_touches_project_check_manifest(root, request) {
+        eprintln!(
+            "[cargoless:obs] project-check-plan root={} coalesce=false reason={} overlay changed",
+            root.display(),
+            PROJECT_CHECK_MANIFEST_NAME
+        );
+        return None;
+    }
+
+    let changed_files = union_changed_files(&request.members);
+    let changed_files = (!changed_files.is_empty()).then_some(changed_files);
+    let plan = match plan_dev_with_changes(root, changed_files.as_deref()) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!(
+                "[cargoless:obs] project-check-plan root={} coalesce=false error={}",
+                root.display(),
+                e
+            );
+            return None;
+        }
+    };
+    if !plan.coalesceable {
+        eprintln!(
+            "[cargoless:obs] project-check-plan root={} coalesce=false reason={}",
+            root.display(),
+            plan.non_coalesce_reason
+                .as_deref()
+                .unwrap_or("plan marked non-coalesceable")
+        );
+        return None;
+    }
+    Some(format!("project-check-plan:{}", plan.fingerprint))
+}
+
+fn request_overlay_touches_project_check_manifest(
+    root: &Path,
+    request: &BatchCheckRequest,
+) -> bool {
+    request.members.iter().any(|member| {
+        member
+            .files
+            .iter()
+            .any(|(path, _)| overlay_path_matches_project_check_manifest(root, Path::new(path)))
+    })
+}
+
+fn overlay_path_matches_project_check_manifest(root: &Path, path: &Path) -> bool {
+    let manifest = Path::new(PROJECT_CHECK_MANIFEST_NAME);
+    if path.is_absolute() {
+        return path.strip_prefix(root).is_ok_and(|rel| rel == manifest);
+    }
+    safe_repo_relative_path(&path.to_string_lossy()).is_ok_and(|rel| rel == manifest)
+}
+
 fn queue_member_count(queue: &BatchQueue) -> usize {
     queue
         .waiters
@@ -511,6 +575,14 @@ impl ServeVerdictState {
     /// `inproc::testmock::MockService`).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the daemon's resolved state directory for transient
+    /// project-check scratch worktrees. This keeps slow advisory/project
+    /// checks out of the shared mutable analysis root.
+    pub fn with_project_check_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.project_check_state_dir = Some(state_dir);
+        self
     }
 
     /// The SOLE verdict-mirror entry point — invoked from servedrv's one
@@ -644,6 +716,18 @@ impl ServeVerdictState {
             return Ok(f(&context.root));
         }
 
+        if let Some(state_dir) = self.project_check_state_dir.as_deref() {
+            return self.with_project_check_scratch_overlay(context, state_dir, f);
+        }
+
+        self.with_project_check_locked_overlay(context, f)
+    }
+
+    fn with_project_check_locked_overlay<T>(
+        &self,
+        context: &ProjectCheckRunContext,
+        f: impl FnOnce(&Path) -> T,
+    ) -> Result<T, String> {
         let _guard = poisoned(&self.sync_lock);
         reset_analysis_root(&context.root, &context.base_ref)?;
         materialize_overlay_files(&context.root, &context.overlay_files)?;
@@ -658,16 +742,59 @@ impl ServeVerdictState {
         Ok(result)
     }
 
+    fn with_project_check_scratch_overlay<T>(
+        &self,
+        context: &ProjectCheckRunContext,
+        state_dir: &Path,
+        f: impl FnOnce(&Path) -> T,
+    ) -> Result<T, String> {
+        let seq = PROJECT_CHECK_SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let scratch_root = state_dir
+            .join("project-check-runs")
+            .join(format!("run-{}-{seq}", std::process::id()));
+
+        {
+            let _guard = poisoned(&self.sync_lock);
+            sync_analysis_root(&context.root, &context.base_ref)?;
+            prepare_project_check_scratch(&context.root, &scratch_root, &context.base_ref)?;
+        }
+
+        let result = match materialize_overlay_files_from_root(
+            &context.root,
+            &scratch_root,
+            &context.overlay_files,
+        ) {
+            Ok(()) => Ok(f(&scratch_root)),
+            Err(e) => Err(e),
+        };
+
+        let cleanup = {
+            let _guard = poisoned(&self.sync_lock);
+            cleanup_project_check_scratch(&context.root, &scratch_root)
+        };
+        if let Err(e) = cleanup {
+            eprintln!(
+                "[cargoless:obs] project-check-scratch-cleanup root={} scratch={} error={}",
+                context.root.display(),
+                scratch_root.display(),
+                e
+            );
+        }
+
+        result
+    }
+
     /// Route a single-WT push-path project-check through the shared
     /// [`BatchCoalescer`] so that N concurrent pushers against the same
-    /// `(base_ref, analysis_root)` pair share ONE physical `run_batch_check_now`
-    /// call instead of N serialised `with_project_check_overlay` calls.
+    /// server-derived project-check plan share ONE physical
+    /// `run_batch_check_now` call instead of N serialised overlay runs.
     ///
     /// ## Coalesce key
-    /// `"pushpath:<base_ref>:<analysis_root>"` — matches the exact shape
-    /// `batch_coalesce_key` would derive for an explicit `batch_check`
-    /// request with the same root, so pushers and batch-check callers can
-    /// share the same window if they arrive simultaneously.
+    /// `"project-check-plan:<fingerprint>"` where the fingerprint is
+    /// computed from the daemon's current `cargoless.checks.yaml`, engine
+    /// version, profile, and selected check configs for this changed-file
+    /// set. Manifest edits deliberately return `None` and fall back to the
+    /// direct path so the overlaid manifest is evaluated after materialize.
     ///
     /// ## overlay_files path convention
     /// The push path already converts repo-relative paths to absolute
@@ -721,7 +848,7 @@ impl ServeVerdictState {
         };
         request.members = vec![member];
         request.corun = true;
-        request.coalesce_key = Some(format!("pushpath:{base_ref}:{}", context.root.display()));
+        request.coalesce_key = Some(project_check_plan_coalesce_token(&context.root, &request)?);
 
         // coalesce_key was set above, so this is always Some; `?` keeps the
         // defensive None-path (empty-after-trim) without a clippy::question_mark lint.
@@ -1308,19 +1435,78 @@ fn reset_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn prepare_project_check_scratch(
+    root: &Path,
+    scratch_root: &Path,
+    base_ref: &str,
+) -> Result<(), String> {
+    if scratch_root.exists() {
+        std::fs::remove_dir_all(scratch_root).map_err(|e| {
+            format!(
+                "could not remove stale project-check scratch `{}`: {e}",
+                scratch_root.display()
+            )
+        })?;
+    }
+    if let Some(parent) = scratch_root.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "could not create project-check scratch parent `{}`: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let scratch = scratch_root.to_string_lossy().into_owned();
+    run_git(root, &["worktree", "add", "--detach", &scratch, base_ref])
+}
+
+fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(), String> {
+    if !scratch_root.exists() {
+        return Ok(());
+    }
+    let scratch = scratch_root.to_string_lossy().into_owned();
+    match run_git(root, &["worktree", "remove", "--force", &scratch]) {
+        Ok(()) => Ok(()),
+        Err(git_err) => {
+            let fallback = std::fs::remove_dir_all(scratch_root).map_err(|e| {
+                format!(
+                    "{git_err}; fallback remove_dir_all `{}` failed: {e}",
+                    scratch_root.display()
+                )
+            });
+            fallback.and(Err(git_err))
+        }
+    }
+}
+
 fn materialize_overlay_files(root: &Path, files: &[(String, String)]) -> Result<(), String> {
+    materialize_overlay_files_from_root(root, root, files)
+}
+
+fn materialize_overlay_files_from_root(
+    source_root: &Path,
+    target_root: &Path,
+    files: &[(String, String)],
+) -> Result<(), String> {
     for (path, content) in files {
         let path = Path::new(path);
         let abs = if path.is_absolute() {
-            path.to_path_buf()
+            let rel = path.strip_prefix(source_root).map_err(|_| {
+                format!(
+                    "overlay path `{}` escapes analysis_root `{}`",
+                    path.display(),
+                    source_root.display()
+                )
+            })?;
+            target_root.join(rel)
         } else {
-            root.join(path)
+            target_root.join(safe_repo_relative_path(&path.to_string_lossy())?)
         };
-        if !abs.starts_with(root) {
+        if !abs.starts_with(target_root) {
             return Err(format!(
                 "overlay path `{}` escapes analysis_root `{}`",
                 abs.display(),
-                root.display()
+                target_root.display()
             ));
         }
         if let Some(parent) = abs.parent() {
@@ -1974,12 +2160,11 @@ checks:
         let api = Arc::new(ServeVerdictState::new());
 
         // We test the coalescing key derivation by wiring a counting closure
-        // directly into the coalescer using the SAME key shape that
-        // `coalesced_project_check` will use: "pushpath:<base_ref>:<root>".
-        // This validates the key format without requiring a real git daemon.
+        // directly into the coalescer using the SAME server-derived
+        // project-check plan token that `coalesced_project_check` will use.
+        // This validates the key format without requiring a real daemon loop.
         let base_ref = "origin/main";
         let root_str = project.root.to_string_lossy().into_owned();
-        let coalesce_key_str = format!("pushpath:{base_ref}:{root_str}");
 
         let run_count = Arc::new(AtomicU32::new(0));
         let start = Arc::new(Barrier::new(3));
@@ -2009,7 +2194,10 @@ checks:
                 changed_files: vec![format!("src/agent_{idx:02}.rs")],
             }];
             request.corun = true;
-            request.coalesce_key = Some(coalesce_key_str.clone());
+            request.coalesce_key = Some(
+                project_check_plan_coalesce_token(&project.root, &request)
+                    .expect("selected project-check plan should be coalesceable"),
+            );
             let key = batch_coalesce_key(&request).expect("coalesce_key should be present");
             thread_args.push((key, request, wt));
         }
@@ -2097,6 +2285,33 @@ checks:
             "each coalesced submitter must receive its own WT member slice, not a neighbour's"
         );
         // project drops here → Drop removes root + remote dirs.
+    }
+
+    #[test]
+    fn project_check_plan_coalesce_token_skips_manifest_edits() {
+        let project = setup_batch_project("pushpath-manifest-edit");
+        let mut request = batch_request(
+            "manifest-edit",
+            &project.root,
+            vec![BatchMember {
+                worktree: "/client/manifest-edit".to_string(),
+                files: vec![(
+                    project
+                        .root
+                        .join("cargoless.checks.yaml")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "version: 1\nchecks: []\n".to_string(),
+                )],
+                changed_files: vec!["cargoless.checks.yaml".to_string()],
+            }],
+        );
+        request.options.repo_relative = false;
+
+        assert!(
+            project_check_plan_coalesce_token(&project.root, &request).is_none(),
+            "manifest edits must evaluate after overlay materialization, not via a stale base plan"
+        );
     }
 
     /// Integration test: `coalesced_project_check` on a real git project
@@ -2837,6 +3052,61 @@ checks:
             "cached\n"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_check_overlay_uses_state_dir_scratch_worktree() {
+        let project = setup_batch_project("project-overlay-scratch");
+        let state_dir = temp_root("project-overlay-scratch-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = ProjectCheckRunContext {
+            root: project.root.clone(),
+            changed_files: Some(vec!["src/lib.rs".into(), "new.yaml".into()]),
+            base_ref: "origin/main".to_string(),
+            overlay_files: vec![
+                (
+                    project
+                        .root
+                        .join("src/lib.rs")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "pub fn changed() {}\n".to_string(),
+                ),
+                (
+                    project.root.join("new.yaml").to_string_lossy().into_owned(),
+                    "value: changed\n".to_string(),
+                ),
+            ],
+            materialize_overlay: true,
+        };
+
+        let seen = api
+            .with_project_check_overlay(&context, |root| {
+                assert_ne!(
+                    root,
+                    project.root.as_path(),
+                    "configured daemons should run project checks in a scratch worktree"
+                );
+                (
+                    root.to_path_buf(),
+                    std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+                    std::fs::read_to_string(root.join("new.yaml")).unwrap(),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(seen.1, "pub fn changed() {}\n");
+        assert_eq!(seen.2, "value: changed\n");
+        assert!(
+            !seen.0.exists(),
+            "scratch worktree should be removed after the check"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.root.join("src/lib.rs")).unwrap(),
+            "pub fn base() {}\n"
+        );
+        assert!(!project.root.join("new.yaml").exists());
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
