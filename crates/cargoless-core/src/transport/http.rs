@@ -56,6 +56,10 @@ use super::{
 /// while fail-closed-bounding a hostile/runaway client.
 pub const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP connect only — read/write keep [`CLIENT_IO_TIMEOUT`]. Daemon-down
+/// detection drops 10s to 2s; the gate failover ladder relies on fast
+/// connect failure.
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const BATCH_CHECK_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
@@ -723,7 +727,7 @@ impl HttpClient {
         let addr = addrs
             .next()
             .ok_or_else(|| TransportError::Protocol("remote resolved to no addresses".into()))?;
-        let stream = TcpStream::connect_timeout(&addr, CLIENT_IO_TIMEOUT)?;
+        let stream = TcpStream::connect_timeout(&addr, CLIENT_CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(read_timeout))?;
         stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
         Ok(stream)
