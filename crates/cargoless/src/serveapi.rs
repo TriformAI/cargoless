@@ -64,6 +64,10 @@ fn poisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 static PROJECT_CHECK_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(1);
+/// #A4.3 — global hard-witness generation source. Monotonic and never
+/// recycled across worktrees, so `finish_hard_witness`'s equality check
+/// can never be fooled by a reused value.
+static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 
 /// A pushed overlay set carried in `ServeVerdictState::pushed`. Stored
@@ -99,6 +103,9 @@ pub struct PushedOverlay {
     /// repo-scoped daemon accept tf-multiverse's per-invocation
     /// `check-remote` selectors without restarting RA per package.
     pub check_profile: Option<CheckProfile>,
+    /// Merge-gate push: promote THIS push's project-check mode from Warn
+    /// to Hard (witness-gated verdict). Wire default `false`.
+    pub gate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +115,9 @@ pub(crate) struct ProjectCheckRunContext {
     pub base_ref: String,
     pub overlay_files: Vec<(String, String)>,
     pub materialize_overlay: bool,
+    /// Carried from [`PushedOverlay::gate`]: the EmitVerdict arm promotes
+    /// Warn → Hard for this push when set.
+    pub gate: bool,
 }
 
 /// Verdict-attribution record for one consumed push (#A2/#A7). Captured by
@@ -220,6 +230,14 @@ pub struct ServeVerdictState {
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
     project_check_state_dir: Option<PathBuf>,
+    /// Per-worktree Hard-witness generation counter. The latest generation
+    /// for each wt-key is the only witness that may publish; stale witnesses
+    /// (from a prior push whose EmitVerdict fired while a newer push's witness
+    /// is already running) are detected by `finish_hard_witness` and dropped.
+    /// The counter values are sourced from the module-level
+    /// `HARD_WITNESS_SEQ` atomic, which is globally monotonic and never
+    /// recycled, so a recycled match is structurally impossible.
+    hard_witness_generation: Mutex<BTreeMap<String, u64>>,
 }
 
 #[derive(Default)]
@@ -768,25 +786,12 @@ impl ServeVerdictState {
             .and_then(|p| p.analysis_root.clone())
     }
 
-    pub(crate) fn record_project_check_context(
-        &self,
-        worktree: &str,
-        root: PathBuf,
-        changed_files: Option<Vec<String>>,
-        base_ref: String,
-        overlay_files: Vec<(String, String)>,
-        materialize_overlay: bool,
-    ) {
-        poisoned(&self.project_check_context).insert(
-            worktree.to_string(),
-            ProjectCheckRunContext {
-                root,
-                changed_files,
-                base_ref,
-                overlay_files,
-                materialize_overlay,
-            },
-        );
+    /// Struct-param form (was six positional params): adding `gate` made
+    /// the positional list 8 args counting `&self`, which trips
+    /// `clippy::too_many_arguments`; the literal at the sole call site is
+    /// also simply more readable.
+    pub(crate) fn record_project_check_context(&self, worktree: &str, ctx: ProjectCheckRunContext) {
+        poisoned(&self.project_check_context).insert(worktree.to_string(), ctx);
     }
 
     pub(crate) fn take_project_check_context(
@@ -815,6 +820,31 @@ impl ServeVerdictState {
 
     pub(crate) fn take_push_attribution(&self, worktree: &str) -> Option<PushAttribution> {
         poisoned(&self.push_attribution).remove(worktree)
+    }
+
+    /// #A4.3 — claim the hard-witness slot for `wt_key`. Returns the new
+    /// generation; a previously claimed (still-running) witness for the
+    /// same key is implicitly invalidated (its `finish_hard_witness` will
+    /// return `false`). Generations come from a global never-recycled
+    /// sequence, so an ABA match is structurally impossible.
+    pub(crate) fn begin_hard_witness(&self, wt_key: &str) -> u64 {
+        let generation = HARD_WITNESS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        poisoned(&self.hard_witness_generation).insert(wt_key.to_string(), generation);
+        generation
+    }
+
+    /// `true` iff `generation` is still the latest claim for `wt_key` —
+    /// the caller may publish. Consumes the claim on success so a
+    /// duplicate finish (watchdog already published, worker completes
+    /// later) reports `false` and stays silent.
+    pub(crate) fn finish_hard_witness(&self, wt_key: &str, generation: u64) -> bool {
+        let mut map = poisoned(&self.hard_witness_generation);
+        if map.get(wt_key) == Some(&generation) {
+            map.remove(wt_key);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn with_project_check_overlay<T>(
@@ -955,6 +985,7 @@ impl ServeVerdictState {
             analysis_root: Some(root_str.into_owned()),
             base_sha: None,
             changed_files: None, // changed_files live on the member, not the options
+            gate: false,
         };
         request.members = vec![member];
         request.corun = true;
@@ -1265,8 +1296,10 @@ impl VerdictService for ServeVerdictState {
         let mut analysis_root = None;
         let mut base_sha = None;
         let mut changed_files = None;
+        let mut gate = false;
         if let Some(options) = options {
             changed_files = options.changed_files.clone();
+            gate = options.gate;
             analysis_root = options
                 .analysis_root
                 .as_deref()
@@ -1347,6 +1380,7 @@ impl VerdictService for ServeVerdictState {
             last_push_unix: crate::statusfile::now_unix(),
             changed_files,
             check_profile: check_profile.cloned(),
+            gate,
         };
         poisoned(&self.pushed).insert(worktree.to_string(), pushed);
         // Wake the serve loop (best-effort — see attach_push_signal doc).
@@ -1418,6 +1452,7 @@ impl ServeBatchChecker<'_> {
             base_ref: self.base_ref.clone(),
             overlay_files,
             materialize_overlay: true,
+            gate: false,
         };
         self.api
             .with_project_check_overlay(&context, |root| {
@@ -2277,6 +2312,7 @@ checks:
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
             changed_files: None,
+            gate: false,
         };
         request.members = members;
         request
@@ -2376,6 +2412,7 @@ checks:
             analysis_root: Some("/workspace/repo".into()),
             base_sha: None,
             changed_files: None,
+            gate: false,
         };
         request.members = vec![BatchMember::new(member)];
         request
@@ -2652,6 +2689,7 @@ checks:
                 analysis_root: Some(root_str.clone()),
                 base_sha: None,
                 changed_files: None,
+                gate: false,
             };
             request.members = vec![cargoless_core::batch::BatchMember {
                 worktree: wt.clone(),
@@ -2811,6 +2849,7 @@ checks:
                 "pub fn added() {}\n".to_string(),
             )],
             materialize_overlay: true,
+            gate: false,
         };
 
         let summary = api.coalesced_project_check(wt, &context);
@@ -3403,6 +3442,7 @@ checks:
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/lib.rs".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3449,6 +3489,7 @@ checks:
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: Some(head),
             changed_files: Some(vec!["src/lib.rs".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options(
@@ -3501,6 +3542,7 @@ checks:
                 ),
             ],
             materialize_overlay: true,
+            gate: false,
         };
 
         let seen = api
@@ -3550,6 +3592,7 @@ checks:
                 ),
             ],
             materialize_overlay: true,
+            gate: false,
         };
 
         let seen = api
@@ -3590,6 +3633,7 @@ checks:
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
             changed_files: None,
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3852,6 +3896,7 @@ checks:
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
+            gate: false,
         };
         api.record_push_attribution("/wt", &pushed("first"));
         api.record_push_attribution("/wt", &pushed("second"));
@@ -3893,6 +3938,7 @@ checks:
             analysis_root: None,
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
+            gate: false,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&options));
         assert!(!ack.accepted, "truncation signature must be rejected");
@@ -3914,6 +3960,7 @@ checks:
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
             changed_files: None,
+            gate: false,
         };
         let ack = api.push_overlay_with_options("/wt", "", &[], None, Some(&options));
         assert!(
@@ -3934,6 +3981,7 @@ checks:
             analysis_root: None,
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/removed.rs".into()]),
+            gate: false,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted, "delete-only diff (empty content) must pass");
@@ -4009,5 +4057,81 @@ checks:
         // One-way: a second mark is a no-op, never an un-set.
         api.mark_ready();
         assert!(api.ready());
+    }
+
+    #[test]
+    fn stale_hard_witness_never_overwrites_fresher() {
+        // #A4.3 publish-once / last-writer-wins ordering: two hard
+        // witnesses for the same wt-key can coexist (push2's EmitVerdict
+        // fires while push1's witness still runs). Only the LATEST
+        // generation may publish; a consumed claim cannot publish twice.
+        let api = ServeVerdictState::new();
+        let g1 = api.begin_hard_witness("/wt");
+        let g2 = api.begin_hard_witness("/wt");
+        assert!(g2 > g1, "generations are monotonic");
+        assert!(
+            !api.finish_hard_witness("/wt", g1),
+            "stale witness (older push) must not publish"
+        );
+        assert!(
+            api.finish_hard_witness("/wt", g2),
+            "latest witness publishes"
+        );
+        assert!(
+            !api.finish_hard_witness("/wt", g2),
+            "a consumed claim cannot publish twice (watchdog-vs-late-worker)"
+        );
+        // Keys are independent: a witness on another worktree is
+        // unaffected by /wt's churn.
+        let g3 = api.begin_hard_witness("/other");
+        assert!(api.finish_hard_witness("/other", g3));
+    }
+
+    #[test]
+    fn push_overlay_with_options_stamps_gate_on_pushed_overlay() {
+        // #A4.3 gate wire: options.gate must survive into the stored
+        // PushedOverlay (SwitchOverlay carries it onward into the
+        // ProjectCheckRunContext the EmitVerdict arm promotes on).
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let options = PushOverlayOptions {
+            gate: true,
+            ..Default::default()
+        };
+        let ack = api.push_overlay_with_options("/wt-gate", "", &files, None, Some(&options));
+        assert!(ack.accepted);
+        assert!(
+            api.peek_overlay_for("/wt-gate").expect("stored").gate,
+            "gate=true push stores gate=true"
+        );
+
+        let ack = api.push_overlay_with_options("/wt-plain", "", &files, None, None);
+        assert!(ack.accepted);
+        assert!(
+            !api.peek_overlay_for("/wt-plain").expect("stored").gate,
+            "optionless push defaults gate=false (warn-fast posture)"
+        );
+    }
+
+    #[test]
+    fn record_project_check_context_carries_gate_through_take() {
+        let api = ServeVerdictState::new();
+        api.record_project_check_context(
+            "/wt",
+            ProjectCheckRunContext {
+                root: PathBuf::from("/root"),
+                changed_files: None,
+                base_ref: String::new(),
+                overlay_files: Vec::new(),
+                materialize_overlay: false,
+                gate: true,
+            },
+        );
+        let ctx = api.take_project_check_context("/wt").expect("recorded");
+        assert!(ctx.gate, "gate survives the record→take round trip");
+        assert!(
+            api.take_project_check_context("/wt").is_none(),
+            "take consumes"
+        );
     }
 }

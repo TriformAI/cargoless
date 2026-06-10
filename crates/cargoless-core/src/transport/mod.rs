@@ -149,6 +149,11 @@ pub struct PushOverlayOptions {
     /// needed for cluster routing, while project-check triggers should see
     /// only the user diff.
     pub changed_files: Option<Vec<String>>,
+    /// `true` marks this push as a merge-gate push: the daemon promotes the
+    /// project-check mode for THIS push from Warn to Hard (witness-gated
+    /// verdict), leaving the global mode untouched. Absent on the wire ⇒
+    /// `false` — old clients and plain dev pushes keep warn-fast verdicts.
+    pub gate: bool,
 }
 
 impl PushOverlayOptions {
@@ -165,6 +170,7 @@ impl PushOverlayOptions {
                 .changed_files
                 .as_ref()
                 .is_none_or(|files| files.is_empty())
+            && !self.gate
     }
 }
 
@@ -823,6 +829,9 @@ impl Request {
                             ),
                         );
                     }
+                    if options.gate {
+                        map.insert("gate".to_string(), serde_json::Value::Bool(true));
+                    }
                 }
                 v
             }
@@ -937,6 +946,9 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
                 ),
             );
         }
+        if options.gate {
+            map.insert("gate".to_string(), serde_json::Value::Bool(true));
+        }
     }
     value
 }
@@ -958,6 +970,10 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty()),
         changed_files: string_array_from_json(v.get("changed_files")),
+        gate: v
+            .get("gate")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -1649,6 +1665,7 @@ mod tests {
             analysis_root: Some("/workspace/repo".into()),
             base_sha: Some("abc123".into()),
             changed_files: None,
+            gate: false,
         };
         req.corun = false;
         req.coalesce_key = Some("tf-multiverse:origin/dev:project-checks".into());
@@ -1900,9 +1917,47 @@ mod tests {
                 analysis_root: Some("/workspace/tf-multiverse".into()),
                 base_sha: Some("abc123".into()),
                 changed_files: Some(vec!["src/lib.rs".into()]),
+                gate: true,
             },
         };
         assert_eq!(Request::from_json(&req.to_json()), Some(req));
+    }
+
+    #[test]
+    fn push_overlay_gate_flag_wire_contract() {
+        // Absent on the wire ⇒ false (old clients unaffected)...
+        let parsed = Request::from_json(
+            r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+                "repo_relative":true,"analysis_root":"/srv/repo"}"#,
+        )
+        .unwrap();
+        let Request::PushOverlayV2 { options, .. } = parsed else {
+            panic!("options present ⇒ V2 parse");
+        };
+        assert!(!options.gate, "gate absent on the wire must parse as false");
+
+        // ...and a gate-only options set is NOT empty (must survive the
+        // V2-vs-legacy demotion in from_json).
+        let gate_only = PushOverlayOptions {
+            gate: true,
+            ..Default::default()
+        };
+        assert!(
+            !gate_only.is_empty(),
+            "gate=true alone must keep the V2 wire shape"
+        );
+        let req = Request::PushOverlayV2 {
+            worktree: "/client/wt".into(),
+            base_ref: "origin/dev".into(),
+            files: vec![],
+            check_profile: None,
+            options: gate_only,
+        };
+        assert_eq!(
+            Request::from_json(&req.to_json()),
+            Some(req),
+            "gate=true must roundtrip the wire"
+        );
     }
 
     #[test]
