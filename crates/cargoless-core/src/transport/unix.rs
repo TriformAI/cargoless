@@ -462,6 +462,7 @@ mod tests {
             red_diagnostics: 1,
             verdict_failure_reason: None,
             base_sha: None,
+            ra_blind_paths: false,
             published_at: 99,
         };
         svc.emit(ev.clone());

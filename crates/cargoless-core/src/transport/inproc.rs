@@ -156,6 +156,7 @@ pub(crate) mod testmock {
                     red_diagnostics: 0,
                     verdict_failure_reason: None,
                     base_sha: None,
+                    ra_blind_paths: false,
                     heartbeat_age_secs: 1,
                     published_at: 1000,
                 }),
@@ -170,6 +171,7 @@ pub(crate) mod testmock {
                     red_diagnostics: 1,
                     verdict_failure_reason: None,
                     base_sha: None,
+                    ra_blind_paths: false,
                     heartbeat_age_secs: 0,
                     published_at: 1001,
                 }),
@@ -246,6 +248,7 @@ mod tests {
             red_diagnostics: 1,
             verdict_failure_reason: None,
             base_sha: None,
+            ra_blind_paths: false,
             published_at: 7,
         };
         svc.emit(ev.clone());

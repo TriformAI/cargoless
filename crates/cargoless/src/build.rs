@@ -270,6 +270,10 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 // diverge under heartbeat-refresh semantics.
                 analysed_at: statusfile::now_unix(),
                 build_id: cargoless_core::build_id().to_string(),
+                // #A8: blind-path annotation is a pushed-overlay concept
+                // (classified from a push's changed_files at consume);
+                // the local watch path has no push, so never annotated.
+                ra_blind_paths: false,
             },
         );
     };

@@ -1365,6 +1365,9 @@ mod tests {
             // SSE attribution case: the echo must survive the SSE frame
             // (the subscribe-driven poller path A2 exists for).
             base_sha: Some("feedfeedfeedfeedfeedfeedfeedfeedfeedfeed".into()),
+            // #A8 annotation case: the blind-path bit must survive the
+            // SSE frame too (a gate consumer keys witness demand on it).
+            ra_blind_paths: true,
             published_at: 5,
         };
         svc.emit(ev.clone());
@@ -2085,6 +2088,7 @@ mod tests {
             red_diagnostics: 0,
             verdict_failure_reason: None,
             base_sha: None,
+            ra_blind_paths: false,
             heartbeat_age_secs: 0,
             published_at: 1,
         });

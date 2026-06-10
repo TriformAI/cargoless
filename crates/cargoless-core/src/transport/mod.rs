@@ -250,6 +250,19 @@ pub struct WorktreeStatus {
     /// verdicts) — pollers treat absence as "unattributed", never as a
     /// match. Additive wire key; absent on the wire when `None`.
     pub base_sha: Option<String>,
+    /// **#A8 macro-blind annotation** — `true` iff the consumed push's
+    /// `changed_files` matched the daemon's configured proc-macro-blind
+    /// path globs (`CARGOLESS_MACRO_BLIND_PATHS`). On those paths the
+    /// RA-native verdict cannot see errors that only exist after
+    /// proc-macro expansion (the tf-mv #4070 class: `view!` bodies
+    /// needing `.into_any()`, double-capture moves), so `green` here is
+    /// machine-readably *necessary but not sufficient* — a consumer may
+    /// require a witness-backed verdict for such pushes instead of
+    /// treating green as proof. `false` when no glob matched, when the
+    /// daemon has no globs configured, or when the push carried no
+    /// `changed_files` (unattributable — absence of evidence is never a
+    /// hit). Additive wire key; absent on the wire when `false`.
+    pub ra_blind_paths: bool,
     pub heartbeat_age_secs: u64,
     pub published_at: u64,
 }
@@ -285,6 +298,11 @@ pub struct TransitionEvent {
     /// be able to discard another branch's verdict without a status
     /// round-trip (the round-trip is exactly the race window).
     pub base_sha: Option<String>,
+    /// See [`WorktreeStatus::ra_blind_paths`] (#A8) — mirrored so a
+    /// subscribe-driven gate consumer can see "this green is RA-blind"
+    /// on the event itself and demand a witness without a status
+    /// round-trip.
+    pub ra_blind_paths: bool,
     pub published_at: u64,
 }
 
@@ -1350,6 +1368,11 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
                 serde_json::Value::String(sha.clone()),
             );
     }
+    if s.ra_blind_paths {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert("ra_blind_paths".to_string(), serde_json::Value::Bool(true));
+    }
     obj.to_string()
 }
 
@@ -1386,6 +1409,10 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("base_sha")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
+        ra_blind_paths: v
+            .get("ra_blind_paths")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         heartbeat_age_secs: v
             .get("heartbeat_age_secs")
             .and_then(serde_json::Value::as_u64)
@@ -1472,6 +1499,11 @@ pub fn event_to_json(e: &TransitionEvent) -> String {
                 serde_json::Value::String(sha.clone()),
             );
     }
+    if e.ra_blind_paths {
+        obj.as_object_mut()
+            .expect("event_to_json constructed an object literal")
+            .insert("ra_blind_paths".to_string(), serde_json::Value::Bool(true));
+    }
     obj.to_string()
 }
 
@@ -1503,6 +1535,10 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
             .get("base_sha")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
+        ra_blind_paths: v
+            .get("ra_blind_paths")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         published_at: v
             .get("published_at")
             .and_then(serde_json::Value::as_u64)
@@ -1780,10 +1816,18 @@ mod tests {
             // Attribution case: a gate push carries its commit; the echo
             // must survive the wire byte-for-byte (pollers string-match).
             base_sha: Some("0123abc0123abc0123abc0123abc0123abc01234".into()),
+            // #A8 annotation case: a macro-blind-path push must carry the
+            // bit across the wire (a consumer keys witness demand on it).
+            ra_blind_paths: true,
             heartbeat_age_secs: 2,
             published_at: 1234567890,
         };
-        assert_eq!(status_from_json(&status_to_json(&s)), Some(s));
+        let wire = status_to_json(&s);
+        assert!(
+            wire.contains(r#""ra_blind_paths":true"#),
+            "blind-path hit must appear on the wire: {wire}"
+        );
+        assert_eq!(status_from_json(&wire), Some(s));
 
         let s2 = WorktreeStatus {
             worktree: "tf-mv-check".into(),
@@ -1804,6 +1848,7 @@ mod tests {
             // Legacy case: no SHA on the push ⇒ key absent on the wire
             // (additive contract — old parsers see exactly the old JSON).
             base_sha: None,
+            ra_blind_paths: false,
             heartbeat_age_secs: 0,
             published_at: 42,
         };
@@ -1811,6 +1856,10 @@ mod tests {
         assert!(
             !wire.contains("base_sha"),
             "absent base_sha must not appear on the wire: {wire}"
+        );
+        assert!(
+            !wire.contains("ra_blind_paths"),
+            "false ra_blind_paths must not appear on the wire (#A8 additive contract): {wire}"
         );
         assert_eq!(status_from_json(&wire), Some(s2));
     }
@@ -1826,6 +1875,10 @@ mod tests {
         assert_eq!(s.daemon_build_id, "");
         assert_eq!(s.red_diagnostics, 0);
         assert!(s.crates.is_empty());
+        assert!(
+            !s.ra_blind_paths,
+            "absent ra_blind_paths key ⇒ false (#A8 pre-A8 servers)"
+        );
     }
 
     #[test]

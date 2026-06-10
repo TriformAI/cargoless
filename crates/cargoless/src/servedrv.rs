@@ -660,6 +660,7 @@ fn heartbeat_repo_status(repo_root: &Path) {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: cargoless_core::build_id().to_string(),
+            ra_blind_paths: false,
         });
     status.pid = std::process::id();
     status.updated = now;
@@ -1139,8 +1140,23 @@ fn exec(
             // default stays Warn — the deployed posture keeps ~2s
             // RA-native verdicts for plain pushes; only gate pushes wait.
             let gate_requested = project_check_context.as_ref().is_some_and(|ctx| ctx.gate);
-            let payload = match effective_project_checks_mode(project_checks_mode(), gate_requested)
-            {
+            // #A8 escalation: a push whose changed_files hit the
+            // macro-blind globs is promoted like a gate push — but only
+            // under the explicit opt-in, because it trades the ~2s
+            // RA-native verdict for the witness on those paths.
+            let macro_blind_hit = attribution.as_ref().is_some_and(|a| a.macro_blind_hit);
+            let macro_blind_escalation = macro_blind_hit && macro_blind_escalate();
+            if macro_blind_escalation && !gate_requested {
+                eprintln!(
+                    "[cargoless:obs] macro-blind-escalate wt={} reason=blind-path-push mode-request=hard (#A8)",
+                    wt.display()
+                );
+            }
+            let payload = match effective_project_checks_mode(
+                project_checks_mode(),
+                gate_requested,
+                macro_blind_escalation,
+            ) {
                 ProjectChecksMode::Off => {
                     // No project-check signal; the only input is the
                     // RA-native bool. Routed through the legacy shim
@@ -1284,6 +1300,11 @@ fn publish_verdict(
     // attribution map entry — an in-body pop would stamp the SECOND
     // push's base_sha onto the FIRST push's verdict (#A4.3).
     let verdict_latency_ms = attribution.as_ref().map(|a| a.verdict_latency_ms());
+    // #A8 — the blind bit was classified at SwitchOverlay consume and
+    // rides the same popped attribution as base_sha, so it can never be
+    // another push's classification. FS-watch verdicts (no attribution)
+    // are never blind-annotated: no changed_files evidence exists.
+    let ra_blind_paths = attribution.as_ref().is_some_and(|a| a.macro_blind_hit);
     // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
     // This span MUST be the only emission of `verdict.publish`, mirroring
     // the structural invariant that publish_verdict fires exactly once per
@@ -1326,6 +1347,10 @@ fn publish_verdict(
             .as_ref()
             .and_then(|a| a.base_sha.as_deref())
             .unwrap_or(""),
+        // #A8 — lets a SigNoz query split "green on a blind path"
+        // (necessary-not-sufficient) from plain green without joining
+        // against the push side.
+        ra_blind_paths = ra_blind_paths,
         pid = std::process::id(),
         trigger_source = "EmitVerdict",
         analysed_at = now,
@@ -1353,6 +1378,9 @@ fn publish_verdict(
         // `analysed_at` at the original settle time).
         analysed_at: now,
         build_id: cargoless_core::build_id().to_string(),
+        // #A8: same bit as the wire status — the operator reading the
+        // on-disk file sees the same blind-path annotation a poller does.
+        ra_blind_paths,
     };
     statusfile::write(wt, &st);
     eprintln!(
@@ -1379,7 +1407,12 @@ fn publish_verdict(
     // Same site, mirror sink: feed the read-plane VerdictService + emit
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.
-    api.publish_attributed(wt, payload, attribution.and_then(|a| a.base_sha));
+    api.publish_attributed(
+        wt,
+        payload,
+        attribution.and_then(|a| a.base_sha),
+        ra_blind_paths,
+    );
 }
 
 /// #A7 — verdict-latency SLO threshold (ms) for the `slo_breach=` stderr
@@ -1415,14 +1448,34 @@ fn project_checks_mode() -> ProjectChecksMode {
 /// witness-gated verdict; in Warn deployments that promotes exactly that
 /// push to Hard. `Off` stays `Off` (an operator kill-switch outranks a
 /// client request); `Hard` is already the requested strength.
+///
+/// #A8 — `macro_blind_escalation` is the second promotion input: the
+/// consumed push touched a macro-blind path (`PushAttribution::
+/// macro_blind_hit`) AND the operator opted in via
+/// `CARGOLESS_MACRO_BLIND_ESCALATE=1`. Same strengthen-only semantics as
+/// the gate bit: RA-native green on a blind path is necessary-not-
+/// sufficient, so the push is promoted to the witness-gated verdict
+/// rather than publishing a green RA cannot stand behind. `Off` still
+/// outranks both (the kill-switch posture is unchanged).
 fn effective_project_checks_mode(
     mode: ProjectChecksMode,
     gate_requested: bool,
+    macro_blind_escalation: bool,
 ) -> ProjectChecksMode {
-    match (mode, gate_requested) {
+    match (mode, gate_requested || macro_blind_escalation) {
         (ProjectChecksMode::Warn, true) => ProjectChecksMode::Hard,
         (mode, _) => mode,
     }
+}
+
+/// #A8 — opt-in switch for macro-blind escalation. Annotation
+/// (`ra_blind_paths` on the wire) is ALWAYS on once globs are configured;
+/// promotion to the witness-gated verdict additionally requires this
+/// explicit `=1`, because it changes verdict latency for those pushes
+/// from ~2s RA-native to the minutes-scale witness — an enforcement-point
+/// decision the operator makes, never a default.
+fn macro_blind_escalate() -> bool {
+    std::env::var("CARGOLESS_MACRO_BLIND_ESCALATE").is_ok_and(|v| v == "1")
 }
 
 /// Compose a `VerdictPayload` from the RA-native bool + the
@@ -2356,9 +2409,33 @@ mod tests {
             (Hard, true, Hard),
         ] {
             assert_eq!(
-                effective_project_checks_mode(mode, gate),
+                effective_project_checks_mode(mode, gate, false),
                 want,
                 "mode={mode:?} gate={gate}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_blind_escalation_promotes_like_gate_and_off_still_wins() {
+        // #A8 truth table: the blind-escalation bit is a second
+        // strengthen-only input with identical semantics to the gate
+        // bit — Warn promotes to Hard, Off (operator kill-switch) and
+        // Hard stay fixed points. Either input alone suffices; the
+        // caller has already ANDed the opt-in env into this bit.
+        use ProjectChecksMode::*;
+        for (mode, gate, blind, want) in [
+            (Off, false, true, Off),
+            (Off, true, true, Off),
+            (Warn, false, true, Hard),
+            (Warn, true, true, Hard),
+            (Warn, false, false, Warn),
+            (Hard, false, true, Hard),
+        ] {
+            assert_eq!(
+                effective_project_checks_mode(mode, gate, blind),
+                want,
+                "mode={mode:?} gate={gate} blind={blind}"
             );
         }
     }
@@ -2387,6 +2464,7 @@ mod tests {
     fn test_attribution(base_sha: &str) -> crate::serveapi::PushAttribution {
         crate::serveapi::PushAttribution {
             base_sha: Some(base_sha.to_string()),
+            macro_blind_hit: false,
             push_received_unix: statusfile::now_unix(),
             consumed_unix: statusfile::now_unix(),
             consumed_at: Instant::now(),
