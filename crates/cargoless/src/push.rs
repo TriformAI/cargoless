@@ -90,6 +90,9 @@ pub struct PushOpts {
     pub await_verdict: bool,
     /// Wall-clock timeout for `await_verdict`.
     pub await_timeout_secs: u64,
+    /// `push --gate` — merge-gate push: ask the daemon to promote this
+    /// push's project-check mode from Warn to Hard (witness-gated verdict).
+    pub gate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +173,7 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         } else {
             Some(payload.trigger_paths.clone())
         },
+        gate: opts.gate,
         ..PushOverlayOptions::default()
     };
     if let Some(root) = opts.server_root.as_ref() {
@@ -963,6 +967,7 @@ mod tests {
             server_root: None,
             await_verdict: true,
             await_timeout_secs: 10,
+            gate: false,
         };
         // Cheap clone+eq sanity (the v0 CLI Opts shape relies on
         // PartialEq for the parser tests in main.rs).

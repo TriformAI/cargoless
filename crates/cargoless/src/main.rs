@@ -135,6 +135,9 @@ struct Opts {
     /// `push --await-verdict` — block until the remote publishes a fresh
     /// verdict for this pushed worktree.
     push_await_verdict: bool,
+    /// `push --gate` — merge-gate push: the daemon promotes this push's
+    /// project-check mode from Warn to Hard (witness-gated verdict).
+    push_gate: bool,
     /// `push --await-timeout-secs <N>` — max wait for fresh verdict.
     push_await_timeout_secs: Option<u64>,
     /// `batch-check --request-json <PATH>` — native batch_check transport
@@ -339,6 +342,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 ));
             }
             "--await-verdict" => opts.push_await_verdict = true,
+            "--gate" => opts.push_gate = true,
             "--request-json" => {
                 opts.batch_request_json = Some(PathBuf::from(
                     it.next()
@@ -457,6 +461,7 @@ fn usage() {
     println!("  --await-verdict      push: wait for a fresh remote verdict");
     println!("  --await-timeout-secs <N>");
     println!("                        push: max wait for --await-verdict (default 900)");
+    println!("  --gate               push: witness-gated (Hard) verdict for this push");
     println!();
     println!(
         "check/watch/build/status/clean are single-project (headless, no \
@@ -670,6 +675,7 @@ fn main() -> ExitCode {
                 server_root: parsed.opts.push_server_root.clone(),
                 await_verdict: parsed.opts.push_await_verdict,
                 await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
+                gate: parsed.opts.push_gate,
             });
         }
         Cmd::BatchCheck => {
@@ -887,6 +893,18 @@ mod tests {
     fn features_flag_accepts_equals_form() {
         let p = parse(&v(&["check", "--features=ssr-frontend telephony"])).unwrap();
         assert_eq!(p.opts.features.as_deref(), Some("ssr-frontend telephony"));
+    }
+
+    #[test]
+    fn push_gate_flag_parses_and_defaults_off() {
+        let p = parse(&v(&["push", "--remote", "http://h:1", "--gate"])).unwrap();
+        assert_eq!(p.cmd, Cmd::Push);
+        assert!(p.opts.push_gate);
+        let p = parse(&v(&["push", "--remote", "http://h:1"])).unwrap();
+        assert!(
+            !p.opts.push_gate,
+            "gate must default off — plain dev pushes stay warn-fast"
+        );
     }
 
     #[test]

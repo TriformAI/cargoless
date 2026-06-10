@@ -1015,11 +1015,14 @@ fn exec(
                 let materialize_overlay = pushed.analysis_root.is_some();
                 api.record_project_check_context(
                     &wt_key,
-                    project_root,
-                    pushed.changed_files.clone(),
-                    pushed.base_ref.clone(),
-                    pushed.files.clone(),
-                    materialize_overlay,
+                    crate::serveapi::ProjectCheckRunContext {
+                        root: project_root,
+                        changed_files: pushed.changed_files.clone(),
+                        base_ref: pushed.base_ref.clone(),
+                        overlay_files: pushed.files.clone(),
+                        materialize_overlay,
+                        gate: pushed.gate,
+                    },
                 );
                 pushed.files
             } else {
@@ -1737,6 +1740,7 @@ mod tests {
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -1793,6 +1797,7 @@ mod tests {
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
             changed_files: Some(vec!["Cargo.toml".into()]),
+            gate: false,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
