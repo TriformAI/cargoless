@@ -75,6 +75,7 @@ name = "cargoless"
 version = "0.3.0"
 dependencies = [
  "cargoless-core",
+ "futures-executor",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
