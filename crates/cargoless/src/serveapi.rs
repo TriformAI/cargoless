@@ -39,8 +39,9 @@
 //! rather than fabricating detail the loop does not yet compute.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1385,6 +1386,29 @@ fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Run `op` up to `1 + sleeps.len()` times, sleeping `sleeps[n]` after
+/// failed attempt `n`. `op` receives the 0-based attempt index so call
+/// sites can log retries. First success wins; otherwise the last error
+/// propagates.
+fn retry_with_sleeps<T>(
+    sleeps: &[Duration],
+    mut op: impl FnMut(usize) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut attempt = 0;
+    loop {
+        match op(attempt) {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt >= sleeps.len() {
+                    return Err(e);
+                }
+                std::thread::sleep(sleeps[attempt]);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     if !root.join(".git").exists() {
         return Err(format!(
@@ -1396,7 +1420,21 @@ fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
         .strip_prefix("origin/")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(base_ref);
-    run_git(root, &["fetch", "--prune", "origin", fetch_ref])?;
+    // The fetch is the only network step here: transient hiccups get 2
+    // retries (1s then 3s) before the error fails the whole push/batch.
+    // The reset/clean below stay single-shot — they are local-only.
+    retry_with_sleeps(
+        &[Duration::from_secs(1), Duration::from_secs(3)],
+        |attempt| {
+            if attempt > 0 {
+                eprintln!(
+                    "[cargoless:git] fetch retry attempt={attempt} worktree-root={}",
+                    root.display()
+                );
+            }
+            run_git(root, &["fetch", "--prune", "origin", fetch_ref])
+        },
+    )?;
     reset_analysis_root(root, base_ref)?;
     Ok(())
 }
@@ -1523,19 +1561,107 @@ fn materialize_overlay_files_from_root(
     Ok(())
 }
 
+/// Output of a bounded child run: `Command::output()` shape with the
+/// streams pre-decoded (lossy) — every consumer here wants strings.
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// `Command::output()` with a deadline: spawn with piped stdout/stderr
+/// drained by two reader threads, poll `try_wait` (~50ms) until `timeout`
+/// elapses, then kill the child and fail. Mirrors the proven
+/// spawn/deadline/kill + reader-thread pattern in
+/// `cargoless_core::project_checks::check_command`. Every git op here
+/// runs under `sync_lock`, so an unbounded wait on one wedged `git
+/// fetch` would hold the lock — and every push ack behind it — forever.
+fn run_command_bounded(cmd: &mut Command, timeout: Duration) -> Result<BoundedOutput, String> {
+    // `Command::output()` nulls stdin; preserve that so a credential
+    // prompt can never wedge the child on terminal input.
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start: {e}"))?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_thread = std::thread::spawn(move || read_pipe(&mut stdout));
+    let err_thread = std::thread::spawn(move || read_pipe(&mut stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Join the readers briefly, then detach: a grandchild
+                // (ssh / git-remote-https) that inherited the pipe write
+                // end can hold it open past the kill, and the bound on
+                // THIS call is the contract. Detached threads exit when
+                // the pipe finally closes.
+                let join_deadline = Instant::now() + Duration::from_millis(250);
+                while !(out_thread.is_finished() && err_thread.is_finished())
+                    && Instant::now() < join_deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return Err(format!("timed out after {}ms", timeout.as_millis()));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait: {e}"));
+            }
+        }
+    };
+    Ok(BoundedOutput {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
+}
+
+fn read_pipe(pipe: &mut Option<impl Read>) -> String {
+    let mut out = String::new();
+    if let Some(pipe) = pipe {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    out
+}
+
+/// Deadline for one git invocation: `CARGOLESS_GIT_TIMEOUT_MS` overrides
+/// everything when set (ops escape hatch); otherwise network fetches get
+/// 120s and local-only git ops 60s.
+fn git_timeout(args: &[&str]) -> Duration {
+    let env_ms = std::env::var("CARGOLESS_GIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    git_timeout_from(env_ms, args)
+}
+
+fn git_timeout_from(env_ms: Option<u64>, args: &[&str]) -> Duration {
+    if let Some(ms) = env_ms {
+        return Duration::from_millis(ms);
+    }
+    if args.first() == Some(&"fetch") {
+        Duration::from_millis(120_000)
+    } else {
+        Duration::from_millis(60_000)
+    }
+}
+
+fn git_command(root: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    cmd
+}
+
 fn run_git(root: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .map_err(|e| {
-            format!(
-                "git {:?} in `{}` failed to start: {e}",
-                args,
-                root.display()
-            )
-        })?;
+    let out = run_command_bounded(&mut git_command(root, args), git_timeout(args))
+        .map_err(|e| format!("git {:?} in `{}` {e}", args, root.display()))?;
     if out.status.success() {
         return Ok(());
     }
@@ -1544,49 +1670,115 @@ fn run_git(root: &Path, args: &[&str]) -> Result<(), String> {
         args,
         root.display(),
         out.status.code(),
-        String::from_utf8_lossy(&out.stderr).trim()
+        out.stderr.trim()
     ))
 }
 
 fn run_git_success(root: &Path, args: &[&str]) -> Result<bool, String> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .status()
-        .map_err(|e| {
-            format!(
-                "git {:?} in `{}` failed to start: {e}",
-                args,
-                root.display()
-            )
-        })?;
-    Ok(status.success())
+    let out = run_command_bounded(&mut git_command(root, args), git_timeout(args))
+        .map_err(|e| format!("git {:?} in `{}` {e}", args, root.display()))?;
+    Ok(out.status.success())
 }
 
 fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .map_err(|e| {
-            format!(
-                "git {:?} in `{}` failed to start: {e}",
-                args,
-                root.display()
-            )
-        })?;
+    let out = run_command_bounded(&mut git_command(root, args), git_timeout(args))
+        .map_err(|e| format!("git {:?} in `{}` {e}", args, root.display()))?;
     if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        return Ok(out.stdout.trim().to_string());
     }
     Err(format!(
         "git {:?} in `{}` exited {:?}: {}",
         args,
         root.display(),
         out.status.code(),
-        String::from_utf8_lossy(&out.stderr).trim()
+        out.stderr.trim()
     ))
+}
+
+#[cfg(test)]
+mod git_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn run_command_bounded_kills_on_deadline() {
+        let start = Instant::now();
+        let err = run_command_bounded(Command::new("sleep").arg("30"), Duration::from_millis(300))
+            .unwrap_err();
+        assert!(err.contains("timed out after 300ms"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "deadline must bound the wait far under the child's 30s sleep; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_command_bounded_captures_output_within_deadline() {
+        let out = run_command_bounded(Command::new("echo").arg("bounded"), Duration::from_secs(30))
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.trim(), "bounded");
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn run_git_fails_fast_without_consuming_the_timeout() {
+        let start = Instant::now();
+        let err = run_git(
+            Path::new("/cargoless-no-such-dir"),
+            &["definitely-not-a-git-subcommand"],
+        )
+        .unwrap_err();
+        assert!(!err.contains("timed out"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "a fast git failure must not wait out the deadline; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn retry_with_sleeps_retries_then_succeeds() {
+        let mut calls = 0;
+        let result = retry_with_sleeps(&[Duration::ZERO, Duration::ZERO], |attempt| {
+            calls += 1;
+            if attempt < 2 {
+                Err(format!("transient {attempt}"))
+            } else {
+                Ok(attempt)
+            }
+        });
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(calls, 3, "fail, fail, succeed = 3 invocations");
+    }
+
+    #[test]
+    fn retry_with_sleeps_propagates_last_error_after_exhaustion() {
+        let mut calls = 0;
+        let err = retry_with_sleeps(&[Duration::ZERO], |_| -> Result<(), String> {
+            calls += 1;
+            Err(format!("fail {calls}"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2, "one retry sleep = two attempts");
+        assert_eq!(err, "fail 2");
+    }
+
+    #[test]
+    fn git_timeout_env_overrides_then_fetch_and_local_defaults_split() {
+        assert_eq!(
+            git_timeout_from(Some(5_000), &["fetch", "origin", "main"]),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            git_timeout_from(None, &["fetch", "--prune", "origin", "main"]),
+            Duration::from_millis(120_000)
+        );
+        assert_eq!(
+            git_timeout_from(None, &["reset", "--hard", "origin/main"]),
+            Duration::from_millis(60_000)
+        );
+    }
 }
 
 #[cfg(test)]
