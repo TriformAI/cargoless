@@ -1,7 +1,7 @@
 //! HTTP + SSE adapter (`D-FLEET-SHARED-DAEMON` §10.2 network mode +
 //! §11 SSE-vs-polling). `serve --repo --bind <addr>` exposes the logical
-//! API over a **minimal, bounded, std-only HTTP/1.1** server (no HTTP
-//! framework — the house ethos: JSON-RPC framing / debounce / ignore are
+//! API over a **minimal, bounded HTTP/1.1** server (no HTTP framework —
+//! the house ethos: JSON-RPC framing / debounce / ignore are
 //! all hand-rolled in-crate; an HTTP crate would be the first heavy dep).
 //!
 //! Routes (§10.1 / §11):
@@ -39,6 +39,10 @@ use std::thread;
 use std::time::Duration;
 
 use cargoless_proto::Diagnostic;
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use native_tls::{HandshakeError, TlsConnector, TlsStream};
 
 use super::{
     Authorizer, BatchCheckRequest, BatchReport, DaemonActivity, PushOverlayAck, PushOverlayOptions,
@@ -55,6 +59,10 @@ use super::{
 /// MiB comfortably covers a whole-file overlay-set for a real workspace
 /// while fail-closed-bounding a hostile/runaway client.
 pub const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
+/// Compress large JSON request bodies before applying the fixed HTTP cap.
+/// This targets full-file generated overlays without changing the logical
+/// push protocol or making small same-host requests pay gzip overhead.
+pub const HTTP_COMPRESSION_MIN_BYTES: usize = 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// TCP connect only — read/write keep [`CLIENT_IO_TIMEOUT`]. Daemon-down
 /// detection drops 10s to 2s; the gate failover ladder relies on fast
@@ -75,6 +83,9 @@ struct HttpReq {
     /// non-numeric value both collapse to `None` ⇒ the POST handler
     /// answers `400` (every GET route still reads no body).
     content_length: Option<usize>,
+    /// Optional request body encoding. `gzip` is accepted on the bounded POST
+    /// routes; unknown encodings fail closed with `415`.
+    content_encoding: Option<String>,
 }
 
 /// Parse the request line + headers (method/path/query +
@@ -94,6 +105,7 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
     };
     let mut bearer = None;
     let mut content_length = None;
+    let mut content_encoding = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -113,6 +125,8 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
                 // Non-numeric ⇒ stays `None` ⇒ POST /overlay answers 400
                 // (absent and non-numeric are the same client error).
                 content_length = v.trim().parse::<usize>().ok();
+            } else if k.eq_ignore_ascii_case("content-encoding") {
+                content_encoding = Some(v.trim().to_ascii_lowercase());
             }
         }
     }
@@ -122,6 +136,7 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
         query,
         bearer,
         content_length,
+        content_encoding,
     })
 }
 
@@ -151,6 +166,92 @@ fn daemon_activity_to_json(activity: &DaemonActivity) -> String {
         "inflight_batch_runs": activity.inflight_batch_runs,
     })
     .to_string()
+}
+
+/// Encoded HTTP request body ready to place after the headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedJsonBody {
+    pub bytes: Vec<u8>,
+    pub content_encoding: Option<&'static str>,
+    pub raw_len: usize,
+}
+
+impl PreparedJsonBody {
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Prepare a JSON request body for the bounded HTTP POST routes. Bodies under
+/// [`HTTP_COMPRESSION_MIN_BYTES`] stay byte-for-byte plain JSON; larger bodies
+/// use gzip only when that reduces the encoded length.
+pub fn prepare_json_body(body: &str) -> Result<PreparedJsonBody, TransportError> {
+    let raw = body.as_bytes();
+    if raw.len() < configured_compression_min_bytes() {
+        return Ok(PreparedJsonBody {
+            bytes: raw.to_vec(),
+            content_encoding: None,
+            raw_len: raw.len(),
+        });
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw)?;
+    let compressed = encoder.finish()?;
+    if compressed.len() < raw.len() {
+        Ok(PreparedJsonBody {
+            bytes: compressed,
+            content_encoding: Some("gzip"),
+            raw_len: raw.len(),
+        })
+    } else {
+        Ok(PreparedJsonBody {
+            bytes: raw.to_vec(),
+            content_encoding: None,
+            raw_len: raw.len(),
+        })
+    }
+}
+
+fn configured_compression_min_bytes() -> usize {
+    std::env::var("CARGOLESS_HTTP_COMPRESSION_MIN_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(HTTP_COMPRESSION_MIN_BYTES)
+}
+
+fn decode_request_body(
+    req: &HttpReq,
+    encoded: Vec<u8>,
+) -> Result<Vec<u8>, (u16, &'static str, String)> {
+    match req.content_encoding.as_deref().filter(|v| !v.is_empty()) {
+        None | Some("identity") => Ok(encoded),
+        Some("gzip") => {
+            let mut decoder = GzDecoder::new(encoded.as_slice());
+            let mut limited = (&mut decoder).take((MAX_OVERLAY_BYTES + 1) as u64);
+            let mut decoded = Vec::new();
+            if let Err(e) = limited.read_to_end(&mut decoded) {
+                return Err((
+                    400,
+                    "Bad Request",
+                    format!("gzip request body could not be decoded: {e}"),
+                ));
+            }
+            if decoded.len() > MAX_OVERLAY_BYTES {
+                return Err((
+                    413,
+                    "Payload Too Large",
+                    "decoded request body exceeds the size cap".to_string(),
+                ));
+            }
+            Ok(decoded)
+        }
+        Some(other) => Err((
+            415,
+            "Unsupported Media Type",
+            format!("unsupported Content-Encoding: {other}"),
+        )),
+    }
 }
 
 // ---- server -------------------------------------------------------------
@@ -253,7 +354,8 @@ impl HttpServer {
     /// signature/behaviour, the [`VerdictService`] trait, the wire codec,
     /// the discovery chain, and the #14 auth seam for **every other
     /// route** are byte-frozen and their exhaustive unit suites untouched.
-    /// `/healthz` is the ONLY auth-exempt path (see [`handle`]).
+    /// `/healthz` and the A6 `/readyz` probe are the ONLY auth-exempt
+    /// paths (see [`handle`]).
     pub fn bind_with_health(
         addr: &str,
         svc: Arc<dyn VerdictService>,
@@ -354,6 +456,25 @@ fn handle(
         write_response(&mut writer, code, reason, "application/json", body);
         return;
     }
+    // ── GET /readyz — RA-warm readiness probe (A6) ──────────────────────
+    // Same no-auth treatment as /healthz (answer + `return` BEFORE the
+    // #14 gate; the exemption stays exactly these two probe paths) and the
+    // same fixed-constant zero-leakage body discipline. Semantics split:
+    // /healthz stays the startup/liveness probe (serve loop entered);
+    // /readyz reflects `svc.ready()` — the service can produce a
+    // meaningful verdict NOW (rust-analyzer warm). k8s: livenessProbe
+    // stays on /healthz; readinessProbe moves to /readyz in the
+    // tf-multiverse manifests (separate repo), so a fresh pod is not
+    // Service-routable while its RA index is still warming.
+    if req.path == "/readyz" {
+        let (code, reason, body): (u16, &str, &str) = if svc.ready() {
+            (200, "OK", "ready")
+        } else {
+            (503, "Service Unavailable", "warming")
+        };
+        write_response(&mut writer, code, reason, "text/plain", body);
+        return;
+    }
     // #14 seam — AllowAll under #10, so this never denies today; the
     // 401 path exists so #14 is pure policy, not a structural change.
     if !auth.authorize(req.bearer.as_deref()) {
@@ -426,6 +547,13 @@ fn handle(
                     return;
                 }
                 buf
+            }
+        };
+        let body = match decode_request_body(&req, body) {
+            Ok(body) => body,
+            Err((code, reason, message)) => {
+                write_response(&mut writer, code, reason, "text/plain", &message);
+                return;
             }
         };
         match Request::from_json(&String::from_utf8_lossy(&body)) {
@@ -520,6 +648,13 @@ fn handle(
                     return;
                 }
                 buf
+            }
+        };
+        let body = match decode_request_body(&req, body) {
+            Ok(body) => body,
+            Err((code, reason, message)) => {
+                write_response(&mut writer, code, reason, "text/plain", &message);
+                return;
             }
         };
         match Request::from_json(&String::from_utf8_lossy(&body)) {
@@ -670,9 +805,56 @@ fn pct_decode(s: &str) -> String {
 
 // ---- client -------------------------------------------------------------
 
-/// HTTP client for the §10.3 `--remote <url>` path. `base` is like
-/// `http://127.0.0.1:8080` (no trailing slash required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpScheme {
+    Http,
+    Https,
+}
+
+impl HttpScheme {
+    fn default_port(self) -> u16 {
+        match self {
+            HttpScheme::Http => 80,
+            HttpScheme::Https => 443,
+        }
+    }
+}
+
+enum ClientStream {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ClientStream::Plain(stream) => stream.read(buf),
+            ClientStream::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ClientStream::Plain(stream) => stream.write(buf),
+            ClientStream::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(stream) => stream.flush(),
+            ClientStream::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+/// HTTP(S) client for the §10.3 `--remote <url>` path. `base` is like
+/// `http://127.0.0.1:8080` or `https://cargoless.example` (no trailing slash
+/// required).
 pub struct HttpClient {
+    scheme: HttpScheme,
     host: String,
     port: u16,
     /// Bearer token for protected HTTP transport routes. `None` ⇒ no
@@ -682,25 +864,63 @@ pub struct HttpClient {
     token: Option<String>,
 }
 
-impl HttpClient {
-    /// Parse `http://host:port` (the only scheme #10 serves; #14 may add
-    /// TLS). Returns a protocol error on a malformed base rather than
-    /// panicking — discovery then falls through. Token-less (the GET read
-    /// paths are token-less); use [`Self::with_token`] for an authed daemon.
-    pub fn new(base: &str) -> Result<Self, TransportError> {
-        let rest = base
-            .strip_prefix("http://")
-            .ok_or_else(|| TransportError::Protocol(format!("unsupported URL: {base}")))?;
-        let rest = rest.trim_end_matches('/');
-        let (host, port) = match rest.split_once(':') {
-            Some((h, p)) => (
-                h.to_string(),
-                p.parse::<u16>()
-                    .map_err(|_| TransportError::Protocol(format!("bad port: {p}")))?,
-            ),
-            None => (rest.to_string(), 80),
+fn parse_host_port(rest: &str, default_port: u16) -> Result<(String, u16), String> {
+    if let Some(after_open) = rest.strip_prefix('[') {
+        let (host, suffix) = after_open
+            .split_once(']')
+            .ok_or_else(|| format!("bad IPv6 host: {rest}"))?;
+        if host.is_empty() {
+            return Err("empty host".into());
+        }
+        let port = match suffix.strip_prefix(':') {
+            Some(port) if !port.is_empty() => port
+                .parse::<u16>()
+                .map_err(|_| format!("bad port: {port}"))?,
+            Some(_) => return Err("bad port: ".into()),
+            None if suffix.is_empty() => default_port,
+            None => return Err(format!("bad host/port: {rest}")),
         };
+        return Ok((host.to_string(), port));
+    }
+
+    match rest.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            if host.is_empty() {
+                return Err("empty host".into());
+            }
+            Ok((
+                host.to_string(),
+                port.parse::<u16>()
+                    .map_err(|_| format!("bad port: {port}"))?,
+            ))
+        }
+        Some(_) => Err(format!("bad host/port: {rest}; bracket IPv6 addresses")),
+        None if rest.is_empty() => Err("empty host".into()),
+        None => Ok((rest.to_string(), default_port)),
+    }
+}
+
+impl HttpClient {
+    /// Parse `http://host:port` or `https://host:port`. Returns a protocol
+    /// error on a malformed base rather than panicking — discovery then falls
+    /// through. Token-less (the GET read paths are token-less); use
+    /// [`Self::with_token`] for an authed daemon.
+    pub fn new(base: &str) -> Result<Self, TransportError> {
+        let (scheme, rest) = if let Some(rest) = base.strip_prefix("http://") {
+            (HttpScheme::Http, rest)
+        } else if let Some(rest) = base.strip_prefix("https://") {
+            (HttpScheme::Https, rest)
+        } else {
+            return Err(TransportError::Protocol(format!("unsupported URL: {base}")));
+        };
+        let rest = rest.trim_end_matches('/');
+        if rest.is_empty() || rest.contains('/') {
+            return Err(TransportError::Protocol(format!("bad remote URL: {base}")));
+        }
+        let (host, port) =
+            parse_host_port(rest, scheme.default_port()).map_err(TransportError::Protocol)?;
         Ok(Self {
+            scheme,
             host,
             port,
             token: None,
@@ -715,14 +935,14 @@ impl HttpClient {
         Ok(c)
     }
 
-    fn connect(&self) -> Result<TcpStream, TransportError> {
+    fn connect(&self) -> Result<ClientStream, TransportError> {
         self.connect_with_read_timeout(CLIENT_IO_TIMEOUT)
     }
 
     fn connect_with_read_timeout(
         &self,
         read_timeout: Duration,
-    ) -> Result<TcpStream, TransportError> {
+    ) -> Result<ClientStream, TransportError> {
         let mut addrs = (self.host.as_str(), self.port).to_socket_addrs()?;
         let addr = addrs
             .next()
@@ -730,7 +950,73 @@ impl HttpClient {
         let stream = TcpStream::connect_timeout(&addr, CLIENT_CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(read_timeout))?;
         stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
-        Ok(stream)
+        match self.scheme {
+            HttpScheme::Http => Ok(ClientStream::Plain(stream)),
+            HttpScheme::Https => {
+                let connector = TlsConnector::new()
+                    .map_err(|e| TransportError::Protocol(format!("TLS init failed: {e}")))?;
+                match connector.connect(&self.host, stream) {
+                    Ok(stream) => Ok(ClientStream::Tls(stream)),
+                    Err(HandshakeError::Failure(e)) => Err(TransportError::Protocol(format!(
+                        "TLS handshake failed for {}:{}: {e}",
+                        self.host, self.port
+                    ))),
+                    Err(HandshakeError::WouldBlock(_)) => Err(TransportError::Protocol(format!(
+                        "TLS handshake would block for {}:{}",
+                        self.host, self.port
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn post_json(
+        &self,
+        path: &str,
+        body: &str,
+        read_timeout: Duration,
+        too_large_label: &str,
+    ) -> Result<(u16, String), TransportError> {
+        let prepared = prepare_json_body(body)?;
+        if prepared.raw_len > MAX_OVERLAY_BYTES || prepared.encoded_len() > MAX_OVERLAY_BYTES {
+            return Err(TransportError::Protocol(format!(
+                "{too_large_label} payload too large ({} encoded bytes, {} raw bytes > {} byte limit)",
+                prepared.encoded_len(),
+                prepared.raw_len,
+                MAX_OVERLAY_BYTES
+            )));
+        }
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            self.host,
+            prepared.encoded_len()
+        )
+        .into_bytes();
+        if let Some(encoding) = prepared.content_encoding {
+            req.extend_from_slice(format!("Content-Encoding: {encoding}\r\n").as_bytes());
+        }
+        if let Some(tok) = &self.token {
+            req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        req.extend_from_slice(&prepared.bytes);
+
+        let mut stream = self.connect_with_read_timeout(read_timeout)?;
+        stream.write_all(&req)?;
+        stream.flush()?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw)?;
+        let (head, resp) = raw
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
+        Ok((code, resp.to_string()))
     }
 
     fn get(&self, path_and_query: &str) -> Result<(u16, String), TransportError> {
@@ -905,42 +1191,9 @@ impl TransportClient for HttpClient {
             },
         }
         .to_json();
-        if body.len() > MAX_OVERLAY_BYTES {
-            return Err(TransportError::Protocol(format!(
-                "overlay payload too large ({} bytes > {} byte limit)",
-                body.len(),
-                MAX_OVERLAY_BYTES
-            )));
-        }
-        let mut req = format!(
-            "POST /overlay HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n",
-            self.host,
-            body.len()
-        )
-        .into_bytes();
-        if let Some(tok) = &self.token {
-            req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
-        }
-        req.extend_from_slice(b"\r\n");
-        req.extend_from_slice(body.as_bytes());
-
-        let mut stream = self.connect()?;
-        stream.write_all(&req)?;
-        stream.flush()?;
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw)?;
-        let (head, resp) = raw
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
-        let code = head
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|c| c.parse::<u16>().ok())
-            .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
+        let (code, resp) = self.post_json("/overlay", &body, CLIENT_IO_TIMEOUT, "overlay")?;
         match code {
-            200 => pushoverlayack_from_json(resp)
+            200 => pushoverlayack_from_json(&resp)
                 .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into())),
             401 => Err(TransportError::Unauthorized),
             413 => Err(TransportError::Protocol(
@@ -955,42 +1208,14 @@ impl TransportClient for HttpClient {
 
     fn batch_check(&self, request: &BatchCheckRequest) -> Result<BatchReport, TransportError> {
         let body = Request::BatchCheck(request.clone()).to_json();
-        if body.len() > MAX_OVERLAY_BYTES {
-            return Err(TransportError::Protocol(format!(
-                "batch_check payload too large ({} bytes > {} byte limit)",
-                body.len(),
-                MAX_OVERLAY_BYTES
-            )));
-        }
-        let mut req = format!(
-            "POST /batch-check HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n",
-            self.host,
-            body.len()
-        )
-        .into_bytes();
-        if let Some(tok) = &self.token {
-            req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
-        }
-        req.extend_from_slice(b"\r\n");
-        req.extend_from_slice(body.as_bytes());
-
-        let mut stream = self.connect_with_read_timeout(BATCH_CHECK_READ_TIMEOUT)?;
-        stream.write_all(&req)?;
-        stream.flush()?;
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw)?;
-        let (head, resp) = raw
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
-        let code = head
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|c| c.parse::<u16>().ok())
-            .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
+        let (code, resp) = self.post_json(
+            "/batch-check",
+            &body,
+            BATCH_CHECK_READ_TIMEOUT,
+            "batch_check",
+        )?;
         match code {
-            200 => batchreport_from_json(resp)
+            200 => batchreport_from_json(&resp)
                 .ok_or_else(|| TransportError::Protocol("malformed batch_check report".into())),
             401 => Err(TransportError::Unauthorized),
             413 => Err(TransportError::Protocol(
@@ -1060,6 +1285,9 @@ mod tests {
             verdict: "red".into(),
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            // SSE attribution case: the echo must survive the SSE frame
+            // (the subscribe-driven poller path A2 exists for).
+            base_sha: Some("feedfeedfeedfeedfeedfeedfeedfeedfeedfeed".into()),
             published_at: 5,
         };
         svc.emit(ev.clone());
@@ -1129,7 +1357,17 @@ mod tests {
     fn bad_base_url_is_typed_error_not_panic() {
         assert!(HttpClient::new("ftp://x").is_err());
         assert!(HttpClient::new("http://h:notaport").is_err());
-        assert!(HttpClient::new("http://h:9").is_ok());
+        let http = HttpClient::new("http://h:9").expect("http ok");
+        assert_eq!(http.scheme, HttpScheme::Http);
+        assert_eq!(http.host, "h");
+        assert_eq!(http.port, 9);
+        let https = HttpClient::new("https://h").expect("https default port ok");
+        assert_eq!(https.scheme, HttpScheme::Https);
+        assert_eq!(https.host, "h");
+        assert_eq!(https.port, 443);
+        let https_port = HttpClient::new("https://h:8443").expect("https explicit port ok");
+        assert_eq!(https_port.scheme, HttpScheme::Https);
+        assert_eq!(https_port.port, 8443);
     }
 
     // ───────── /healthz — unauthenticated readiness probe ─────────
@@ -1273,13 +1511,27 @@ mod tests {
         body: &str,
         content_length: Option<&str>,
     ) -> (u16, String) {
+        raw_post_bytes(addr, path, body.as_bytes(), content_length, None)
+    }
+
+    fn raw_post_bytes(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: &[u8],
+        content_length: Option<&str>,
+        content_encoding: Option<&str>,
+    ) -> (u16, String) {
         let mut s = TcpStream::connect(addr).expect("connect");
         let mut head = format!("POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
         if let Some(cl) = content_length {
             head.push_str(&format!("Content-Length: {cl}\r\n"));
         }
+        if let Some(encoding) = content_encoding {
+            head.push_str(&format!("Content-Encoding: {encoding}\r\n"));
+        }
         head.push_str("\r\n");
-        write!(s, "{head}{body}").unwrap();
+        s.write_all(head.as_bytes()).unwrap();
+        s.write_all(body).unwrap();
         s.flush().unwrap();
         let mut raw = String::new();
         s.read_to_string(&mut raw).unwrap();
@@ -1384,6 +1636,67 @@ mod tests {
             raw_post(s.addr(), "/overlay", junk, Some(&junk.len().to_string())).0,
             400
         );
+        drop(s);
+    }
+
+    #[test]
+    fn post_overlay_accepts_gzip_body_with_bounded_decode() {
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let body = Request::PushOverlay {
+            worktree: "wt-gzip".into(),
+            base_ref: "origin/main".into(),
+            files: vec![(
+                "src/generated.rs".into(),
+                "registry_mirror_entry = 42;\n".repeat(80_000),
+            )],
+            check_profile: None,
+        }
+        .to_json();
+        let prepared = prepare_json_body(&body).expect("gzip body");
+        assert_eq!(prepared.content_encoding, Some("gzip"));
+        assert!(prepared.encoded_len() < body.len());
+
+        let (code, resp) = raw_post_bytes(
+            s.addr(),
+            "/overlay",
+            &prepared.bytes,
+            Some(&prepared.encoded_len().to_string()),
+            prepared.content_encoding,
+        );
+
+        assert_eq!(code, 200, "gzip POST /overlay should decode and route");
+        let ack = pushoverlayack_from_json(&resp).expect("ack parses");
+        assert_eq!(ack.worktree, "wt-gzip");
+        drop(s);
+    }
+
+    #[test]
+    fn post_overlay_rejects_unknown_content_encoding() {
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let body = overlay_body();
+
+        let (code, resp) = raw_post_bytes(
+            s.addr(),
+            "/overlay",
+            body.as_bytes(),
+            Some(&body.len().to_string()),
+            Some("br"),
+        );
+
+        assert_eq!(code, 415);
+        assert!(resp.contains("unsupported Content-Encoding"));
         drop(s);
     }
 

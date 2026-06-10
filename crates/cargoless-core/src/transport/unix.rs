@@ -461,6 +461,7 @@ mod tests {
             verdict: "red".into(),
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            base_sha: None,
             published_at: 99,
         };
         svc.emit(ev.clone());
