@@ -1030,6 +1030,11 @@ fn exec(
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
+                // #A2/#A7 — stamp attribution (base_sha + receipt/consume
+                // clocks) the instant the push is consumed, BEFORE the
+                // partial moves below; `publish_verdict` pops it at the
+                // sole attribution site.
+                api.record_push_attribution(&wt_key, &pushed);
                 pushed_check_profile = pushed.check_profile;
                 let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
                 let materialize_overlay = pushed.analysis_root.is_some();
@@ -1043,6 +1048,11 @@ fn exec(
                 );
                 pushed.files
             } else {
+                // #A2 — this verdict cycle is FS-derived. A leftover
+                // attribution from an earlier consumed-but-never-published
+                // push (RA wedge, restart) must not stamp its base_sha
+                // onto a verdict computed from the on-disk tree.
+                let _ = api.take_push_attribution(&wt_key);
                 let mut pairs = Vec::new();
                 if let Some(files) = pending_batch.get(&wt) {
                     for f in files {
@@ -1232,6 +1242,11 @@ fn publish_verdict(
     let verdict = payload.verdict;
     let red_diagnostics = payload.red_diagnostics;
     let failure_reason = payload.analysis_failure_reason.clone();
+    // #A2/#A7 — pop the attribution stamped by the SwitchOverlay arm when
+    // this verdict's push was consumed. `None` ⇒ FS-watch verdict: no
+    // base_sha echo, no latency line (there was no push to measure from).
+    let attribution = api.take_push_attribution(&wt.to_string_lossy());
+    let verdict_latency_ms = attribution.as_ref().map(|a| a.verdict_latency_ms());
     // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
     // This span MUST be the only emission of `verdict.publish`, mirroring
     // the structural invariant that publish_verdict is called from exactly
@@ -1264,6 +1279,14 @@ fn publish_verdict(
         verdict_color = verdict.as_str(),
         red_diagnostics = red_diagnostics,
         verdict_failure_reason = failure_reason.as_deref().unwrap_or(""),
+        // #A7 — push-receipt → publish latency; 0 = FS-watch verdict
+        // (no push to measure from; the SigNoz SLO query filters those
+        // out via `base_sha != ''`).
+        verdict_latency_ms = verdict_latency_ms.unwrap_or(0),
+        base_sha = attribution
+            .as_ref()
+            .and_then(|a| a.base_sha.as_deref())
+            .unwrap_or(""),
         pid = std::process::id(),
         trigger_source = "EmitVerdict",
         analysed_at = now,
@@ -1301,10 +1324,33 @@ fn publish_verdict(
         failure_reason.as_deref().unwrap_or("-"),
         now
     );
+    // #A7 — one greppable latency line per push-triggered verdict, with
+    // an explicit SLO-breach bit so the soak evidence is a `grep -c
+    // slo_breach=true` away (no telemetry stack required).
+    if let Some(ms) = verdict_latency_ms {
+        let slo_ms = verdict_slo_ms();
+        eprintln!(
+            "[cargoless:obs] verdict-latency wt={} ms={} slo_ms={} slo_breach={} (#A7)",
+            wt.display(),
+            ms,
+            slo_ms,
+            ms > slo_ms
+        );
+    }
     // Same site, mirror sink: feed the read-plane VerdictService + emit
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.
-    api.publish(wt, payload);
+    api.publish_attributed(wt, payload, attribution.and_then(|a| a.base_sha));
+}
+
+/// #A7 — verdict-latency SLO threshold (ms) for the `slo_breach=` stderr
+/// bit. Default 10s: generous against the ~2s RA-native budget, tight
+/// enough that a breach means "a human would have noticed the wait".
+fn verdict_slo_ms() -> u64 {
+    std::env::var("CARGOLESS_VERDICT_SLO_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(10_000)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

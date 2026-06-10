@@ -109,6 +109,51 @@ pub(crate) struct ProjectCheckRunContext {
     pub materialize_overlay: bool,
 }
 
+/// Verdict-attribution record for one consumed push (#A2/#A7). Captured by
+/// the serve loop's SwitchOverlay arm at the moment a [`PushedOverlay`] is
+/// actually applied to rust-analyzer, consumed by [`ServeVerdictState::
+/// publish`] when the resulting verdict lands. Recorded at *consume* time
+/// (not push receipt) so a replacing second push can never leave its
+/// `base_sha` stamped on the first push's verdict — the loop's
+/// record→publish pairs are properly nested per worktree key.
+#[derive(Debug, Clone)]
+pub(crate) struct PushAttribution {
+    /// Client-resolved base SHA from the push, echoed on the published
+    /// [`WorktreeStatus`] so a poller sharing a status key with other
+    /// branches accepts only verdicts stamped with its own commit.
+    pub base_sha: Option<String>,
+    /// `PushedOverlay::last_push_unix` — wall-clock push receipt (seconds).
+    pub push_received_unix: u64,
+    /// Wall-clock + monotonic pair captured together at overlay-apply, so
+    /// publish-time latency = coarse queue wait (receipt→consume, second
+    /// granularity) + exact analysis time (consume→publish, monotonic ms).
+    pub consumed_unix: u64,
+    pub consumed_at: Instant,
+}
+
+impl PushAttribution {
+    /// Push-receipt → verdict-publish latency in milliseconds (#A7).
+    pub(crate) fn verdict_latency_ms(&self) -> u64 {
+        latency_ms(
+            self.push_received_unix,
+            self.consumed_unix,
+            self.consumed_at.elapsed(),
+        )
+    }
+}
+
+/// #A7 latency composition: coarse queue wait (unix-second receipt →
+/// consume; `now_unix` is the only clock the push receipt has) plus exact
+/// monotonic analysis time (consume → publish). Saturating throughout —
+/// wall-clock skew (NTP step between receipt and consume) degrades to a
+/// smaller-but-sane number, never a panic or a u64 wrap.
+fn latency_ms(push_received_unix: u64, consumed_unix: u64, analysis: Duration) -> u64 {
+    consumed_unix
+        .saturating_sub(push_received_unix)
+        .saturating_mul(1000)
+        .saturating_add(u64::try_from(analysis.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// The serve-loop's live verdict state, presented as the shipped logical
 /// [`VerdictService`]. `Send + Sync` (the trait demands it so the
 /// HTTP/Unix adapters can share one service across connection threads):
@@ -155,13 +200,11 @@ pub struct ServeVerdictState {
     /// changed-file trigger set and central-daemon analysis root need a
     /// small handoff store keyed by the client-visible worktree.
     project_check_context: Mutex<BTreeMap<String, ProjectCheckRunContext>>,
-    /// Optional server-side coalescing for explicit `coalesce_key`
-    /// batch-check requests. Absent key keeps historical immediate behavior.
-    batch_coalescer: BatchCoalescer,
-    /// Server-local state directory used for transient project-check
-    /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
-    /// and embedded callers that do not have a resolved fleet config.
-    project_check_state_dir: Option<PathBuf>,
+    /// #A2/#A7 — attribution handoff parallel to `project_check_context`:
+    /// captured at SwitchOverlay consume, popped by `publish`. Worktrees
+    /// whose verdict came from the FS-watch path simply have no entry
+    /// (their status carries `base_sha: None`, no latency line).
+    push_attribution: Mutex<BTreeMap<String, PushAttribution>>,
     /// A6 — RA-warm readiness latch, the `GET /readyz` source of truth.
     /// `false` (the `Default`) until servedrv flips it via
     /// [`Self::mark_ready`] at the first completed rust-analyzer LSP
@@ -169,6 +212,13 @@ pub struct ServeVerdictState {
     /// which goes `true` before RA can produce any verdict. One-way
     /// monotonic latch ⇒ `Relaxed` ordering suffices.
     ready: AtomicBool,
+    /// Optional server-side coalescing for explicit `coalesce_key`
+    /// batch-check requests. Absent key keeps historical immediate behavior.
+    batch_coalescer: BatchCoalescer,
+    /// Server-local state directory used for transient project-check
+    /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
+    /// and embedded callers that do not have a resolved fleet config.
+    project_check_state_dir: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -600,9 +650,12 @@ impl ServeVerdictState {
         self.ready.store(true, Ordering::Relaxed);
     }
 
-    /// The SOLE verdict-mirror entry point — invoked from servedrv's one
-    /// `publish_verdict` (the `ClusterAction::EmitVerdict` arm, Judgment B
-    /// as composed), right after the durable `statusfile::write`. Updates
+    /// Unattributed convenience wrapper over [`Self::publish_attributed`]
+    /// (`base_sha: None`) — the entry point for callers without a push to
+    /// attribute (tests, embedded use). servedrv's one `publish_verdict`
+    /// (the `ClusterAction::EmitVerdict` arm, Judgment B as composed) calls
+    /// `publish_attributed` directly, right after the durable
+    /// `statusfile::write`. Updates
     /// the in-memory status map AND fans out one [`TransitionEvent`]
     /// (subscribe-emit, plan 0b). One real verdict ⇒ one map update ⇒ one
     /// event; never a fabricated transition.
@@ -613,7 +666,25 @@ impl ServeVerdictState {
     /// statusfile — a remote `subscribe` client sees what a local
     /// `status` reader sees, instead of every error condition
     /// collapsing into `verdict=red, red_diagnostics=0`.
+    // Non-test builds have no caller (servedrv's sole publish site calls
+    // `publish_attributed`); the wrapper is kept as the unattributed
+    // entry point for tests/embedded use, so allow it dead there.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn publish(&self, wt: &Path, payload: crate::statusfile::VerdictPayload) {
+        self.publish_attributed(wt, payload, None);
+    }
+
+    /// [`Self::publish`] with verdict attribution (#A2): `base_sha` is the
+    /// client-resolved commit from the overlay push this verdict answers,
+    /// popped by servedrv's `publish_verdict` via
+    /// [`Self::take_push_attribution`] at the sole attribution site.
+    /// `None` ⇒ FS-watch / legacy verdict — the wire key stays absent.
+    pub fn publish_attributed(
+        &self,
+        wt: &Path,
+        payload: crate::statusfile::VerdictPayload,
+        base_sha: Option<String>,
+    ) {
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
         let red_diagnostics = payload.red_diagnostics;
@@ -631,6 +702,7 @@ impl ServeVerdictState {
             crates: Vec::new(),
             red_diagnostics,
             verdict_failure_reason: failure_reason.clone(),
+            base_sha: base_sha.clone(),
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -642,6 +714,7 @@ impl ServeVerdictState {
             verdict: verdict_color,
             red_diagnostics,
             verdict_failure_reason: failure_reason,
+            base_sha,
             published_at,
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
@@ -720,6 +793,27 @@ impl ServeVerdictState {
         worktree: &str,
     ) -> Option<ProjectCheckRunContext> {
         poisoned(&self.project_check_context).remove(worktree)
+    }
+
+    /// #A2/#A7 — stamp the attribution for the push just consumed by the
+    /// SwitchOverlay arm. Same lifecycle as `record_project_check_context`:
+    /// recorded at consume, popped at publish; a replacing push for the
+    /// same key overwrites (the verdict that eventually publishes belongs
+    /// to the LAST consumed push, so its attribution must win too).
+    pub(crate) fn record_push_attribution(&self, worktree: &str, pushed: &PushedOverlay) {
+        poisoned(&self.push_attribution).insert(
+            worktree.to_string(),
+            PushAttribution {
+                base_sha: pushed.base_sha.clone(),
+                push_received_unix: pushed.last_push_unix,
+                consumed_unix: crate::statusfile::now_unix(),
+                consumed_at: Instant::now(),
+            },
+        );
+    }
+
+    pub(crate) fn take_push_attribution(&self, worktree: &str) -> Option<PushAttribution> {
+        poisoned(&self.push_attribution).remove(worktree)
     }
 
     pub(crate) fn with_project_check_overlay<T>(
@@ -997,32 +1091,85 @@ impl ServeVerdictState {
                 Err(e) => return batch_indeterminate(request, e),
             };
 
-        {
-            let _guard = poisoned(&self.sync_lock);
-            if let Err(e) = sync_analysis_root(&root, base_ref) {
-                return batch_indeterminate(request, e);
+        // #A3 — per-member truncation guard. Suspect members are withheld
+        // from execution and stitched back as Indeterminate (escalate, not
+        // green, not whole-batch failure): one truncated member must
+        // neither pass on a bare-base check nor poison its batch-mates'
+        // honest results.
+        let suspect_reasons: Vec<Option<String>> =
+            members.iter().map(member_truncation_suspect).collect();
+        for (member, reason) in members.iter().zip(&suspect_reasons) {
+            if let Some(why) = reason {
+                eprintln!(
+                    "[cargoless:batch] member-rejected worktree={}: {why} (#A3)",
+                    member.worktree
+                );
             }
         }
+        let clean_members: Vec<BatchMember> = members
+            .iter()
+            .zip(&suspect_reasons)
+            .filter(|(_, reason)| reason.is_none())
+            .map(|(member, _)| member.clone())
+            .collect();
 
-        let checker = ServeBatchChecker {
-            api: self,
-            root,
-            base_ref: base_ref.to_string(),
+        let inner = if clean_members.is_empty() && !members.is_empty() {
+            // Every member suspect ⇒ nothing executes; skip the fetch (no
+            // point spending the sync_lock on a batch that cannot run).
+            BatchReport {
+                batch_id: request.batch_id.clone(),
+                verdict: BatchVerdict::Green,
+                members: Vec::new(),
+                combined_checks: 0,
+                solo_checks: 0,
+                duration_ms: 0,
+                queue_wait_ms: 0,
+                executed_members: 0,
+                executed_batch_id: Some(request.batch_id.clone()),
+            }
+        } else {
+            {
+                let _guard = poisoned(&self.sync_lock);
+                if let Err(e) = sync_analysis_root(&root, base_ref) {
+                    return batch_indeterminate(request, e);
+                }
+            }
+
+            let checker = ServeBatchChecker {
+                api: self,
+                root,
+                base_ref: base_ref.to_string(),
+            };
+            run_batch(
+                request.batch_id.clone(),
+                &clean_members,
+                &checker,
+                if request.corun {
+                    CorunPolicy::Corun
+                } else {
+                    CorunPolicy::NoCorun
+                },
+            )
         };
-        run_batch(
-            request.batch_id.clone(),
-            &members,
-            &checker,
-            if request.corun {
-                CorunPolicy::Corun
-            } else {
-                CorunPolicy::NoCorun
-            },
-        )
+
+        if suspect_reasons.iter().all(Option::is_none) {
+            // No suspects ⇒ `clean_members == members`; the executed
+            // report passes through byte-identical to the pre-#A3 path.
+            return inner;
+        }
+        stitch_suspect_members(inner, &members, &suspect_reasons)
     }
 }
 
 impl VerdictService for ServeVerdictState {
+    /// A6 — `GET /readyz` reads this. Overrides the default-`true` trait
+    /// body with the honest RA-warm latch: `false` until servedrv calls
+    /// [`ServeVerdictState::mark_ready`] at the first completed RA
+    /// handshake.
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
         let g = poisoned(&self.statuses);
         let mut s = g.get(worktree).cloned()?;
@@ -1142,6 +1289,39 @@ impl VerdictService for ServeVerdictState {
                 };
             }
 
+            // #A3 — empty-overlay false-green guard. Keyed on file COUNT,
+            // never content: deletions arrive deliberately as empty-content
+            // entries (push.rs carries them so RA stops seeing the dead
+            // file) and must pass. Two truncation signatures are fatal:
+            // a push *claiming* changed files while carrying none, and a
+            // central-daemon (analysis_root) push with nothing to apply —
+            // both would make the daemon check the bare base and publish
+            // a verdict attributed to changes it never saw (the known
+            // 32MiB-payload false-green incident class). Plain optionless
+            // empty pushes stay accepted: locally that is the legitimate
+            // "revert RA to the on-disk tree" operation. Placed BEFORE
+            // `ensure_analysis_root` so a doomed push never spends the
+            // sync_lock on a fetch.
+            if files.is_empty() {
+                if let Some(changed) = changed_files.as_ref().filter(|c| !c.is_empty()) {
+                    return rejected_push(
+                        worktree,
+                        &format!(
+                            "push claims {} changed file(s) but carries 0 overlay files; \
+                             suspect payload truncation — refusing to check the bare base",
+                            changed.len()
+                        ),
+                    );
+                }
+                if analysis_root.is_some() {
+                    return rejected_push(
+                        worktree,
+                        "central-daemon push (analysis_root set) carries 0 overlay files; \
+                         refusing to publish a base-tree verdict as if it covered the push",
+                    );
+                }
+            }
+
             if let Some(root) = analysis_root.as_ref() {
                 let base = base_ref.trim();
                 if !base.is_empty() {
@@ -1199,14 +1379,6 @@ impl VerdictService for ServeVerdictState {
         }
         self.batch_coalescer.cv.notify_all();
         self.activity_snapshot()
-    }
-
-    /// A6 — `GET /readyz` reads this. Overrides the default-`true` trait
-    /// body with the honest RA-warm latch: `false` until servedrv calls
-    /// [`ServeVerdictState::mark_ready`] at the first completed RA
-    /// handshake.
-    fn ready(&self) -> bool {
-        self.ready.load(Ordering::Relaxed)
     }
 }
 
@@ -1274,6 +1446,89 @@ fn map_batch_members(
             })
         })
         .collect()
+}
+
+/// #A3 — the per-member truncation signature: a member *claiming* changed
+/// files while carrying zero overlay files. Such a member would execute
+/// against the bare base and return a verdict attributed to changes the
+/// daemon never saw (the 32MiB-payload false-green incident class). A
+/// member with empty `changed_files` AND empty `files` stays legal — that
+/// is an honest "no diff vs base" entry, and a bare-base check is exactly
+/// its verdict. Keyed on file COUNT, never content (deletions are carried
+/// as empty-content entries and must pass).
+fn member_truncation_suspect(member: &BatchMember) -> Option<String> {
+    if member.files.is_empty() && !member.changed_files.is_empty() {
+        return Some(format!(
+            "member claims {} changed file(s) but carries 0 overlay files; \
+             suspect payload truncation",
+            member.changed_files.len()
+        ));
+    }
+    None
+}
+
+/// #A3 — rebuild the report in request-member order, splicing executed
+/// results (from `inner`, which ran only the clean members, in order)
+/// around Indeterminate placeholders for the suspects. Request order is
+/// load-bearing: `distribute_combined_report` slices a coalesced report
+/// by per-waiter member offsets.
+fn stitch_suspect_members(
+    inner: BatchReport,
+    members: &[BatchMember],
+    suspect_reasons: &[Option<String>],
+) -> BatchReport {
+    // Destructure (not `..inner` after moving `members` out — E0382):
+    // every counter passes through from the executed run, so the report
+    // stays honest about what physically ran (`executed_members` counts
+    // only clean members; suspects never executed).
+    let BatchReport {
+        batch_id,
+        verdict: _,
+        members: executed_results,
+        combined_checks,
+        solo_checks,
+        duration_ms,
+        queue_wait_ms,
+        executed_members,
+        executed_batch_id,
+    } = inner;
+    let mut executed = executed_results.into_iter();
+    let stitched: Vec<cargoless_core::batch::BatchMemberResult> = members
+        .iter()
+        .zip(suspect_reasons)
+        .map(|(member, reason)| {
+            let why = match reason {
+                Some(why) => why.as_str(),
+                // Total by construction: `run_batch` returns one result
+                // per input member in order, so this branch is
+                // unreachable today — but a short executed report must
+                // surface as an honest Indeterminate, never a member
+                // silently missing from the report.
+                None => match executed.next() {
+                    Some(result) => return result,
+                    None => "internal: executed batch report ran short of members",
+                },
+            };
+            cargoless_core::batch::BatchMemberResult {
+                worktree: member.worktree.clone(),
+                verdict: BatchVerdict::Indeterminate,
+                provenance: cargoless_core::batch::BatchProvenance::Indeterminate,
+                diagnostics: vec![batch_diagnostic(why)],
+                duration_ms: 0,
+            }
+        })
+        .collect();
+    BatchReport {
+        batch_id,
+        verdict: verdict_for_members(&stitched),
+        members: stitched,
+        combined_checks,
+        solo_checks,
+        duration_ms,
+        queue_wait_ms,
+        executed_members,
+        executed_batch_id,
+    }
 }
 
 fn union_overlay_files(members: &[BatchMember]) -> Result<Vec<(String, String)>, String> {
@@ -1640,20 +1895,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
-    }
-
-    #[test]
-    fn readyz_latch_starts_false_and_mark_ready_flips_it() {
-        // A6: a fresh daemon state is NOT ready (RA cold ⇒ /readyz 503,
-        // k8s keeps the pod out of Service rotation); mark_ready (the
-        // servedrv RA-warm flip) latches it true.
-        let api = ServeVerdictState::new();
-        assert!(!api.ready(), "fresh state must report not-ready");
-        api.mark_ready();
-        assert!(api.ready(), "after mark_ready the latch reports ready");
-        // One-way: a second mark is a no-op, never an un-set.
-        api.mark_ready();
-        assert!(api.ready());
     }
 
     #[test]
@@ -3365,5 +3606,214 @@ checks:
             }
         );
         assert!(api.drain_complete());
+    }
+
+    // ──────── #A2/#A3/#A7 — verdict attribution + truncation guard ────────
+
+    #[test]
+    fn publish_attributed_echoes_base_sha_on_status_and_event() {
+        // #A2 — the flip-blocking contract: a poller sharing a status key
+        // with other branches must see ITS commit on the verdict (status
+        // AND the SSE event — the event is the race-free path).
+        let api = ServeVerdictState::new();
+        let rx = api.subscribe();
+        api.publish_attributed(
+            Path::new("/workspace/tf-multiverse"),
+            crate::statusfile::VerdictPayload::green(),
+            Some("abc123def".into()),
+        );
+        let status = api
+            .get_status("/workspace/tf-multiverse")
+            .expect("status present");
+        assert_eq!(status.base_sha.as_deref(), Some("abc123def"));
+        let ev = rx.try_recv().expect("transition event");
+        assert_eq!(ev.base_sha.as_deref(), Some("abc123def"));
+
+        // Unattributed publish (FS-watch path) — echo must CLEAR, never
+        // hold a stale SHA from the previous push's verdict.
+        api.publish(
+            Path::new("/workspace/tf-multiverse"),
+            crate::statusfile::VerdictPayload::green(),
+        );
+        let status = api
+            .get_status("/workspace/tf-multiverse")
+            .expect("status present");
+        assert_eq!(
+            status.base_sha, None,
+            "FS-watch verdict must not inherit the prior push's base_sha"
+        );
+    }
+
+    #[test]
+    fn push_attribution_records_and_pops_per_worktree() {
+        // #A2 — the record→take handoff mirrors project_check_context:
+        // recorded at SwitchOverlay consume, popped exactly once at
+        // publish; a replacing push overwrites.
+        let api = ServeVerdictState::new();
+        let pushed = |sha: &str| PushedOverlay {
+            base_ref: "origin/main".into(),
+            files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
+            analysis_root: None,
+            base_sha: Some(sha.into()),
+            last_push_unix: crate::statusfile::now_unix(),
+            changed_files: None,
+            check_profile: None,
+        };
+        api.record_push_attribution("/wt", &pushed("first"));
+        api.record_push_attribution("/wt", &pushed("second"));
+        let attribution = api.take_push_attribution("/wt").expect("recorded");
+        assert_eq!(
+            attribution.base_sha.as_deref(),
+            Some("second"),
+            "replacing push's attribution wins (matches overlay-replace semantics)"
+        );
+        assert!(
+            api.take_push_attribution("/wt").is_none(),
+            "pop-on-consume: one publish consumes the attribution"
+        );
+    }
+
+    #[test]
+    fn verdict_latency_composes_queue_wait_and_analysis_time() {
+        // #A7 — latency = (consume - receipt) seconds + monotonic
+        // analysis ms; saturating against clock skew.
+        assert_eq!(latency_ms(100, 103, Duration::from_millis(250)), 3250);
+        assert_eq!(latency_ms(100, 100, Duration::from_millis(7)), 7);
+        assert_eq!(
+            latency_ms(200, 100, Duration::from_millis(5)),
+            5,
+            "receipt clock ahead of consume clock (NTP step) saturates to analysis-only"
+        );
+    }
+
+    #[test]
+    fn zero_file_push_claiming_changes_is_rejected() {
+        // #A3 — the false-green incident class: gate builds a >32MiB
+        // payload, the files array arrives empty, the daemon checks the
+        // bare base and publishes green "for" the push. The COUNT
+        // mismatch (changed_files says N>0, files says 0) is the
+        // truncation signature and must refuse the push.
+        let api = ServeVerdictState::new();
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: None,
+            base_sha: Some("abc123".into()),
+            changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
+        };
+        let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&options));
+        assert!(!ack.accepted, "truncation signature must be rejected");
+        assert_eq!(ack.applied_files, 0);
+        assert!(
+            api.peek_overlay_for("/wt").is_none(),
+            "rejected push must not be stored"
+        );
+    }
+
+    #[test]
+    fn zero_file_central_daemon_push_is_rejected() {
+        // #A3 — an analysis_root push exists to get a verdict for pushed
+        // content; zero files means the daemon would publish a bare-base
+        // verdict attributed to the push.
+        let api = ServeVerdictState::new();
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: Some("/workspace/tf-multiverse".into()),
+            base_sha: None,
+            changed_files: None,
+        };
+        let ack = api.push_overlay_with_options("/wt", "", &[], None, Some(&options));
+        assert!(
+            !ack.accepted,
+            "central-daemon zero-file push must be rejected"
+        );
+    }
+
+    #[test]
+    fn delete_only_push_with_empty_content_files_passes_guard() {
+        // #A3 — deletions are deliberately carried as empty-CONTENT
+        // overlay entries (push.rs); the guard keys on file COUNT, so a
+        // delete-only diff (1 file, 0 bytes) must stay accepted.
+        let api = ServeVerdictState::new();
+        let files = vec![("src/removed.rs".to_string(), String::new())];
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: None,
+            base_sha: Some("abc123".into()),
+            changed_files: Some(vec!["src/removed.rs".into()]),
+        };
+        let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
+        assert!(ack.accepted, "delete-only diff (empty content) must pass");
+        assert_eq!(ack.applied_files, 1);
+    }
+
+    #[test]
+    fn plain_optionless_empty_push_stays_accepted() {
+        // #A3 boundary — a bare `push_overlay` with no files and no
+        // options is the legitimate local "revert RA to the on-disk
+        // tree" operation; the guard must not break it.
+        let api = ServeVerdictState::new();
+        let ack = api.push_overlay("/wt", "origin/main", &[]);
+        assert!(ack.accepted, "optionless empty push is a legal revert");
+    }
+
+    #[test]
+    fn batch_member_truncation_suspect_goes_indeterminate_not_green() {
+        // #A3 per-member guard — one truncated member must neither run
+        // (bare-base false green) nor poison its batch-mates: the clean
+        // member still executes and reports its honest verdict.
+        let project = setup_batch_project("member-truncation");
+        let request = batch_request(
+            "batch-truncated-member",
+            &project.root,
+            vec![
+                batch_member("clean", "src/ok.rs", "pub fn ok() {}\n"),
+                BatchMember {
+                    worktree: "/client/truncated".into(),
+                    files: vec![],
+                    changed_files: vec!["src/lost.rs".into()],
+                },
+            ],
+        );
+        let report = http_batch_check(&request);
+
+        assert_eq!(report.verdict, BatchVerdict::Indeterminate);
+        let clean = member_result(&report, "/client/clean");
+        assert_eq!(
+            clean.verdict,
+            BatchVerdict::Green,
+            "clean member's verdict survives a truncated batch-mate"
+        );
+        let truncated = member_result(&report, "/client/truncated");
+        assert_eq!(truncated.verdict, BatchVerdict::Indeterminate);
+        assert!(
+            truncated
+                .diagnostics
+                .first()
+                .is_some_and(|d| d.message.contains("suspect payload truncation")),
+            "diagnostic names the truncation suspicion: {:?}",
+            truncated.diagnostics
+        );
+    }
+
+    #[test]
+    fn batch_member_with_no_claims_and_no_files_is_not_suspect() {
+        // #A3 boundary — empty changed_files AND empty files is an honest
+        // "no diff vs base" member, not a truncation signature.
+        let member = BatchMember::new("wt-empty");
+        assert_eq!(member_truncation_suspect(&member), None);
+    }
+
+    #[test]
+    fn readyz_latch_starts_false_and_mark_ready_flips_it() {
+        // A6: a fresh daemon state is NOT ready (RA cold ⇒ /readyz 503,
+        // k8s keeps the pod out of Service rotation); mark_ready (the
+        // servedrv RA-warm flip) latches it true.
+        let api = ServeVerdictState::new();
+        assert!(!api.ready(), "fresh state must report not-ready");
+        api.mark_ready();
+        assert!(api.ready(), "after mark_ready the latch reports ready");
+        // One-way: a second mark is a no-op, never an un-set.
+        api.mark_ready();
+        assert!(api.ready());
     }
 }

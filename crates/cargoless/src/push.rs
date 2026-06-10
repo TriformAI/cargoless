@@ -35,14 +35,14 @@
 //!   prior verdict.
 //! * Git ops via `std::process::Command` — same discipline as
 //!   `build.rs`'s trunk subprocess and `watch.rs`'s tooling.
-//! * No new external deps. The client uses the shipped HTTP transport
-//!   surface and its additive profile-aware push verb.
+//! * The client uses the shipped HTTP(S) transport surface and its additive
+//!   profile-aware push verb.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use cargoless_core::transport::http::{HttpClient, MAX_OVERLAY_BYTES};
+use cargoless_core::transport::http::{HttpClient, MAX_OVERLAY_BYTES, prepare_json_body};
 use cargoless_core::transport::{CheckProfile, PushOverlayOptions, Request, TransportClient};
 
 const WORKSPACE_CONFIG_FILES: &[&str] = &[
@@ -190,7 +190,7 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         options.as_ref(),
     );
     emit_payload_diagnostics(&changed, &payload, body.len());
-    if let Err(message) = validate_overlay_http_cap(body.len(), &payload.content_stats) {
+    if let Err(message) = validate_overlay_http_cap(&body, &payload.content_stats) {
         crate::ui::error(message);
         return ExitCode::from(2);
     }
@@ -629,16 +629,16 @@ fn emit_payload_diagnostics(changed: &[String], payload: &PushPayload, json_byte
     }
 }
 
-fn validate_overlay_http_cap(
-    json_bytes: usize,
-    content_stats: &[ContentFileStat],
-) -> Result<(), String> {
-    if json_bytes <= MAX_OVERLAY_BYTES {
+fn validate_overlay_http_cap(body: &str, content_stats: &[ContentFileStat]) -> Result<(), String> {
+    let prepared = prepare_json_body(body)
+        .map_err(|e| format!("push: failed to prepare overlay HTTP body: {e}"))?;
+    if prepared.raw_len <= MAX_OVERLAY_BYTES && prepared.encoded_len() <= MAX_OVERLAY_BYTES {
         return Ok(());
     }
     Err(format!(
-        "push: overlay JSON body is {} bytes, exceeding the 32 MiB HTTP cap ({} bytes); refusing before network send. Largest content files: {}. Suggested next step: split the change or remove generated/heavy artifacts from the source diff; Cargoless will not fall back to cargo check.",
-        json_bytes,
+        "push: overlay HTTP body is {} encoded bytes ({} raw JSON bytes), exceeding the 32 MiB HTTP cap ({} bytes); refusing before network send. Largest content files: {}. Suggested next step: split the change or remove generated/heavy artifacts from the source diff; Cargoless will not fall back to cargo check.",
+        prepared.encoded_len(),
+        prepared.raw_len,
         MAX_OVERLAY_BYTES,
         format_largest_content_files(content_stats)
     ))
@@ -1239,13 +1239,38 @@ mod tests {
         }];
         let body = push_overlay_request_body("wt", "origin/main", &files, None, None);
 
-        let err = validate_overlay_http_cap(body.len(), &stats).unwrap_err();
+        let err = validate_overlay_http_cap(&body, &stats).unwrap_err();
 
+        assert!(err.contains("encoded bytes"));
+        assert!(err.contains("raw JSON bytes"));
         assert!(err.contains("exceeding the 32 MiB HTTP cap"));
         assert!(err.contains("refusing before network send"));
         assert!(err.contains("src/big.rs"));
         assert!(err.contains("Suggested next step"));
         assert!(err.contains("will not fall back to cargo check"));
+    }
+
+    #[test]
+    fn multi_megabyte_generated_overlay_is_compressed_before_http_send() {
+        let content = "registry_mirror_entry = 42;\n".repeat(240_000);
+        let files = vec![(
+            "physics/src/generated/scaffold_registry.rs".to_string(),
+            content,
+        )];
+        let body = push_overlay_request_body("wt", "origin/main", &files, None, None);
+        assert!(
+            body.len() > 6 * 1024 * 1024,
+            "fixture should model the observed multi-megabyte full-file overlay"
+        );
+
+        let prepared = prepare_json_body(&body).expect("prepare body");
+
+        assert_eq!(prepared.content_encoding, Some("gzip"));
+        assert!(
+            prepared.encoded_len() < body.len() / 20,
+            "repeated generated mirrors should shrink materially"
+        );
+        validate_overlay_http_cap(&body, &[]).expect("compressed overlay fits the HTTP cap");
     }
 
     #[test]

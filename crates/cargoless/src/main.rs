@@ -116,7 +116,7 @@ struct Opts {
     /// prefer the `CARGOLESS_AUTH_TOKEN` env for secrets).
     auth_token: Option<String>,
     /// `status --remote <url>` — query a remote `serve --bind` fleet
-    /// daemon over the shipped HTTP transport instead of the on-disk
+    /// daemon over the shipped HTTP(S) transport instead of the on-disk
     /// `cli-status`. Resolved through `transport::discovery` (explicit
     /// operator intent — `--remote` wins the §10.3 precedence).
     remote: Option<String>,
@@ -425,10 +425,10 @@ fn usage() {
     println!("                        (TF_CHECK_NO_DEFAULT_FEATURES=1)");
     println!(
         "  --remote <URL>        status: query a remote `serve --bind` daemon \
-         over HTTP"
+         over HTTP(S)"
     );
     println!(
-        "                        (e.g. http://host:8080) instead of the local \
+        "                        (e.g. https://host or http://host:8080) instead of the local \
          cli-status file"
     );
     println!("  --worktree <KEY>      status/push: query or push one served worktree");
@@ -619,7 +619,7 @@ fn main() -> ExitCode {
             });
         }
         // `status --remote <url>` queries a remote fleet `serve --bind`
-        // daemon over the shipped HTTP transport. Dispatch BEFORE the
+        // daemon over the shipped HTTP(S) transport. Dispatch BEFORE the
         // `config::Config::resolve` front-door (exactly like `serve`):
         // that detector would wrongly reject a non-WASM cwd, and asking a
         // *remote* daemon must not require a local cargoless project.
