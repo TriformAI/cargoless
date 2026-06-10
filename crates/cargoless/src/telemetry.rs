@@ -11,23 +11,34 @@
 //!
 //! ## INFRA-49 — why blocking transport
 //!
-//! The simple-exporter (chosen over batch-exporter to sidestep the
-//! BatchSpanProcessor's "no reactor running" panic — see comment at
-//! `try_init`'s `with_simple_exporter` call) exports spans synchronously
-//! inline on each span emit. With the async `reqwest-client` feature,
-//! that export tries to drive a `.send().await` future from cargoless's
-//! main worker thread, which is NOT inside the Tokio runtime context
-//! (the runtime guards init+shutdown, not the daemon's verdict-emit
-//! loop) — same "no reactor running" panic class as the batch case,
-//! caught by a different code path. The blocking client uses
-//! `reqwest::blocking::Client` which has no runtime requirement at
-//! call time. ~1-2ms per export to the in-cluster signoz collector;
-//! verdict cadence is seconds, so the cost is negligible.
-//! * Runtime: **tokio current-thread**, owned by `serve.rs` via
-//!   `runtime.block_on(async { ... })`. The daemon's existing sync code
-//!   runs unchanged inside the async context — tokio is the substrate the
-//!   OTel SDK needs, nothing more. Subcommands other than `serve` remain
-//!   pure-sync (they never init telemetry, so they never need a runtime).
+//! No tokio reactor may be required on the threads that end spans (the
+//! serve-loop / verdict threads are plain sync threads). With the async
+//! `reqwest-client` feature the export future needs an ambient runtime —
+//! the "no reactor running" panic class, observed live on cargoless 0.2.7
+//! in both the batch-processor-thread and inline-export shapes. The
+//! blocking client (`reqwest::blocking::Client`) has no runtime
+//! requirement at call time.
+//!
+//! ## A5 — queued background export (collector outage ≠ verdict stall)
+//!
+//! Blocking transport alone still exported INLINE on whatever thread
+//! ended the span (`with_simple_exporter`): a SigNoz collector outage
+//! stalled the span-ending thread — including the serve-loop thread that
+//! publishes verdicts — for up to the 10s HTTP timeout per span. The
+//! default is now the [`queue`] module's `QueuedSpanProcessor`: `on_end`
+//! is a bounded `try_send` (overflow drops, power-of-two-sampled stderr
+//! accounting); one dedicated `cargoless-otlp` worker thread owns the
+//! exporter and is the only thread that ever blocks on the collector
+//! (INFRA-49 holds — it drives the export future with
+//! `futures_executor::block_on`, the exact execution shape
+//! `SimpleSpanProcessor` uses inline). Shutdown drains for at most 2s,
+//! then detaches. `CARGOLESS_OTLP_INLINE=1` restores the previous inline
+//! construction (one-release rollback path).
+//! * Runtime: **tokio**, owned by `serve.rs`. Span export no longer needs
+//!   it (see A5 above); it remains the substrate for
+//!   [`shutdown_telemetry`]'s explicit 5s flush-timeout machinery.
+//!   Subcommands other than `serve` remain pure-sync (they never init
+//!   telemetry, so they never need a runtime).
 //!
 //! Cores stay log-free (no `tracing` macros in `cargoless-core`). All
 //! instrumentation lands at the binary call sites in `servedrv.rs` (5c).
@@ -65,10 +76,11 @@
 //! ## Caller contract for init
 //!
 //! `init_telemetry` MUST be invoked from inside a tokio runtime context
-//! (typically via `runtime.block_on(async { ... })` in `serve.rs`). The
-//! OTel SDK's batch exporter needs a runtime handle to spawn its export
-//! task. If called outside a runtime AND `cfg.enabled()` is true, init
-//! takes the fail-soft path: stderr warning + inert handle, no panic.
+//! (serve.rs owns the runtime + `runtime.enter()` guard). Span export
+//! does not need the runtime (the `cargoless-otlp` worker is a plain std
+//! thread); the requirement comes from [`shutdown_telemetry`]'s explicit
+//! 5s flush-timeout machinery (`Handle::current()` +
+//! `tokio::time::timeout`).
 
 use cargoless_core::TelemetryConfig;
 
@@ -314,16 +326,17 @@ fn try_init(cfg: &TelemetryConfig) -> Result<ShutdownHandle, String> {
         .as_deref()
         .ok_or_else(|| "enabled() lied: endpoint absent".to_string())?;
 
-    // OTLP HTTP/protobuf exporter — async reqwest-client transport per
-    // SigNoz canonical Rust guide. The exporter spawns its export task
-    // on the ambient tokio runtime (provided by serve.rs's block_on).
+    // OTLP HTTP/protobuf exporter — blocking reqwest transport
+    // (`reqwest-blocking-client` feature): no reactor needed at export
+    // time, so the `cargoless-otlp` worker drives it as a plain thread.
     let exporter = SpanExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
         .with_protocol(Protocol::HttpBinary)
         // 10 s cap matches physics telemetry.rs:156. Without this the blocking
-        // reqwest call has no deadline — a slow or wedged in-cluster collector
-        // would stall the verdict-emit path indefinitely (AMEM-49 follow-up).
+        // reqwest call has no deadline — a wedged in-cluster collector would
+        // stall the `cargoless-otlp` export worker indefinitely (and, under
+        // CARGOLESS_OTLP_INLINE=1, the span-ending thread itself).
         .with_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("OTLP exporter build failed: {e}"))?;
@@ -339,48 +352,45 @@ fn try_init(cfg: &TelemetryConfig) -> Result<ShutdownHandle, String> {
         ])
         .build();
 
-    // INFRA-49: Use `with_simple_exporter` instead of `with_batch_exporter`.
+    // A5: default = QueuedSpanProcessor (bounded queue + dedicated
+    // `cargoless-otlp` worker thread — see the `queue` module header for
+    // the full INFRA-49 / never-stall-the-verdict-path rationale).
     //
-    // Background: `with_batch_exporter` spawns a long-lived background
-    // thread (`OpenTelemetry.Traces.BatchProcessor`) that needs an
-    // ambient Tokio runtime to drive its async HTTP export calls. We
-    // build the provider inside `serve.rs`'s `runtime.block_on(...)`
-    // scope, so the *exporter handle* gets a runtime; but the
-    // batch-processor thread it spawns is its own scope and has no
-    // ambient runtime when it later wakes up to flush. Observed live
-    // on cargoless 0.2.7 (PR #22 + tf-multiverse PR #3526):
+    // Why NOT the SDK's own `with_batch_exporter`: its BatchSpanProcessor
+    // thread needs an ambient Tokio runtime to drive async HTTP export.
+    // Observed live on cargoless 0.2.7 (PR #22 + tf-multiverse PR #3526):
     //
     //     thread 'OpenTelemetry.Traces.BatchProcessor' panicked at ...:
     //     there is no reactor running, must be called from the context
     //     of a Tokio 1.x runtime
     //
-    // followed by repeating
+    // after which the SDK entered permanent shutdown and silently dropped
+    // every subsequent span. (With the blocking reqwest transport now in
+    // use that specific panic is gone, but the queue processor keeps the
+    // export off the span-ending thread AND bounds the shutdown drain at
+    // 2s instead of the SDK default 5s-per-processor.)
     //
-    //     WARN opentelemetry_sdk: BatchSpanProcessor.OnEnd.AfterShutdown
-    //     Spans are being emitted even after Shutdown.
+    // Why NOT `with_simple_exporter` (the previous default): it exports
+    // INLINE on whatever thread ends the span — a SigNoz collector outage
+    // stalls the serve-loop verdict path for up to the 10s HTTP timeout
+    // per span. That deployment-stall class is what A5 removes.
     //
-    // — the SDK enters permanent shutdown after one panic and silently
-    // drops every subsequent span. Net effect: SigNoz dashboards see
-    // nothing even though the daemon emits every span correctly. The
-    // existing `[cargoless:obs]` stderr lines remained as the only
-    // observability surface.
-    //
-    // `with_simple_exporter` exports synchronously inline on each
-    // span emit, sidestepping the background-thread runtime hazard
-    // entirely. Latency cost per span is the OTLP HTTP call's round-
-    // trip (in-cluster signoz collector is ~1-2ms), but `verdict.publish`
-    // fires on the order of seconds, not microseconds, so the cost is
-    // negligible. Batch is the right choice for high-volume
-    // instrumentation (per-request HTTP servers); cargoless's verdict
-    // cadence is operator-watching-the-tree, not request-firehose.
-    //
-    // Higher throughput can revisit later by either keeping a
-    // long-lived runtime handle alive for the daemon lifetime + entering
-    // it around the batch thread (option 2 in INFRA-49) or switching
-    // to gRPC + `with_tokio` (option 3). Both are larger refactors.
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_simple_exporter(exporter)
+    // CARGOLESS_OTLP_INLINE=1 keeps the old inline construction as a
+    // one-release rollback path.
+    let inline = std::env::var("CARGOLESS_OTLP_INLINE").is_ok_and(|v| v == "1");
+    let builder = SdkTracerProvider::builder().with_resource(resource);
+    let builder = if inline {
+        eprintln!(
+            "[cargoless:telemetry] CARGOLESS_OTLP_INLINE=1 — inline (simple) \
+             span export; span ends block on the collector."
+        );
+        builder.with_simple_exporter(exporter)
+    } else {
+        let processor = queue::QueuedSpanProcessor::spawn(exporter)
+            .map_err(|e| format!("OTLP export worker spawn failed: {e}"))?;
+        builder.with_span_processor(processor)
+    };
+    let tracer_provider = builder
         .with_sampler(Sampler::TraceIdRatioBased(cfg.otel_sampler_arg))
         .build();
 
@@ -420,6 +430,318 @@ fn try_init(cfg: &TelemetryConfig) -> Result<ShutdownHandle, String> {
             service_name: cfg.otel_service_name.clone(),
         }),
     })
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// A5 — queued background OTLP span export.
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "telemetry")]
+mod queue {
+    //! [`QueuedSpanProcessor`] — bounded-queue + dedicated-worker span
+    //! processor, the default instead of `with_simple_exporter` (A5).
+    //!
+    //! Contract, ranked:
+    //!
+    //! 1. **`on_end` never blocks** the span-ending thread. The serve
+    //!    loop's single thread ends the verdict spans; a SigNoz collector
+    //!    outage must cost it nothing. `on_end` is a `try_send` into a
+    //!    bounded channel — overflow DROPS the span (spans are
+    //!    diagnostics; they must never block or fail the verdict path),
+    //!    with power-of-two-sampled stderr accounting (1st, 2nd, 4th,
+    //!    8th... drop) so a sustained outage is loud but not spammy.
+    //! 2. **Only the worker thread blocks on the collector.** One
+    //!    dedicated `cargoless-otlp` std thread owns the exporter and
+    //!    drives each batch with `futures_executor::block_on` — the
+    //!    exact execution shape `SimpleSpanProcessor::on_end` uses
+    //!    inline, so INFRA-49 (no tokio reactor required on the threads
+    //!    that end spans) holds by construction: the worker is a plain
+    //!    std thread and the blocking-reqwest export future completes
+    //!    without a reactor.
+    //! 3. **Shutdown/flush are bounded.** The drain gets at most
+    //!    [`DRAIN_BUDGET`] (2s); past the deadline the worker is
+    //!    detached and the call returns. A wedged collector costs CLI
+    //!    shutdown ≤2s, not 10s-per-pending-span.
+    //!
+    //! Control messages (resource, flush, shutdown) share the one FIFO
+    //! channel with spans, which buys ordering for free: the resource
+    //! set by `TracerProviderBuilder::build()` is applied before any
+    //! span export, and a shutdown sentinel drains exactly the spans
+    //! enqueued before it.
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use opentelemetry::Context;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
+    use opentelemetry_sdk::trace::{Span, SpanData, SpanExporter, SpanProcessor};
+
+    /// Queue bound. Matches the OTel BatchSpanProcessor default
+    /// (`OTEL_BSP_MAX_QUEUE_SIZE` = 2048); at cargoless's verdict-cadence
+    /// span volume that is minutes of headroom across an outage.
+    /// `pub(super)` so the overflow test can size its push loop off the
+    /// real bound instead of a copy that could drift.
+    pub(super) const QUEUE_CAP: usize = 2048;
+    /// Max spans per export call.
+    const BATCH_MAX: usize = 64;
+    /// Max time a span waits in an unfilled batch before export.
+    const BATCH_WINDOW: Duration = Duration::from_millis(500);
+    /// Shutdown/flush drain budget — past it, detach the worker and
+    /// return (kills the multi-second CLI shutdown tax).
+    const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+    /// One channel carries spans + control so ordering is FIFO-exact.
+    /// SpanData (~hundreds of bytes) dwarfs the control variants; boxing
+    /// it would put an allocation on the span-end hot path, so take the
+    /// size hit — same call the SDK's own BatchMessage makes.
+    #[allow(clippy::large_enum_variant)]
+    enum Msg {
+        Span(SpanData),
+        SetResource(Resource),
+        Flush(SyncSender<()>),
+        Shutdown(SyncSender<()>),
+    }
+
+    #[derive(Debug)]
+    pub(super) struct QueuedSpanProcessor {
+        sender: SyncSender<Msg>,
+        worker: Mutex<Option<thread::JoinHandle<()>>>,
+        stopped: AtomicBool,
+        dropped: AtomicUsize,
+        disconnect_noted: AtomicBool,
+    }
+
+    impl QueuedSpanProcessor {
+        /// Spawn the `cargoless-otlp` worker that owns `exporter`. Thread
+        /// spawn failure surfaces as `Err` so `try_init` can take the
+        /// fail-soft inert path (daemon continues, stderr-only).
+        pub(super) fn spawn<E>(exporter: E) -> std::io::Result<Self>
+        where
+            E: SpanExporter + 'static,
+        {
+            let (sender, receiver) = mpsc::sync_channel(QUEUE_CAP);
+            let worker = thread::Builder::new()
+                .name("cargoless-otlp".to_string())
+                .spawn(move || worker_loop(exporter, receiver))?;
+            Ok(Self {
+                sender,
+                worker: Mutex::new(Some(worker)),
+                stopped: AtomicBool::new(false),
+                dropped: AtomicUsize::new(0),
+                disconnect_noted: AtomicBool::new(false),
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) fn dropped_so_far(&self) -> usize {
+            self.dropped.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SpanProcessor for QueuedSpanProcessor {
+        fn on_start(&self, _span: &mut Span, _cx: &Context) {
+            // Ignored — export concerns finished spans only.
+        }
+
+        fn on_end(&self, span: SpanData) {
+            // Parity with SimpleSpanProcessor: RecordOnly (unsampled)
+            // spans are recorded but never exported.
+            if !span.span_context.is_sampled() {
+                return;
+            }
+            if self.stopped.load(Ordering::Relaxed) {
+                return; // post-shutdown spans are dropped silently
+            }
+            match self.sender.try_send(Msg::Span(span)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        eprintln!("[cargoless:otel] span queue full, dropped {n} spans so far");
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    if !self.disconnect_noted.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[cargoless:otel] span emitted after export worker exit; dropping"
+                        );
+                    }
+                }
+            }
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(OTelSdkError::AlreadyShutdown);
+            }
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            match self.sender.try_send(Msg::Flush(ack_tx)) {
+                Ok(()) => ack_rx
+                    .recv_timeout(DRAIN_BUDGET)
+                    .map_err(|_| OTelSdkError::Timeout(DRAIN_BUDGET)),
+                Err(TrySendError::Full(_)) => Err(OTelSdkError::InternalFailure(
+                    "span queue full; flush request dropped (best-effort)".into(),
+                )),
+                Err(TrySendError::Disconnected(_)) => Err(OTelSdkError::AlreadyShutdown),
+            }
+        }
+
+        fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+            if self.stopped.swap(true, Ordering::SeqCst) {
+                return Err(OTelSdkError::AlreadyShutdown);
+            }
+            let budget = timeout.min(DRAIN_BUDGET);
+            let deadline = Instant::now() + budget;
+            let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+            // The sentinel competes with queued spans for capacity; retry
+            // within the budget while the worker drains ahead of it.
+            let mut msg = Msg::Shutdown(ack_tx);
+            loop {
+                match self.sender.try_send(msg) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(m)) => {
+                        if Instant::now() >= deadline {
+                            eprintln!(
+                                "[cargoless:otel] shutdown: span queue still full at \
+                                 deadline; detaching export worker"
+                            );
+                            return Err(OTelSdkError::Timeout(budget));
+                        }
+                        msg = m;
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Err(OTelSdkError::AlreadyShutdown);
+                    }
+                }
+            }
+            match ack_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(()) => {
+                    // Acked ⇒ the worker is past its final export and
+                    // exiting; join is immediate.
+                    if let Some(h) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        let _ = h.join();
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    // Deadline elapsed mid-drain: detach. The worker keeps
+                    // draining and exits on its own; the process is free to
+                    // return now (pending spans are diagnostics).
+                    eprintln!(
+                        "[cargoless:otel] shutdown: drain exceeded {}ms; detaching \
+                         export worker (pending spans may be lost)",
+                        budget.as_millis()
+                    );
+                    Err(OTelSdkError::Timeout(budget))
+                }
+            }
+        }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            // Called by TracerProviderBuilder::build() before the provider
+            // is installed (queue empty), so try_send cannot realistically
+            // fail; if it ever does, degrade loudly — spans would export
+            // without service.name and look unattributed in SigNoz.
+            if self
+                .sender
+                .try_send(Msg::SetResource(resource.clone()))
+                .is_err()
+            {
+                eprintln!(
+                    "[cargoless:otel] set_resource dropped; exported spans may \
+                     lack service attributes"
+                );
+            }
+        }
+    }
+
+    /// Worker body: batch up to [`BATCH_MAX`] spans or [`BATCH_WINDOW`],
+    /// then export. The ONLY place that blocks on the collector.
+    fn worker_loop<E: SpanExporter>(mut exporter: E, rx: Receiver<Msg>) {
+        // Same guard the SDK's batch worker takes: the exporter's own HTTP
+        // stack must not generate spans about exporting spans.
+        let _suppress = Context::enter_telemetry_suppressed_scope();
+        let mut batch: Vec<SpanData> = Vec::with_capacity(BATCH_MAX);
+        let mut window_deadline: Option<Instant> = None;
+        let mut export_failures: u64 = 0;
+        loop {
+            let wait = window_deadline.map_or(BATCH_WINDOW, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
+            match rx.recv_timeout(wait) {
+                Ok(Msg::Span(span)) => {
+                    if batch.is_empty() {
+                        window_deadline = Some(Instant::now() + BATCH_WINDOW);
+                    }
+                    batch.push(span);
+                    if batch.len() >= BATCH_MAX {
+                        export_batch(&exporter, &mut batch, &mut export_failures);
+                        window_deadline = None;
+                    }
+                }
+                Ok(Msg::SetResource(resource)) => exporter.set_resource(&resource),
+                Ok(Msg::Flush(ack)) => {
+                    export_batch(&exporter, &mut batch, &mut export_failures);
+                    window_deadline = None;
+                    let _ = ack.send(());
+                }
+                Ok(Msg::Shutdown(ack)) => {
+                    // Drain stragglers racing the shutdown flag, then the
+                    // final export. The shutdown caller stops waiting at
+                    // its deadline regardless — a slow drain only costs
+                    // this (detached) thread.
+                    while let Ok(msg) = rx.try_recv() {
+                        if let Msg::Span(span) = msg {
+                            batch.push(span);
+                            if batch.len() >= BATCH_MAX {
+                                export_batch(&exporter, &mut batch, &mut export_failures);
+                            }
+                        }
+                    }
+                    export_batch(&exporter, &mut batch, &mut export_failures);
+                    let _ = exporter.shutdown();
+                    let _ = ack.send(());
+                    return;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    export_batch(&exporter, &mut batch, &mut export_failures);
+                    window_deadline = None;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Processor dropped without shutdown (test paths,
+                    // provider Drop): flush what we hold and exit.
+                    export_batch(&exporter, &mut batch, &mut export_failures);
+                    let _ = exporter.shutdown();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Export `batch` (if nonempty), blocking this worker thread only.
+    /// `futures_executor::block_on` is the same executor
+    /// `SimpleSpanProcessor` uses inline — the blocking-reqwest export
+    /// future needs no reactor. Failures are power-of-two-sampled to
+    /// stderr so a long outage stays visible without spamming.
+    fn export_batch<E: SpanExporter>(exporter: &E, batch: &mut Vec<SpanData>, failures: &mut u64) {
+        if batch.is_empty() {
+            return;
+        }
+        // split_off(0) hands the spans over while keeping `batch`'s
+        // allocation for the next round.
+        let spans = batch.split_off(0);
+        if let Err(err) = futures_executor::block_on(exporter.export(spans)) {
+            *failures += 1;
+            if failures.is_power_of_two() {
+                eprintln!("[cargoless:otel] OTLP export failed ({failures} so far): {err}");
+            }
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -567,5 +889,179 @@ mod tests {
                 .any(|(k, v)| k == "overlay_size_bytes" && v == "4096"),
             "overlay_size_bytes not surfaced (CATCH-1 regression): captured={buf:?}"
         );
+    }
+
+    // ───────── A5 — QueuedSpanProcessor contract tests ─────────
+    //
+    // No network anywhere: the "collector" is a stub exporter. The two
+    // load-bearing properties are (1) `on_end` never blocks the
+    // span-ending thread even with a wedged collector + full queue, and
+    // (2) shutdown DRAINS (spans actually export) within the 2s budget.
+    #[cfg(feature = "telemetry")]
+    mod queue_tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+
+        use opentelemetry::trace::{SpanContext, SpanKind, Status, TraceState};
+        use opentelemetry::{InstrumentationScope, SpanId, TraceFlags, TraceId};
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{
+            SpanData, SpanEvents, SpanExporter, SpanLinks, SpanProcessor,
+        };
+
+        use super::super::queue::{QUEUE_CAP, QueuedSpanProcessor};
+
+        /// A sampled SpanData (mirrors the SDK's own test helper —
+        /// unsampled spans never reach the export path).
+        fn sampled_span() -> SpanData {
+            SpanData {
+                span_context: SpanContext::new(
+                    TraceId::from(1u128),
+                    SpanId::from(1u64),
+                    TraceFlags::SAMPLED,
+                    false,
+                    TraceState::default(),
+                ),
+                parent_span_id: SpanId::INVALID,
+                parent_span_is_remote: false,
+                span_kind: SpanKind::Internal,
+                name: "test-span".into(),
+                start_time: std::time::SystemTime::now(),
+                end_time: std::time::SystemTime::now(),
+                attributes: Vec::new(),
+                dropped_attributes_count: 0,
+                events: SpanEvents::default(),
+                links: SpanLinks::default(),
+                status: Status::Unset,
+                instrumentation_scope: InstrumentationScope::default(),
+            }
+        }
+
+        /// Export parks until the gate opens — models a wedged collector
+        /// (the exact outage class A5 removes from the verdict path).
+        #[derive(Debug)]
+        struct ParkingExporter {
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl SpanExporter for ParkingExporter {
+            async fn export(&self, _batch: Vec<SpanData>) -> OTelSdkResult {
+                let (lock, cvar) = &*self.gate;
+                let mut open = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while !*open {
+                    open = cvar.wait(open).unwrap_or_else(|e| e.into_inner());
+                }
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn on_end_never_blocks_when_queue_full() {
+            let gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let processor = QueuedSpanProcessor::spawn(ParkingExporter { gate: gate.clone() })
+                .expect("worker spawn");
+
+            // The worker parks inside its first export; the queue then
+            // fills and every further on_end must DROP, never block. 3x
+            // the queue bound guarantees overflow under any interleaving
+            // (the worker can absorb at most one batch + QUEUE_CAP).
+            let t0 = Instant::now();
+            for _ in 0..(3 * QUEUE_CAP) {
+                processor.on_end(sampled_span());
+            }
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "on_end loop took {elapsed:?} — a span end blocked on the wedged collector"
+            );
+            assert!(
+                processor.dropped_so_far() > 0,
+                "queue never overflowed — the drop path was not exercised"
+            );
+
+            // Open the gate so the worker drains + shutdown joins cleanly
+            // (the detach path is not what this test is about).
+            {
+                let (lock, cvar) = &*gate;
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                cvar.notify_all();
+            }
+            let _ = processor.shutdown();
+        }
+
+        /// Records every exported span + exporter-shutdown call — proves
+        /// the shutdown path drains rather than merely returning.
+        #[derive(Debug)]
+        struct RecordingExporter {
+            spans: Arc<Mutex<Vec<SpanData>>>,
+            shutdowns: Arc<AtomicUsize>,
+        }
+
+        impl SpanExporter for RecordingExporter {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                self.spans
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(batch);
+                Ok(())
+            }
+
+            fn shutdown_with_timeout(&mut self, _timeout: Duration) -> OTelSdkResult {
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn shutdown_drains_within_deadline() {
+            let spans = Arc::new(Mutex::new(Vec::new()));
+            let shutdowns = Arc::new(AtomicUsize::new(0));
+            let processor = QueuedSpanProcessor::spawn(RecordingExporter {
+                spans: spans.clone(),
+                shutdowns: shutdowns.clone(),
+            })
+            .expect("worker spawn");
+
+            for _ in 0..5 {
+                processor.on_end(sampled_span());
+            }
+
+            let t0 = Instant::now();
+            let result = processor.shutdown();
+            let elapsed = t0.elapsed();
+
+            assert!(result.is_ok(), "clean drain must report Ok: {result:?}");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "shutdown took {elapsed:?} — exceeds the 2s drain budget"
+            );
+            assert_eq!(
+                spans.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                5,
+                "all spans enqueued before shutdown must be exported by the drain"
+            );
+            assert_eq!(
+                shutdowns.load(Ordering::SeqCst),
+                1,
+                "exporter shutdown exactly once"
+            );
+        }
+
+        #[test]
+        fn second_shutdown_is_prompt_err_not_hang() {
+            let processor = QueuedSpanProcessor::spawn(RecordingExporter {
+                spans: Arc::new(Mutex::new(Vec::new())),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+            })
+            .expect("worker spawn");
+            assert!(processor.shutdown().is_ok());
+            // SpanProcessor contract: shutdown must be safe to call more
+            // than once. Same shape as the SDK's BatchSpanProcessor:
+            // prompt AlreadyShutdown error, no second drain.
+            let t0 = Instant::now();
+            assert!(processor.shutdown().is_err(), "second shutdown reports Err");
+            assert!(t0.elapsed() < Duration::from_millis(500));
+        }
     }
 }

@@ -37,13 +37,14 @@
 //!
 //! ## Dependency posture
 //!
-//! std-only + the crate's existing `serde_json` (Value + `json!`, no
-//! derive — the sanctioned house tool; hand-rolled JSON for the wire is
-//! the latent-bug factory the crate's dep rationale warns against). No
-//! HTTP framework: the network adapter is a minimal, bounded HTTP/1.1 +
-//! SSE over `std::net` (house ethos — JSON-RPC framing / debounce /
-//! ignore are all hand-rolled in-crate already). Best-effort throughout:
-//! a transport failure is surfaced as a typed error, never a panic.
+//! The wire remains hand-rolled around `serde_json` (Value + `json!`, no
+//! derive — the sanctioned house tool; hand-rolled JSON parsing for the
+//! payload would be the latent-bug factory the crate's dep rationale warns
+//! against). No HTTP framework: the network adapter is a minimal, bounded
+//! HTTP/1.1 + SSE surface over `std::net`, with native TLS only on the client
+//! side for direct ingress and gzip only for large bounded JSON POST bodies.
+//! Best-effort throughout: a transport failure is surfaced as a typed error,
+//! never a panic.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -420,6 +421,16 @@ pub trait VerdictService: Send + Sync {
     /// is a no-op so non-daemon test services keep compiling.
     fn request_quiesce(&self) -> DaemonActivity {
         self.daemon_activity()
+    }
+
+    /// A6 — RA-warm readiness, the `GET /readyz` probe input. `true` means
+    /// the service can produce a meaningful verdict NOW (for the serve
+    /// daemon: a rust-analyzer instance has completed its LSP handshake
+    /// and accepts routed batches). Default `true` so every existing impl
+    /// and test mock is unaffected (additive, non-breaking); the serve
+    /// loop's `ServeVerdictState` overrides it with its warm-up latch.
+    fn ready(&self) -> bool {
+        true
     }
 }
 

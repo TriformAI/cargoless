@@ -19,6 +19,12 @@ cargoless-cas = { path = "../cargoless-cas", version = "0.3.0" }      # publish-
 # than pulling notify-debouncer-* / the ignore crate, keeping the dep tree
 # minimal for the CI-only build model.
 notify = "6"
+# Native TLS keeps the hand-rolled HTTP adapter small while allowing the CLI
+# to connect directly to HTTPS ingress endpoints.
+native-tls = "0.2"
+# Gzip is used only for large JSON request bodies before they hit the fixed
+# HTTP body cap; the daemon still bounds both encoded and decoded sizes.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Owner-added (daemon-core, Epic 2 / CWDL #4). serde_json for LSP JSON-RPC:
 # we emit controlled requests but must robustly parse rust-analyzer's
 # publishDiagnostics (nested arrays, escaped strings) — hand-rolled JSON there

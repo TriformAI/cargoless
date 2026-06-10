@@ -13,10 +13,25 @@ use cargoless_core::batch::BatchVerdict;
 use cargoless_core::transport::http::HttpClient;
 use cargoless_core::transport::{Request, TransportClient, batchreport_to_json};
 
+/// EX_TEMPFAIL — the fleet-wide "escalate, do not fix" exit code: the gate
+/// could not produce a real green/red verdict (indeterminate report, or a
+/// transport/IO failure talking to the daemon). Distinct from 2 (caller
+/// misuse: bad request file / malformed JSON / bad --remote).
+const EXIT_TEMPFAIL: u8 = 75;
+
 pub struct BatchCheckOpts {
     pub remote: String,
     pub auth_token: Option<String>,
     pub request_json: PathBuf,
+}
+
+/// Green ⇒ 0, Red ⇒ 1, Indeterminate ⇒ 75 ([`EXIT_TEMPFAIL`]).
+fn verdict_exit_code(verdict: BatchVerdict) -> u8 {
+    match verdict {
+        BatchVerdict::Green => 0,
+        BatchVerdict::Red => 1,
+        BatchVerdict::Indeterminate => EXIT_TEMPFAIL,
+    }
 }
 
 pub fn run(opts: &BatchCheckOpts) -> ExitCode {
@@ -58,17 +73,15 @@ pub fn run(opts: &BatchCheckOpts) -> ExitCode {
         Ok(report) => report,
         Err(e) => {
             crate::ui::error(format!("batch-check: remote `{}` failed: {e}", opts.remote));
-            return ExitCode::from(2);
+            // Transport/IO failure: no verdict was produced — EX_TEMPFAIL,
+            // so gate wrappers escalate instead of treating it as red.
+            return ExitCode::from(EXIT_TEMPFAIL);
         }
     };
 
     // Machine-readable stdout. Stderr gets human errors/logging.
     println!("{}", batchreport_to_json(&report));
-    match report.verdict {
-        BatchVerdict::Green => ExitCode::SUCCESS,
-        BatchVerdict::Red => ExitCode::from(1),
-        BatchVerdict::Indeterminate => ExitCode::from(2),
-    }
+    ExitCode::from(verdict_exit_code(report.verdict))
 }
 
 #[cfg(test)]
@@ -76,6 +89,58 @@ mod tests {
     use super::*;
     use cargoless_core::batch::{BatchMember, BatchReport};
     use cargoless_core::transport::{BatchCheckRequest, batchreport_from_json};
+
+    #[test]
+    fn verdict_exit_codes_green_0_red_1_indeterminate_75() {
+        assert_eq!(verdict_exit_code(BatchVerdict::Green), 0);
+        assert_eq!(verdict_exit_code(BatchVerdict::Red), 1);
+        // 75 = EX_TEMPFAIL, the fleet-wide escalate-do-not-fix convention.
+        assert_eq!(verdict_exit_code(BatchVerdict::Indeterminate), 75);
+    }
+
+    #[test]
+    fn transport_error_exits_75_not_red() {
+        let dir = std::env::temp_dir().join(format!(
+            "cargoless-batchcheck-tempfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let request_json = dir.join("request.json");
+        let mut request = BatchCheckRequest::new("batch-tempfail", "origin/main");
+        request.members = vec![BatchMember::new("wt-a")];
+        std::fs::write(&request_json, Request::BatchCheck(request).to_json()).unwrap();
+
+        // Port 9 is intentionally not served (same convention as the
+        // transport's own connect-refused tests): connect fails fast, no
+        // daemon answers — the canonical "daemon down" transport error.
+        let code = run(&BatchCheckOpts {
+            remote: "http://127.0.0.1:9".into(),
+            auth_token: None,
+            request_json,
+        });
+
+        // ExitCode has no PartialEq; its Debug repr is stable within one
+        // platform, so compare against the constructor we expect.
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::from(EXIT_TEMPFAIL))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_request_file_stays_caller_misuse_exit_2() {
+        let code = run(&BatchCheckOpts {
+            remote: "http://127.0.0.1:1".into(),
+            auth_token: None,
+            request_json: PathBuf::from("/cargoless-no-such-dir/request.json"),
+        });
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+    }
 
     #[test]
     fn request_json_uses_the_transport_shape() {
