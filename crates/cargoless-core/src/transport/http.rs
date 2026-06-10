@@ -862,6 +862,13 @@ pub struct HttpClient {
     /// loopback/`AllowAll` posture. Network daemons that bind with an auth
     /// token require it for read and write routes.
     token: Option<String>,
+    /// Extra request headers sent on EVERY request this client makes,
+    /// reads and writes alike. The pool ingress (C1) consistent-hashes on
+    /// `X-Cargoless-Routing-Key`: the push AND the status polls that
+    /// follow it must hash to the same shard, so injection is
+    /// client-wide, never per-verb. Built via [`Self::with_header`],
+    /// which rejects CR/LF header-injection shapes.
+    extra_headers: Vec<(String, String)>,
 }
 
 fn parse_host_port(rest: &str, default_port: u16) -> Result<(String, u16), String> {
@@ -924,6 +931,7 @@ impl HttpClient {
             host,
             port,
             token: None,
+            extra_headers: Vec::new(),
         })
     }
 
@@ -933,6 +941,72 @@ impl HttpClient {
         let mut c = Self::new(base)?;
         c.token = Some(token.into());
         Ok(c)
+    }
+
+    /// A1 — attach one extra header to every request this client sends
+    /// (builder style; call repeatedly for several). The C1 pool ingress
+    /// routes on `X-Cargoless-Routing-Key`, so the header must ride the
+    /// push and all follow-up status polls identically.
+    ///
+    /// The raw-socket writer below emits `{name}: {value}\r\n` verbatim,
+    /// so a name/value containing CR/LF would let a caller smuggle
+    /// arbitrary headers or split the request — rejected here as a typed
+    /// protocol error, never silently sanitized. `Authorization`,
+    /// `Host`, `Content-Length`, `Content-Type`, and `Connection` are
+    /// reserved (owned by the client itself).
+    pub fn with_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, TransportError> {
+        let name = name.into();
+        let value = value.into();
+        let name_trimmed = name.trim();
+        if name_trimmed.is_empty()
+            || !name_trimmed
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(TransportError::Protocol(format!(
+                "invalid header name: {name:?} (token chars only — letters, digits, '-', '_')"
+            )));
+        }
+        for reserved in [
+            "authorization",
+            "host",
+            "content-length",
+            "content-type",
+            "connection",
+        ] {
+            if name_trimmed.eq_ignore_ascii_case(reserved) {
+                return Err(TransportError::Protocol(format!(
+                    "header {name_trimmed:?} is reserved (set by the client itself)"
+                )));
+            }
+        }
+        if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(TransportError::Protocol(format!(
+                "invalid header value for {name_trimmed:?}: CR/LF/NUL are not allowed"
+            )));
+        }
+        self.extra_headers
+            .push((name_trimmed.to_string(), value.trim().to_string()));
+        Ok(self)
+    }
+
+    /// Render the configured extra headers as wire lines
+    /// (`Name: value\r\n` each). Values were CR/LF-validated at
+    /// [`Self::with_header`] time, so this is injection-safe by
+    /// construction.
+    fn extra_header_lines(&self) -> String {
+        let mut lines = String::new();
+        for (name, value) in &self.extra_headers {
+            lines.push_str(name);
+            lines.push_str(": ");
+            lines.push_str(value);
+            lines.push_str("\r\n");
+        }
+        lines
     }
 
     fn connect(&self) -> Result<ClientStream, TransportError> {
@@ -999,6 +1073,7 @@ impl HttpClient {
         if let Some(tok) = &self.token {
             req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
         }
+        req.extend_from_slice(self.extra_header_lines().as_bytes());
         req.extend_from_slice(b"\r\n");
         req.extend_from_slice(&prepared.bytes);
 
@@ -1029,6 +1104,7 @@ impl HttpClient {
         if let Some(tok) = &self.token {
             write!(stream, "Authorization: Bearer {tok}\r\n")?;
         }
+        write!(stream, "{}", self.extra_header_lines())?;
         write!(stream, "\r\n")?;
         stream.flush()?;
         let mut raw = String::new();
@@ -1114,6 +1190,7 @@ impl TransportClient for HttpClient {
         if let Some(tok) = &self.token {
             write!(stream, "Authorization: Bearer {tok}\r\n")?;
         }
+        write!(stream, "{}", self.extra_header_lines())?;
         write!(stream, "\r\n")?;
         stream.flush()?;
         let (tx, rx) = channel();
@@ -1961,5 +2038,144 @@ mod tests {
             "HTTP server should process overlapping batch_check requests"
         );
         drop(s);
+    }
+
+    // ───────── A1 — client extra-header injection (C1 routing key) ─────────
+
+    /// One-shot wire tap: accepts a single connection, captures the raw
+    /// request head, replies with the given body. Proves what the client
+    /// PUT ON THE WIRE — not what a parsed abstraction claims.
+    fn capture_one_request(response_body: String) -> (std::net::SocketAddr, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tap");
+        let addr = listener.local_addr().expect("tap addr");
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 65536];
+            let mut raw = Vec::new();
+            // Read until the blank line ends the head (the tap only ever
+            // needs headers; bodies may follow but the assertions don't).
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = s.flush();
+            let _ = s.shutdown(Shutdown::Both);
+            let _ = tx.send(String::from_utf8_lossy(&raw).into_owned());
+        });
+        (addr, rx)
+    }
+
+    #[test]
+    fn with_header_rides_get_requests_on_the_wire() {
+        let status = status_to_json(&WorktreeStatus {
+            worktree: "wt".into(),
+            verdict: "green".into(),
+            daemon_build_id: "test".into(),
+            crates: vec![],
+            red_diagnostics: 0,
+            verdict_failure_reason: None,
+            base_sha: None,
+            heartbeat_age_secs: 0,
+            published_at: 1,
+        });
+        let (addr, rx) = capture_one_request(status);
+        let client = HttpClient::new(&format!("http://{addr}"))
+            .expect("client")
+            .with_header("X-Cargoless-Routing-Key", "tf-mv-route-7")
+            .expect("header");
+        let got = client.get_status("wt").expect("status");
+        assert_eq!(got.map(|s| s.verdict), Some("green".to_string()));
+        let head = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        assert!(
+            head.contains("X-Cargoless-Routing-Key: tf-mv-route-7\r\n"),
+            "routing-key header must be on the GET wire; got head:\n{head}"
+        );
+    }
+
+    #[test]
+    fn with_header_rides_post_overlay_on_the_wire() {
+        let (addr, rx) = capture_one_request(
+            r#"{"worktree":"wt","accepted":true,"applied_files":1}"#.to_string(),
+        );
+        let client = HttpClient::with_token(&format!("http://{addr}"), "sekret")
+            .expect("client")
+            .with_header("X-Cargoless-Routing-Key", "tf-mv-route-7")
+            .expect("header");
+        let ack = client
+            .push_overlay(
+                "wt",
+                "origin/main",
+                &[("src/lib.rs".into(), "fn f(){}".into())],
+            )
+            .expect("push");
+        assert!(ack.accepted);
+        let head = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        assert!(
+            head.contains("X-Cargoless-Routing-Key: tf-mv-route-7\r\n"),
+            "routing-key header must be on the POST /overlay wire; got head:\n{head}"
+        );
+        assert!(
+            head.contains("Authorization: Bearer sekret\r\n"),
+            "extra headers must not displace the bearer token; got head:\n{head}"
+        );
+    }
+
+    #[test]
+    fn with_header_rejects_crlf_injection_and_reserved_names() {
+        let ok = HttpClient::new("http://127.0.0.1:1").expect("client");
+        // CR/LF in the VALUE would let a caller smuggle a second header
+        // (request splitting) — typed Protocol error, never sanitized.
+        assert!(matches!(
+            ok.with_header("X-Key", "v\r\nX-Smuggled: 1"),
+            Err(TransportError::Protocol(_))
+        ));
+        let ok = HttpClient::new("http://127.0.0.1:1").expect("client");
+        assert!(matches!(
+            ok.with_header("X-Key\r\nX-Smuggled", "v"),
+            Err(TransportError::Protocol(_))
+        ));
+        // Reserved names are owned by the client (Authorization carries
+        // the token; Host/Content-*/Connection frame the request).
+        for reserved in [
+            "Authorization",
+            "host",
+            "Content-Length",
+            "content-type",
+            "Connection",
+        ] {
+            let c = HttpClient::new("http://127.0.0.1:1").expect("client");
+            assert!(
+                matches!(
+                    c.with_header(reserved, "v"),
+                    Err(TransportError::Protocol(_))
+                ),
+                "{reserved} must be rejected as reserved"
+            );
+        }
+        // The happy path keeps building.
+        let c = HttpClient::new("http://127.0.0.1:1")
+            .expect("client")
+            .with_header("X-Cargoless-Routing-Key", "abc")
+            .expect("valid header")
+            .with_header("X-Trace-Id", "123")
+            .expect("second header");
+        assert_eq!(
+            c.extra_header_lines(),
+            "X-Cargoless-Routing-Key: abc\r\nX-Trace-Id: 123\r\n"
+        );
     }
 }

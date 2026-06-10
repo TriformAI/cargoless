@@ -72,7 +72,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cargoless"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cargoless-core",
  "futures-executor",
@@ -89,14 +89,14 @@ dependencies = [
 
 [[package]]
 name = "cargoless-cas"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cargoless-proto",
 ]
 
 [[package]]
 name = "cargoless-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cargoless-cas",
  "cargoless-proto",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "cargoless-proto"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "cc"
