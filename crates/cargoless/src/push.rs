@@ -96,13 +96,13 @@ pub struct PushOpts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AwaitFreshness {
-    prior_published_at: Option<u64>,
-    not_before_unix: u64,
+pub(crate) struct AwaitFreshness {
+    pub(crate) prior_published_at: Option<u64>,
+    pub(crate) not_before_unix: u64,
 }
 
 impl AwaitFreshness {
-    fn is_fresh(self, published_at: u64) -> bool {
+    pub(crate) fn is_fresh(self, published_at: u64) -> bool {
         match self.prior_published_at {
             Some(prior) => published_at > prior,
             None => published_at > self.not_before_unix,
@@ -347,7 +347,7 @@ pub(crate) fn git_changed_files(repo: &Path, base: &str) -> std::io::Result<Vec<
         .collect())
 }
 
-fn git_resolve_ref(repo: &Path, base: &str) -> std::io::Result<String> {
+pub(crate) fn git_resolve_ref(repo: &Path, base: &str) -> std::io::Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -366,10 +366,10 @@ fn git_resolve_ref(repo: &Path, base: &str) -> std::io::Result<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PushPayload {
-    files: Vec<(String, String)>,
-    content_stats: Vec<ContentFileStat>,
-    trigger_paths: Vec<String>,
+pub(crate) struct PushPayload {
+    pub(crate) files: Vec<(String, String)>,
+    pub(crate) content_stats: Vec<ContentFileStat>,
+    pub(crate) trigger_paths: Vec<String>,
     metadata_only_paths: Vec<MetadataOnlyPath>,
     excluded_paths: Vec<MetadataOnlyPath>,
 }
@@ -391,7 +391,7 @@ impl PushPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ContentFileStat {
+pub(crate) struct ContentFileStat {
     path: String,
     bytes: usize,
 }
@@ -447,7 +447,7 @@ impl ContentFileFailureReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PushPayloadError {
+pub(crate) struct PushPayloadError {
     failures: Vec<ContentFileFailure>,
 }
 
@@ -463,7 +463,7 @@ impl std::fmt::Display for PushPayloadError {
 
 impl std::error::Error for PushPayloadError {}
 
-fn build_push_payload(
+pub(crate) fn build_push_payload(
     repo: &Path,
     changed: &[String],
     repo_relative: bool,
@@ -572,7 +572,7 @@ fn build_push_payload(
     }
 }
 
-fn push_overlay_request_body(
+pub(crate) fn push_overlay_request_body(
     worktree: &str,
     base_ref: &str,
     files: &[(String, String)],
@@ -597,7 +597,11 @@ fn push_overlay_request_body(
     .to_json()
 }
 
-fn emit_payload_diagnostics(changed: &[String], payload: &PushPayload, json_bytes: usize) {
+pub(crate) fn emit_payload_diagnostics(
+    changed: &[String],
+    payload: &PushPayload,
+    json_bytes: usize,
+) {
     eprintln!(
         "[cargoless:push] payload changed_paths={} content_files={} content_bytes={} metadata_only_paths={} excluded_paths={} json_bytes={}",
         changed.len(),
@@ -633,7 +637,7 @@ fn emit_payload_diagnostics(changed: &[String], payload: &PushPayload, json_byte
     }
 }
 
-fn validate_overlay_http_cap(
+pub(crate) fn validate_overlay_http_cap(
     json_bytes: usize,
     content_stats: &[ContentFileStat],
 ) -> Result<(), String> {
