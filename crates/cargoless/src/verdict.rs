@@ -216,7 +216,7 @@ pub fn run(opts: &VerdictOpts) -> ExitCode {
         options.as_ref(),
     );
     emit_payload_diagnostics(&changed, &payload, body.len());
-    if let Err(message) = validate_overlay_http_cap(body.len(), &payload.content_stats) {
+    if let Err(message) = validate_overlay_http_cap(&body, &payload.content_stats) {
         crate::ui::error(message);
         return ExitCode::from(2);
     }

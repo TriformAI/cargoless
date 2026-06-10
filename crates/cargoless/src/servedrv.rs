@@ -369,9 +369,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     }
     // #225 0d: the daemon's serve loop is now live → flip the /healthz
     // readiness latch (503 {"status":"starting"} → 200 {"status":"ready"}).
-    // This is the ONE meaningful readiness transition the k8s probe needs;
-    // it is harmless (a no-op observer) when `--bind` is absent.
+    // A6 split: /healthz is the startup/LIVENESS boundary only — RA is not
+    // warm yet; the honest k8s readinessProbe signal is `GET /readyz`
+    // (api.mark_ready below, at the RA-warm boundary). Harmless (a no-op
+    // observer) when `--bind` is absent.
     ready.store(true, Ordering::Relaxed);
+    // A6 — /readyz RA-warm latch arming; flipped at the bottom of the loop.
+    let mut ra_warm_latched = false;
     let mut last_status_heartbeat = Instant::now()
         .checked_sub(statusfile::HEARTBEAT)
         .unwrap_or_else(Instant::now);
@@ -516,6 +520,27 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                     }
                 }
             }
+        }
+
+        // A6 — /readyz RA-warm latch: flip once the FIRST cluster can take
+        // routed batches (LSP handshake complete + project-ready; in
+        // push-only RA-native mode project-ready is set at handshake-drain
+        // because a cold push-only RA may never emit IndexingEnded — the
+        // per-request settle delay covers index warm-up). One-way: respawn
+        // churn after first-warm is a liveness concern (/healthz), not
+        // readiness. TRADEOFF (named — A6 hard-constraint fallback):
+        // clusters spawn lazily on the first push/watch batch, so this
+        // boundary is traffic-dependent today; a pod that receives zero
+        // traffic stays NotReady. The deploy-side mitigation is a boot-time
+        // warm-up push (tf-multiverse manifests, separate repo); an eager
+        // boot-time cluster spawn is the in-repo follow-up that removes the
+        // traffic dependence entirely.
+        if !ra_warm_latched && clusters.values().any(|cs| cs.lsp.is_some() && cs.ready) {
+            ra_warm_latched = true;
+            api.mark_ready();
+            eprintln!(
+                "[cargoless:obs] ra-warm — first cluster handshaked+ready; /readyz now 200 (A6)"
+            );
         }
 
         if push_only {
