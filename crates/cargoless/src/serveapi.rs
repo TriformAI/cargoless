@@ -41,7 +41,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -205,6 +205,13 @@ pub struct ServeVerdictState {
     /// whose verdict came from the FS-watch path simply have no entry
     /// (their status carries `base_sha: None`, no latency line).
     push_attribution: Mutex<BTreeMap<String, PushAttribution>>,
+    /// A6 — RA-warm readiness latch, the `GET /readyz` source of truth.
+    /// `false` (the `Default`) until servedrv flips it via
+    /// [`Self::mark_ready`] at the first completed rust-analyzer LSP
+    /// handshake — distinct from the `/healthz` serve-loop-entered flag,
+    /// which goes `true` before RA can produce any verdict. One-way
+    /// monotonic latch ⇒ `Relaxed` ordering suffices.
+    ready: AtomicBool,
     /// Optional server-side coalescing for explicit `coalesce_key`
     /// batch-check requests. Absent key keeps historical immediate behavior.
     batch_coalescer: BatchCoalescer,
@@ -633,6 +640,14 @@ impl ServeVerdictState {
     pub fn with_project_check_state_dir(mut self, state_dir: PathBuf) -> Self {
         self.project_check_state_dir = Some(state_dir);
         self
+    }
+
+    /// A6 — flip the RA-warm readiness latch. Called by servedrv once the
+    /// daemon is first able to produce a meaningful verdict (the first
+    /// cluster's RA handshake completed). One-way: never un-set; a
+    /// respawning RA mid-flight is a liveness concern, not readiness.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Relaxed);
     }
 
     /// Unattributed convenience wrapper over [`Self::publish_attributed`]
@@ -1147,6 +1162,14 @@ impl ServeVerdictState {
 }
 
 impl VerdictService for ServeVerdictState {
+    /// A6 — `GET /readyz` reads this. Overrides the default-`true` trait
+    /// body with the honest RA-warm latch: `false` until servedrv calls
+    /// [`ServeVerdictState::mark_ready`] at the first completed RA
+    /// handshake.
+    fn ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
         let g = poisoned(&self.statuses);
         let mut s = g.get(worktree).cloned()?;
@@ -3778,5 +3801,19 @@ checks:
         // "no diff vs base" member, not a truncation signature.
         let member = BatchMember::new("wt-empty");
         assert_eq!(member_truncation_suspect(&member), None);
+    }
+
+    #[test]
+    fn readyz_latch_starts_false_and_mark_ready_flips_it() {
+        // A6: a fresh daemon state is NOT ready (RA cold ⇒ /readyz 503,
+        // k8s keeps the pod out of Service rotation); mark_ready (the
+        // servedrv RA-warm flip) latches it true.
+        let api = ServeVerdictState::new();
+        assert!(!api.ready(), "fresh state must report not-ready");
+        api.mark_ready();
+        assert!(api.ready(), "after mark_ready the latch reports ready");
+        // One-way: a second mark is a no-op, never an un-set.
+        api.mark_ready();
+        assert!(api.ready());
     }
 }

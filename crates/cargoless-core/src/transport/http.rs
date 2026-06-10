@@ -350,7 +350,8 @@ impl HttpServer {
     /// signature/behaviour, the [`VerdictService`] trait, the wire codec,
     /// the discovery chain, and the #14 auth seam for **every other
     /// route** are byte-frozen and their exhaustive unit suites untouched.
-    /// `/healthz` is the ONLY auth-exempt path (see [`handle`]).
+    /// `/healthz` and the A6 `/readyz` probe are the ONLY auth-exempt
+    /// paths (see [`handle`]).
     pub fn bind_with_health(
         addr: &str,
         svc: Arc<dyn VerdictService>,
@@ -449,6 +450,25 @@ fn handle(
             (503, "Service Unavailable", "{\"status\":\"starting\"}")
         };
         write_response(&mut writer, code, reason, "application/json", body);
+        return;
+    }
+    // ── GET /readyz — RA-warm readiness probe (A6) ──────────────────────
+    // Same no-auth treatment as /healthz (answer + `return` BEFORE the
+    // #14 gate; the exemption stays exactly these two probe paths) and the
+    // same fixed-constant zero-leakage body discipline. Semantics split:
+    // /healthz stays the startup/liveness probe (serve loop entered);
+    // /readyz reflects `svc.ready()` — the service can produce a
+    // meaningful verdict NOW (rust-analyzer warm). k8s: livenessProbe
+    // stays on /healthz; readinessProbe moves to /readyz in the
+    // tf-multiverse manifests (separate repo), so a fresh pod is not
+    // Service-routable while its RA index is still warming.
+    if req.path == "/readyz" {
+        let (code, reason, body): (u16, &str, &str) = if svc.ready() {
+            (200, "OK", "ready")
+        } else {
+            (503, "Service Unavailable", "warming")
+        };
+        write_response(&mut writer, code, reason, "text/plain", body);
         return;
     }
     // #14 seam — AllowAll under #10, so this never denies today; the
