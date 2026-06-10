@@ -1100,7 +1100,22 @@ fn exec(
             // is no longer constructible — `VerdictPayload::red(0)`
             // downgrades to `Unknown` with a self-describing reason.
             let project_check_context = api.take_project_check_context(&wt.to_string_lossy());
-            let payload = match project_checks_mode() {
+            // #A4.3 — pop the attribution HERE, on the loop thread, not
+            // inside publish_verdict. record (SwitchOverlay consume) and
+            // pop (EmitVerdict dispatch) strictly alternate per wt-key on
+            // this thread, so the pairing is race-free. Once Hard mode
+            // publishes from a supervisor thread, an in-body pop could
+            // race a second consumed push for the same key and stamp ITS
+            // base_sha onto the first push's verdict — silent
+            // cross-attribution, the exact failure #A2 exists to prevent.
+            let attribution = api.take_push_attribution(&wt.to_string_lossy());
+            // #A4.3 gate promotion: an explicit `--gate` push gets the
+            // witness-gated (Hard) verdict even while the daemon-wide
+            // default stays Warn — the deployed posture keeps ~2s
+            // RA-native verdicts for plain pushes; only gate pushes wait.
+            let gate_requested = project_check_context.as_ref().is_some_and(|ctx| ctx.gate);
+            let payload = match effective_project_checks_mode(project_checks_mode(), gate_requested)
+            {
                 ProjectChecksMode::Off => {
                     // No project-check signal; the only input is the
                     // RA-native bool. Routed through the legacy shim
@@ -1117,17 +1132,25 @@ fn exec(
                     statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
                 }
                 ProjectChecksMode::Hard => {
-                    // Hard mode: both inputs compose. The merge rule
-                    // is "any Red wins; otherwise any Unknown wins;
-                    // else Green" — and crucially, each non-Green
-                    // outcome carries its own evidence (RA-native:
-                    // analysis_failure_reason; project-checks: real
-                    // error_count or its own classifier).
-                    let summary = run_project_checks_and_log(&wt, project_check_context, api);
-                    compose_hard_mode_payload(authoritative_error, summary)
+                    // Hard mode (#A4.3): the witness runs OFF the serve
+                    // loop. The supervisor owns watchdog + deferred
+                    // publish; this arm returns immediately so every
+                    // other worktree keeps getting verdicts during a
+                    // minutes-long (or wedged) witness. Early return is
+                    // safe: exec_driver_action computed take_followup
+                    // from the action BEFORE calling exec, so the
+                    // follow-up SwitchOverlay still fires.
+                    spawn_project_checks_hard(
+                        wt.clone(),
+                        authoritative_error,
+                        project_check_context,
+                        attribution,
+                        Arc::clone(api),
+                    );
+                    return;
                 }
             };
-            publish_verdict(&wt, payload, api);
+            publish_verdict(&wt, payload, attribution, api);
         }
     }
 }
@@ -1203,6 +1226,12 @@ fn spawn_ra_native_settle(
 /// Write `wt`'s per-worktree verdict — the only place a verdict is
 /// attributed/published in the whole wire (Judgment B as composed).
 ///
+/// Called exactly once per `EmitVerdict`: inline from the arm for
+/// Off/Warn modes, or deferred onto the `cargoless-project-checks-hard`
+/// supervisor thread for Hard mode (#A4.3) — where publish-once is
+/// enforced by the `finish_hard_witness` generation guard (a stale
+/// witness's publish is dropped, a watchdog publish consumes the claim).
+///
 /// Increment 0: this one site now feeds BOTH sinks — the durable
 /// `statusfile` (the v0 on-disk read path, unchanged) AND the in-memory
 /// [`crate::serveapi::ServeVerdictState`] that backs the shipped HTTP+SSE
@@ -1214,21 +1243,28 @@ fn spawn_ra_native_settle(
 fn publish_verdict(
     wt: &Path,
     payload: statusfile::VerdictPayload,
+    attribution: Option<crate::serveapi::PushAttribution>,
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     let now = statusfile::now_unix();
     let verdict = payload.verdict;
     let red_diagnostics = payload.red_diagnostics;
     let failure_reason = payload.analysis_failure_reason.clone();
-    // #A2/#A7 — pop the attribution stamped by the SwitchOverlay arm when
-    // this verdict's push was consumed. `None` ⇒ FS-watch verdict: no
-    // base_sha echo, no latency line (there was no push to measure from).
-    let attribution = api.take_push_attribution(&wt.to_string_lossy());
+    // #A2/#A7 — the attribution was popped by the EmitVerdict arm at
+    // dispatch time (loop thread) and handed in as a parameter. `None` ⇒
+    // FS-watch verdict: no base_sha echo, no latency line (there was no
+    // push to measure from). The pop must NOT live in this body: in Hard
+    // mode this fn runs on the witness supervisor thread, where a second
+    // consumed push for the same wt-key may already have replaced the
+    // attribution map entry — an in-body pop would stamp the SECOND
+    // push's base_sha onto the FIRST push's verdict (#A4.3).
     let verdict_latency_ms = attribution.as_ref().map(|a| a.verdict_latency_ms());
     // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
     // This span MUST be the only emission of `verdict.publish`, mirroring
-    // the structural invariant that publish_verdict is called from exactly
-    // one site (the ClusterAction::EmitVerdict arm in `exec()`). A future
+    // the structural invariant that publish_verdict fires exactly once per
+    // EmitVerdict — inline from the arm in `exec()` for Off/Warn, deferred
+    // onto the hard-witness supervisor thread for Hard (#A4.3; the
+    // generation guard + watchdog structure enforce the once). A future
     // emission seam introducing a non-EmitVerdict path would by-pass this
     // span site → loud telemetry signal at the type-system level (Layer-2
     // keystone criterion at the OTEL surface).
@@ -1350,6 +1386,20 @@ fn project_checks_mode() -> ProjectChecksMode {
     }
 }
 
+/// #A4.3 — per-push Warn→Hard promotion. A `--gate` push asks for a
+/// witness-gated verdict; in Warn deployments that promotes exactly that
+/// push to Hard. `Off` stays `Off` (an operator kill-switch outranks a
+/// client request); `Hard` is already the requested strength.
+fn effective_project_checks_mode(
+    mode: ProjectChecksMode,
+    gate_requested: bool,
+) -> ProjectChecksMode {
+    match (mode, gate_requested) {
+        (ProjectChecksMode::Warn, true) => ProjectChecksMode::Hard,
+        (mode, _) => mode,
+    }
+}
+
 /// Compose a `VerdictPayload` from the RA-native bool + the
 /// project-checks summary, under the INFRA-36 honesty contract.
 ///
@@ -1430,6 +1480,198 @@ fn spawn_project_checks_warn(
             "[cargoless:obs] project-checks-warn wt={} spawn_error={}",
             display, e
         );
+    }
+}
+
+/// #A4.3 — wall-clock budget for one hard-witness run (the supervisor's
+/// `recv_timeout`). Default 30 min: deliberately ABOVE the 20-min
+/// manifest-level check `timeout_ms` ceiling plus the git fetch/reset/
+/// scratch budget, so per-check timeouts fire first and the watchdog only
+/// catches truly wedged witnesses (unbounded git, stuck IO, lost thread).
+fn witness_timeout() -> Duration {
+    const DEFAULT_MS: u64 = 1_800_000;
+    Duration::from_millis(
+        std::env::var("CARGOLESS_WITNESS_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_MS),
+    )
+}
+
+/// #A10 — `CARGOLESS_GATE_REQUIRE_CHECKS`: when truthy, a hard-witness
+/// run that evaluated ZERO checks publishes `unknown` instead of a
+/// vacuous green (the gate caller asked for witness-backed green; an
+/// empty witness witnessed nothing).
+fn gate_require_checks() -> bool {
+    truthy_env("CARGOLESS_GATE_REQUIRE_CHECKS")
+}
+
+/// Pure half of the vacuous-green guard (unit-testable without env
+/// mutation): under `require`, `Empty` becomes `Indeterminate`; every
+/// other summary — and `Empty` without `require` — is identity.
+fn apply_require_checks(summary: ProjectCheckSummary, require: bool) -> ProjectCheckSummary {
+    match summary {
+        ProjectCheckSummary::Empty if require => ProjectCheckSummary::Indeterminate {
+            reason: "witness",
+            detail: "vacuous (0 checks evaluated)".to_string(),
+        },
+        other => other,
+    }
+}
+
+/// #A4.3 — Hard-mode witness, OFF the serve loop, watchdog included.
+///
+/// Production entry: reads the timeout + require-checks knobs from env
+/// once at spawn. Tests inject both via
+/// [`spawn_project_checks_hard_with_timeout`] (parallel `cargo test`
+/// shares process env — env mutation in tests is forbidden here).
+fn spawn_project_checks_hard(
+    wt: PathBuf,
+    authoritative_error: bool,
+    context: Option<crate::serveapi::ProjectCheckRunContext>,
+    attribution: Option<crate::serveapi::PushAttribution>,
+    api: Arc<crate::serveapi::ServeVerdictState>,
+) {
+    spawn_project_checks_hard_with_timeout(
+        wt,
+        authoritative_error,
+        context,
+        attribution,
+        api,
+        witness_timeout(),
+        gate_require_checks(),
+    )
+}
+
+/// Supervisor pattern: claim the publish generation on the CALLER's
+/// thread (spawn order == generation order), then a named supervisor
+/// thread spawns the actual witness worker and `recv_timeout`s for its
+/// summary. On timeout (or a dead worker) the supervisor publishes
+/// `unknown` with a `witness: ...` reason — never red (no code
+/// evidence), never green (the gate caller asked for a witness-backed
+/// green), never silence (a gate push must always resolve).
+///
+/// Publish-once: only `finish_hard_witness(generation) == true` may
+/// publish, so a watchdog publish consumes the claim and the wedged
+/// worker's late result is dropped; a NEWER gate push for the same
+/// wt-key invalidates this claim entirely (last-writer-wins ordering).
+///
+/// Deliberately NO warn-style slot permit: a gate push must never be
+/// silently skipped on backpressure; the BatchCoalescer already dedupes
+/// the physical check runs for same-plan pushes. Rust cannot kill a
+/// thread, so a watchdog-fired witness leaks its worker until the
+/// wedged call returns — bounded in practice by the per-check timeouts
+/// and the bounded-git work (#A4.1).
+fn spawn_project_checks_hard_with_timeout(
+    wt: PathBuf,
+    authoritative_error: bool,
+    context: Option<crate::serveapi::ProjectCheckRunContext>,
+    attribution: Option<crate::serveapi::PushAttribution>,
+    api: Arc<crate::serveapi::ServeVerdictState>,
+    timeout: Duration,
+    require_checks: bool,
+) {
+    let wt_key = wt.to_string_lossy().into_owned();
+    let generation = api.begin_hard_witness(&wt_key);
+    let attribution_fallback = attribution.clone();
+    let supervisor = {
+        let wt = wt.clone();
+        let wt_key = wt_key.clone();
+        let api = Arc::clone(&api);
+        move || {
+            let (tx, rx) = channel::<ProjectCheckSummary>();
+            let worker = std::thread::Builder::new()
+                .name("cargoless-witness".to_string())
+                .spawn({
+                    let wt = wt.clone();
+                    let api = Arc::clone(&api);
+                    move || {
+                        let summary = run_project_checks_and_log(&wt, context, &api);
+                        if tx.send(summary).is_err() {
+                            // rx dropped ⇒ the watchdog already published
+                            // and the supervisor exited; this late result
+                            // has no claim to the verdict.
+                            eprintln!(
+                                "[cargoless:obs] project-checks-hard wt={} witness-result-discarded reason=watchdog-already-published (#A4.3)",
+                                wt.display()
+                            );
+                        }
+                    }
+                });
+            let summary = match worker {
+                // Dropping the JoinHandle detaches the worker on purpose:
+                // never join a possibly-wedged witness.
+                Ok(_detached) => match rx.recv_timeout(timeout) {
+                    Ok(summary) => summary,
+                    Err(RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=timeout timeout_ms={} (#A4.3)",
+                            wt.display(),
+                            timeout.as_millis()
+                        );
+                        ProjectCheckSummary::Indeterminate {
+                            reason: "witness",
+                            detail: format!("timeout after {}ms", timeout.as_millis()),
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        eprintln!(
+                            "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=worker-died (#A4.3)",
+                            wt.display()
+                        );
+                        ProjectCheckSummary::Indeterminate {
+                            reason: "witness",
+                            detail: "worker exited without a result".to_string(),
+                        }
+                    }
+                },
+                Err(e) => ProjectCheckSummary::Indeterminate {
+                    reason: "witness",
+                    detail: format!("spawn failed: {e}"),
+                },
+            };
+            if matches!(summary, ProjectCheckSummary::Empty) {
+                // Loud vacuous-green marker even when REQUIRE is off —
+                // soak evidence is a grep away (#A10).
+                eprintln!(
+                    "[cargoless:obs] project-checks-hard wt={} verdict=vacuous-green checks=0 require_checks={} (#A10)",
+                    wt.display(),
+                    require_checks
+                );
+            }
+            let summary = apply_require_checks(summary, require_checks);
+            let payload = compose_hard_mode_payload(authoritative_error, summary);
+            if api.finish_hard_witness(&wt_key, generation) {
+                publish_verdict(&wt, payload, attribution, &api);
+            } else {
+                eprintln!(
+                    "[cargoless:obs] project-checks-hard wt={} verdict=stale-witness-dropped generation={} (#A4.3)",
+                    wt.display(),
+                    generation
+                );
+            }
+        }
+    };
+    if let Err(e) = std::thread::Builder::new()
+        .name("cargoless-project-checks-hard".to_string())
+        .spawn(supervisor)
+    {
+        // No supervisor thread ⇒ publish synchronously on the caller's
+        // thread. Unknown, never green: the gate caller asked for a
+        // witness-backed verdict and no witness can run. (Deliberate
+        // change from the historical branch, which published RA-native —
+        // possibly green — here.)
+        let payload = compose_hard_mode_payload(
+            authoritative_error,
+            ProjectCheckSummary::Indeterminate {
+                reason: "witness",
+                detail: format!("spawn failed: {e}"),
+            },
+        );
+        if api.finish_hard_witness(&wt_key, generation) {
+            publish_verdict(&wt, payload, attribution_fallback, &api);
+        }
     }
 }
 
@@ -1574,6 +1816,12 @@ fn run_project_checks_and_log(
     match report {
         Ok(Ok(report)) if report.results.is_empty() && report.skipped.is_empty() => {
             tracing::info!(outcome = "empty", "no project checks selected");
+            // #A10 mirror of the hard supervisor's vacuous-green marker,
+            // so warn-mode dashboards can count vacuous runs too.
+            eprintln!(
+                "[cargoless:obs] project-checks wt={} verdict=vacuous-green checks=0 source=direct (#A10)",
+                wt.display()
+            );
             ProjectCheckSummary::Empty
         }
         Ok(Ok(report)) => {
