@@ -1989,6 +1989,7 @@ mod tests {
             base_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
+            check_ids: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -2046,6 +2047,7 @@ mod tests {
             base_sha: None,
             changed_files: Some(vec!["Cargo.toml".into()]),
             gate: false,
+            check_ids: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));

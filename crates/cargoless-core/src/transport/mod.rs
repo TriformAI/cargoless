@@ -153,6 +153,13 @@ pub struct PushOverlayOptions {
     /// verdict), leaving the global mode untouched. Absent on the wire ⇒
     /// `false` — old clients and plain dev pushes keep warn-fast verdicts.
     pub gate: bool,
+    /// Requested witness check-ids for a gate push (B3 surface). The
+    /// `verdict` CLI attaches these so a merge gate can ask for specific
+    /// manifest checks instead of the whole profile. Additive wire key:
+    /// absent ⇒ `None`; current daemons parse it but do not yet select on
+    /// it (consumption lands with the B3 per-check witness gating) — old
+    /// daemons simply ignore the key.
+    pub check_ids: Option<Vec<String>>,
 }
 
 impl PushOverlayOptions {
@@ -170,6 +177,10 @@ impl PushOverlayOptions {
                 .as_ref()
                 .is_none_or(|files| files.is_empty())
             && !self.gate
+            && self
+                .check_ids
+                .as_ref()
+                .is_none_or(|check_ids| check_ids.is_empty())
     }
 }
 
@@ -821,6 +832,21 @@ impl Request {
                     if options.gate {
                         map.insert("gate".to_string(), serde_json::Value::Bool(true));
                     }
+                    if let Some(check_ids) = options
+                        .check_ids
+                        .as_ref()
+                        .filter(|check_ids| !check_ids.is_empty())
+                    {
+                        map.insert(
+                            "check_ids".to_string(),
+                            serde_json::Value::Array(
+                                check_ids
+                                    .iter()
+                                    .map(|id| serde_json::Value::String(id.clone()))
+                                    .collect(),
+                            ),
+                        );
+                    }
                 }
                 v
             }
@@ -938,6 +964,21 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
         if options.gate {
             map.insert("gate".to_string(), serde_json::Value::Bool(true));
         }
+        if let Some(check_ids) = options
+            .check_ids
+            .as_ref()
+            .filter(|check_ids| !check_ids.is_empty())
+        {
+            map.insert(
+                "check_ids".to_string(),
+                serde_json::Value::Array(
+                    check_ids
+                        .iter()
+                        .map(|id| serde_json::Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+        }
     }
     value
 }
@@ -963,6 +1004,7 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .get("gate")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        check_ids: string_array_from_json(v.get("check_ids")).filter(|ids| !ids.is_empty()),
     }
 }
 
@@ -1655,6 +1697,7 @@ mod tests {
             base_sha: Some("abc123".into()),
             changed_files: None,
             gate: false,
+            check_ids: None,
         };
         req.corun = false;
         req.coalesce_key = Some("tf-multiverse:origin/dev:project-checks".into());
@@ -1907,6 +1950,7 @@ mod tests {
                 base_sha: Some("abc123".into()),
                 changed_files: Some(vec!["src/lib.rs".into()]),
                 gate: true,
+                check_ids: None,
             },
         };
         assert_eq!(Request::from_json(&req.to_json()), Some(req));
@@ -1947,6 +1991,71 @@ mod tests {
             Some(req),
             "gate=true must roundtrip the wire"
         );
+    }
+
+    #[test]
+    fn push_overlay_check_ids_wire_contract() {
+        // A1/B3 surface — absent on the wire ⇒ None (old clients
+        // unaffected; daemons that predate the key ignore it)...
+        let parsed = Request::from_json(
+            r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+                "repo_relative":true,"analysis_root":"/srv/repo"}"#,
+        )
+        .unwrap();
+        let Request::PushOverlayV2 { options, .. } = parsed else {
+            panic!("options present ⇒ V2 parse");
+        };
+        assert!(
+            options.check_ids.is_none(),
+            "check_ids absent on the wire must parse as None"
+        );
+
+        // ...a check_ids-only options set keeps the V2 wire shape...
+        let ids_only = PushOverlayOptions {
+            check_ids: Some(vec!["witness-compile".into(), "fmt".into()]),
+            ..Default::default()
+        };
+        assert!(
+            !ids_only.is_empty(),
+            "check_ids alone must keep the V2 wire shape"
+        );
+        let req = Request::PushOverlayV2 {
+            worktree: "/client/wt".into(),
+            base_ref: "origin/dev".into(),
+            files: vec![],
+            check_profile: None,
+            options: ids_only,
+        };
+        assert_eq!(
+            Request::from_json(&req.to_json()),
+            Some(req),
+            "check_ids must roundtrip the wire"
+        );
+
+        // ...and an EMPTY array normalizes to None on both encode (key
+        // suppressed) and decode (filtered), so `Some(vec![])` can never
+        // leak a meaningless `"check_ids":[]` onto the wire.
+        let empty_ids = PushOverlayOptions {
+            gate: true,
+            check_ids: Some(vec![]),
+            ..Default::default()
+        };
+        let req = Request::PushOverlayV2 {
+            worktree: "w".into(),
+            base_ref: "b".into(),
+            files: vec![],
+            check_profile: None,
+            options: empty_ids,
+        };
+        let json = req.to_json();
+        assert!(
+            !json.contains("check_ids"),
+            "empty check_ids must be suppressed on the wire: {json}"
+        );
+        let Some(Request::PushOverlayV2 { options, .. }) = Request::from_json(&json) else {
+            panic!("gate keeps V2 shape");
+        };
+        assert_eq!(options.check_ids, None, "decode normalizes to None");
     }
 
     #[test]

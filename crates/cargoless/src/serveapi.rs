@@ -970,6 +970,7 @@ impl ServeVerdictState {
             base_sha: None,
             changed_files: None, // changed_files live on the member, not the options
             gate: false,
+            check_ids: None,
         };
         request.members = vec![member];
         request.corun = true;
@@ -2096,6 +2097,7 @@ checks:
             base_sha: None,
             changed_files: None,
             gate: false,
+            check_ids: None,
         };
         request.members = members;
         request
@@ -2196,6 +2198,7 @@ checks:
             base_sha: None,
             changed_files: None,
             gate: false,
+            check_ids: None,
         };
         request.members = vec![BatchMember::new(member)];
         request
@@ -2473,6 +2476,7 @@ checks:
                 base_sha: None,
                 changed_files: None,
                 gate: false,
+                check_ids: None,
             };
             request.members = vec![cargoless_core::batch::BatchMember {
                 worktree: wt.clone(),
@@ -3226,6 +3230,7 @@ checks:
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
+            check_ids: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3273,6 +3278,7 @@ checks:
             base_sha: Some(head),
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
+            check_ids: None,
         };
 
         let ack = api.push_overlay_with_options(
@@ -3417,6 +3423,7 @@ checks:
             base_sha: None,
             changed_files: None,
             gate: false,
+            check_ids: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3722,6 +3729,7 @@ checks:
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             gate: false,
+            check_ids: None,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&options));
         assert!(!ack.accepted, "truncation signature must be rejected");
@@ -3744,6 +3752,7 @@ checks:
             base_sha: None,
             changed_files: None,
             gate: false,
+            check_ids: None,
         };
         let ack = api.push_overlay_with_options("/wt", "", &[], None, Some(&options));
         assert!(
@@ -3765,6 +3774,7 @@ checks:
             base_sha: Some("abc123".into()),
             changed_files: Some(vec!["src/removed.rs".into()]),
             gate: false,
+            check_ids: None,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted, "delete-only diff (empty content) must pass");
