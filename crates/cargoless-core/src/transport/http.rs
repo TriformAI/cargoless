@@ -1261,6 +1261,9 @@ mod tests {
             verdict: "red".into(),
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            // SSE attribution case: the echo must survive the SSE frame
+            // (the subscribe-driven poller path A2 exists for).
+            base_sha: Some("feedfeedfeedfeedfeedfeedfeedfeedfeedfeed".into()),
             published_at: 5,
         };
         svc.emit(ev.clone());
