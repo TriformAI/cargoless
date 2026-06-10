@@ -651,6 +651,10 @@ impl ServeVerdictState {
     /// statusfile — a remote `subscribe` client sees what a local
     /// `status` reader sees, instead of every error condition
     /// collapsing into `verdict=red, red_diagnostics=0`.
+    // Non-test builds have no caller (servedrv's sole publish site calls
+    // `publish_attributed`); the wrapper is kept as the unattributed
+    // entry point for tests/embedded use, so allow it dead there.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn publish(&self, wt: &Path, payload: crate::statusfile::VerdictPayload) {
         self.publish_attributed(wt, payload, None);
     }
