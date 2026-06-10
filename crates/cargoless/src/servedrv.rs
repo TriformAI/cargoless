@@ -2276,4 +2276,231 @@ mod tests {
         assert!(reason.starts_with("project_check_overlay_error"));
         assert!(reason.contains("PVC ENOSPC"));
     }
+
+    #[test]
+    fn apply_require_checks_truth_table() {
+        // Pure half of the #A10 vacuous-green guard. Only (Empty, true)
+        // converts; everything else — including Empty without require —
+        // is identity.
+        let converted = apply_require_checks(ProjectCheckSummary::Empty, true);
+        assert_eq!(
+            converted,
+            ProjectCheckSummary::Indeterminate {
+                reason: "witness",
+                detail: "vacuous (0 checks evaluated)".to_string(),
+            }
+        );
+        assert_eq!(
+            apply_require_checks(ProjectCheckSummary::Empty, false),
+            ProjectCheckSummary::Empty
+        );
+        for require in [false, true] {
+            assert_eq!(
+                apply_require_checks(ProjectCheckSummary::Green, require),
+                ProjectCheckSummary::Green
+            );
+            assert_eq!(
+                apply_require_checks(ProjectCheckSummary::Red { error_count: 3 }, require),
+                ProjectCheckSummary::Red { error_count: 3 }
+            );
+            let indeterminate = ProjectCheckSummary::Indeterminate {
+                reason: "witness",
+                detail: "timeout after 5ms".to_string(),
+            };
+            assert_eq!(
+                apply_require_checks(indeterminate.clone(), require),
+                indeterminate
+            );
+        }
+    }
+
+    #[test]
+    fn gate_promotes_warn_to_hard_only_for_that_push() {
+        // #A4.3 per-push promotion truth table: gate only ever
+        // STRENGTHENS Warn; Off (operator kill-switch) and Hard are
+        // fixed points regardless of the request bit.
+        use ProjectChecksMode::*;
+        for (mode, gate, want) in [
+            (Off, false, Off),
+            (Off, true, Off),
+            (Warn, false, Warn),
+            (Warn, true, Hard),
+            (Hard, false, Hard),
+            (Hard, true, Hard),
+        ] {
+            assert_eq!(
+                effective_project_checks_mode(mode, gate),
+                want,
+                "mode={mode:?} gate={gate}"
+            );
+        }
+    }
+
+    /// #A4.3 poll helper: Hard mode publishes from the supervisor
+    /// thread, so tests await the status instead of assuming
+    /// EmitVerdict-returns-after-publish ordering.
+    fn await_verdict(
+        api: &Arc<crate::serveapi::ServeVerdictState>,
+        key: &str,
+        deadline: Duration,
+    ) -> cargoless_core::transport::WorktreeStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(st) = api.get_status(key) {
+                return st;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "no verdict published for {key} within {deadline:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn test_attribution(base_sha: &str) -> crate::serveapi::PushAttribution {
+        crate::serveapi::PushAttribution {
+            base_sha: Some(base_sha.to_string()),
+            push_received_unix: statusfile::now_unix(),
+            consumed_unix: statusfile::now_unix(),
+            consumed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn hard_witness_publishes_gated_green_off_loop() {
+        // Clean tree, no cargoless.checks.yaml manifest, REQUIRE off ⇒
+        // Empty ⇒ green — published from the supervisor thread (the
+        // spawn returns immediately; only polling observes the verdict).
+        // The attribution parameter must survive the off-loop hand-off
+        // (#A2's base_sha echo through the relocated pop).
+        let root = temp_root("hard-green");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        spawn_project_checks_hard_with_timeout(
+            root.clone(),
+            false,
+            None,
+            Some(test_attribution("abc123")),
+            Arc::clone(&api),
+            Duration::from_secs(30),
+            false,
+        );
+        let st = await_verdict(&api, &root.to_string_lossy(), Duration::from_secs(10));
+        assert_eq!(st.verdict, "green");
+        assert_eq!(
+            st.base_sha.as_deref(),
+            Some("abc123"),
+            "attribution threads through the off-loop publish"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hard_witness_ra_error_publishes_unknown_off_loop() {
+        // INFRA-36 expectation: an RA-native bool error with no
+        // diagnostics composes to Unknown("ra_native_unattributed_error"),
+        // never a fabricated Red.
+        let root = temp_root("hard-ra-error");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        spawn_project_checks_hard_with_timeout(
+            root.clone(),
+            true,
+            None,
+            None,
+            Arc::clone(&api),
+            Duration::from_secs(30),
+            false,
+        );
+        let st = await_verdict(&api, &root.to_string_lossy(), Duration::from_secs(10));
+        assert_eq!(st.verdict, "unknown");
+        assert_eq!(
+            st.verdict_failure_reason.as_deref(),
+            Some("ra_native_unattributed_error")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hard_witness_require_checks_converts_vacuous_green_to_unknown() {
+        // #A10: same Empty input as the green test, but require=true ⇒
+        // the gate caller asked for witness-backed green and the witness
+        // witnessed nothing ⇒ unknown, classifier 'witness: vacuous'.
+        let root = temp_root("hard-vacuous");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        spawn_project_checks_hard_with_timeout(
+            root.clone(),
+            false,
+            None,
+            None,
+            Arc::clone(&api),
+            Duration::from_secs(30),
+            true,
+        );
+        let st = await_verdict(&api, &root.to_string_lossy(), Duration::from_secs(10));
+        assert_eq!(st.verdict, "unknown");
+        let reason = st.verdict_failure_reason.expect("vacuous classifier");
+        assert!(
+            reason.starts_with("witness: vacuous"),
+            "got reason {reason:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn witness_watchdog_publishes_unknown_on_timeout() {
+        // A wedged witness (here: a 2s command against a 50ms injected
+        // watchdog) must publish unknown 'witness: timeout' — never red
+        // (no code evidence), never green (gate asked for a witness),
+        // never silence. When the worker eventually finishes (its check
+        // would pass ⇒ green), the consumed generation claim drops the
+        // late result: the verdict must NOT flip.
+        let root = temp_root("hard-watchdog");
+        std::fs::write(
+            root.join("cargoless.checks.yaml"),
+            r#"
+version: 1
+checks:
+  - id: slow
+    kind: command
+    read_only: true
+    timeout_ms: 10000
+    command: ["bash", "-lc", "sleep 2"]
+"#,
+        )
+        .unwrap();
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        let started = Instant::now();
+        spawn_project_checks_hard_with_timeout(
+            root.clone(),
+            false,
+            None,
+            None,
+            Arc::clone(&api),
+            Duration::from_millis(50),
+            false,
+        );
+        let st = await_verdict(&api, &root.to_string_lossy(), Duration::from_secs(10));
+        assert_eq!(st.verdict, "unknown");
+        let reason = st.verdict_failure_reason.clone().expect("watchdog reason");
+        assert!(
+            reason.starts_with("witness: timeout"),
+            "got reason {reason:?}"
+        );
+        // Let the wedged worker finish (sleep 2 + slack), then confirm
+        // publish-once: the late (green) result was dropped by the
+        // generation guard.
+        let worker_budget = Duration::from_secs(4).saturating_sub(started.elapsed());
+        std::thread::sleep(worker_budget);
+        let st_after = api
+            .get_status(&root.to_string_lossy())
+            .expect("status persists");
+        assert_eq!(
+            st_after.verdict, "unknown",
+            "late witness result must not overwrite the watchdog verdict"
+        );
+        assert_eq!(
+            st_after.verdict_failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

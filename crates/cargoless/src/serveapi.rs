@@ -3827,4 +3827,80 @@ checks:
         let member = BatchMember::new("wt-empty");
         assert_eq!(member_truncation_suspect(&member), None);
     }
+
+    #[test]
+    fn stale_hard_witness_never_overwrites_fresher() {
+        // #A4.3 publish-once / last-writer-wins ordering: two hard
+        // witnesses for the same wt-key can coexist (push2's EmitVerdict
+        // fires while push1's witness still runs). Only the LATEST
+        // generation may publish; a consumed claim cannot publish twice.
+        let api = ServeVerdictState::new();
+        let g1 = api.begin_hard_witness("/wt");
+        let g2 = api.begin_hard_witness("/wt");
+        assert!(g2 > g1, "generations are monotonic");
+        assert!(
+            !api.finish_hard_witness("/wt", g1),
+            "stale witness (older push) must not publish"
+        );
+        assert!(
+            api.finish_hard_witness("/wt", g2),
+            "latest witness publishes"
+        );
+        assert!(
+            !api.finish_hard_witness("/wt", g2),
+            "a consumed claim cannot publish twice (watchdog-vs-late-worker)"
+        );
+        // Keys are independent: a witness on another worktree is
+        // unaffected by /wt's churn.
+        let g3 = api.begin_hard_witness("/other");
+        assert!(api.finish_hard_witness("/other", g3));
+    }
+
+    #[test]
+    fn push_overlay_with_options_stamps_gate_on_pushed_overlay() {
+        // #A4.3 gate wire: options.gate must survive into the stored
+        // PushedOverlay (SwitchOverlay carries it onward into the
+        // ProjectCheckRunContext the EmitVerdict arm promotes on).
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let options = PushOverlayOptions {
+            gate: true,
+            ..Default::default()
+        };
+        let ack = api.push_overlay_with_options("/wt-gate", "", &files, None, Some(&options));
+        assert!(ack.accepted);
+        assert!(
+            api.peek_overlay_for("/wt-gate").expect("stored").gate,
+            "gate=true push stores gate=true"
+        );
+
+        let ack = api.push_overlay_with_options("/wt-plain", "", &files, None, None);
+        assert!(ack.accepted);
+        assert!(
+            !api.peek_overlay_for("/wt-plain").expect("stored").gate,
+            "optionless push defaults gate=false (warn-fast posture)"
+        );
+    }
+
+    #[test]
+    fn record_project_check_context_carries_gate_through_take() {
+        let api = ServeVerdictState::new();
+        api.record_project_check_context(
+            "/wt",
+            ProjectCheckRunContext {
+                root: PathBuf::from("/root"),
+                changed_files: None,
+                base_ref: String::new(),
+                overlay_files: Vec::new(),
+                materialize_overlay: false,
+                gate: true,
+            },
+        );
+        let ctx = api.take_project_check_context("/wt").expect("recorded");
+        assert!(ctx.gate, "gate survives the record→take round trip");
+        assert!(
+            api.take_project_check_context("/wt").is_none(),
+            "take consumes"
+        );
+    }
 }
