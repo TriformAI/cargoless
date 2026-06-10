@@ -1563,6 +1563,8 @@ fn materialize_overlay_files_from_root(
 
 /// Output of a bounded child run: `Command::output()` shape with the
 /// streams pre-decoded (lossy) — every consumer here wants strings.
+/// Debug is load-bearing for `unwrap_err` in the deadline tests.
+#[derive(Debug)]
 struct BoundedOutput {
     status: std::process::ExitStatus,
     stdout: String,
@@ -1646,7 +1648,7 @@ fn git_timeout_from(env_ms: Option<u64>, args: &[&str]) -> Duration {
     if let Some(ms) = env_ms {
         return Duration::from_millis(ms);
     }
-    if args.first() == Some(&"fetch") {
+    if matches!(args.first(), Some(&"fetch")) {
         Duration::from_millis(120_000)
     } else {
         Duration::from_millis(60_000)
