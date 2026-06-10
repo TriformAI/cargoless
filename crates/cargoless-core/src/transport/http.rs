@@ -17,6 +17,9 @@
 //! * `POST /admin/quiesce`                   → refuse new pushes, drain,
 //!   then let the daemon exit cleanly for restart
 //! * `POST /batch-check`                     → native batch gate report
+//! * `GET /readyz`                           → unauthenticated RA-warm
+//!   readiness probe (A6): 200 `ready` iff [`VerdictService::ready`],
+//!   else 503 `warming` (liveness stays `GET /healthz`)
 //!
 //! **Auth (#14 seam, NOT policy):** every request is gated by an
 //! [`Authorizer`]; the default is [`AllowAll`] (the #10 posture —
@@ -249,7 +252,8 @@ impl HttpServer {
     /// signature/behaviour, the [`VerdictService`] trait, the wire codec,
     /// the discovery chain, and the #14 auth seam for **every other
     /// route** are byte-frozen and their exhaustive unit suites untouched.
-    /// `/healthz` is the ONLY auth-exempt path (see [`handle`]).
+    /// `/healthz` and the A6 `/readyz` probe are the ONLY auth-exempt
+    /// paths (see [`handle`]).
     pub fn bind_with_health(
         addr: &str,
         svc: Arc<dyn VerdictService>,
@@ -331,11 +335,11 @@ fn handle(
         write_response(&mut writer, 400, "Bad Request", "text/plain", "bad request");
         return;
     };
-    // ── GET /healthz — the ONLY unauthenticated route ───────────────────
+    // ── GET /healthz — unauthenticated liveness probe ────────────────────
     // Structurally Authorizer-EXEMPT: we answer and `return` for EXACTLY
-    // this path BEFORE the #14 auth gate below, so the exemption cannot
-    // widen to any other route (every other path still flows into
-    // `auth.authorize`). The body is a FIXED constant — ZERO verdict,
+    // this path (and `/readyz` below) BEFORE the #14 auth gate, so the
+    // exemption cannot widen to any other route (every other path still
+    // flows into `auth.authorize`). The body is a FIXED constant — ZERO verdict,
     // diagnostics, worktree names, paths, or counts — so an
     // unauthenticated caller learns only a readiness boolean (a path or a
     // count would leak repo structure off-host). k8s probe semantic: a
@@ -348,6 +352,25 @@ fn handle(
             (503, "Service Unavailable", "{\"status\":\"starting\"}")
         };
         write_response(&mut writer, code, reason, "application/json", body);
+        return;
+    }
+    // ── GET /readyz — RA-warm readiness probe (A6) ──────────────────────
+    // Same no-auth treatment as /healthz (answer + `return` BEFORE the
+    // #14 gate; the exemption stays exactly these two probe paths) and the
+    // same fixed-constant zero-leakage body discipline. Semantics split:
+    // /healthz stays the startup/liveness probe (serve loop entered);
+    // /readyz reflects `svc.ready()` — the service can produce a
+    // meaningful verdict NOW (rust-analyzer warm). k8s: livenessProbe
+    // stays on /healthz; readinessProbe moves to /readyz in the
+    // tf-multiverse manifests (separate repo), so a fresh pod is not
+    // Service-routable while its RA index is still warming.
+    if req.path == "/readyz" {
+        let (code, reason, body): (u16, &str, &str) = if svc.ready() {
+            (200, "OK", "ready")
+        } else {
+            (503, "Service Unavailable", "warming")
+        };
+        write_response(&mut writer, code, reason, "text/plain", body);
         return;
     }
     // #14 seam — AllowAll under #10, so this never denies today; the
@@ -1237,6 +1260,95 @@ mod tests {
         }
         // …and /healthz on the SAME deny server still answers (200, ready).
         assert_eq!(raw_get(s.addr(), "/healthz").0, 200);
+    }
+
+    // ───────── /readyz — unauthenticated RA-warm readiness probe (A6) ─────────
+
+    /// MockService wrapper with a togglable `VerdictService::ready` —
+    /// stands in for the serve daemon's RA-warm latch. Default = not
+    /// ready (`AtomicBool` defaults `false`), matching a cold daemon.
+    #[derive(Default)]
+    struct TogglableReadyService {
+        inner: MockService,
+        ready: AtomicBool,
+    }
+
+    impl VerdictService for TogglableReadyService {
+        fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
+            self.inner.get_status(worktree)
+        }
+
+        fn get_verdict(&self, worktree: &str) -> Option<String> {
+            self.inner.get_verdict(worktree)
+        }
+
+        fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic> {
+            self.inner.get_diagnostics(worktree)
+        }
+
+        fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+            self.inner.list_worktrees()
+        }
+
+        fn subscribe(&self) -> Receiver<TransitionEvent> {
+            self.inner.subscribe()
+        }
+
+        fn ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn readyz_is_503_warming_until_service_ready_then_200() {
+        let svc = Arc::new(TogglableReadyService::default());
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::clone(&svc) as Arc<dyn VerdictService>,
+            Arc::new(AllowAll),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // RA not warm ⇒ 503 + the fixed "warming" constant (zero leakage,
+        // same discipline as /healthz). Note /healthz on the same server is
+        // already 200 (`bind` = always-ready) — the two probes are distinct.
+        let (code, body) = raw_get(s.addr(), "/readyz");
+        assert_eq!(code, 503, "not ready ⇒ 503");
+        assert_eq!(body, "warming");
+        assert_eq!(raw_get(s.addr(), "/healthz").0, 200, "liveness unaffected");
+
+        // Latch flips ⇒ 200 + the fixed "ready" constant.
+        svc.ready.store(true, Ordering::Relaxed);
+        let (code, body) = raw_get(s.addr(), "/readyz");
+        assert_eq!(code, 200, "ready ⇒ 200");
+        assert_eq!(body, "ready");
+    }
+
+    #[test]
+    fn readyz_is_auth_exempt_like_healthz_and_default_trait_ready_is_200() {
+        // DenyAll: /readyz must answer without a token (same structural
+        // exemption as /healthz — k8s probes carry no bearer), while every
+        // other route still 401s (covered by the surgical /healthz test).
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(DenyAll),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // MockService keeps the default trait `ready()` (true) ⇒ existing
+        // impls are unaffected by the additive method, and the route is
+        // exempt from the DenyAll gate.
+        let (code, body) = raw_get(s.addr(), "/readyz");
+        assert_eq!(code, 200, "auth-exempt: DenyAll did not 401 /readyz");
+        assert_eq!(body, "ready", "default trait ready() ⇒ 200 ready");
     }
 
     #[test]

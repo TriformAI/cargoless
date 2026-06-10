@@ -402,6 +402,16 @@ pub trait VerdictService: Send + Sync {
     fn request_quiesce(&self) -> DaemonActivity {
         self.daemon_activity()
     }
+
+    /// A6 — RA-warm readiness, the `GET /readyz` probe input. `true` means
+    /// the service can produce a meaningful verdict NOW (for the serve
+    /// daemon: a rust-analyzer instance has completed its LSP handshake
+    /// and accepts routed batches). Default `true` so every existing impl
+    /// and test mock is unaffected (additive, non-breaking); the serve
+    /// loop's `ServeVerdictState` overrides it with its warm-up latch.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 /// The **client** counterpart of [`VerdictService`] — the uniform
