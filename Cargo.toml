@@ -17,7 +17,7 @@ license = "Apache-2.0"
 # this value and asserts it matches the cut tag's semver; drift = hard fail.
 # Bump in lockstep with every release tag. (0.0.0 = pre-launch state; first
 # real release will be 0.1.0.)
-version = "0.3.0"
+version = "0.4.0"
 # Canonical public source URL — resolved per D-RELEASE §8 #8 (operator picked
 # option (b) GitHub mirror; URL confirmed 2026-05-17).
 # Forgejo (forgejo.triform.dev/triform/cargoless) remains the internal
