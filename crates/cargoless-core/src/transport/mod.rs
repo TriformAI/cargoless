@@ -224,6 +224,14 @@ pub struct WorktreeStatus {
     /// dashboards group on the leading classifier (the substring before
     /// `: `) to separate "gate doing its job" from "gate didn't run".
     pub verdict_failure_reason: Option<String>,
+    /// Verdict attribution — the client-resolved base SHA carried on the
+    /// overlay push this verdict was computed against (`PushOverlayOptions::
+    /// base_sha`), echoed back so a poller sharing a status key with other
+    /// branches can accept only verdicts stamped with *its own* commit.
+    /// `None` when the push carried no SHA (legacy clients, fs-watch
+    /// verdicts) — pollers treat absence as "unattributed", never as a
+    /// match. Additive wire key; absent on the wire when `None`.
+    pub base_sha: Option<String>,
     pub heartbeat_age_secs: u64,
     pub published_at: u64,
 }
@@ -254,6 +262,11 @@ pub struct TransitionEvent {
     /// Unknown-the-daemon-couldn't-evaluate without round-tripping a
     /// `get_status` call.
     pub verdict_failure_reason: Option<String>,
+    /// See [`WorktreeStatus::base_sha`] — mirrored here for the same
+    /// reason as `verdict_failure_reason`: a subscribe-driven poller must
+    /// be able to discard another branch's verdict without a status
+    /// round-trip (the round-trip is exactly the race window).
+    pub base_sha: Option<String>,
     pub published_at: u64,
 }
 
@@ -1260,6 +1273,14 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
                 serde_json::Value::String(reason.clone()),
             );
     }
+    if let Some(sha) = &s.base_sha {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert(
+                "base_sha".to_string(),
+                serde_json::Value::String(sha.clone()),
+            );
+    }
     obj.to_string()
 }
 
@@ -1290,6 +1311,10 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .unwrap_or(0) as u32,
         verdict_failure_reason: v
             .get("verdict_failure_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string()),
+        base_sha: v
+            .get("base_sha")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
         heartbeat_age_secs: v
@@ -1370,6 +1395,14 @@ pub fn event_to_json(e: &TransitionEvent) -> String {
                 serde_json::Value::String(reason.clone()),
             );
     }
+    if let Some(sha) = &e.base_sha {
+        obj.as_object_mut()
+            .expect("event_to_json constructed an object literal")
+            .insert(
+                "base_sha".to_string(),
+                serde_json::Value::String(sha.clone()),
+            );
+    }
     obj.to_string()
 }
 
@@ -1395,6 +1428,10 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
             .unwrap_or(0) as u32,
         verdict_failure_reason: v
             .get("verdict_failure_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string()),
+        base_sha: v
+            .get("base_sha")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
         published_at: v
@@ -1669,6 +1706,9 @@ mod tests {
             crates: vec![],
             red_diagnostics: 3,
             verdict_failure_reason: None,
+            // Attribution case: a gate push carries its commit; the echo
+            // must survive the wire byte-for-byte (pollers string-match).
+            base_sha: Some("0123abc0123abc0123abc0123abc0123abc01234".into()),
             heartbeat_age_secs: 2,
             published_at: 1234567890,
         };
@@ -1690,10 +1730,18 @@ mod tests {
             ],
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            // Legacy case: no SHA on the push ⇒ key absent on the wire
+            // (additive contract — old parsers see exactly the old JSON).
+            base_sha: None,
             heartbeat_age_secs: 0,
             published_at: 42,
         };
-        assert_eq!(status_from_json(&status_to_json(&s2)), Some(s2));
+        let wire = status_to_json(&s2);
+        assert!(
+            !wire.contains("base_sha"),
+            "absent base_sha must not appear on the wire: {wire}"
+        );
+        assert_eq!(status_from_json(&wire), Some(s2));
     }
 
     #[test]
