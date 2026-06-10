@@ -38,6 +38,7 @@ mod servedrv;
 mod statusfile;
 mod telemetry; // #246 Wave-1 5a — OTEL+SigNoz init seam.
 mod ui;
+mod verdict; // A1 (0.4) — one-shot merge-gate verdict client.
 mod watch;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +58,11 @@ enum Cmd {
     /// Native batch gate client — POST `/batch-check` and print the
     /// machine-readable attribution report.
     BatchCheck,
+    /// A1 (0.4) — one-shot gate verdict client: push the local diff,
+    /// await the SHA-attributed verdict, print machine-readable JSON.
+    /// Owns routing-header injection (C1) and the endpoint failover
+    /// ladder so gate wrappers collapse to a single binary call.
+    Verdict,
     Help,
     Version,
 }
@@ -143,6 +149,24 @@ struct Opts {
     /// `batch-check --request-json <PATH>` — native batch_check transport
     /// request body to send to a remote daemon.
     batch_request_json: Option<PathBuf>,
+    // ── A1 (0.4) `verdict` flags ────────────────────────────────────
+    /// `verdict --remote <url>` repeatable — failover ladder, tried in
+    /// order (first = primary). Separate from the scalar `remote` so the
+    /// status/push/batch-check single-endpoint grammar is untouched.
+    verdict_remotes: Vec<String>,
+    /// `verdict --header "Name: value"` repeatable — raw client-wide HTTP
+    /// headers (C1: the pool ingress consistent-hashes
+    /// `X-Cargoless-Routing-Key`, so headers must ride every request,
+    /// pushes AND status polls). Parsed/validated in `verdict::run`.
+    verdict_headers: Vec<String>,
+    /// `verdict --output json|text` — stdout format (default json).
+    verdict_output: Option<String>,
+    /// `verdict --check-id <id>` repeatable — B3 witness check-ids,
+    /// attached to the push as `PushOverlayOptions::check_ids`.
+    verdict_check_ids: Vec<String>,
+    /// `verdict -- <repo>` — positional repo path after the `--`
+    /// separator (the thin-wrapper calling convention).
+    verdict_repo_positional: Option<PathBuf>,
     /// `checks list|run|explain`.
     checks_action: Option<String>,
     /// Optional check id for `checks run <id>` / `checks explain <id>`.
@@ -190,6 +214,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "serve" => Cmd::Serve,
         "push" => Cmd::Push,
         "batch-check" => Cmd::BatchCheck,
+        "verdict" => Cmd::Verdict,
         "help" | "-h" | "--help" => Cmd::Help,
         "version" | "-V" | "--version" => Cmd::Version,
         other => return Err(ParseError::UnknownCommand(other.to_string())),
@@ -318,6 +343,15 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .clone(),
                 );
             }
+            // verdict: --remote is repeatable (failover ladder) — must
+            // precede the scalar arm below (match arms are tried in order).
+            "--remote" if cmd == Cmd::Verdict => {
+                opts.verdict_remotes.push(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--remote"))?
+                        .clone(),
+                );
+            }
             "--remote" => {
                 opts.remote = Some(
                     it.next()
@@ -356,6 +390,39 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 opts.push_await_timeout_secs = Some(v.parse::<u64>().map_err(|_| {
                     ParseError::MissingValue("--await-timeout-secs (numeric seconds)")
                 })?);
+            }
+            // ── A1 (0.4) `verdict` flags ────────────────────────────
+            "--header" if cmd == Cmd::Verdict => {
+                opts.verdict_headers.push(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--header"))?
+                        .clone(),
+                );
+            }
+            "--output" if cmd == Cmd::Verdict => {
+                let v = it.next().ok_or(ParseError::MissingValue("--output"))?;
+                match v.as_str() {
+                    "json" | "text" => opts.verdict_output = Some(v.clone()),
+                    _ => return Err(ParseError::MissingValue("--output (json|text)")),
+                }
+            }
+            "--check-id" if cmd == Cmd::Verdict => {
+                opts.verdict_check_ids.push(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--check-id"))?
+                        .clone(),
+                );
+            }
+            // `verdict ... -- <repo>`: everything after the separator is
+            // positional; exactly one (the repo path) is accepted.
+            "--" if cmd == Cmd::Verdict => {
+                for rest in it.by_ref() {
+                    if opts.verdict_repo_positional.is_none() {
+                        opts.verdict_repo_positional = Some(PathBuf::from(rest));
+                    } else {
+                        return Err(ParseError::UnknownFlag(rest.clone()));
+                    }
+                }
             }
             other
                 if cmd == Cmd::Checks
@@ -397,6 +464,10 @@ fn usage() {
     println!("                        worktrees, one shared daemon for the fleet");
     println!("  batch-check --remote <URL> --request-json <PATH>");
     println!("                        Native optimistic batch gate; prints report JSON");
+    println!("  verdict --remote <URL> [--remote <URL>...] [-- <REPO>]");
+    println!("                        One-shot gate verdict: push the diff, await the");
+    println!("                        SHA-attributed verdict, print one JSON object;");
+    println!("                        exit 0=green 1=red 75=unknown/infra 2=setup");
     println!();
     println!("FLAGS:");
     println!("  --root <DIR>          Project root (default: current directory)");
@@ -460,8 +531,18 @@ fn usage() {
     );
     println!("  --await-verdict      push: wait for a fresh remote verdict");
     println!("  --await-timeout-secs <N>");
-    println!("                        push: max wait for --await-verdict (default 900)");
-    println!("  --gate               push: witness-gated (Hard) verdict for this push");
+    println!("                        push/verdict: max verdict wait (default 900)");
+    println!("  --gate               push/verdict: witness-gated (Hard) verdict");
+    println!();
+    println!("VERDICT FLAGS (one-shot gate client):");
+    println!("  --remote <URL>        repeatable: failover ladder, tried in order");
+    println!("  --header \"Name: v\"    repeatable: HTTP header on EVERY request (push +");
+    println!("                        status polls — e.g. X-Cargoless-Routing-Key for");
+    println!("                        shard-affine pool routing)");
+    println!("  --output json|text    stdout format (default json: one object with");
+    println!("                        verdict/base_sha/remote/source keys)");
+    println!("  --check-id <ID>       repeatable: witness check-ids attached to the push");
+    println!("  -- <REPO>             positional repo path (after the -- separator)");
     println!();
     println!(
         "check/watch/build/status/clean are single-project (headless, no \
@@ -693,6 +774,54 @@ fn main() -> ExitCode {
                 request_json,
             });
         }
+        // A1 (0.4) — `verdict` is a server-protocol command like push:
+        // dispatch BEFORE the `config::Config::resolve` front-door. Repo
+        // resolution mirrors push exactly; the positional `-- <repo>`
+        // form (the thin-wrapper convention) wins over --repo/--root.
+        Cmd::Verdict => {
+            let repo = parsed
+                .opts
+                .verdict_repo_positional
+                .clone()
+                .or_else(|| parsed.opts.repo.clone())
+                .or_else(|| parsed.opts.root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let worktree = parsed.opts.push_worktree.clone().unwrap_or_else(|| {
+                std::fs::canonicalize(&repo)
+                    .unwrap_or_else(|_| repo.clone())
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let base = parsed
+                .opts
+                .push_base
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string());
+            let output = match parsed.opts.verdict_output.as_deref() {
+                Some(mode) => match verdict::OutputMode::parse(mode) {
+                    Some(mode) => mode,
+                    None => {
+                        ui::error(format!("verdict: --output must be json|text, got {mode}"));
+                        return ExitCode::from(2);
+                    }
+                },
+                None => verdict::OutputMode::Json,
+            };
+            return verdict::run(&verdict::VerdictOpts {
+                remotes: parsed.opts.verdict_remotes.clone(),
+                headers: parsed.opts.verdict_headers.clone(),
+                output,
+                auth_token: auth_token_for_push(parsed.opts.auth_token.clone()),
+                repo,
+                worktree,
+                base,
+                server_root: parsed.opts.push_server_root.clone(),
+                gate: parsed.opts.push_gate,
+                check_ids: parsed.opts.verdict_check_ids.clone(),
+                await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
+            });
+        }
         _ => {}
     }
 
@@ -728,7 +857,7 @@ fn main() -> ExitCode {
             parsed.opts.checks_report_json.as_deref(),
         ),
         Cmd::Clean => clean::run(&cfg),
-        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push | Cmd::BatchCheck => {
+        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push | Cmd::BatchCheck | Cmd::Verdict => {
             unreachable!("handled above")
         }
     }
@@ -760,10 +889,101 @@ mod tests {
             ("checks", Cmd::Checks),
             ("serve", Cmd::Serve),
             ("push", Cmd::Push),
+            ("verdict", Cmd::Verdict),
             ("version", Cmd::Version),
         ] {
             assert_eq!(parse(&v(&[s])).unwrap().cmd, c);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 (0.4) — `verdict` grammar: repeatable --remote/--header/--check-id,
+    // --output validation, positional `-- <repo>` capture
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verdict_full_grammar_parses() {
+        let p = parse(&v(&[
+            "verdict",
+            "--output",
+            "json",
+            "--header",
+            "X-Cargoless-Routing-Key: route-7",
+            "--header",
+            "X-Trace: abc",
+            "--remote",
+            "http://pool:8787",
+            "--remote",
+            "http://shard-0:8787",
+            "--check-id",
+            "portal-compile",
+            "--gate",
+            "--base",
+            "origin/dev",
+            "--await-timeout-secs",
+            "300",
+            "--",
+            "/workspace/repo",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::Verdict);
+        assert_eq!(p.opts.verdict_output.as_deref(), Some("json"));
+        assert_eq!(
+            p.opts.verdict_headers,
+            vec![
+                "X-Cargoless-Routing-Key: route-7".to_string(),
+                "X-Trace: abc".to_string()
+            ]
+        );
+        // Ladder order is failover order — preserved verbatim.
+        assert_eq!(
+            p.opts.verdict_remotes,
+            vec![
+                "http://pool:8787".to_string(),
+                "http://shard-0:8787".to_string()
+            ]
+        );
+        assert_eq!(p.opts.verdict_check_ids, vec!["portal-compile".to_string()]);
+        assert!(p.opts.push_gate);
+        assert_eq!(p.opts.push_base.as_deref(), Some("origin/dev"));
+        assert_eq!(p.opts.push_await_timeout_secs, Some(300));
+        assert_eq!(
+            p.opts.verdict_repo_positional,
+            Some(PathBuf::from("/workspace/repo"))
+        );
+        // The scalar --remote used by status/push/batch-check stays unset:
+        // verdict's repeatable arm captured every occurrence.
+        assert_eq!(p.opts.remote, None);
+    }
+
+    #[test]
+    fn verdict_output_rejects_unknown_mode() {
+        let r = parse(&v(&["verdict", "--output", "yaml"]));
+        assert!(matches!(r, Err(ParseError::MissingValue(s)) if s.contains("--output")));
+    }
+
+    #[test]
+    fn verdict_rejects_second_positional() {
+        let r = parse(&v(&["verdict", "--", "/repo-a", "/repo-b"]));
+        assert_eq!(r, Err(ParseError::UnknownFlag("/repo-b".into())));
+    }
+
+    #[test]
+    fn verdict_flags_are_scoped_to_verdict() {
+        // --header/--output/--check-id exist only in the verdict grammar;
+        // other commands must keep rejecting them (no surface creep).
+        assert_eq!(
+            parse(&v(&["push", "--header", "X: y"])),
+            Err(ParseError::UnknownFlag("--header".into()))
+        );
+        assert_eq!(
+            parse(&v(&["status", "--output", "json"])),
+            Err(ParseError::UnknownFlag("--output".into()))
+        );
+        // And push's scalar --remote semantics are untouched.
+        let p = parse(&v(&["push", "--remote", "http://h:1"])).unwrap();
+        assert_eq!(p.opts.remote.as_deref(), Some("http://h:1"));
+        assert!(p.opts.verdict_remotes.is_empty());
     }
 
     #[test]
