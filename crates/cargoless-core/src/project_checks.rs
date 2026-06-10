@@ -2359,7 +2359,14 @@ fn ignored_rel(rel: &str) -> bool {
     })
 }
 
-fn glob_match_path(pattern: &str, path: &str) -> bool {
+/// Slash-segmented glob match (`*` within a segment, `**` spanning
+/// segments), the matcher behind manifest `triggers:` patterns. `pub`
+/// since #A8: the serve layer reuses it to classify pushed
+/// `changed_files` against the operator's macro-blind path globs
+/// (`CARGOLESS_MACRO_BLIND_PATHS`) — one matcher, one semantics, so a
+/// pattern that scopes a project check matches identically as a
+/// blind-path annotation.
+pub fn glob_match_path(pattern: &str, path: &str) -> bool {
     let pattern = pattern.trim_matches('/');
     let path = path.trim_matches('/');
     let p: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();

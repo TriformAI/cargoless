@@ -633,6 +633,7 @@ mod tests {
             red_diagnostics: u32::from(verdict == "red"),
             verdict_failure_reason: None,
             base_sha: base_sha.map(str::to_string),
+            ra_blind_paths: false,
             heartbeat_age_secs: 1,
             published_at,
         }
@@ -998,6 +999,7 @@ mod tests {
                 red_diagnostics: 0,
                 verdict_failure_reason: None,
                 base_sha: Some(self.sha.clone()),
+                ra_blind_paths: false,
                 heartbeat_age_secs: 0,
                 published_at: 2000,
             })

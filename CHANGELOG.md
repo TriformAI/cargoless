@@ -24,7 +24,21 @@ canonical, in this order):
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Macro-blind annotation + opt-in witness escalation (#A8)** — the daemon
+  classifies each consumed push against `CARGOLESS_MACRO_BLIND_PATHS`
+  (comma-separated path globs; e.g. Leptos `view!`-heavy trees whose
+  proc-macro-expansion errors the RA-native verdict cannot see). Matching
+  pushes publish an additive `ra_blind_paths: true` key on the status/event
+  wire and `ra_blind_paths=1` in the status file, making green on those
+  paths machine-readably *necessary-not-sufficient*. With
+  `CARGOLESS_MACRO_BLIND_ESCALATE=1`, such pushes additionally auto-promote
+  to the witness-gated (Hard) project-checks path — strengthen-only;
+  `CARGOLESS_PROJECT_CHECKS_MODE=off` still wins. A known-blind corpus
+  reproducing the two incident patterns lives in
+  `bench/fixture/src/known_blind/` (deliberately unreachable from the
+  fixture module tree).
 
 ## [0.3.0] - 2026-06-08
 

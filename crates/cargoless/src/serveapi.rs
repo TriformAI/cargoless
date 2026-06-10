@@ -133,6 +133,14 @@ pub(crate) struct PushAttribution {
     /// [`WorktreeStatus`] so a poller sharing a status key with other
     /// branches accepts only verdicts stamped with its own commit.
     pub base_sha: Option<String>,
+    /// #A8 — `true` iff the push's `changed_files` matched the daemon's
+    /// macro-blind path globs (`CARGOLESS_MACRO_BLIND_PATHS`) at consume
+    /// time. Rides the attribution so it stays paired with `base_sha`
+    /// through the record→pop lifecycle (incl. the Hard-mode supervisor
+    /// thread), is echoed as the additive `ra_blind_paths` wire key, and
+    /// — with `CARGOLESS_MACRO_BLIND_ESCALATE=1` — promotes this push's
+    /// project-check mode Warn → Hard at the EmitVerdict dispatch.
+    pub macro_blind_hit: bool,
     /// `PushedOverlay::last_push_unix` — wall-clock push receipt (seconds).
     pub push_received_unix: u64,
     /// Wall-clock + monotonic pair captured together at overlay-apply, so
@@ -163,6 +171,52 @@ fn latency_ms(push_received_unix: u64, consumed_unix: u64, analysis: Duration) -
         .saturating_sub(push_received_unix)
         .saturating_mul(1000)
         .saturating_add(u64::try_from(analysis.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// #A8 — the operator's proc-macro-blind path globs, comma-separated in
+/// `CARGOLESS_MACRO_BLIND_PATHS` (e.g. `portal/**,chemistry/shell/**`).
+/// Empty / unset ⇒ no globs ⇒ the annotation never fires (the feature is
+/// inert until the deployment opts in). Read per consume, not cached:
+/// pushes are seconds-apart events and a fleet env edit must not require
+/// a daemon restart reasoning step during an incident.
+fn macro_blind_globs() -> Vec<String> {
+    parse_macro_blind_globs(&std::env::var("CARGOLESS_MACRO_BLIND_PATHS").unwrap_or_default())
+}
+
+/// Env-free parse body of [`macro_blind_globs`] (testable without
+/// process-env mutation under parallel test threads). Tolerant of
+/// spaces around commas and stray empty segments (`a/**,,b/**` ⇒ two
+/// globs) — a fleet env edit must not silently disable the annotation
+/// over a formatting slip.
+fn parse_macro_blind_globs(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// #A8 — does this push touch a macro-blind path? Matches the push's
+/// repo-relative `changed_files` (the same list project-check triggers
+/// filter on — NOT the overlay file list, which carries extra workspace
+/// config files for cluster routing) against the operator globs with the
+/// manifest-trigger matcher, so one pattern language serves both.
+///
+/// `None`/empty `changed_files` ⇒ `false`: with no attributable change
+/// list there is no evidence the push touches a blind path, and the
+/// annotation must never fire on absence of evidence (the same posture
+/// as `base_sha: None` ⇒ unattributed, never a match).
+fn compute_macro_blind_hit(changed_files: Option<&[String]>, blind_globs: &[String]) -> bool {
+    if blind_globs.is_empty() {
+        return false;
+    }
+    changed_files.is_some_and(|files| {
+        files.iter().any(|path| {
+            blind_globs
+                .iter()
+                .any(|pattern| cargoless_core::project_checks::glob_match_path(pattern, path))
+        })
+    })
 }
 
 /// The serve-loop's live verdict state, presented as the shipped logical
@@ -690,7 +744,7 @@ impl ServeVerdictState {
     // entry point for tests/embedded use, so allow it dead there.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn publish(&self, wt: &Path, payload: crate::statusfile::VerdictPayload) {
-        self.publish_attributed(wt, payload, None);
+        self.publish_attributed(wt, payload, None, false);
     }
 
     /// [`Self::publish`] with verdict attribution (#A2): `base_sha` is the
@@ -698,11 +752,17 @@ impl ServeVerdictState {
     /// popped by servedrv's `publish_verdict` via
     /// [`Self::take_push_attribution`] at the sole attribution site.
     /// `None` ⇒ FS-watch / legacy verdict — the wire key stays absent.
+    ///
+    /// `ra_blind_paths` (#A8) travels the same pop: `true` iff the push's
+    /// attribution classified its `changed_files` as macro-blind; `false`
+    /// for FS-watch verdicts (no push ⇒ no blind evidence) and the key
+    /// stays absent on the wire.
     pub fn publish_attributed(
         &self,
         wt: &Path,
         payload: crate::statusfile::VerdictPayload,
         base_sha: Option<String>,
+        ra_blind_paths: bool,
     ) {
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
@@ -722,6 +782,7 @@ impl ServeVerdictState {
             red_diagnostics,
             verdict_failure_reason: failure_reason.clone(),
             base_sha: base_sha.clone(),
+            ra_blind_paths,
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -734,6 +795,7 @@ impl ServeVerdictState {
             red_diagnostics,
             verdict_failure_reason: failure_reason,
             base_sha,
+            ra_blind_paths,
             published_at,
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
@@ -806,11 +868,32 @@ impl ServeVerdictState {
     /// recorded at consume, popped at publish; a replacing push for the
     /// same key overwrites (the verdict that eventually publishes belongs
     /// to the LAST consumed push, so its attribution must win too).
+    ///
+    /// #A8 — also classifies the push's `changed_files` against the
+    /// operator's macro-blind globs at this same consume instant, so the
+    /// blind bit and the `base_sha` travel as one record and can never be
+    /// stamped onto a different push's verdict.
     pub(crate) fn record_push_attribution(&self, worktree: &str, pushed: &PushedOverlay) {
+        self.record_push_attribution_with_globs(worktree, pushed, &macro_blind_globs());
+    }
+
+    /// Env-free body of [`Self::record_push_attribution`] (the
+    /// `_with_timeout` injection discipline): tests pass globs explicitly
+    /// instead of mutating process env under parallel test threads.
+    pub(crate) fn record_push_attribution_with_globs(
+        &self,
+        worktree: &str,
+        pushed: &PushedOverlay,
+        blind_globs: &[String],
+    ) {
         poisoned(&self.push_attribution).insert(
             worktree.to_string(),
             PushAttribution {
                 base_sha: pushed.base_sha.clone(),
+                macro_blind_hit: compute_macro_blind_hit(
+                    pushed.changed_files.as_deref(),
+                    blind_globs,
+                ),
                 push_received_unix: pushed.last_push_unix,
                 consumed_unix: crate::statusfile::now_unix(),
                 consumed_at: Instant::now(),
@@ -3866,13 +3949,22 @@ checks:
             Path::new("/workspace/tf-multiverse"),
             crate::statusfile::VerdictPayload::green(),
             Some("abc123def".into()),
+            true,
         );
         let status = api
             .get_status("/workspace/tf-multiverse")
             .expect("status present");
         assert_eq!(status.base_sha.as_deref(), Some("abc123def"));
+        assert!(
+            status.ra_blind_paths,
+            "#A8: blind-path bit must ride the published status"
+        );
         let ev = rx.try_recv().expect("transition event");
         assert_eq!(ev.base_sha.as_deref(), Some("abc123def"));
+        assert!(
+            ev.ra_blind_paths,
+            "#A8: blind-path bit must ride the transition event"
+        );
 
         // Unattributed publish (FS-watch path) — echo must CLEAR, never
         // hold a stale SHA from the previous push's verdict.
@@ -3886,6 +3978,10 @@ checks:
         assert_eq!(
             status.base_sha, None,
             "FS-watch verdict must not inherit the prior push's base_sha"
+        );
+        assert!(
+            !status.ra_blind_paths,
+            "#A8: FS-watch verdict must not inherit the prior push's blind bit"
         );
     }
 
@@ -3916,6 +4012,89 @@ checks:
         assert!(
             api.take_push_attribution("/wt").is_none(),
             "pop-on-consume: one publish consumes the attribution"
+        );
+    }
+
+    // ──────────────── #A8 — macro-blind classification ────────────────
+
+    #[test]
+    fn macro_blind_hit_matches_changed_files_against_globs() {
+        // The tf-mv deployment shape: portal/** etc. are the RA-blind
+        // proc-macro surfaces; only changed_files (repo-relative diff
+        // list) participates — never the overlay file list.
+        let globs = parse_macro_blind_globs(
+            "portal/**, chemistry/shell/**,chemistry/generated/portal-*/**,runtime-types/**",
+        );
+        assert_eq!(globs.len(), 4, "tolerant split incl. space after comma");
+        let hit = |files: &[&str]| {
+            let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+            compute_macro_blind_hit(Some(&files), &globs)
+        };
+        assert!(hit(&["portal/src/app.rs"]));
+        assert!(hit(&["chemistry/generated/portal-7/lib.rs"]));
+        assert!(
+            hit(&["physics/src/lib.rs", "runtime-types/src/ids.rs"]),
+            "any single blind file marks the whole push"
+        );
+        assert!(!hit(&["physics/src/lib.rs", "docs/README.md"]));
+    }
+
+    #[test]
+    fn macro_blind_hit_never_fires_without_evidence() {
+        // Absence-of-evidence posture (same as base_sha: None ⇒
+        // unattributed): no globs configured, no changed_files, or an
+        // empty list ⇒ false — the annotation must never be a guess.
+        let globs = parse_macro_blind_globs("portal/**");
+        assert!(!compute_macro_blind_hit(None, &globs));
+        assert!(!compute_macro_blind_hit(Some(&[]), &globs));
+        let files = vec!["portal/src/app.rs".to_string()];
+        assert!(
+            !compute_macro_blind_hit(Some(&files), &[]),
+            "unconfigured daemon (no globs) ⇒ annotation inert"
+        );
+        assert!(compute_macro_blind_hit(Some(&files), &globs));
+    }
+
+    #[test]
+    fn record_push_attribution_classifies_blind_paths_at_consume() {
+        // The blind bit rides the SAME record as base_sha (record at
+        // consume, pop at publish) so it can never be stamped onto a
+        // different push's verdict.
+        let api = ServeVerdictState::new();
+        let globs = parse_macro_blind_globs("portal/**");
+        let pushed = |changed: Option<Vec<String>>| PushedOverlay {
+            base_ref: "origin/dev".into(),
+            files: vec![("portal/src/app.rs".into(), "fn a() {}".into())],
+            analysis_root: None,
+            base_sha: Some("cafe1234".into()),
+            last_push_unix: crate::statusfile::now_unix(),
+            changed_files: changed,
+            check_profile: None,
+            gate: false,
+        };
+        api.record_push_attribution_with_globs(
+            "/wt",
+            &pushed(Some(vec!["portal/src/app.rs".into()])),
+            &globs,
+        );
+        let attribution = api.take_push_attribution("/wt").expect("recorded");
+        assert!(attribution.macro_blind_hit, "portal/** push classifies");
+
+        api.record_push_attribution_with_globs(
+            "/wt",
+            &pushed(Some(vec!["physics/src/lib.rs".into()])),
+            &globs,
+        );
+        let attribution = api.take_push_attribution("/wt").expect("recorded");
+        assert!(!attribution.macro_blind_hit, "non-blind push stays clean");
+
+        // changed_files: None (legacy client) — overlay FILES touch
+        // portal/ but provide no diff evidence; must NOT classify.
+        api.record_push_attribution_with_globs("/wt", &pushed(None), &globs);
+        let attribution = api.take_push_attribution("/wt").expect("recorded");
+        assert!(
+            !attribution.macro_blind_hit,
+            "overlay file list must not substitute for changed_files"
         );
     }
 

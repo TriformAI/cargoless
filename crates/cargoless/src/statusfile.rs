@@ -19,6 +19,8 @@
 //! crates=<name>:<v>,<name>:<v>    # schema=2, OPTIONAL — see below
 //! red_diagnostics=<u32>           # schema=2 — count of error-severity diags
 //! build_id=<string>               # schema=2 — writer binary identity
+//! ra_blind_paths=1                # #A8, OPTIONAL — push touched a proc-macro-
+//!                                 # blind path; green is necessary-not-sufficient
 //! ```
 //!
 //! **schema=2 (Model R #9, `D-FLEET-SHARED-DAEMON` §9):** adds the
@@ -219,6 +221,16 @@ pub struct Status {
     pub analysed_at: u64,
     /// Writer binary identity. Empty for old status files.
     pub build_id: String,
+    /// **#A8 macro-blind annotation** — `true` iff the push this verdict
+    /// answers touched a configured proc-macro-blind path
+    /// (`CARGOLESS_MACRO_BLIND_PATHS` glob hit on the push's
+    /// `changed_files`). RA-native green on such paths is necessary but
+    /// not sufficient (the tf-mv #4070 class); a statusfile reader can
+    /// demand witness-backed evidence instead of trusting green. `false`
+    /// for FS-watch verdicts, unconfigured daemons, and pre-#A8 files
+    /// (forward-compatible default; serializer omits the line when
+    /// `false` so unaware readers see no new key).
+    pub ra_blind_paths: bool,
 }
 
 pub fn path(root: &Path) -> PathBuf {
@@ -292,6 +304,12 @@ impl Status {
         // `analysed_at` key (the parse-arm-driven discipline).
         out.push_str(&format!("analysed_at={}\n", self.analysed_at));
         out.push_str(&format!("build_id={}\n", self.build_id));
+        // #A8: `ra_blind_paths=1` emitted ONLY on a blind-path hit —
+        // same omit-when-default discipline as verdict_failure_reason,
+        // so pre-#A8 readers see no new key on ordinary verdicts.
+        if self.ra_blind_paths {
+            out.push_str("ra_blind_paths=1\n");
+        }
         out
     }
 
@@ -316,6 +334,7 @@ impl Status {
                 "verdict_failure_reason" => s.verdict_failure_reason = v.trim().to_string(),
                 "analysed_at" => s.analysed_at = v.trim().parse().unwrap_or(0),
                 "build_id" => s.build_id = v.trim().to_string(),
+                "ra_blind_paths" => s.ra_blind_paths = v.trim() == "1",
                 _ => {}
             }
         }
@@ -882,6 +901,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         };
         assert_eq!(Status::parse(&st.serialize()), st);
         let forward = format!("{}future_key=42\n", st.serialize());
@@ -908,6 +928,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         };
         let wire = st.serialize();
         assert!(wire.starts_with("schema=2\n"), "schema bumped: {wire}");
@@ -948,6 +969,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         };
         let wire = st.serialize();
         assert!(!wire.contains("crates="), "no crates line: {wire}");
@@ -986,6 +1008,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         };
         let wire = st.serialize();
         // The schema=1-era parser was exactly today's parser minus the
@@ -1038,6 +1061,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 200, // settled 50s before write (meaningful gap)
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         };
         let wire = st.serialize();
         assert!(wire.contains("analysed_at=200\n"), "emitted: {wire}");
@@ -1060,6 +1084,49 @@ mod tests {
         assert_eq!(s.analysed_at, 0, "absent ⇒ 0, not error");
         assert_eq!(s.verdict_str, "green");
         assert_eq!(s.updated, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // #A8 — ra_blind_paths annotation line (omit-when-false discipline)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ra_blind_paths_roundtrips_and_is_omitted_when_false() {
+        // Hit case: the line must appear and survive a roundtrip — the
+        // operator-facing mirror of the wire annotation.
+        let st = Status {
+            pid: 8,
+            root: "/ws".into(),
+            started: 1,
+            updated: 2,
+            verdict_str: "green".into(),
+            crates: vec![],
+            red_diagnostics: 0,
+            verdict_failure_reason: String::new(),
+            analysed_at: 2,
+            build_id: "test-build".into(),
+            ra_blind_paths: true,
+        };
+        let wire = st.serialize();
+        assert!(wire.contains("ra_blind_paths=1\n"), "emitted: {wire}");
+        assert_eq!(Status::parse(&wire), st, "exact roundtrip incl. #A8 line");
+
+        // Default case: the line must be ABSENT (pre-#A8 readers see no
+        // new key on ordinary verdicts), and a pre-#A8 file parses false.
+        let plain = Status {
+            ra_blind_paths: false,
+            ..st.clone()
+        };
+        let wire = plain.serialize();
+        assert!(
+            !wire.contains("ra_blind_paths"),
+            "false must omit the line: {wire}"
+        );
+        assert_eq!(Status::parse(&wire), plain);
+        assert!(
+            !Status::parse("schema=2\npid=1\nroot=/p\nverdict=green\n").ra_blind_paths,
+            "pre-#A8 file ⇒ false, not error"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1125,6 +1192,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         };
         write(&root, &st);
         let back = Status::parse(&std::fs::read_to_string(path(&root)).unwrap());
@@ -1150,6 +1218,7 @@ mod tests {
             verdict_failure_reason: String::new(),
             analysed_at: 0,
             build_id: "test-build".into(),
+            ra_blind_paths: false,
         }
     }
 

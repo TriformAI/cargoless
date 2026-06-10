@@ -200,6 +200,9 @@ pub fn run(cfg: &Config) -> ExitCode {
                 // is preserved for the Model R serve --repo path.
                 analysed_at: statusfile::now_unix(),
                 build_id: cargoless_core::build_id().to_string(),
+                // #A8: push-overlay concept; the local watch path has no
+                // push, so never annotated.
+                ra_blind_paths: false,
             },
         );
         // Model R #11: retain the full diagnostic list for a red tree
