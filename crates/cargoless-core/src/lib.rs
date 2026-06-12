@@ -12,6 +12,8 @@
 pub mod activity;
 pub mod activitymgr;
 pub mod analyzer;
+pub mod appinstances;
+pub mod appmanifest;
 pub mod attribution;
 pub mod barrier;
 pub mod batch;
@@ -36,6 +38,7 @@ pub mod shutdown;
 pub mod structural;
 pub mod transport;
 pub mod watcher;
+mod yamlscan;
 
 pub use cargoless_cas::{ContentStore, LocalDiskStore};
 pub use cargoless_proto::{
