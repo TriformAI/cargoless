@@ -23,6 +23,7 @@ use std::process::ExitCode;
 
 use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 
+mod appserve;
 mod batchcheck;
 mod build;
 mod check;
@@ -52,6 +53,10 @@ enum Cmd {
     Checks,
     /// Model R Stream B #3: repo-scoped daemon (`serve --repo <path>`).
     Serve,
+    /// app-serve: run the apps the checker certifies — one L4-proxied
+    /// instance per configured ref, latest-green-per-ref, never serve red
+    /// (`app-serve --repo <path> --instances <file> --port-range A-B`).
+    AppServe,
     /// #240/2c: thin push-client — push a local overlay-set to a remote
     /// `serve --repo --bind` daemon via `POST /overlay`.
     Push,
@@ -121,6 +126,14 @@ struct Opts {
     /// `serve --auth-token <secret>` — bearer token (#14 enforces;
     /// prefer the `CARGOLESS_AUTH_TOKEN` env for secrets).
     auth_token: Option<String>,
+    /// `app-serve --instances <file>` — the instances file (which refs to
+    /// serve). Absent ⇒ zero-config single `default` instance on repo HEAD.
+    instances: Option<PathBuf>,
+    /// `app-serve --port-range START-END` — app child ports the daemon
+    /// allocates (one per running instance build).
+    port_range: Option<String>,
+    /// `app-serve --poll-interval-ms <N>` — ref poll cadence (default 2000).
+    poll_interval_ms: Option<u64>,
     /// `status --remote <url>` — query a remote `serve --bind` fleet
     /// daemon over the shipped HTTP(S) transport instead of the on-disk
     /// `cli-status`. Resolved through `transport::discovery` (explicit
@@ -212,6 +225,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "clean" => Cmd::Clean,
         "checks" => Cmd::Checks,
         "serve" => Cmd::Serve,
+        "app-serve" => Cmd::AppServe,
         "push" => Cmd::Push,
         "batch-check" => Cmd::BatchCheck,
         "verdict" => Cmd::Verdict,
@@ -343,6 +357,26 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .clone(),
                 );
             }
+            "--instances" => {
+                opts.instances = Some(PathBuf::from(
+                    it.next().ok_or(ParseError::MissingValue("--instances"))?,
+                ));
+            }
+            "--port-range" => {
+                opts.port_range = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--port-range"))?
+                        .clone(),
+                );
+            }
+            "--poll-interval-ms" => {
+                opts.poll_interval_ms = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--poll-interval-ms"))?
+                        .parse()
+                        .map_err(|_| ParseError::MissingValue("--poll-interval-ms"))?,
+                );
+            }
             // verdict: --remote is repeatable (failover ladder) — must
             // precede the scalar arm below (match arms are tried in order).
             "--remote" if cmd == Cmd::Verdict => {
@@ -462,6 +496,9 @@ fn usage() {
     println!("                        Inspect or run cargoless.checks.yaml project checks");
     println!("  serve --repo <DIR>    Model R repo-scoped daemon: auto-discovers");
     println!("                        worktrees, one shared daemon for the fleet");
+    println!("  app-serve --repo <DIR> --instances <FILE> --port-range A-B");
+    println!("                        Run the apps the checker certifies: one");
+    println!("                        L4-proxied instance per ref, never serve red");
     println!("  batch-check --remote <URL> --request-json <PATH>");
     println!("                        Native optimistic batch gate; prints report JSON");
     println!("  verdict --remote <URL> [--remote <URL>...] [-- <REPO>]");
@@ -704,6 +741,21 @@ fn main() -> ExitCode {
                 auth_token: parsed.opts.auth_token.clone(),
             });
         }
+        // app-serve is repo-scoped like serve — dispatch BEFORE the v0
+        // `config::Config::resolve` front-door (that detector would wrongly
+        // reject a repo root that isn't a single cdylib/leptos crate;
+        // app-serve resolves its own instance config).
+        Cmd::AppServe => {
+            return appserve::run(&appserve::AppServeOpts {
+                repo: parsed.opts.repo.clone(),
+                bind: parsed.opts.bind.clone(),
+                instances: parsed.opts.instances.clone(),
+                port_range: parsed.opts.port_range.clone(),
+                state_dir: parsed.opts.state_dir.clone(),
+                auth_token: parsed.opts.auth_token.clone(),
+                poll_interval_ms: parsed.opts.poll_interval_ms,
+            });
+        }
         // `status --remote <url>` queries a remote fleet `serve --bind`
         // daemon over the shipped HTTP(S) transport. Dispatch BEFORE the
         // `config::Config::resolve` front-door (exactly like `serve`):
@@ -857,7 +909,13 @@ fn main() -> ExitCode {
             parsed.opts.checks_report_json.as_deref(),
         ),
         Cmd::Clean => clean::run(&cfg),
-        Cmd::Help | Cmd::Version | Cmd::Serve | Cmd::Push | Cmd::BatchCheck | Cmd::Verdict => {
+        Cmd::Help
+        | Cmd::Version
+        | Cmd::Serve
+        | Cmd::AppServe
+        | Cmd::Push
+        | Cmd::BatchCheck
+        | Cmd::Verdict => {
             unreachable!("handled above")
         }
     }
