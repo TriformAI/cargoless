@@ -530,9 +530,11 @@ mod tests {
         c.read_exact(&mut banner).unwrap(); // connection is established & spliced
         assert_eq!(&banner, b"HI:");
 
-        // Poll the gauge up — the inc happens just after accept.
+        // Poll the gauge up — the inc happens just after accept. Budgets are
+        // generous (~3s, early-exit on success) so a loaded CI runner sharing
+        // cores across 5 jobs can't flake the timing.
         let mut saw_one = false;
-        for _ in 0..200 {
+        for _ in 0..600 {
             if proxy.gauge().count(42) == 1 {
                 saw_one = true;
                 break;
@@ -548,7 +550,7 @@ mod tests {
         c.shutdown(Shutdown::Both).unwrap();
         drop(c);
         let mut drained = false;
-        for _ in 0..200 {
+        for _ in 0..600 {
             if proxy.gauge().count(42) == 0 {
                 drained = true;
                 break;
