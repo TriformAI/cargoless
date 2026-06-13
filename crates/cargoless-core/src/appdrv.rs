@@ -282,10 +282,14 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
     }
 
     fn spawn_and_probe(&mut self, instance: &str, sha: &str, generation: Generation) {
-        let Some(rt) = self.runtimes.get_mut(instance) else {
-            return;
+        // Read what we need from the runtime, then DROP the borrow before any
+        // other `self.*` call — `ports`/`sink`/`launcher` are disjoint fields
+        // but each access reborrows `self`, so the runtime borrow can't be
+        // live across them.
+        let (bundle_dir, env) = match self.runtimes.get(instance) {
+            Some(rt) => (rt.paths.bundle_dir(sha), rt.env.clone()),
+            None => return,
         };
-        let bundle_dir = rt.paths.bundle_dir(sha);
         let Some(port) = self.ports.alloc() else {
             self.sink.post(
                 instance,
@@ -296,9 +300,11 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
             );
             return;
         };
-        match self.launcher.spawn(instance, &bundle_dir, port, &rt.env) {
+        match self.launcher.spawn(instance, &bundle_dir, port, &env) {
             Ok(handle) => {
-                rt.children.insert(generation, handle);
+                if let Some(rt) = self.runtimes.get_mut(instance) {
+                    rt.children.insert(generation, handle);
+                }
                 self.launcher.start_probe(instance, generation, port);
             }
             Err(e) => {
@@ -325,26 +331,32 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
     }
 
     fn stop_child(&mut self, instance: &str, generation: Generation, drain: bool) {
-        let Some(rt) = self.runtimes.get_mut(instance) else {
+        // Copy the handle out (and, for a kill, remove it) before touching
+        // `self.launcher`/`self.ports` — the runtime borrow can't be live
+        // across those reborrows of `self`.
+        let child = match self.runtimes.get_mut(instance) {
+            Some(rt) if !drain => rt.children.remove(&generation),
+            Some(rt) => rt.children.get(&generation).copied(),
+            None => return,
+        };
+        let Some(child) = child else {
             return;
         };
-        if let Some(child) = rt.children.get(&generation).copied() {
-            self.launcher.stop(instance, generation, child.token, drain);
-            if !drain {
-                // A killed standby never served: reclaim its port + slot now.
-                // A *draining* child keeps its port until DrainComplete.
-                rt.children.remove(&generation);
-                self.ports.release(child.port);
-            }
+        self.launcher.stop(instance, generation, child.token, drain);
+        if !drain {
+            // A killed standby never served: reclaim its port now. A
+            // *draining* child keeps its port until DrainComplete.
+            self.ports.release(child.port);
         }
     }
 
     /// Called by the loop when a drain finishes: reclaim the child's port.
     pub fn on_drain_reclaimed(&mut self, instance: &str, generation: Generation) {
-        let Some(rt) = self.runtimes.get_mut(instance) else {
-            return;
+        let child = match self.runtimes.get_mut(instance) {
+            Some(rt) => rt.children.remove(&generation),
+            None => return,
         };
-        if let Some(child) = rt.children.remove(&generation) {
+        if let Some(child) = child {
             self.ports.release(child.port);
         }
     }
