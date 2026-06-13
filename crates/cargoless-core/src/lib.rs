@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod activitymgr;
 pub mod analyzer;
+pub mod appbuild;
 pub mod appinstances;
 pub mod appmanifest;
 pub mod appstate;
