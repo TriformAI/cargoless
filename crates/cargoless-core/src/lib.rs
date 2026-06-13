@@ -27,6 +27,7 @@ pub mod config;
 pub mod corun;
 pub mod diagnostics_store;
 pub mod idle;
+pub mod l4proxy;
 pub mod lsp;
 pub mod model;
 pub mod multiplex;
