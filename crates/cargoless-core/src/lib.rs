@@ -14,6 +14,7 @@ pub mod activitymgr;
 pub mod analyzer;
 pub mod appinstances;
 pub mod appmanifest;
+pub mod appstate;
 pub mod attribution;
 pub mod barrier;
 pub mod batch;
