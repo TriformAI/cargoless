@@ -537,6 +537,11 @@ fn serve_loop(
         }
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok((instance, event)) => {
+                // inc-6 telemetry: one structured event per observed lifecycle
+                // transition, tagged with the instance, exported via the bin's
+                // OTLP→SigNoz bracket (tracing degrades to a no-op with no
+                // subscriber). The driver then makes + executes the decision.
+                trace_event(&instance, &event);
                 // DrainComplete also reclaims the child's port in the driver.
                 if let Event::DrainComplete { generation } = &event {
                     driver.on_drain_reclaimed(&instance, *generation);
@@ -553,6 +558,85 @@ fn serve_loop(
     // their drain/stop paths. A full ordered child reap is inc-6 hardening.
     drop(proxies);
     Ok(())
+}
+
+/// Emit one structured telemetry event for an observed lifecycle transition.
+/// The `cargoless.app.instance` field is the per-instance attribute the plan
+/// specifies; `app.event` names the transition. Red/probe-fail carry the
+/// reason so SigNoz shows *why* without a log dive. `tracing` is a no-op until
+/// a subscriber is installed (the bin's telemetry bracket installs the
+/// OTLP→SigNoz one when OTEL_EXPORTER_OTLP_ENDPOINT is set).
+fn trace_event(instance: &str, event: &Event) {
+    // Dotted field keys must be quoted in `tracing` macros (a bare `a.b.c`
+    // parses as field access). `cargoless.app.instance` is the plan's
+    // per-instance attribute; `app.event` names the transition.
+    match event {
+        Event::HeadAdvanced { sha } => {
+            tracing::info!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "head_advanced",
+                sha = sha.as_str(),
+            );
+        }
+        Event::BuildFinished {
+            generation,
+            outcome,
+        } => {
+            // Name the build verdict so green/red/indeterminate are filterable.
+            let (verdict, reason) = match outcome {
+                cargoless_core::appstate::AppBuildOutcome::Green => ("green", String::new()),
+                cargoless_core::appstate::AppBuildOutcome::Red { reason } => {
+                    ("red", reason.clone())
+                }
+                cargoless_core::appstate::AppBuildOutcome::Indeterminate { reason } => {
+                    ("indeterminate", reason.clone())
+                }
+            };
+            tracing::info!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "build_finished",
+                generation = *generation,
+                verdict = verdict,
+                reason = reason.as_str(),
+            );
+        }
+        Event::ProbeSucceeded { generation } => {
+            tracing::info!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "probe_succeeded",
+                generation = *generation,
+            );
+        }
+        Event::ProbeFailed { generation, reason } => {
+            tracing::warn!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "probe_failed",
+                generation = *generation,
+                reason = reason.as_str(),
+            );
+        }
+        Event::ServingExited { generation } => {
+            tracing::warn!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "serving_exited",
+                generation = *generation,
+            );
+        }
+        Event::DrainComplete { generation } => {
+            tracing::info!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "drain_complete",
+                generation = *generation,
+            );
+        }
+        Event::RecoverFromPointer { sha } => {
+            tracing::info!(
+                "cargoless.app.instance" = instance,
+                "app.event" = "recover_from_pointer",
+                sha = sha.as_str(),
+            );
+        }
+    }
 }
 
 /// Per-instance git worktree path (daemon-owned checkout scratch). Each
