@@ -1,0 +1,351 @@
+# cargoless app-serve preview — run N branches of tf-multiverse in-cluster.
+#
+# ⚠️ REFERENCE COPY — NOT the deployed source of truth.
+#   The live deployment is reconciled by Flux from the *tf-multiverse* repo at
+#   `deployment/kubernetes/apps/staging/cargoless-preview.yaml` (Part B of the
+#   app-serve plan). This file is the cargoless-repo reference so the daemon's
+#   own contract (flags, ports, probes, the instances ConfigMap shape) lives
+#   beside the code. Keep the two in sync; edit the tf-multiverse manifest to
+#   change the LIVE preview.
+#
+# Deploys into `triform-staging` (NOT cargoless-builder): the previews need the
+# staging data plane — `triform-config` (Postgres/JWT), `rustfs-credentials`,
+# NATS, Iggy — which already live there. This is the SAME risk class as a long
+# rolling staging deploy (the `dev` instance is a full canary).
+#
+# Multi-instance from day one. First rollout = two instances:
+#   - `dev`        : full canary, shares staging's DB/NATS/Iggy/RustFS.
+#   - `feature-x`  : own database `preview_feature_x` in the same staging
+#                    Postgres (DB isolation; queues still shared — a known
+#                    limitation until physics grows isolation knobs).
+#
+# Required out-of-band secrets in triform-staging (Secrets are namespace-local):
+#   kubectl -n triform-staging create secret generic cargoless-serve-auth \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#   kubectl -n triform-staging create secret generic forgejo-cargoless-auth \
+#     --from-literal=username=<forgejo-bot-user> --from-literal=token=<token>
+#   kubectl -n triform-staging create secret generic cargoless-preview-dbs \
+#     --from-literal=PREVIEW_FEATURE_X_DATABASE_URL=postgres://.../preview_feature_x \
+#     --from-literal=PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL=postgres://.../preview_feature_x
+#   # triform-config + rustfs-credentials already exist in triform-staging.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cargoless-preview-workspace
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: triform-replicated-fsn-2x
+  resources:
+    requests:
+      # Shared CARGO_TARGET_DIR + N per-instance worktrees + bundles headroom.
+      # Bigger than the gate's 150Gi because app-serve keeps built artifacts
+      # (current + previous bundle per instance) plus a warm incremental target.
+      storage: 250Gi
+---
+# The instances file (the daemon's --instances input). Adding a branch later =
+# edit this ConfigMap + the Ingress host + (if DB-isolated) a cargoless-preview-dbs
+# entry, then restart the pod. Secrets are NEVER in here — the ${VAR} refs
+# resolve from the pod env (cargoless-preview-dbs) at daemon startup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cargoless-preview-instances
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+data:
+  instances.yaml: |
+    version: 1
+    instances:
+      - name: dev
+        ref: origin/dev
+        app_bind: "0.0.0.0:8080"
+        env:
+          TRIFORM_PUBLIC_BASE_URL: "https://dev.preview.triform.dev"
+          TRIFORM_API_URL: "https://dev.preview.triform.dev"
+      - name: feature-x
+        ref: origin/feature/x
+        app_bind: "0.0.0.0:8081"
+        env:
+          DATABASE_URL: "${PREVIEW_FEATURE_X_DATABASE_URL}"
+          MIGRATION_DATABASE_URL: "${PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL}"
+          TRIFORM_PUBLIC_BASE_URL: "https://feature-x.preview.triform.dev"
+          TRIFORM_API_URL: "https://feature-x.preview.triform.dev"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cargoless-preview
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cargoless-preview
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cargoless-preview
+        app.kubernetes.io/part-of: cargoless
+    spec:
+      nodeSelector:
+        topology.triform.dev/site: fsn
+        storage.triform.dev/pool: fsn
+        longhorn-storage: "true"
+      # Generous grace: an ordered drain of N app children within the pod
+      # shutdown window (each app honours its cargoless.app.yaml drain.grace_ms).
+      terminationGracePeriodSeconds: 90
+      imagePullSecrets:
+        - name: registry-pull
+      initContainers:
+        - name: fix-permissions
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /workspace
+              chown 1000:1000 /workspace || true
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+        - name: repo-bootstrap
+          image: registry.triform.cloud/triform-dev:latest
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          env:
+            - name: FORGEJO_USER
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: FORGEJO_TOKEN
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+          args:
+            - |
+              set -eu
+              repo=/workspace/tf-multiverse
+              url="https://${FORGEJO_USER}:${FORGEJO_TOKEN}@forgejo.triform.dev/triform/tf-multiverse.git"
+              if [ ! -d "$repo/.git" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+                echo "[cargoless-preview] initializing repo"
+                rm -rf "$repo"; mkdir -p "$repo"
+                git -C "$repo" init --quiet
+                git -C "$repo" remote add origin "$url"
+                # Fetch every ref the instances file references.
+                git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet
+                git -C "$repo" fetch --depth 1 origin feature/x:refs/remotes/origin/feature/x --quiet || true
+                git -C "$repo" checkout -f --quiet origin/dev
+              fi
+              git -C "$repo" config user.email "cargoless-preview@triform.dev"
+              git -C "$repo" config user.name "cargoless-preview"
+              echo "[cargoless-preview] repo ready @ $(git -C "$repo" rev-parse --short HEAD)"
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+      containers:
+        - name: app-serve
+          image: registry.triform.cloud/cargoless/cargoless-appserve:latest
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              git config --global --add safe.directory '*'
+              exec /usr/local/bin/cargoless app-serve \
+                --repo /workspace/tf-multiverse \
+                --bind 0.0.0.0:8787 \
+                --instances /etc/cargoless/instances.yaml \
+                --port-range 8090-8190 \
+                --state-dir /workspace/cargoless-state
+          env:
+            # --- cargoless control plane auth ---
+            - name: CARGOLESS_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef: { name: cargoless-serve-auth, key: token }
+            # --- per-branch DB secrets the instances-file ${VAR} refs resolve from ---
+            - name: PREVIEW_FEATURE_X_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: cargoless-preview-dbs, key: PREVIEW_FEATURE_X_DATABASE_URL }
+            - name: PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: cargoless-preview-dbs, key: PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL }
+            # --- the dev (canary) instance's base environment = the staging
+            #     `triform` Deployment env block. Copy it here from
+            #     apps/staging/triform.yaml: DATABASE_URL / MIGRATION_DATABASE_URL
+            #     (triform-config), S3→rustfs.infra-staging, NATS→nats.infra-staging:4222,
+            #     Iggy→iggy.iggy-staging:8090 + IGGY_PUBLIC_URL, JWT/master keys,
+            #     COOKIE_SECURE=true. Instance env overlays (instances.yaml) win per branch. ---
+            - { name: TRIFORM_ENV, value: "staging" }
+            - { name: RUST_LOG, value: "info" }
+            - { name: OTEL_SERVICE_NAME, value: "cargoless-preview" }
+            # DEVIATIONS from the canonical staging Deployment (intentional):
+            #   - STORED_FUNCTION_DRIFT_AUTOCORRECT unset (BUGS-1531: only the
+            #     canonical Deployment autocorrects stored-function drift).
+            #   - CIRCLE_PURGE_SWEEP_SECS unset (default hourly).
+            # --- build toolchain (image-provided; PVC-backed cache) ---
+            - { name: PATH, value: "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            - { name: CARGO_HOME, value: "/workspace/.cargo" }
+            - { name: RUSTUP_HOME, value: "/usr/local/rustup" }
+            - { name: RUSTUP_TOOLCHAIN, value: "1.93.1-x86_64-unknown-linux-gnu" }
+            - { name: CARGO_TARGET_DIR, value: "/workspace/target" }
+            - { name: CARGO_INCREMENTAL, value: "1" }
+          ports:
+            - { name: ctl, containerPort: 8787 }   # cargoless control plane
+            - { name: dev, containerPort: 8080 }   # dev instance app proxy
+            - { name: feature-x, containerPort: 8081 } # feature-x instance app proxy
+          # Startup gets a long budget: a cold build on a fresh PVC is tens of
+          # minutes. /healthz = control-plane liveness (the daemon is up);
+          # /readyz = "every ever-green instance is serving" (real readiness).
+          startupProbe:
+            httpGet: { path: /healthz, port: ctl }
+            periodSeconds: 10
+            failureThreshold: 180   # ~30 min cold-build budget
+          readinessProbe:
+            httpGet: { path: /readyz, port: ctl }
+            periodSeconds: 15
+            failureThreshold: 4
+          livenessProbe:
+            httpGet: { path: /healthz, port: ctl }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            # Sized for 2 running physics instances + serialized builds. Tune
+            # from observed staging pod RSS.
+            requests: { cpu: "6", memory: 24Gi }
+            limits: { cpu: "16", memory: 64Gi }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: instances, mountPath: /etc/cargoless, readOnly: true }
+        # repo-sync sidecar: FETCH-ONLY of the configured refs (the DAEMON owns
+        # checkouts — it moves the per-instance worktrees, not this sidecar).
+        - name: repo-sync
+          image: registry.triform.cloud/triform-dev:latest
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          env:
+            - name: FORGEJO_USER
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: FORGEJO_TOKEN
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+          args:
+            - |
+              set -u
+              repo=/workspace/tf-multiverse
+              url="https://${FORGEJO_USER}:${FORGEJO_TOKEN}@forgejo.triform.dev/triform/tf-multiverse.git"
+              while true; do
+                if [ -d "$repo/.git" ]; then
+                  git -C "$repo" remote set-url origin "$url" 2>/dev/null \
+                    || git -C "$repo" remote add origin "$url" 2>/dev/null || true
+                  # Fetch-only: update remote-tracking refs; the daemon's ref
+                  # pollers see the new sha and drive the build. NEVER checkout here.
+                  git -C "$repo" fetch origin dev:refs/remotes/origin/dev --quiet || true
+                  git -C "$repo" fetch origin feature/x:refs/remotes/origin/feature/x --quiet || true
+                fi
+                sleep 30
+              done
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cargoless-preview-workspace
+        - name: instances
+          configMap:
+            name: cargoless-preview-instances
+            items:
+              - { key: instances.yaml, path: instances.yaml }
+---
+# One Service per instance app port (the k8s Service targets the fixed
+# app_bind; the Ingress routes the public host to it). Plus a control Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cargoless-preview-app
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cargoless-preview
+  ports:
+    - { name: dev, port: 8080, targetPort: dev }
+    - { name: feature-x, port: 8081, targetPort: feature-x }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cargoless-preview-ctl
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cargoless-preview
+  ports:
+    - { name: ctl, port: 8787, targetPort: ctl }
+---
+# Public ingress: one host per instance, cloned from triform-ingress'
+# annotations (websocket upgrade, proxy-buffering off for SSE, HTTP/1.1,
+# sticky-cookie), per-host HTTP-01 TLS (no wildcard/DNS-01 infra needed).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cargoless-preview
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # SSE/WebSocket pass-through (the L4 proxy already byte-splices; the
+    # ingress must not buffer or it defeats live streaming).
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [dev.preview.triform.dev]
+      secretName: cargoless-preview-dev-tls
+    - hosts: [feature-x.preview.triform.dev]
+      secretName: cargoless-preview-feature-x-tls
+  rules:
+    - host: dev.preview.triform.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cargoless-preview-app
+                port: { name: dev }
+    - host: feature-x.preview.triform.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cargoless-preview-app
+                port: { name: feature-x }
