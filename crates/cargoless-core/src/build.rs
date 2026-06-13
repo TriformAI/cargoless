@@ -500,11 +500,8 @@ pub fn read_latest_green(project_root: &Path) -> io::Result<Option<PublishedArti
     }
 }
 
-/// Atomically advance the canonical pointer to `meta` (**AC#4**). The new
-/// record is written to a temp file in the **same directory** (so the
-/// `rename` is same-filesystem and therefore atomic), `fsync`'d, then renamed
-/// over the live pointer. The live pointer is never written in place: a crash
-/// or a full disk leaves the previous green pointer byte-intact, never torn.
+/// Atomically advance the canonical pointer to `meta` (**AC#4**): render the
+/// [`PublishedArtifact`] record and swap it in via [`write_pointer_atomic`].
 fn publish_latest_green(project_root: &Path, meta: &ArtifactMeta) -> io::Result<()> {
     let published_at = UnixSeconds(
         SystemTime::now()
@@ -516,16 +513,35 @@ fn publish_latest_green(project_root: &Path, meta: &ArtifactMeta) -> io::Result<
         artifact: meta.clone(),
         published_at,
     };
+    write_pointer_atomic(&latest_green_path(project_root), &record.render())
+}
 
-    let dir = project_root.join(".cargoless");
-    fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".latest-green.{}.tmp", std::process::id()));
+/// Atomically replace `path` with `contents` — the pointer-file write
+/// discipline behind every "never publish red" surface (the latest-green
+/// artifact pointer here; the app-serve per-instance pointers reuse it).
+///
+/// The new contents go to a temp file in the **same directory** (so the
+/// `rename` is same-filesystem and therefore atomic), are `fsync`'d, then
+/// renamed over the live pointer. The live pointer is never written in
+/// place: a crash or a full disk leaves the previous contents byte-intact,
+/// never torn. The parent directory is created if absent; a failed rename
+/// removes the temp so no stale `.tmp` litters the directory.
+pub fn write_pointer_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pointer path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pointer path has no name"))?
+        .to_string_lossy();
+    fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(record.render().as_bytes())?;
+        f.write_all(contents.as_bytes())?;
         f.sync_all()?;
     }
-    match fs::rename(&tmp, dir.join("latest-green")) {
+    match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             // Don't leave a stale temp behind if the swap failed.
@@ -961,6 +977,36 @@ mod tests {
                 .unwrap(),
             "artifact is safely cached despite the publish failure"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_pointer_atomic_creates_replaces_and_cleans_up() {
+        let dir = scratch("ptr-atomic");
+
+        // Creates the parent directory and the pointer in one call.
+        let ptr = dir.join("deep").join("nested").join("pointer");
+        write_pointer_atomic(&ptr, "one\n").unwrap();
+        assert_eq!(fs::read_to_string(&ptr).unwrap(), "one\n");
+
+        // Replaces in full — never appends, never truncates partially.
+        write_pointer_atomic(&ptr, "two\n").unwrap();
+        assert_eq!(fs::read_to_string(&ptr).unwrap(), "two\n");
+
+        // A failed swap (target is a non-empty directory ⇒ rename fails)
+        // leaves no `.tmp` litter behind and the obstacle untouched.
+        let blocked = dir.join("blocked");
+        fs::create_dir_all(blocked.join("occupied")).unwrap();
+        write_pointer_atomic(&blocked, "x").unwrap_err();
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp litter: {leftovers:?}");
+        assert!(blocked.join("occupied").is_dir(), "obstacle untouched");
 
         let _ = fs::remove_dir_all(&dir);
     }

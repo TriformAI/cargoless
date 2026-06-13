@@ -763,6 +763,15 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
             },
             None => (404, "null".into()),
         },
+        // app-serve report. On the gate daemon `app_report()` is the default
+        // `None`, so this arm yields the SAME `(404, "null")` the fall-through
+        // would — the read plane stays byte-identical (guarded by
+        // `app_route_is_404_on_a_non_appserve_service`). Only the app-serve
+        // daemon's `AppServeState` returns `Some(json)` here.
+        "/app" => match svc.app_report() {
+            Some(json) => (200, json),
+            None => (404, "null".into()),
+        },
         _ => (404, "null".into()),
     }
 }
@@ -1475,6 +1484,63 @@ mod tests {
             .and_then(|c| c.parse::<u16>().ok())
             .expect("status code");
         (code, body.to_string())
+    }
+
+    #[test]
+    fn app_route_is_404_byte_identical_on_a_non_appserve_service() {
+        // The gate-daemon non-regression guard. `MockService` uses the
+        // `VerdictService::app_report` default (`None`), so `GET /app` must
+        // be indistinguishable from any other unknown path: a 404 with the
+        // canonical `null` body. If app-serve ever made the gate read plane
+        // diverge here, this fails.
+        let s = server();
+        std::thread::sleep(Duration::from_millis(50));
+        let (code_app, body_app) = raw_get(s.addr(), "/app");
+        let (code_unknown, body_unknown) = raw_get(s.addr(), "/no-such-route");
+        assert_eq!(code_app, 404, "gate /app is 404");
+        assert_eq!(
+            (code_app, body_app.as_str()),
+            (code_unknown, body_unknown.as_str()),
+            "/app is byte-identical to any other unknown route on the gate"
+        );
+    }
+
+    #[test]
+    fn app_route_is_200_json_when_the_service_reports() {
+        // The app-serve side of the same seam: a service overriding
+        // `app_report` to `Some(json)` makes `GET /app` a 200 carrying it.
+        struct AppService(String);
+        impl VerdictService for AppService {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+            fn app_report(&self) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+        let json = r#"{"instances":[{"name":"dev","phase":"serving"}]}"#;
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(AppService(json.to_string())),
+            Arc::new(AllowAll),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let (code, body) = raw_get(s.addr(), "/app");
+        assert_eq!(code, 200);
+        assert_eq!(body, json);
     }
 
     #[test]

@@ -461,6 +461,17 @@ pub trait VerdictService: Send + Sync {
     fn ready(&self) -> bool {
         true
     }
+
+    /// app-serve — the `GET /app` report: a JSON snapshot of every served
+    /// instance (its phase, serving sha, last red, drain count). `None` ⇒
+    /// this daemon is **not** an app-serve daemon, so the route 404s exactly
+    /// like any other unknown path. ADDITIVE with a default of `None` so the
+    /// gate daemon's read plane is byte-identical to pre-app-serve (the
+    /// `/app`-404 guard test pins this); only `appsvc::AppServeState`
+    /// overrides it.
+    fn app_report(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The **client** counterpart of [`VerdictService`] — the uniform
