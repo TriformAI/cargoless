@@ -387,6 +387,9 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
 mod tests {
     use super::*;
     use crate::appstate::AppBuildOutcome;
+    // `ready()` is a VerdictService method; the trait must be in scope to
+    // call it on the AppServeState behind `svc`.
+    use crate::transport::VerdictService;
     use std::sync::Mutex;
 
     #[test]
