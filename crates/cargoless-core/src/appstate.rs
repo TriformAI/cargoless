@@ -112,7 +112,12 @@ pub struct InstanceState {
     /// The serving child died while the pipeline was busy; restore serving
     /// from `last_green` as soon as the pipeline frees up.
     pub needs_respawn: bool,
-    indeterminate_streak: u8,
+    /// Consecutive `Indeterminate` builds for this instance — internal
+    /// backstop bookkeeping (requeue once, then red). `pub` only so sibling
+    /// modules (appsvc/appstatefile tests, future read-plane) can build an
+    /// `InstanceState` literal with `..Default::default()`; not part of the
+    /// lifecycle contract — only [`AppState::step`] ever advances it.
+    pub indeterminate_streak: u8,
 }
 
 /// Input to [`AppState::step`] — everything the daemon can observe.
