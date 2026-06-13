@@ -328,6 +328,34 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         if let Some(child) = rt.children.get(&generation) {
             rt.slot.set(child.port, generation);
         }
+        // inc-6: bound disk after a promote landed a new bundle. Protect the
+        // live set — the new serving sha + last_green (both set by the state
+        // machine before this action runs) — and keep the 1 next-newest so a
+        // fast rollback has a warm previous bundle. A still-draining child's
+        // bundle is protected because its generation maps to a sha we include.
+        self.prune_instance_bundles(instance);
+    }
+
+    /// Prune this instance's bundle dir, never deleting a live/recovery
+    /// bundle. Protected = currently-serving sha + last_green sha + every sha a
+    /// tracked child (promoted or draining) still runs from.
+    fn prune_instance_bundles(&self, instance: &str) {
+        let Some(rt) = self.runtimes.get(instance) else {
+            return;
+        };
+        let Some(st) = self.state.instance(instance) else {
+            return;
+        };
+        let mut protected: Vec<String> = Vec::new();
+        if let Some(s) = &st.serving {
+            protected.push(s.sha.clone());
+        }
+        if let Some(g) = &st.last_green {
+            protected.push(g.clone());
+        }
+        let refs: Vec<&str> = protected.iter().map(String::as_str).collect();
+        // keep_extra = 1: a warm previous bundle for instant rollback.
+        let _ = crate::appbuild::prune_bundles(&rt.paths.bundles, &refs, 1);
     }
 
     fn stop_child(&mut self, instance: &str, generation: Generation, drain: bool) {

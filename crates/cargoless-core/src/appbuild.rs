@@ -326,6 +326,60 @@ fn harvest(paths: &InstancePaths, sha: &str, manifest: &AppManifest) -> std::io:
     }
 }
 
+/// Prune an instance's bundle dir to bound disk: keep every `protected` sha
+/// (the currently-serving + last-green bundles — never delete what a running
+/// or recoverable child needs), plus the `keep_extra` most-recently-modified
+/// of the remaining bundles; delete the rest. Returns the shas removed.
+///
+/// inc-6 hardening: without this the PVC fills with every sha ever built (the
+/// 250Gi preview PVC assumes a bounded set). Called by the driver after a
+/// promote, with `protected = {serving_sha, last_green}` so it is impossible
+/// to delete a live or recovery bundle even if it is old. A pathological
+/// `<sha>.tmp.<pid>` left by a crashed harvest is also swept (never protected,
+/// never a valid `<sha>`).
+pub fn prune_bundles(
+    bundles: &Path,
+    protected: &[&str],
+    keep_extra: usize,
+) -> std::io::Result<Vec<String>> {
+    let read = match fs::read_dir(bundles) {
+        Ok(r) => r,
+        // No bundles dir yet ⇒ nothing to prune (not an error).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    // Collect candidate (name, mtime) for every bundle dir that is NOT
+    // protected. Sort newest-first; everything past `keep_extra` is removed.
+    let mut candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    let mut to_remove: Vec<String> = Vec::new();
+    for entry in read {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Always sweep tmp-harvest litter regardless of keep counts.
+        if name.contains(".tmp.") {
+            to_remove.push(name);
+            continue;
+        }
+        if protected.contains(&name.as_str()) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        candidates.push((name, mtime));
+    }
+    // Newest first; keep the first `keep_extra`, remove the tail.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    for (name, _) in candidates.into_iter().skip(keep_extra) {
+        to_remove.push(name);
+    }
+    for name in &to_remove {
+        let _ = fs::remove_dir_all(bundles.join(name));
+    }
+    Ok(to_remove)
+}
+
 /// Flat, human-inspectable bundle provenance (the [`crate::build`] pointer
 /// style). Records the sha, the manifest hash (which pipeline produced it),
 /// the app name, and the harvested artifact list.
@@ -888,6 +942,90 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "timeout fired promptly, not after the 30s sleep"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Make `<bundles>/<name>/` with a marker file and a controlled mtime
+    /// (older `age_secs` = older bundle), so prune ordering is deterministic.
+    fn bundle_at(bundles: &Path, name: &str, age_secs: u64) {
+        let d = bundles.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("meta"), format!("sha={name}\n")).unwrap();
+        let when = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        // Best-effort: set mtime so newest-first sorting is stable in test.
+        let _ = filetime_set(&d, when);
+    }
+
+    // std has no stable set-mtime; shell out to `touch -d` (portable enough for
+    // the test container) and fall back to leaving the natural mtime.
+    fn filetime_set(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // `touch -t` wants [[CC]YY]MMDDhhmm[.ss]; use -d @epoch (GNU coreutils
+        // on the Debian CI image). Non-fatal if it fails.
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(path)
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn prune_keeps_protected_and_newest_extra_removes_rest() {
+        let dir = scratch("prune");
+        let bundles = dir.join("bundles");
+        // serving (old), last_green (old), + 4 others of varying age.
+        bundle_at(&bundles, "serving", 1000);
+        bundle_at(&bundles, "lastgreen", 900);
+        bundle_at(&bundles, "new1", 10);
+        bundle_at(&bundles, "new2", 20);
+        bundle_at(&bundles, "old1", 500);
+        bundle_at(&bundles, "old2", 600);
+
+        // Keep the 2 protected + the 1 newest non-protected.
+        let mut removed = prune_bundles(&bundles, &["serving", "lastgreen"], 1).unwrap();
+        removed.sort();
+
+        // Protected always survive even though they are the OLDEST.
+        assert!(bundles.join("serving").is_dir(), "serving protected");
+        assert!(bundles.join("lastgreen").is_dir(), "last_green protected");
+        // The single newest non-protected (new1, age 10) survives.
+        assert!(bundles.join("new1").is_dir(), "newest extra kept");
+        // The rest are gone.
+        assert!(!bundles.join("new2").exists());
+        assert!(!bundles.join("old1").exists());
+        assert!(!bundles.join("old2").exists());
+        assert_eq!(removed, vec!["new2", "old1", "old2"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_sweeps_tmp_litter_and_tolerates_absent_dir() {
+        let dir = scratch("prune-litter");
+        let bundles = dir.join("bundles");
+        bundle_at(&bundles, "keep", 10);
+        // A crashed harvest's tmp dir — must be swept regardless of keep count.
+        fs::create_dir_all(bundles.join("abc.tmp.99999")).unwrap();
+
+        let removed = prune_bundles(&bundles, &["keep"], 5).unwrap();
+        assert!(bundles.join("keep").is_dir());
+        assert!(!bundles.join("abc.tmp.99999").exists(), "tmp litter swept");
+        assert!(removed.iter().any(|n| n.contains(".tmp.")));
+
+        // Absent bundles dir is a clean no-op (not an error).
+        let absent = dir.join("nope");
+        assert_eq!(
+            prune_bundles(&absent, &[], 3).unwrap(),
+            Vec::<String>::new()
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
