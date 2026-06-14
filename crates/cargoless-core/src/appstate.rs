@@ -1264,7 +1264,7 @@ mod tests {
         let mut s = state(&["dev", "feat"]);
         // dev takes the single build slot; feat queues behind it.
         let a = head(&mut s, "dev", "d1");
-        let _g_dev = build_gen(&a);
+        let g_dev = build_gen(&a);
         head(&mut s, "feat", "f1");
         assert_eq!(
             s.instance("feat").unwrap().pipeline,
@@ -1283,7 +1283,7 @@ mod tests {
         assert!(!s.queue_contains("feat"), "scrubbed from the build queue");
 
         // dev's build still completes normally (the queue scrub didn't wedge).
-        let a = green(&mut s, "dev", _g_dev);
+        let a = green(&mut s, "dev", g_dev);
         assert!(a.iter().any(|x| matches!(x, Action::SpawnAndProbe { .. })));
     }
 

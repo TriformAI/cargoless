@@ -472,6 +472,35 @@ pub trait VerdictService: Send + Sync {
     fn app_report(&self) -> Option<String> {
         None
     }
+
+    /// app-serve self-serve previews — enqueue an add/remove of a preview
+    /// instance (the `POST/DELETE /instances` routes). `false` ⇒ this daemon
+    /// does not accept self-serve requests (the default, so the gate + the
+    /// static app-serve daemon both 404/refuse identically); only the
+    /// self-serve `AppServeState` overrides it to enqueue onto the control
+    /// loop. ADDITIVE — `request` is a [`PreviewControl`] so the frozen trait
+    /// stays serde-free and the bin crate owns the request shape.
+    fn app_preview_control(&self, _request: PreviewControl) -> bool {
+        false
+    }
+}
+
+/// A self-serve preview add/remove request crossing the [`VerdictService`]
+/// seam. Kept here (next to the trait) so the transport layer can carry it
+/// without depending on `appsvc`. The string-typed `add` form keeps the trait
+/// serde-free; the daemon parses/validates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewControl {
+    /// Add `name` tracking `git_ref`; `env` overlay (k=v pairs), `own_db` for
+    /// an isolated database.
+    Add {
+        name: String,
+        git_ref: String,
+        env: Vec<(String, String)>,
+        own_db: bool,
+    },
+    /// Remove the named preview.
+    Remove { name: String },
 }
 
 /// The **client** counterpart of [`VerdictService`] — the uniform

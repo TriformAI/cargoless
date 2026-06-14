@@ -247,14 +247,15 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
     /// with the host-router / legacy proxy) and the on-disk paths come in via
     /// [`InstanceConfig`], exactly like a startup instance.
     pub fn add_instance(&mut self, cfg: InstanceConfig) -> bool {
-        if self.runtimes.contains_key(&cfg.name) {
+        let name = cfg.name;
+        if self.runtimes.contains_key(&name) {
             return false;
         }
-        if !self.state.add_instance(cfg.name.clone()) {
+        if !self.state.add_instance(name.clone()) {
             return false; // belt-and-braces: state + runtimes stay in lockstep
         }
         self.runtimes.insert(
-            cfg.name.clone(),
+            name.clone(),
             Runtime {
                 slot: cfg.slot,
                 paths: cfg.paths,
@@ -262,7 +263,7 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
                 children: BTreeMap::new(),
             },
         );
-        self.persist_and_publish(&cfg.name);
+        self.persist_and_publish(&name);
         true
     }
 

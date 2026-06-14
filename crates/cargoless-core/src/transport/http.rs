@@ -505,6 +505,95 @@ fn handle(
         return;
     }
 
+    // ── self-serve previews: POST /instances, DELETE /instances/<name> ──
+    // Bearer-gated (the #14 gate above already ran). The daemon enqueues the
+    // request onto the control loop and answers 202 Accepted (the actual
+    // add/teardown is async — proxy bind, port alloc, git worktree). A
+    // non-self-serve daemon (the default `app_preview_control` ⇒ false)
+    // answers 404, byte-identical to any unknown route.
+    if req.method == "POST" && req.path == "/instances" {
+        // Small JSON body: {"name","ref","env"?,"own_db"?}. Cap hard.
+        let body = match req.content_length {
+            Some(n) if n <= 64 * 1024 => {
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() {
+                    write_response(&mut writer, 400, "Bad Request", "text/plain", "short body");
+                    return;
+                }
+                buf
+            }
+            Some(_) => {
+                write_response(
+                    &mut writer,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    "too large",
+                );
+                return;
+            }
+            None => {
+                write_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    "POST /instances requires a numeric Content-Length",
+                );
+                return;
+            }
+        };
+        match parse_preview_add(&String::from_utf8_lossy(&body)) {
+            Ok(control) => {
+                if svc.app_preview_control(control) {
+                    write_response(
+                        &mut writer,
+                        202,
+                        "Accepted",
+                        "application/json",
+                        "{\"accepted\":true}",
+                    );
+                } else {
+                    // No control channel wired ⇒ not a self-serve daemon, or
+                    // the loop is gone. 404 keeps the gate byte-identical.
+                    write_response(&mut writer, 404, "Not Found", "application/json", "null");
+                }
+            }
+            Err(msg) => {
+                write_response(&mut writer, 400, "Bad Request", "text/plain", &msg);
+            }
+        }
+        return;
+    }
+    let delete_target = (req.method == "DELETE")
+        .then(|| req.path.strip_prefix("/instances/"))
+        .flatten();
+    if let Some(raw_name) = delete_target {
+        let name = pct_decode(raw_name);
+        if name.is_empty() || name.contains('/') {
+            write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "text/plain",
+                "bad instance name",
+            );
+            return;
+        }
+        if svc.app_preview_control(super::PreviewControl::Remove { name }) {
+            write_response(
+                &mut writer,
+                202,
+                "Accepted",
+                "application/json",
+                "{\"accepted\":true}",
+            );
+        } else {
+            write_response(&mut writer, 404, "Not Found", "application/json", "null");
+        }
+        return;
+    }
+
     // ── POST /overlay — the server's FIRST body-reading route (Inc 2) ──
     // Bearer-gated: the #14 auth gate above already ran, so POST /overlay
     // inherits the SAME Authorizer as every non-/healthz route — no new
@@ -779,6 +868,51 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
 /// Minimal percent-decoding for `%XX` + `+`→space (worktree ids are
 /// paths/names; the few bytes that need escaping in a query are enough).
 /// Std-only; not a general URL decoder, just what the API surface needs.
+/// Parse a `POST /instances` JSON body into a [`PreviewControl::Add`].
+/// Shape: `{"name": "...", "ref": "...", "env": {"K":"V",...}?, "own_db": bool?}`.
+/// `name` and `ref` are required and non-empty; everything else defaults.
+fn parse_preview_add(body: &str) -> Result<super::PreviewControl, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let name = v
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("`name` is required")?
+        .to_string();
+    // Names key worktrees, dirs, hostnames — keep them tame.
+    if name.contains('/') || name.contains(char::is_whitespace) {
+        return Err("`name` must not contain `/` or whitespace".to_string());
+    }
+    let git_ref = v
+        .get("ref")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("`ref` is required")?
+        .to_string();
+    let env = match v.get("env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(map)) => map
+            .iter()
+            .map(|(k, val)| {
+                let s = val
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| val.to_string());
+                (k.clone(), s)
+            })
+            .collect(),
+        Some(_) => return Err("`env` must be an object".to_string()),
+    };
+    let own_db = v.get("own_db").and_then(|x| x.as_bool()).unwrap_or(false);
+    Ok(super::PreviewControl::Add {
+        name,
+        git_ref,
+        env,
+        own_db,
+    })
+}
+
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -1484,6 +1618,49 @@ mod tests {
             .and_then(|c| c.parse::<u16>().ok())
             .expect("status code");
         (code, body.to_string())
+    }
+
+    fn raw_req(addr: std::net::SocketAddr, method: &str, target: &str, body: &str) -> u16 {
+        let mut s = TcpStream::connect(addr).expect("connect");
+        write!(
+            s,
+            "{method} {target} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        s.flush().unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        raw.lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .expect("status code")
+    }
+
+    #[test]
+    fn instances_routes_404_on_a_non_selfserve_service() {
+        // The gate non-regression guard for the self-serve routes: MockService
+        // uses the `app_preview_control` default (`false`), so POST /instances
+        // and DELETE /instances/<name> must 404 — indistinguishable from any
+        // unknown route on a gate or a non-self-serve app-serve daemon.
+        let s = server();
+        std::thread::sleep(Duration::from_millis(50));
+        let post = raw_req(
+            s.addr(),
+            "POST",
+            "/instances",
+            "{\"name\":\"x\",\"ref\":\"origin/x\"}",
+        );
+        let del = raw_req(s.addr(), "DELETE", "/instances/x", "");
+        assert_eq!(
+            post, 404,
+            "POST /instances 404s on a non-self-serve service"
+        );
+        assert_eq!(
+            del, 404,
+            "DELETE /instances/x 404s on a non-self-serve service"
+        );
     }
 
     #[test]

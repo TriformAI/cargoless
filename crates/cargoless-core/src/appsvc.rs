@@ -86,14 +86,39 @@ fn phase_label(inst: &InstanceState) -> &'static str {
     }
 }
 
+/// A self-serve preview request, enqueued by the `POST /instances` /
+/// `DELETE /instances/<name>` routes for the control loop to perform. The
+/// HTTP thread only expresses *intent* — the control loop owns all the
+/// effectful setup/teardown (proxy bind, port alloc, git worktree), so it is
+/// the only mutator of the live instance set (the single-mutator discipline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewRequest {
+    /// Add a preview for `git_ref` named `name`, with `env` overlay and an
+    /// optional own database (else the shared dev DB).
+    Add {
+        name: String,
+        git_ref: String,
+        env: Vec<(String, String)>,
+        own_db: bool,
+    },
+    /// Tear down the named preview instance and reclaim its resources.
+    Remove { name: String },
+}
+
 /// The shared read state. The driver publishes a fresh `Vec<InstanceReport>`
 /// after every transition; the HTTP threads clone-and-read it. An
 /// `arc-swap`-free design (no external dep): a `Mutex<Arc<Vec<…>>>` where the
 /// lock is held only for the pointer swap/clone, never across any real work.
+///
+/// It also carries the **control channel** to the loop: the `POST/DELETE
+/// /instances` routes enqueue a [`PreviewRequest`] here, and the control loop
+/// drains it. The sender is wired in after the channel exists (`set_control`);
+/// before that (or on a non-self-serve daemon) requests are refused.
 #[derive(Debug)]
 pub struct AppServeState {
     reports: std::sync::Mutex<Arc<Vec<InstanceReport>>>,
     ready: AtomicBool,
+    control: std::sync::Mutex<Option<std::sync::mpsc::Sender<PreviewRequest>>>,
 }
 
 impl Default for AppServeState {
@@ -101,6 +126,7 @@ impl Default for AppServeState {
         Self {
             reports: std::sync::Mutex::new(Arc::new(Vec::new())),
             ready: AtomicBool::new(false),
+            control: std::sync::Mutex::new(None),
         }
     }
 }
@@ -126,6 +152,26 @@ impl AppServeState {
     /// Current snapshot (cheap Arc clone).
     pub fn snapshot(&self) -> Arc<Vec<InstanceReport>> {
         self.reports.lock().expect("appsvc reports lock").clone()
+    }
+
+    /// Wire the control channel to the loop (called once at daemon startup,
+    /// after the loop's `Sender<PreviewRequest>` exists). A daemon that never
+    /// calls this refuses self-serve requests with `false` from
+    /// [`request_preview`].
+    pub fn set_control(&self, tx: std::sync::mpsc::Sender<PreviewRequest>) {
+        *self.control.lock().expect("appsvc control lock") = Some(tx);
+    }
+
+    /// Enqueue a self-serve preview request for the control loop. Returns
+    /// `false` if no control channel is wired (not a self-serve daemon) or the
+    /// loop has shut down (send failed) — the route then answers 503/409. The
+    /// request is performed asynchronously on the control thread; this only
+    /// expresses intent (the loop owns proxy/port/worktree setup).
+    pub fn request_preview(&self, req: PreviewRequest) -> bool {
+        match &*self.control.lock().expect("appsvc control lock") {
+            Some(tx) => tx.send(req).is_ok(),
+            None => false,
+        }
     }
 
     /// Render the `/app` JSON body.
@@ -197,6 +243,26 @@ impl VerdictService for AppServeState {
     /// THE override: the gate returns `None` here (→ 404); we return the JSON.
     fn app_report(&self) -> Option<String> {
         Some(self.render_json())
+    }
+
+    /// Self-serve: translate the transport-level [`PreviewControl`] into a
+    /// [`PreviewRequest`] and enqueue it for the control loop.
+    fn app_preview_control(&self, request: crate::transport::PreviewControl) -> bool {
+        let req = match request {
+            crate::transport::PreviewControl::Add {
+                name,
+                git_ref,
+                env,
+                own_db,
+            } => PreviewRequest::Add {
+                name,
+                git_ref,
+                env,
+                own_db,
+            },
+            crate::transport::PreviewControl::Remove { name } => PreviewRequest::Remove { name },
+        };
+        self.request_preview(req)
     }
 
     /// `/readyz` latch.
@@ -285,6 +351,47 @@ mod tests {
         assert!(!svc.ready(), "nothing serving ⇒ not ready");
         svc.publish(vec![report("dev", Some("g1"), Some("g1"))]);
         assert!(svc.ready(), "serving ⇒ ready");
+    }
+
+    #[test]
+    fn preview_request_refused_until_control_wired_then_enqueues() {
+        let svc = AppServeState::new();
+        let req = PreviewRequest::Add {
+            name: "feat".into(),
+            git_ref: "origin/feat".into(),
+            env: vec![],
+            own_db: false,
+        };
+        // No control channel ⇒ refused (a non-self-serve daemon answers 404).
+        assert!(
+            !svc.request_preview(req.clone()),
+            "refused before set_control"
+        );
+
+        // Wire the loop's receiver; now requests enqueue.
+        let (tx, rx) = std::sync::mpsc::channel();
+        svc.set_control(tx);
+        assert!(
+            svc.request_preview(req.clone()),
+            "enqueued after set_control"
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            req,
+            "the control loop receives it verbatim"
+        );
+
+        // The VerdictService seam maps PreviewControl → PreviewRequest.
+        use crate::transport::{PreviewControl, VerdictService};
+        assert!(svc.app_preview_control(PreviewControl::Remove {
+            name: "feat".into()
+        }));
+        assert_eq!(
+            rx.recv().unwrap(),
+            PreviewRequest::Remove {
+                name: "feat".into()
+            }
+        );
     }
 
     #[test]
