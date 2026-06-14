@@ -88,6 +88,28 @@ pub enum VerdictPolicy {
 struct ActiveTxn {
     wt: WtId,
     barrier: FlycheckBarrier,
+    /// `true` once any REAL rust-analyzer flycheck activity (a
+    /// `Diagnostics` publish or a `FlycheckFailed`) has been observed for
+    /// this transaction. The adapter's per-request liveness fallback
+    /// synthesizes an `LspEvent::FlycheckEnded` on a timer (so a wedged RA
+    /// can't hang the verdict forever); that synthetic end settles the
+    /// barrier on an EMPTY window, which `has_authoritative_error()` reads
+    /// as GREEN. On the foreign-overlay path (the client worktree is not
+    /// the daemon's served tree, so `didChange` no-ops) RA runs NO flycheck
+    /// for either a clean or a broken overlay — empirically confirmed
+    /// 2026-06-14: clean and planted-red foreign pushes both bare-timer-
+    /// settle with zero `Diagnostics`. That timer-settled empty window is a
+    /// FALSE GREEN (the CGLS-9 a8 residual: a planted type error went green
+    /// because the 2s timer settled before any real flycheck ran). This
+    /// flag lets the verdict consumer distinguish "RA ran and the window is
+    /// authoritatively empty" (real flycheck-end ⇒ at least one Diagnostics
+    /// arrived, including RA's empty-clear publishes) from "the timer fired
+    /// and RA never participated" (publish `unknown`, fail-closed). It does
+    /// NOT touch the proven `FlycheckBarrier` core — the violated
+    /// precondition ("a real flycheck pass ran") is restored at this wire
+    /// seam (the #247 [[proven-core-precondition-violated-at-integration-seam]]
+    /// pattern).
+    real_flycheck_activity_seen: bool,
 }
 
 /// What the live serve-loop adapter must do next for this cluster. The
@@ -104,7 +126,19 @@ pub enum ClusterAction {
     /// bit, computed from the settled barrier at the settle instant.
     /// The adapter attributes this to `wt` (`tag_for_worktree`) and
     /// publishes; it is the *sole* verdict-bearing output.
-    EmitVerdict { wt: WtId, authoritative_error: bool },
+    EmitVerdict {
+        wt: WtId,
+        authoritative_error: bool,
+        /// `false` iff the barrier settled WITHOUT any real RA flycheck
+        /// activity (no `Diagnostics`, no `FlycheckFailed`) — i.e. on the
+        /// adapter's synthetic liveness timer-settle before RA
+        /// participated. The adapter MUST map
+        /// `(authoritative_error=false, real_flycheck_activity_seen=false)`
+        /// to an `unknown` verdict, never green: an empty window from a
+        /// timer that out-raced (or replaced) analysis is "RA never ran",
+        /// not "RA verified clean". See [`ActiveTxn`].
+        real_flycheck_activity_seen: bool,
+    },
     /// Nothing to do for this event (serialized-wait, stray pre-arm RA
     /// chatter, deduped re-request, or pruned deactivation).
     Idle,
@@ -196,6 +230,7 @@ impl ClusterDriver {
             self.current = Some(ActiveTxn {
                 wt: wt.clone(),
                 barrier: FlycheckBarrier::arm(false),
+                real_flycheck_activity_seen: false,
             });
             return ClusterAction::SwitchOverlay { wt };
         }
@@ -221,7 +256,25 @@ impl ClusterDriver {
             // No transaction ⇒ RA stream chatter (e.g. initial indexing)
             // with nothing to attribute it to. Never a verdict.
             None => return ClusterAction::Idle,
-            Some(active) => active.barrier.observe(&ev),
+            Some(active) => {
+                // Record REAL flycheck participation BEFORE observing, so
+                // a settle (even one triggered by this same event, e.g. a
+                // real `FlycheckEnded` preceded by `Diagnostics`) carries an
+                // accurate "did RA actually run" bit. `Diagnostics`
+                // (including RA's empty-clear publishes) and `FlycheckFailed`
+                // are real RA output; `FlycheckEnded` and `IndexingEnded`
+                // are NOT, on their own, evidence of analysis — the adapter
+                // synthesizes `FlycheckEnded` on a liveness timer, and that
+                // synthetic end must not pass as "RA ran" (the CGLS-9 a8
+                // false-green seam).
+                if matches!(
+                    ev,
+                    LspEvent::Diagnostics(_) | LspEvent::FlycheckFailed { .. }
+                ) {
+                    active.real_flycheck_activity_seen = true;
+                }
+                active.barrier.observe(&ev)
+            }
         };
         match state {
             BarrierState::Waiting => ClusterAction::Idle,
@@ -243,6 +296,7 @@ impl ClusterDriver {
                 let action = ClusterAction::EmitVerdict {
                     wt: txn.wt.clone(),
                     authoritative_error: verdict_error,
+                    real_flycheck_activity_seen: txn.real_flycheck_activity_seen,
                 };
                 // Transaction complete ⇒ start the next serialized one
                 // (self-recheck of the just-finished WT takes priority
@@ -287,6 +341,7 @@ impl ClusterDriver {
             self.current = Some(ActiveTxn {
                 wt,
                 barrier: FlycheckBarrier::arm(false),
+                real_flycheck_activity_seen: false,
             });
         }
     }
@@ -469,7 +524,9 @@ mod tests {
             d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
-                authoritative_error: true
+                authoritative_error: true,
+                // rustc_err (Diagnostics) observed before settle ⇒ RA ran.
+                real_flycheck_activity_seen: true
             }
         );
         // Transaction consumed ⇒ idle again, no follow-up (queue empty).
@@ -482,13 +539,60 @@ mod tests {
         let mut d = ClusterDriver::new();
         d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") });
         // No rustc error published; flycheck ends ⇒ authoritative-green.
+        // real_flycheck_activity_seen=false: no Diagnostics arrived in this
+        // unit-level scenario (a direct FlycheckEnded). At clusterdrv this
+        // is still authoritative-green; the servedrv consumer is what maps
+        // (false,false) → unknown for the synthetic-timer path. In a real
+        // served-tree clean flycheck RA emits ≥1 empty-clear Diagnostics, so
+        // this flag is true in production for a genuine clean pass.
         assert_eq!(
             d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
-                authoritative_error: false
+                authoritative_error: false,
+                real_flycheck_activity_seen: false
             }
         );
+    }
+
+    /// CGLS-9 a8 residual: the EmitVerdict must carry an honest
+    /// `real_flycheck_activity_seen` so the adapter can tell a
+    /// timer-settled empty window (RA never ran — false green) from a
+    /// genuine clean flycheck. A settle reached with NO prior `Diagnostics`
+    /// / `FlycheckFailed` ⇒ `false`; a settle preceded by real RA output ⇒
+    /// `true`. The barrier core is untouched; this bit rides the wire seam.
+    #[test]
+    fn real_flycheck_activity_seen_distinguishes_timer_settle_from_real_flycheck() {
+        // (a) Bare FlycheckEnded with no preceding RA output (the adapter's
+        // synthetic liveness timer, or a respawn-era stray) ⇒ false.
+        let mut d = ClusterDriver::new();
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") });
+        match d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)) {
+            ClusterAction::EmitVerdict {
+                real_flycheck_activity_seen,
+                ..
+            } => assert!(
+                !real_flycheck_activity_seen,
+                "no Diagnostics before settle ⇒ RA did not run (timer-settle) ⇒ false"
+            ),
+            other => panic!("expected EmitVerdict, got {other:?}"),
+        }
+
+        // (b) A real Diagnostics publish before the settle ⇒ true, even when
+        // the window carries no authoritative error (clean real flycheck).
+        let mut d = ClusterDriver::new();
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/b") });
+        d.on_event(DriverEvent::Lsp(advisory_err("file:///r/b/x.rs")));
+        match d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)) {
+            ClusterAction::EmitVerdict {
+                real_flycheck_activity_seen,
+                ..
+            } => assert!(
+                real_flycheck_activity_seen,
+                "a Diagnostics publish before settle ⇒ RA ran ⇒ true"
+            ),
+            other => panic!("expected EmitVerdict, got {other:?}"),
+        }
     }
 
     #[test]
@@ -500,7 +604,9 @@ mod tests {
             d.on_event(DriverEvent::Lsp(LspEvent::FlycheckEnded)),
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
-                authoritative_error: true
+                authoritative_error: true,
+                // advisory_err (Diagnostics) observed before settle ⇒ RA ran.
+                real_flycheck_activity_seen: true
             }
         );
     }
@@ -517,7 +623,8 @@ mod tests {
             v,
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
-                authoritative_error: false
+                authoritative_error: false,
+                real_flycheck_activity_seen: false
             }
         );
         assert!(d.is_busy(), "B's txn started — still exactly one in flight");
@@ -653,6 +760,7 @@ mod tests {
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
                 authoritative_error: false,
+                real_flycheck_activity_seen: false,
             },
             "after fresh RoutedBatch + fresh FlycheckEnded, the settle attributes correctly"
         );
@@ -691,6 +799,7 @@ mod tests {
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
                 authoritative_error: false,
+                real_flycheck_activity_seen: false,
             }
         );
         // start_next_after_settle drained /r/b from pending ⇒ that's the
