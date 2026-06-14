@@ -841,8 +841,11 @@ mod tests {
         assert!(!d.remove_instance("dev"), "second remove ⇒ false");
         assert!(d.state().instance("dev").is_none(), "gone from pure state");
         assert!(
-            rec.stops.lock().unwrap().iter().any(|(i, gen, drain)|
-                i == "dev" && *gen == g && !*drain),
+            rec.stops
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(i, child_g, drain)| i == "dev" && *child_g == g && !*drain),
             "the serving child was stopped (kill, not drain): {:?}",
             rec.stops.lock().unwrap()
         );
