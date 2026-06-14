@@ -62,7 +62,7 @@ RUN cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
 RUN curl -fsSL \
         "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
         | tar -xz -C /opt \
-    && ln -s "/opt/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt
+    && ln -sf "/opt/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" /usr/local/bin/wasm-opt
 
 # tailwindcss standalone CLI (the portal's CSS pipeline).
 RUN curl -fsSLo /usr/local/bin/tailwindcss \
