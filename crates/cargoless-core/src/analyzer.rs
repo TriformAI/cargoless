@@ -366,9 +366,22 @@ pub fn rust_analyzer_command() -> io::Result<Command> {
     if let Some(path) = std::env::var_os("CARGOLESS_RA_LOG_FILE") {
         cmd.arg("--log-file").arg(path).arg("--no-log-buffering");
     }
+    // RA's stderr carries its panics + load-time errors (e.g. the
+    // proc-macro ABI-mismatch ERROR, or a "no reactor" panic). Historically
+    // this was `Stdio::null()`, which made a crash-looping or dead RA
+    // INVISIBLE in the daemon logs — a dead cluster RA could sit unrespawned
+    // and the only symptom was verdict=unknown, with nothing explaining why.
+    // Default to INHERIT so RA's crash output lands in the pod log alongside
+    // the daemon's. Opt out with `CARGOLESS_RA_STDERR=null` for callers that
+    // want the old silent behavior (or set `CARGOLESS_RA_LOG_FILE` to route
+    // RA's own structured log to a file instead — the two are independent).
+    let ra_stderr = match std::env::var("CARGOLESS_RA_STDERR").as_deref() {
+        Ok("null") | Ok("off") | Ok("0") => Stdio::null(),
+        _ => Stdio::inherit(),
+    };
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(ra_stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
