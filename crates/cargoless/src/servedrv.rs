@@ -1115,8 +1115,35 @@ fn exec(
         ClusterAction::EmitVerdict {
             wt,
             authoritative_error,
+            real_flycheck_activity_seen,
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
+            //
+            // CGLS-9 a8 residual fix: the barrier may have settled on the
+            // adapter's SYNTHETIC liveness-timer `FlycheckEnded`
+            // (spawn_ra_native_settle) rather than a real RA flycheck-end.
+            // On the foreign-overlay path RA never analyzed the overlay
+            // (its files aren't in the served workspace ⇒ didChange no-ops),
+            // so the timer settles an EMPTY window → authoritative_error
+            // =false → from_bool_unattributed(false) → a FALSE GREEN
+            // (planted type errors went green 10/11 live; clean and broken
+            // foreign pushes are indistinguishable here — both bare-timer-
+            // settle with zero Diagnostics, confirmed 2026-06-14). When NO
+            // real flycheck activity was observed for this txn, the absence
+            // of errors is "RA never ran", NOT "RA verified clean" — publish
+            // an honest Unknown (exit 75, fail-closed; the gate already
+            // blocks on it) instead of green. A genuinely clean REAL
+            // flycheck (served-tree path) still publishes ≥1 Diagnostics
+            // (the empty-clear), so real_flycheck_activity_seen is true and
+            // that path stays green. A real authoritative error
+            // (authoritative_error=true) is always honored regardless.
+            let timer_settled_no_flycheck = !authoritative_error && !real_flycheck_activity_seen;
+            if timer_settled_no_flycheck {
+                eprintln!(
+                    "[cargoless:obs] timer-settled-no-activity wt={} verdict=unknown reason=ra_native_timer_settled_no_flycheck_activity (CGLS-9)",
+                    wt.display()
+                );
+            }
             //
             // INFRA-36: payload composition now plumbs real diagnostic
             // counts and failure reasons through to `publish_verdict`
@@ -1162,7 +1189,13 @@ fn exec(
                     // RA-native bool. Routed through the legacy shim
                     // which produces Green-or-Unknown (never an
                     // unattributed Red).
-                    statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
+                    if timer_settled_no_flycheck {
+                        statusfile::VerdictPayload::unknown(
+                            "ra_native_timer_settled_no_flycheck_activity",
+                        )
+                    } else {
+                        statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
+                    }
                 }
                 ProjectChecksMode::Warn => {
                     // Warn mode: RA-native is the publish input;
@@ -1170,7 +1203,13 @@ fn exec(
                     // thread (logged + telemetered, but cannot change
                     // the published verdict by design).
                     spawn_project_checks_warn(wt.clone(), project_check_context, Arc::clone(api));
-                    statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
+                    if timer_settled_no_flycheck {
+                        statusfile::VerdictPayload::unknown(
+                            "ra_native_timer_settled_no_flycheck_activity",
+                        )
+                    } else {
+                        statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
+                    }
                 }
                 ProjectChecksMode::Hard => {
                     // Hard mode (#A4.3): the witness runs OFF the serve
