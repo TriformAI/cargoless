@@ -321,17 +321,31 @@ fn try_init(cfg: &TelemetryConfig) -> Result<ShutdownHandle, String> {
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let endpoint = cfg
+    let endpoint_base = cfg
         .otel_endpoint
         .as_deref()
         .ok_or_else(|| "enabled() lied: endpoint absent".to_string())?;
+
+    // INFRA-55: with an EXPLICIT `.with_protocol(HttpBinary)`, opentelemetry-otlp
+    // 0.31 treats `.with_endpoint()` as the FULL per-signal URL and does NOT
+    // append the OTLP/HTTP `/v1/traces` path segment — so it POSTed to the bare
+    // collector root (`:4318/`) and got HTTP 404, silently dropping every batch
+    // (observed live on 0.4.0: `OTLP export failed ... Status(404) url ":4318/"`,
+    // then the SDK shut the provider down and every later span hit
+    // `BatchSpanProcessor.OnEnd.AfterShutdown` — zero 0.4.0 spans ever reached
+    // SigNoz). The collector's traces receiver is at `/v1/traces`. Append it
+    // explicitly (idempotent on a trailing slash) so the signal endpoint is
+    // correct regardless of SDK auto-append behavior. physics/telemetry.rs omits
+    // `with_protocol` and gets the SDK's default append; we keep the explicit
+    // protocol + append the path ourselves.
+    let endpoint = format!("{}/v1/traces", endpoint_base.trim_end_matches('/'));
 
     // OTLP HTTP/protobuf exporter — blocking reqwest transport
     // (`reqwest-blocking-client` feature): no reactor needed at export
     // time, so the `cargoless-otlp` worker drives it as a plain thread.
     let exporter = SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint)
+        .with_endpoint(&endpoint)
         .with_protocol(Protocol::HttpBinary)
         // 10 s cap matches physics telemetry.rs:156. Without this the blocking
         // reqwest call has no deadline — a wedged in-cluster collector would
