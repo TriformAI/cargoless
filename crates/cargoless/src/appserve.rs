@@ -513,6 +513,27 @@ fn serve_loop(
         t0.elapsed().as_secs_f64()
     ));
 
+    // Per-instance git worktrees: each instance builds in its OWN worktree of
+    // the main repo (shared object store, independent checked-out tree) so two
+    // instances' builds never collide on the working tree. The daemon owns the
+    // worktree; `appbuild::checkout` moves it to each build sha. Create it once
+    // here, before any build or recovery touches it — otherwise the first
+    // checkout fails with "cannot change to <worktree>: No such file or
+    // directory" (the build worker assumes the tree exists).
+    for spec in &specs {
+        let wt = instance_worktree(state_dir, &spec.name);
+        if let Err(e) = ensure_instance_worktree(repo, &wt, &spec.git_ref) {
+            // Non-fatal: log and continue. That instance's first checkout will
+            // surface the failure as a red build (visible in /app), and the
+            // other instances still come up.
+            ui::warn(format!(
+                "instance `{}`: could not set up worktree {}: {e}",
+                spec.name,
+                wt.display()
+            ));
+        }
+    }
+
     // Boot recovery: respawn each instance's durable last-green before any
     // build, so a restart restores service in seconds, not a cold build.
     for spec in &specs {
@@ -640,11 +661,48 @@ fn trace_event(instance: &str, event: &Event) {
 }
 
 /// Per-instance git worktree path (daemon-owned checkout scratch). Each
-/// instance gets its own worktree under the state dir; the actual `git
-/// worktree add` wiring (and the zero-config "repo IS the worktree" shortcut)
-/// is inc-6 hardening.
+/// instance gets its own worktree under the state dir.
 fn instance_worktree(state_dir: &Path, name: &str) -> PathBuf {
     state_dir.join("app").join(name).join("worktree")
+}
+
+/// Create the instance's git worktree (a `git worktree add` of the main repo)
+/// if it does not already exist, so `appbuild::checkout` has a tree to move.
+/// Idempotent: a worktree dir that already contains `.git` is left as-is (a
+/// restart reuses it). The worktree shares the main repo's object store and is
+/// checked out detached at `initial_ref` (the build worker re-checks out the
+/// exact sha per build).
+fn ensure_instance_worktree(repo: &Path, worktree: &Path, initial_ref: &str) -> Result<(), String> {
+    if worktree.join(".git").exists() {
+        return Ok(()); // already set up (survives a pod restart)
+    }
+    if let Some(parent) = worktree.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create worktree parent dir: {e}"))?;
+    }
+    // `git worktree add --detach <path> <ref>`: a stray dir from a half-set-up
+    // previous run would make `add` refuse, so prune first (cheap, safe).
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(worktree)
+        .arg(initial_ref)
+        .output()
+        .map_err(|e| format!("could not spawn git worktree add: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 fn default_run_plan() -> RunPlan {
