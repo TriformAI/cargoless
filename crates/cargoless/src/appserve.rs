@@ -40,6 +40,7 @@ use cargoless_core::appdrv::{
     InstancePaths, PortAllocator,
 };
 use cargoless_core::appinstances::{InstanceSpec, load_instances};
+use cargoless_core::appmanifest::load_app_manifest;
 use cargoless_core::appstate::{Event, Generation};
 use cargoless_core::appsvc::AppServeState;
 use cargoless_core::l4proxy::{HoldingResponse, L4Proxy};
@@ -468,10 +469,19 @@ fn serve_loop(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         });
-        // A default run plan; the real one is refreshed from each build's
-        // manifest (inc-6 wires manifest→plan). For now a sensible default
-        // lets the daemon boot and the contract hold.
-        run_plans.insert(spec.name.clone(), default_run_plan());
+        // Build the run plan from the instance's `cargoless.app.yaml`: how to
+        // run the harvested app (command, port_env), how to health-probe it,
+        // and the drain grace. The manifest rides each branch's sha, so read it
+        // from the instance worktree first; before the first checkout that dir
+        // is empty, so fall back to the daemon's repo checkout, then to the
+        // built-in default. (inc-6: previously every instance used the hardcoded
+        // `./run.sh` default, which never matched a real manifest — the app
+        // failed to spawn with "no such file" even on a green build.)
+        let wt = instance_worktree(state_dir, &spec.name);
+        let plan = run_plan_from_manifest(&wt)
+            .or_else(|| run_plan_from_manifest(repo))
+            .unwrap_or_else(default_run_plan);
+        run_plans.insert(spec.name.clone(), plan);
         proxies.push(proxy);
     }
 
@@ -703,6 +713,36 @@ fn ensure_instance_worktree(repo: &Path, worktree: &Path, initial_ref: &str) -> 
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+/// Build a [`RunPlan`] from a `cargoless.app.yaml` under `root`, if present.
+/// `None` ⇒ the repo has no manifest (or it is unreadable/invalid) and the
+/// caller should fall back to another root or the default. The manifest's
+/// run command + port_env, health path/timeouts, and drain grace map directly
+/// onto the launcher's run plan (the manifest's `run.env` rides the app via the
+/// instance env overlay, not the plan, so it is not duplicated here).
+fn run_plan_from_manifest(root: &Path) -> Option<RunPlan> {
+    let manifest = match load_app_manifest(root) {
+        Ok(Some(m)) => m,
+        Ok(None) => return None,
+        Err(e) => {
+            ui::warn(format!(
+                "manifest {} at {}: {} — falling back",
+                cargoless_core::appmanifest::APP_MANIFEST_NAME,
+                root.display(),
+                e.message
+            ));
+            return None;
+        }
+    };
+    Some(RunPlan {
+        command: manifest.run.command,
+        port_env: manifest.run.port_env,
+        health_path: manifest.health.path,
+        ready_timeout_ms: manifest.health.ready_timeout_ms,
+        interval_ms: manifest.health.interval_ms,
+        grace_ms: manifest.drain.grace_ms,
+    })
 }
 
 fn default_run_plan() -> RunPlan {
