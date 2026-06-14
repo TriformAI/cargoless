@@ -196,6 +196,18 @@ pub enum Action {
     },
 }
 
+/// What [`AppState::remove_instance`] hands the driver: the children to stop
+/// and any actions unblocked by freeing the build slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal {
+    /// Generations of this instance's still-tracked children (serving +
+    /// draining) the driver must `stop` to free their ports/processes.
+    pub child_generations: Vec<Generation>,
+    /// Actions newly unblocked by the removal (e.g. a `StartBuild` for the
+    /// queued instance that inherits the freed build slot).
+    pub actions: Vec<Action>,
+}
+
 /// The daemon-wide state: every instance plus the serialized build queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
@@ -233,6 +245,49 @@ impl AppState {
     /// Which instance currently holds the build slot, if any.
     pub fn building(&self) -> Option<&str> {
         self.building.as_deref()
+    }
+
+    /// Add a fresh `Idle` instance at runtime (self-serve previews). Returns
+    /// `false` if an instance of that name already exists (the caller should
+    /// reject a duplicate add rather than clobber a live instance). A newly
+    /// added instance has no serving child and an empty pipeline; the driver
+    /// then drives a `HeadAdvanced` to start its first build.
+    pub fn add_instance(&mut self, name: String) -> bool {
+        if self.instances.contains_key(&name) {
+            return false;
+        }
+        self.instances.insert(name, InstanceState::default());
+        true
+    }
+
+    /// Remove an instance at runtime. `None` if it does not exist; otherwise a
+    /// [`Removal`] carrying the child generations the driver must stop (the
+    /// serving child + any draining) and any `actions` newly unblocked —
+    /// removing the build-slot holder lets a queued instance dispatch, so the
+    /// freed slot is handed out immediately rather than wedging until the next
+    /// event.
+    pub fn remove_instance(&mut self, name: &str) -> Option<Removal> {
+        let inst = self.instances.remove(name)?;
+        self.queue.retain(|n| n != name);
+        let freed_slot = self.building.as_deref() == Some(name);
+        if freed_slot {
+            self.building = None;
+        }
+        // Every child the driver still tracks for this instance must be
+        // stopped: the promoted serving child plus any draining generations.
+        let mut child_generations: Vec<Generation> = inst.draining.clone();
+        if let Some(serving) = &inst.serving {
+            child_generations.push(serving.generation);
+        }
+        // If this instance held the slot, hand it to the next queued instance.
+        let mut actions = Vec::new();
+        if freed_slot {
+            self.dispatch(&mut actions);
+        }
+        Some(Removal {
+            child_generations,
+            actions,
+        })
     }
 
     #[cfg(test)]
@@ -1186,5 +1241,123 @@ mod tests {
     fn unknown_instance_is_ignored() {
         let mut s = state(&["dev"]);
         assert_eq!(head(&mut s, "nope", "aaa"), vec![]);
+    }
+
+    #[test]
+    fn add_instance_makes_it_buildable_and_rejects_duplicates() {
+        let mut s = state(&["dev"]);
+        // A head for an unknown instance no-ops until it is added.
+        assert_eq!(head(&mut s, "feat", "f1"), vec![]);
+
+        assert!(s.add_instance("feat".into()), "first add succeeds");
+        assert!(!s.add_instance("feat".into()), "duplicate add is rejected");
+        assert!(s.instance("feat").is_some());
+
+        // Now it builds like any instance.
+        let a = head(&mut s, "feat", "f1");
+        assert!(matches!(&a[0], Action::StartBuild { instance, sha, .. }
+            if instance == "feat" && sha == "f1"));
+    }
+
+    #[test]
+    fn remove_instance_returns_child_generations_and_scrubs_queue() {
+        let mut s = state(&["dev", "feat"]);
+        // dev takes the single build slot; feat queues behind it.
+        let a = head(&mut s, "dev", "d1");
+        let _g_dev = build_gen(&a);
+        head(&mut s, "feat", "f1");
+        assert_eq!(
+            s.instance("feat").unwrap().pipeline,
+            Pipeline::Queued { sha: "f1".into() }
+        );
+        assert!(s.queue_contains("feat"));
+
+        // Remove feat while it is queued — no children yet, empty gen list.
+        let r = s.remove_instance("feat").expect("feat existed");
+        assert!(r.child_generations.is_empty(), "queued-only: no children");
+        assert!(
+            r.actions.is_empty(),
+            "feat didn't hold the slot ⇒ nothing dispatched"
+        );
+        assert!(s.instance("feat").is_none(), "instance gone");
+        assert!(!s.queue_contains("feat"), "scrubbed from the build queue");
+
+        // dev's build still completes normally (the queue scrub didn't wedge).
+        let a = green(&mut s, "dev", _g_dev);
+        assert!(a.iter().any(|x| matches!(x, Action::SpawnAndProbe { .. })));
+    }
+
+    #[test]
+    fn remove_serving_instance_reports_its_child_generation() {
+        let mut s = state(&["dev"]);
+        let g = drive_to_serving(&mut s, "dev", "aaa");
+        // Removing a serving instance must hand back its child generation so
+        // the driver can stop the process + free the port.
+        let r = s.remove_instance("dev").expect("dev existed");
+        assert_eq!(
+            r.child_generations,
+            vec![g],
+            "serving child's generation returned"
+        );
+        assert!(s.instance("dev").is_none());
+    }
+
+    #[test]
+    fn remove_instance_holding_the_build_slot_dispatches_the_queued_one() {
+        let mut s = state(&["dev", "feat"]);
+        // dev holds the build slot; feat queues behind it.
+        let a = head(&mut s, "dev", "d1");
+        let g = build_gen(&a);
+        assert_eq!(s.building(), Some("dev"));
+        head(&mut s, "feat", "f1");
+
+        // Remove dev *while it builds* — the freed slot is handed to feat in
+        // the same call (no separate nudge needed).
+        let r = s.remove_instance("dev").expect("dev existed");
+        assert!(
+            r.child_generations.is_empty(),
+            "dev had no serving child yet"
+        );
+        assert!(
+            r.actions
+                .iter()
+                .any(|x| matches!(x, Action::StartBuild { instance, sha, .. }
+                    if instance == "feat" && sha == "f1")),
+            "feat dispatches into the freed slot: {:?}",
+            r.actions
+        );
+        assert_eq!(s.building(), Some("feat"), "feat now holds the slot");
+
+        // A stray BuildFinished for the removed dev is a safe no-op.
+        assert_eq!(
+            s.step(
+                "dev",
+                Event::BuildFinished {
+                    generation: g,
+                    outcome: AppBuildOutcome::Green
+                }
+            ),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn remove_unknown_instance_is_none() {
+        let mut s = state(&["dev"]);
+        assert!(s.remove_instance("ghost").is_none());
+    }
+
+    #[test]
+    fn removed_instance_name_can_be_re_added_fresh() {
+        // A preview teardown + re-create of the same branch name yields a
+        // clean Idle instance (no leaked red/serving from the prior life).
+        let mut s = state(&["dev"]);
+        drive_to_serving(&mut s, "dev", "aaa");
+        s.remove_instance("dev").expect("existed");
+        assert!(s.add_instance("dev".into()), "name reusable after removal");
+        let inst = s.instance("dev").unwrap();
+        assert_eq!(inst.serving, None);
+        assert_eq!(inst.last_red, None);
+        assert_eq!(inst.pipeline, Pipeline::Idle);
     }
 }

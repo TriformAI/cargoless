@@ -240,6 +240,60 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         self.persist_and_publish(instance);
     }
 
+    /// Add a preview instance at runtime (self-serve previews). Inserts its
+    /// runtime + pure state and returns `true`; `false` if the name is already
+    /// live (the caller rejects the duplicate). The caller drives a subsequent
+    /// `HeadAdvanced` to kick the first build. Both the proxy `slot` (shared
+    /// with the host-router / legacy proxy) and the on-disk paths come in via
+    /// [`InstanceConfig`], exactly like a startup instance.
+    pub fn add_instance(&mut self, cfg: InstanceConfig) -> bool {
+        if self.runtimes.contains_key(&cfg.name) {
+            return false;
+        }
+        if !self.state.add_instance(cfg.name.clone()) {
+            return false; // belt-and-braces: state + runtimes stay in lockstep
+        }
+        self.runtimes.insert(
+            cfg.name.clone(),
+            Runtime {
+                slot: cfg.slot,
+                paths: cfg.paths,
+                env: cfg.env,
+                children: BTreeMap::new(),
+            },
+        );
+        self.persist_and_publish(&cfg.name);
+        true
+    }
+
+    /// Remove a preview instance at runtime: stop every child it still runs
+    /// (serving + draining), clear its proxy upstream, drop its runtime + pure
+    /// state, and execute any actions the removal unblocked (a queued instance
+    /// inheriting the freed build slot). Returns `false` if it did not exist.
+    /// On-disk bundle/worktree cleanup is the caller's concern (it owns the
+    /// repo path + the `git worktree remove`).
+    pub fn remove_instance(&mut self, name: &str) -> bool {
+        let Some(removal) = self.state.remove_instance(name) else {
+            return false;
+        };
+        // Stop the children the pure state handed back, freeing their ports.
+        if let Some(rt) = self.runtimes.get(name) {
+            rt.slot.clear(); // new connections get the holding page immediately
+        }
+        for generation in removal.child_generations {
+            // `drain=false`: a removed instance is gone — kill its children
+            // outright and reclaim ports, don't wait out a drain grace.
+            self.stop_child(name, generation, false);
+        }
+        self.runtimes.remove(name);
+        // A removal can free the build slot for a queued instance; run those.
+        for action in removal.actions {
+            self.execute(action);
+        }
+        self.publish();
+        true
+    }
+
     fn execute(&mut self, action: Action) {
         match action {
             Action::StartBuild {
@@ -701,5 +755,100 @@ mod tests {
             "red build spawns nothing"
         );
         assert_eq!(slot.get(), serving_before, "slot untouched by a red build");
+    }
+
+    /// A standalone InstanceConfig for the runtime-add tests.
+    fn config(name: &str) -> InstanceConfig {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("cargoless-appdrv-add-{}", std::process::id()));
+        InstanceConfig {
+            name: name.to_string(),
+            slot: Arc::new(UpstreamSlot::new()),
+            paths: InstancePaths {
+                worktree: dir.join(name).join("wt"),
+                bundles: dir.join(name).join("bundles"),
+            },
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn add_instance_at_runtime_then_it_builds_and_promotes() {
+        let rec = Arc::new(Recorder {
+            spawn_ok: true,
+            ..Default::default()
+        });
+        let ports = Arc::new(PortAllocator::new(9000, 9009));
+        let mut d = driver(&["dev"], rec.clone(), ports);
+
+        // Add a brand-new instance after construction.
+        assert!(d.add_instance(config("feat")), "runtime add succeeds");
+        assert!(!d.add_instance(config("feat")), "duplicate add rejected");
+        assert!(d.state().instance("feat").is_some());
+
+        // It builds + promotes exactly like a startup instance.
+        let slot = slots(&d, "feat");
+        d.drive("feat", Event::HeadAdvanced { sha: "f1".into() });
+        let g = rec
+            .builds
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|b| b.0 == "feat")
+            .map(|b| b.2)
+            .expect("feat build dispatched");
+        d.drive(
+            "feat",
+            Event::BuildFinished {
+                generation: g,
+                outcome: AppBuildOutcome::Green,
+            },
+        );
+        d.drive("feat", Event::ProbeSucceeded { generation: g });
+        assert!(
+            slot.get().is_some(),
+            "feat promoted ⇒ its proxy slot is set"
+        );
+    }
+
+    #[test]
+    fn remove_instance_stops_children_clears_slot_and_frees_port() {
+        let rec = Arc::new(Recorder {
+            spawn_ok: true,
+            ..Default::default()
+        });
+        let ports = Arc::new(PortAllocator::new(9000, 9000)); // exactly one port
+        let mut d = driver(&["dev"], rec.clone(), ports.clone());
+
+        // Drive dev to serving (consumes the one port).
+        d.drive("dev", Event::HeadAdvanced { sha: "d1".into() });
+        let g = rec.builds.lock().unwrap()[0].2;
+        d.drive(
+            "dev",
+            Event::BuildFinished {
+                generation: g,
+                outcome: AppBuildOutcome::Green,
+            },
+        );
+        d.drive("dev", Event::ProbeSucceeded { generation: g });
+        let slot = slots(&d, "dev");
+        assert!(slot.get().is_some(), "dev serving");
+        assert_eq!(ports.alloc(), None, "the one port is in use");
+
+        // Remove dev: stop its child, clear the slot, free the port, drop it.
+        assert!(d.remove_instance("dev"), "remove succeeds");
+        assert!(!d.remove_instance("dev"), "second remove ⇒ false");
+        assert!(d.state().instance("dev").is_none(), "gone from pure state");
+        assert!(
+            rec.stops.lock().unwrap().iter().any(|(i, gen, drain)|
+                i == "dev" && *gen == g && !*drain),
+            "the serving child was stopped (kill, not drain): {:?}",
+            rec.stops.lock().unwrap()
+        );
+        assert!(
+            slot.get().is_none(),
+            "slot cleared ⇒ new conns get holding page"
+        );
+        assert_eq!(ports.alloc(), Some(9000), "port returned to the pool");
     }
 }
