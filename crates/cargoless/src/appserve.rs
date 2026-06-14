@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cargoless_core::appbuild::{self, BuildReport, InstancePaths as BuildPaths};
@@ -41,7 +41,7 @@ use cargoless_core::appdrv::{
 };
 use cargoless_core::appinstances::{InstanceSpec, load_instances};
 use cargoless_core::appstate::{Event, Generation};
-use cargoless_core::appsvc::AppServeState;
+use cargoless_core::appsvc::{AppServeState, PreviewRequest};
 use cargoless_core::l4proxy::{HoldingResponse, L4Proxy};
 use cargoless_core::transport::http::HttpServer;
 use cargoless_core::transport::{AllowAll, BearerToken, VerdictService};
@@ -220,7 +220,10 @@ fn is_non_loopback(bind: &str) -> bool {
 struct ProcLauncher {
     /// Per-instance health spec + run command, captured at bundle build time.
     /// Keyed by instance; the driver only spawns instances we configured.
-    plans: BTreeMap<String, RunPlan>,
+    /// `Mutex` so the control loop can insert a run plan for a *runtime-added*
+    /// preview (self-serve, inc-1) and drop one on removal — the launcher is
+    /// shared (`Arc`) between the driver and the loop.
+    plans: std::sync::Mutex<BTreeMap<String, RunPlan>>,
     children: std::sync::Mutex<BTreeMap<u64, std::process::Child>>,
     next_token: std::sync::atomic::AtomicU64,
     events_tx: Sender<(String, Event)>,
@@ -253,7 +256,10 @@ impl ChildLauncher for ProcLauncher {
     ) -> Result<ChildHandle, String> {
         let plan = self
             .plans
+            .lock()
+            .expect("plans")
             .get(instance)
+            .cloned()
             .ok_or_else(|| format!("no run plan for instance `{instance}`"))?;
         let mut cmd = std::process::Command::new(&plan.command[0]);
         cmd.args(&plan.command[1..])
@@ -290,7 +296,7 @@ impl ChildLauncher for ProcLauncher {
     }
 
     fn start_probe(&self, instance: &str, generation: Generation, port: u16) {
-        let plan = match self.plans.get(instance) {
+        let plan = match self.plans.lock().expect("plans").get(instance) {
             Some(p) => p.clone(),
             None => return,
         };
@@ -321,7 +327,12 @@ impl ChildLauncher for ProcLauncher {
     }
 
     fn stop(&self, instance: &str, generation: Generation, token: u64, drain: bool) {
-        let grace = self.plans.get(instance).map_or(0, |p| p.grace_ms);
+        let grace = self
+            .plans
+            .lock()
+            .expect("plans")
+            .get(instance)
+            .map_or(0, |p| p.grace_ms);
         let child = self.children.lock().expect("children").remove(&token);
         let tx = self.events_tx.clone();
         let instance = instance.to_string();
@@ -446,37 +457,12 @@ fn serve_loop(
         "<!doctype html><title>starting</title><h1>cargoless app-serve</h1>\
          <p>no green build is serving yet — building…</p>",
     ));
-    let mut proxies: Vec<L4Proxy> = Vec::new();
-    let mut instance_configs = Vec::new();
-    let mut run_plans: BTreeMap<String, RunPlan> = BTreeMap::new();
-    for spec in &specs {
-        let proxy = L4Proxy::bind(spec.app_bind, holding.clone())
-            .map_err(|e| format!("instance `{}` proxy bind {}: {e}", spec.name, spec.app_bind))?;
-        // The driver flips the SAME slot Arc the proxy reads on every accept,
-        // so a promote is visible to new connections immediately.
-        let paths = InstancePaths {
-            worktree: instance_worktree(state_dir, &spec.name),
-            bundles: state_dir.join("app").join(&spec.name).join("bundles"),
-        };
-        instance_configs.push(InstanceConfig {
-            name: spec.name.clone(),
-            slot: proxy.slot().clone(),
-            paths,
-            env: spec
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        });
-        // A default run plan; the real one is refreshed from each build's
-        // manifest (inc-6 wires manifest→plan). For now a sensible default
-        // lets the daemon boot and the contract hold.
-        run_plans.insert(spec.name.clone(), default_run_plan());
-        proxies.push(proxy);
-    }
-
+    // The launcher holds run plans behind a `Mutex` so the control loop can
+    // register one for a runtime-added preview (self-serve) and drop it on
+    // removal. Built first (empty) so `setup_instance` can register each plan as
+    // it binds — boot and runtime share the exact same per-instance setup path.
     let launcher = Arc::new(ProcLauncher {
-        plans: run_plans,
+        plans: std::sync::Mutex::new(BTreeMap::new()),
         children: std::sync::Mutex::new(BTreeMap::new()),
         next_token: std::sync::atomic::AtomicU64::new(1),
         events_tx: events_tx.clone(),
@@ -489,11 +475,22 @@ fn serve_loop(
     });
     let ports = Arc::new(PortAllocator::new(range.start, range.end));
 
+    // One L4 proxy per instance, keyed by name so a removal drops exactly one.
+    // `setup_instance` does all the per-spec effectful setup (proxy bind, run
+    // plan, worktree, config) and is reused verbatim by the control loop's Add.
+    let mut proxies: BTreeMap<String, L4Proxy> = BTreeMap::new();
+    let mut instance_configs = Vec::new();
+    for spec in &specs {
+        let (config, proxy) = setup_instance(repo, state_dir, spec, &launcher, &holding)?;
+        proxies.insert(spec.name.clone(), proxy);
+        instance_configs.push(config);
+    }
+
     let mut driver = Driver::new(
         instance_configs,
         Backends {
             build,
-            launcher,
+            launcher: launcher.clone(),
             sink,
             svc: svc.clone(),
             ports,
@@ -513,27 +510,6 @@ fn serve_loop(
         t0.elapsed().as_secs_f64()
     ));
 
-    // Per-instance git worktrees: each instance builds in its OWN worktree of
-    // the main repo (shared object store, independent checked-out tree) so two
-    // instances' builds never collide on the working tree. The daemon owns the
-    // worktree; `appbuild::checkout` moves it to each build sha. Create it once
-    // here, before any build or recovery touches it — otherwise the first
-    // checkout fails with "cannot change to <worktree>: No such file or
-    // directory" (the build worker assumes the tree exists).
-    for spec in &specs {
-        let wt = instance_worktree(state_dir, &spec.name);
-        if let Err(e) = ensure_instance_worktree(repo, &wt, &spec.git_ref) {
-            // Non-fatal: log and continue. That instance's first checkout will
-            // surface the failure as a red build (visible in /app), and the
-            // other instances still come up.
-            ui::warn(format!(
-                "instance `{}`: could not set up worktree {}: {e}",
-                spec.name,
-                wt.display()
-            ));
-        }
-    }
-
     // Boot recovery: respawn each instance's durable last-green before any
     // build, so a restart restores service in seconds, not a cold build.
     for spec in &specs {
@@ -545,17 +521,44 @@ fn serve_loop(
     }
 
     // Ref pollers: one thread per instance, posting HeadAdvanced on change.
+    // Each poller gets its OWN stop flag, kept here so a runtime DELETE can
+    // stop just that instance's poller (the global SHUTDOWN flag stops all).
     let poll_ms = opts.poll_interval_ms.unwrap_or(2000).max(200);
+    let mut poller_stops: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
     for spec in &specs {
-        spawn_ref_poller(repo, spec, poll_ms, events_tx.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_ref_poller(repo, spec, poll_ms, events_tx.clone(), stop.clone());
+        poller_stops.insert(spec.name.clone(), stop);
     }
 
+    // Wire the self-serve control channel: the `POST/DELETE /instances` routes
+    // enqueue a `PreviewRequest` onto `control_tx` (via `svc.request_preview`),
+    // and this loop — the single driver mutator — performs the effectful
+    // add/teardown. Before `set_control` runs, the routes answer 404 (a
+    // non-self-serve daemon), so the capability is opt-in by this wiring alone.
+    let (control_tx, control_rx) = channel::<PreviewRequest>();
+    svc.set_control(control_tx);
+
     // ── the control loop ─────────────────────────────────────────────
-    // Single mutator of the driver; 200ms tick polls the shutdown flag.
+    // Single mutator of the driver; 200ms tick polls the shutdown flag and,
+    // between lifecycle events, drains any pending self-serve add/remove.
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
         }
+        // Self-serve add/remove requests (non-blocking drain each tick).
+        drain_preview_requests(
+            &control_rx,
+            repo,
+            state_dir,
+            poll_ms,
+            &holding,
+            &launcher,
+            &events_tx,
+            &mut driver,
+            &mut proxies,
+            &mut poller_stops,
+        );
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok((instance, event)) => {
                 // inc-6 telemetry: one structured event per observed lifecycle
@@ -705,6 +708,41 @@ fn ensure_instance_worktree(repo: &Path, worktree: &Path, initial_ref: &str) -> 
     }
 }
 
+/// Remove an instance's git worktree on teardown (self-serve Remove). Best
+/// effort: `git worktree remove --force` (the tree may have a dirty checkout
+/// from an in-flight build), then `git worktree prune` to clear the admin
+/// entry. Failures are logged, not fatal — a leftover worktree dir only wastes
+/// disk and is reclaimed by the next `prune`. The shared object store is
+/// untouched (only this worktree's checked-out files go).
+fn remove_instance_worktree(repo: &Path, worktree: &Path) {
+    if !worktree.exists() {
+        return;
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => ui::warn(format!(
+            "git worktree remove {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => ui::warn(format!(
+            "could not spawn git worktree remove {}: {e}",
+            worktree.display()
+        )),
+    }
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
+}
+
 fn default_run_plan() -> RunPlan {
     RunPlan {
         command: vec!["./run.sh".to_string()],
@@ -739,15 +777,182 @@ fn bind_control_plane(
     Ok(Some(server))
 }
 
+/// All the per-instance effectful setup, factored so boot and a runtime
+/// self-serve Add share one path: bind the instance's L4 proxy, register its
+/// run plan on the launcher, create its git worktree, and produce the
+/// [`InstanceConfig`] the driver tracks. Returns the config + the live proxy
+/// (the caller keeps the proxy alive and keyed by name). A worktree failure is
+/// non-fatal (logged) — the instance's first checkout then surfaces it as a red
+/// build in `/app`, exactly as a static instance would.
+fn setup_instance(
+    repo: &Path,
+    state_dir: &Path,
+    spec: &InstanceSpec,
+    launcher: &Arc<ProcLauncher>,
+    holding: &Arc<HoldingResponse>,
+) -> Result<(InstanceConfig, L4Proxy), String> {
+    let proxy = L4Proxy::bind(spec.app_bind, holding.clone())
+        .map_err(|e| format!("instance `{}` proxy bind {}: {e}", spec.name, spec.app_bind))?;
+    // The driver flips the SAME slot Arc the proxy reads on every accept, so a
+    // promote is visible to new connections immediately.
+    let paths = InstancePaths {
+        worktree: instance_worktree(state_dir, &spec.name),
+        bundles: state_dir.join("app").join(&spec.name).join("bundles"),
+    };
+    let config = InstanceConfig {
+        name: spec.name.clone(),
+        slot: proxy.slot().clone(),
+        paths,
+        env: spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    // A default run plan; the real one is refreshed from each build's manifest
+    // (inc-6 wires manifest→plan). For now a sensible default lets the instance
+    // boot and the contract hold.
+    launcher
+        .plans
+        .lock()
+        .expect("plans")
+        .insert(spec.name.clone(), default_run_plan());
+
+    // The instance builds in its OWN worktree of the main repo (shared object
+    // store, independent checked-out tree) so two instances' builds never
+    // collide on the working tree. Create it before any build/recovery touches
+    // it — otherwise the first checkout fails "cannot change to <worktree>".
+    let wt = instance_worktree(state_dir, &spec.name);
+    if let Err(e) = ensure_instance_worktree(repo, &wt, &spec.git_ref) {
+        ui::warn(format!(
+            "instance `{}`: could not set up worktree {}: {e}",
+            spec.name,
+            wt.display()
+        ));
+    }
+    Ok((config, proxy))
+}
+
+/// Drain any pending self-serve `PreviewRequest`s (non-blocking) and perform
+/// each against the live driver. This runs on the control thread — the single
+/// driver mutator — so an `Add`/`Remove` is serialized with every lifecycle
+/// event, no lock around the driver needed.
+///
+/// `Add`: bind+configure via [`setup_instance`], register the runtime in the
+/// driver, start a ref poller (its own stop flag), and kick a first
+/// `HeadAdvanced` so the build starts immediately (the poller's first tick
+/// would do the same — a duplicate same-sha HeadAdvanced is a no-op).
+///
+/// `Remove`: stop the poller, tear down the driver runtime (stops children,
+/// clears the proxy slot, frees ports), drop the proxy (its accept loop stops),
+/// and remove the git worktree.
+#[allow(clippy::too_many_arguments)]
+fn drain_preview_requests(
+    control_rx: &Receiver<PreviewRequest>,
+    repo: &Path,
+    state_dir: &Path,
+    poll_ms: u64,
+    holding: &Arc<HoldingResponse>,
+    launcher: &Arc<ProcLauncher>,
+    events_tx: &Sender<(String, Event)>,
+    driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
+    proxies: &mut BTreeMap<String, L4Proxy>,
+    poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
+) {
+    while let Ok(req) = control_rx.try_recv() {
+        match req {
+            PreviewRequest::Add {
+                name,
+                git_ref,
+                env,
+                own_db,
+            } => {
+                if own_db {
+                    // Per-branch DB provisioning is inc-3; for inc-1 the
+                    // preview shares the daemon's DB env. Flagged, not failed.
+                    ui::warn(format!(
+                        "preview `{name}`: own_db requested but per-branch DB \
+                         provisioning is not in this increment — using shared DB"
+                    ));
+                }
+                // A runtime Add needs a front bind. Inc-1 routing stays
+                // per-`app_bind` (the host-routing front is inc-2), so a
+                // dynamically-added preview gets an ephemeral OS-assigned port;
+                // external reachability arrives with the host-router. Bind 0.
+                let app_bind = match "127.0.0.1:0".parse() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let spec = InstanceSpec {
+                    name: name.clone(),
+                    git_ref,
+                    app_bind,
+                    env: env.into_iter().collect(),
+                };
+                let (config, proxy) =
+                    match setup_instance(repo, state_dir, &spec, launcher, holding) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            ui::warn(format!("preview `{name}`: setup failed: {e}"));
+                            continue;
+                        }
+                    };
+                if !driver.add_instance(config) {
+                    // Name already live: drop the proxy we just bound + the run
+                    // plan we registered, leaving the existing instance intact.
+                    ui::warn(format!("preview `{name}`: already exists — ignored"));
+                    drop(proxy);
+                    launcher.plans.lock().expect("plans").remove(&name);
+                    continue;
+                }
+                let bound = proxy.addr();
+                proxies.insert(name.clone(), proxy);
+                let stop = Arc::new(AtomicBool::new(false));
+                spawn_ref_poller(repo, &spec, poll_ms, events_tx.clone(), stop.clone());
+                poller_stops.insert(name.clone(), stop);
+                // Kick the first build now (the poller will also detect HEAD).
+                if let Some(sha) = resolve_ref(repo, &spec.git_ref) {
+                    driver.drive(&name, Event::HeadAdvanced { sha });
+                }
+                ui::ok(format!("preview `{name}` added — serving on {bound}"));
+            }
+            PreviewRequest::Remove { name } => {
+                // Stop the poller first so no new HeadAdvanced races the teardown.
+                if let Some(stop) = poller_stops.remove(&name) {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                if !driver.remove_instance(&name) {
+                    ui::warn(format!("preview `{name}`: not found — ignored"));
+                    continue;
+                }
+                launcher.plans.lock().expect("plans").remove(&name);
+                // Drop the proxy (its accept loop stops) and remove the worktree.
+                drop(proxies.remove(&name));
+                let wt = instance_worktree(state_dir, &name);
+                remove_instance_worktree(repo, &wt);
+                ui::ok(format!("preview `{name}` removed"));
+            }
+        }
+    }
+}
+
 /// One ref poller: resolve `spec.git_ref` to a sha on an interval, post
 /// HeadAdvanced when it changes. Uses `git rev-parse` (the same git the build
-/// worker uses); a transient git error is skipped (next tick retries).
-fn spawn_ref_poller(repo: &Path, spec: &InstanceSpec, poll_ms: u64, tx: Sender<(String, Event)>) {
+/// worker uses); a transient git error is skipped (next tick retries). Stops
+/// when either the per-instance `stop` flag (a runtime DELETE) or the global
+/// `SHUTDOWN` flag is set, so a removed preview's poller exits promptly.
+fn spawn_ref_poller(
+    repo: &Path,
+    spec: &InstanceSpec,
+    poll_ms: u64,
+    tx: Sender<(String, Event)>,
+    stop: Arc<AtomicBool>,
+) {
     let (repo, name, git_ref) = (repo.to_path_buf(), spec.name.clone(), spec.git_ref.clone());
     std::thread::spawn(move || {
         let mut last: Option<String> = None;
         loop {
-            if SHUTDOWN.load(Ordering::SeqCst) {
+            if stop.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
                 return;
             }
             match resolve_ref(&repo, &git_ref) {
