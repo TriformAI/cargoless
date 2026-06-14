@@ -690,10 +690,26 @@ mod tests {
         // Artifacts harvested faithfully.
         assert_eq!(fs::read(bundle.join("server-bin")).unwrap(), b"ELF...");
         assert_eq!(fs::read(bundle.join("site/index.html")).unwrap(), b"<html>");
-        // Provenance names the sha + manifest hash.
+        // Provenance names the sha + manifest hash. The hash is the sha256 of
+        // the on-disk `cargoless.app.yaml` that `build()` re-loads at the sha
+        // (the in-memory `manifest_hash` on the test struct is discarded — the
+        // worker rehashes the committed manifest text), so assert against THAT
+        // real hash, not the struct's placeholder. Re-load the same way build()
+        // does to compute the expected value.
         let meta = fs::read_to_string(bundle.join("meta")).unwrap();
         assert!(meta.contains("sha=sha1"), "{meta}");
-        assert!(meta.contains("manifest_hash=deadbeef"), "{meta}");
+        let expected_hash = load_app_manifest(&p.worktree)
+            .expect("manifest re-loads")
+            .expect("manifest present")
+            .manifest_hash;
+        assert!(
+            !expected_hash.is_empty() && expected_hash != "deadbeef",
+            "re-loaded manifest must carry a real computed hash, got {expected_hash:?}"
+        );
+        assert!(
+            meta.contains(&format!("manifest_hash={expected_hash}")),
+            "meta must record the re-loaded manifest's real hash ({expected_hash}): {meta}"
+        );
         assert!(meta.contains("artifacts=server-bin,site"), "{meta}");
         let _ = fs::remove_dir_all(&dir);
     }
