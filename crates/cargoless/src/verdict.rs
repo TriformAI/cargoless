@@ -447,9 +447,21 @@ fn push_with_failover<'a, C: TransportClient>(
 
 /// The attribution acceptance predicate (module doc, A2 consumer):
 ///
-/// * both sides carry a SHA and they MATCH ⇒ accept, freshness ignored
-///   (idempotent re-run fast-path — same key + same SHA ⇒ same overlay
-///   content ⇒ same verdict);
+/// * both sides carry a SHA and they MATCH ⇒ accept ONLY IF the status
+///   is also FRESH (published after our push). The matching SHA proves
+///   "this verdict is for our base"; it does NOT prove "this verdict
+///   analyzed our overlay". A green published for the base BEFORE our
+///   push — the central `--server-root` / foreign-worktree case, where
+///   the daemon cannot map our overlay onto its served tree and so never
+///   publishes an overlay-attributed verdict for our key — would match
+///   the SHA while having analyzed nothing of ours (`crates: []`). The
+///   freshness conjunct closes that base_sha-echo false-green (the CGLS-9
+///   a8 residual: a planted type error went green 10/11 because a stale
+///   matching-SHA base-green was accepted as the overlay's verdict). Cost
+///   of dropping the old freshness-ignored fast-path: a genuine idempotent
+///   re-run now waits for one fresh publication instead of accepting the
+///   cached green — seconds, paid rarely. Soundness over the micro-opt for
+///   a merge gate.
 /// * both carry a SHA and they MISMATCH ⇒ never accept (another
 ///   branch's verdict on a shared key, or a stale prior publication
 ///   mid-replacement);
@@ -463,7 +475,7 @@ fn status_is_acceptable(
     freshness: AwaitFreshness,
 ) -> bool {
     match (resolved_sha, status.base_sha.as_deref()) {
-        (Some(mine), Some(theirs)) => mine == theirs,
+        (Some(mine), Some(theirs)) => mine == theirs && freshness.is_fresh(status.published_at),
         _ => freshness.is_fresh(status.published_at),
     }
 }
@@ -679,18 +691,30 @@ mod tests {
 
     /// The A2 attribution matrix — the predicate the required merge
     /// check will trust. Each arm is a distinct correctness class:
-    /// matching SHAs accept regardless of freshness (idempotent re-run
-    /// fast-path), mismatched SHAs NEVER accept (cross-branch verdict
-    /// bleed — the false-attribution incident class A2 closes), and
-    /// missing SHAs degrade to the freshness guard.
+    /// matching SHAs accept ONLY when also fresh (the base_sha-echo
+    /// false-green fix — CGLS-9 a8 residual), mismatched SHAs NEVER
+    /// accept (cross-branch verdict bleed — the false-attribution
+    /// incident class A2 closes), and missing SHAs degrade to the
+    /// freshness guard.
     #[test]
     fn attribution_predicate_matrix() {
         let fresh_after_100 = AwaitFreshness {
             prior_published_at: Some(100),
             not_before_unix: 100,
         };
-        // Match ⇒ accept even when stale (published before our push).
+        // Match + FRESH ⇒ accept (published after our push: a verdict
+        // genuinely produced for our overlay on this base).
         assert!(status_is_acceptable(
+            &status("green", Some("abc"), 101),
+            Some("abc"),
+            fresh_after_100
+        ));
+        // Match but STALE ⇒ REJECT. This is the a8 residual fix: a green
+        // published for our base BEFORE our push (published_at=50 < 100)
+        // is the daemon's pre-existing base-green, NOT a verdict that
+        // analyzed our overlay (foreign-worktree / central --server-root
+        // case). Accepting it false-greened planted type errors 10/11.
+        assert!(!status_is_acceptable(
             &status("green", Some("abc"), 50),
             Some("abc"),
             fresh_after_100
@@ -958,16 +982,28 @@ mod tests {
     }
 
     #[test]
-    fn await_accepts_sha_match_instantly_and_times_out_on_mismatch() {
-        // SHA match: instant accept, no freshness needed.
-        let matching = StubClient::new(Some(status("red", Some("abc"), 1)), Ok(accepted_ack()));
+    fn await_accepts_fresh_sha_match_and_times_out_on_stale_match_or_mismatch() {
         let guard = AwaitFreshness {
             prior_published_at: Some(1000),
             not_before_unix: 1000,
         };
-        let got = await_attributed_verdict(&matching, "/wt", Some("abc"), guard, 5)
-            .expect("sha-matched status accepted");
+
+        // SHA match + FRESH (published_at 1001 > prior 1000): instant accept.
+        let fresh_match =
+            StubClient::new(Some(status("red", Some("abc"), 1001)), Ok(accepted_ack()));
+        let got = await_attributed_verdict(&fresh_match, "/wt", Some("abc"), guard, 5)
+            .expect("fresh sha-matched status accepted");
         assert_eq!(got.verdict, "red");
+
+        // SHA match but STALE (published_at 1 < prior 1000): NEVER accepted.
+        // This is the a8 residual fix — a pre-existing base-green that
+        // predates our push must not be attributed to our overlay. The
+        // await honestly times out (1s floor) instead of false-greening.
+        let stale_match = StubClient::new(Some(status("green", Some("abc"), 1)), Ok(accepted_ack()));
+        assert!(
+            await_attributed_verdict(&stale_match, "/wt", Some("abc"), guard, 1).is_none(),
+            "stale matching base_sha must never satisfy the await (base_sha-echo false-green)"
+        );
 
         // SHA mismatch: never accepted; the await honestly times out
         // (1s floor) instead of returning another branch's verdict.
@@ -983,14 +1019,34 @@ mod tests {
 
     // ── One real-wire ladder roundtrip (HttpServer + HttpClient) ──────
 
-    /// Minimal accepting daemon: takes any push, publishes a green
-    /// status attributed to a fixed SHA.
+    /// Minimal accepting daemon modelling the real publish-after-analysis
+    /// flow: NO attributed verdict exists until an overlay is pushed; the
+    /// push triggers publication of a fresh green at `published_at: 2000`.
+    /// Returning `None` pre-push is what makes the post-push status read as
+    /// FRESH (the await captures `prior_published_at: None` pre-push, then
+    /// 2000 > not_before). A stub that returned a constant timestamp both
+    /// before and after the push could never satisfy the freshness conjunct
+    /// — and would mask the very base_sha-echo bug the fix closes.
     struct GreenService {
         sha: String,
+        pushed: std::sync::atomic::AtomicBool,
+    }
+
+    impl GreenService {
+        fn new(sha: &str) -> Self {
+            Self {
+                sha: sha.to_string(),
+                pushed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
     }
 
     impl cargoless_core::transport::VerdictService for GreenService {
         fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
+            // Pre-push: no verdict attributed to this key yet.
+            if !self.pushed.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
             Some(WorktreeStatus {
                 worktree: worktree.to_string(),
                 verdict: "green".into(),
@@ -1001,7 +1057,12 @@ mod tests {
                 base_sha: Some(self.sha.clone()),
                 ra_blind_paths: false,
                 heartbeat_age_secs: 0,
-                published_at: 2000,
+                // Stamp wall-clock at publish (post-push) so the status is
+                // genuinely fresher than the await's not_before_unix — the
+                // real daemon publishes a new verdict after analyzing the
+                // pushed overlay. A hardcoded past constant could never
+                // satisfy the freshness conjunct in the None-prior branch.
+                published_at: crate::statusfile::now_unix(),
             })
         }
         fn get_verdict(&self, _worktree: &str) -> Option<String> {
@@ -1022,6 +1083,8 @@ mod tests {
             _base_ref: &str,
             files: &[(String, String)],
         ) -> PushOverlayAck {
+            self.pushed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             PushOverlayAck {
                 worktree: worktree.to_string(),
                 accepted: true,
@@ -1067,9 +1130,7 @@ mod tests {
             HttpServer::bind("127.0.0.1:0", Arc::new(RefusingService), Arc::new(AllowAll)).unwrap();
         let green = HttpServer::bind(
             "127.0.0.1:0",
-            Arc::new(GreenService {
-                sha: "abc123".into(),
-            }),
+            Arc::new(GreenService::new("abc123")),
             Arc::new(AllowAll),
         )
         .unwrap();
