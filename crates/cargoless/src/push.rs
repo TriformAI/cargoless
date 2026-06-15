@@ -647,7 +647,7 @@ pub(crate) fn validate_overlay_http_cap(
         return Ok(());
     }
     Err(format!(
-        "push: overlay HTTP body is {} encoded bytes ({} raw JSON bytes), exceeding the 32 MiB HTTP cap ({} bytes); refusing before network send. Largest content files: {}. Suggested next step: split the change or remove generated/heavy artifacts from the source diff; Cargoless will not fall back to cargo check.",
+        "push: overlay HTTP body is {} encoded bytes ({} raw JSON bytes), exceeding the 128 MiB HTTP cap ({} bytes); refusing before network send. Largest content files: {}. Suggested next step: split the change or remove generated/heavy artifacts from the source diff; Cargoless will not fall back to cargo check.",
         prepared.encoded_len(),
         prepared.raw_len,
         MAX_OVERLAY_BYTES,
@@ -1255,7 +1255,7 @@ mod tests {
 
         assert!(err.contains("encoded bytes"));
         assert!(err.contains("raw JSON bytes"));
-        assert!(err.contains("exceeding the 32 MiB HTTP cap"));
+        assert!(err.contains("exceeding the 128 MiB HTTP cap"));
         assert!(err.contains("refusing before network send"));
         assert!(err.contains("src/big.rs"));
         assert!(err.contains("Suggested next step"));
