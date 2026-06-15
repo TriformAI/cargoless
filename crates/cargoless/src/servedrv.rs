@@ -1206,28 +1206,30 @@ fn exec(
                     // No project-check signal; the only input is the
                     // RA-native bool. Routed through the legacy shim
                     // which produces Green-or-Unknown (never an
-                    // unattributed Red).
-                    if timer_settled_no_flycheck {
-                        statusfile::VerdictPayload::unknown(
-                            "ra_native_timer_settled_no_flycheck_activity",
-                        )
-                    } else {
-                        statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
-                    }
+                    // unattributed Red). #A8-closer: a blind-path GREEN is
+                    // downgraded to honest-unknown here (RA cannot witness
+                    // a proc-macro it could not expand — see
+                    // `ra_native_payload`).
+                    ra_native_payload(
+                        authoritative_error,
+                        timer_settled_no_flycheck,
+                        macro_blind_hit,
+                    )
                 }
                 ProjectChecksMode::Warn => {
                     // Warn mode: RA-native is the publish input;
                     // project-checks run advisory in a background
                     // thread (logged + telemetered, but cannot change
-                    // the published verdict by design).
+                    // the published verdict by design). #A8-closer: same
+                    // blind-path GREEN → honest-unknown downgrade as Off
+                    // (the advisory witness here never feeds the verdict,
+                    // so RA-native green on a blind path is unwitnessed).
                     spawn_project_checks_warn(wt.clone(), project_check_context, Arc::clone(api));
-                    if timer_settled_no_flycheck {
-                        statusfile::VerdictPayload::unknown(
-                            "ra_native_timer_settled_no_flycheck_activity",
-                        )
-                    } else {
-                        statusfile::VerdictPayload::from_bool_unattributed(authoritative_error)
-                    }
+                    ra_native_payload(
+                        authoritative_error,
+                        timer_settled_no_flycheck,
+                        macro_blind_hit,
+                    )
                 }
                 ProjectChecksMode::Hard => {
                     // Hard mode (#A4.3): the witness runs OFF the serve
@@ -1533,6 +1535,56 @@ fn effective_project_checks_mode(
 /// decision the operator makes, never a default.
 fn macro_blind_escalate() -> bool {
     std::env::var("CARGOLESS_MACRO_BLIND_ESCALATE").is_ok_and(|v| v == "1")
+}
+
+/// The RA-native-only verdict payload for the Off / Warn arms (no
+/// witness feeds the verdict), under the INFRA-36 honesty contract plus
+/// the #A8 macro-blind closer.
+///
+/// Inputs, in strict precedence:
+/// 1. `timer_settled_no_flycheck` (CGLS-9): the barrier settled on the
+///    adapter's synthetic liveness timer with NO real RA flycheck
+///    activity. The empty window is "RA never ran", not "RA verified
+///    clean" → `unknown(ra_native_timer_settled_no_flycheck_activity)`.
+/// 2. `authoritative_error`: a real rustc/flycheck error was in the
+///    window → the legacy shim renders it as
+///    `unknown(ra_native_unattributed_error)` (never a fabricated Red —
+///    no per-diagnostic detail is available at this seam).
+/// 3. `macro_blind_hit` (#A8 false-GREEN closer): the push touched a
+///    configured proc-macro-blind path. RA-native is structurally blind
+///    to errors that only exist after proc-macro expansion (the
+///    tf-mv #4070 class: a Leptos `view!` that fails to compile but for
+///    which RA — unable to expand the macro — emits no rustc error). A
+///    clean RA-native window over such a push is therefore
+///    *necessary-not-sufficient*; publishing GREEN would be the
+///    false-GREEN this closes. Fail closed:
+///    `unknown(ra_blind_path_green_unwitnessed)` — an honest "RA cannot
+///    stand behind green here; demand a witness". The `ra_blind_paths`
+///    annotation that already rides the verdict (status file + wire +
+///    OTEL) thus becomes verdict-AFFECTING, not merely advisory.
+///
+/// Only a *clean, witnessed, non-blind* RA-native window is GREEN. A
+/// blind-path push that wants a fast green must opt into the witness
+/// (`CARGOLESS_MACRO_BLIND_ESCALATE=1` under Warn/Hard), which routes to
+/// the Hard arm BEFORE this helper is reached — so escalation is
+/// strictly stronger, never weaker, than this downgrade.
+fn ra_native_payload(
+    authoritative_error: bool,
+    timer_settled_no_flycheck: bool,
+    macro_blind_hit: bool,
+) -> statusfile::VerdictPayload {
+    if timer_settled_no_flycheck {
+        return statusfile::VerdictPayload::unknown("ra_native_timer_settled_no_flycheck_activity");
+    }
+    let payload = statusfile::VerdictPayload::from_bool_unattributed(authoritative_error);
+    // #A8 — only a GREEN can be a macro-blind false-GREEN; a real error
+    // (already `unknown` via the shim) is honored as-is. Downgrade a
+    // blind-path green to honest-unknown: RA could not witness the
+    // expanded macro, so its green is unwitnessed.
+    if macro_blind_hit && payload.verdict == statusfile::Verdict::Green {
+        return statusfile::VerdictPayload::unknown("ra_blind_path_green_unwitnessed");
+    }
+    payload
 }
 
 /// Compose a `VerdictPayload` from the RA-native bool + the
@@ -2447,6 +2499,77 @@ mod tests {
             assert_eq!(
                 apply_require_checks(indeterminate.clone(), require),
                 indeterminate
+            );
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // #A8 false-GREEN closer — ra_native_payload truth table.
+    //
+    // The Off/Warn verdict seam (deployed posture is
+    // CARGOLESS_PROJECT_CHECKS_MODE=off) is where a Leptos `view!` macro
+    // that does NOT compile could publish GREEN: RA-native is structurally
+    // blind to post-proc-macro-expansion errors, so a clean RA window over
+    // a blind-path push is necessary-not-sufficient. These pin the exact
+    // green-vs-unknown decision so the false-GREEN cannot silently return.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ra_native_payload_clean_non_blind_is_green() {
+        // The ONLY green path: a real, witnessed, non-blind clean window.
+        let p = ra_native_payload(false, false, false);
+        assert_eq!(p.verdict, statusfile::Verdict::Green);
+        assert!(p.analysis_failure_reason.is_none());
+    }
+
+    #[test]
+    fn ra_native_payload_clean_blind_path_downgrades_to_unknown() {
+        // THE keystone: a clean RA-native window on a macro-blind path is
+        // NOT green — RA could not witness the expanded macro. This is the
+        // view!-macro false-GREEN closer. The historical behavior here was
+        // `from_bool_unattributed(false)` ⇒ GREEN.
+        let p = ra_native_payload(false, false, true);
+        assert_eq!(
+            p.verdict,
+            statusfile::Verdict::Unknown,
+            "a blind-path clean RA window MUST NOT be green (macro-blind \
+             false-GREEN closer)"
+        );
+        assert_eq!(
+            p.analysis_failure_reason.as_deref(),
+            Some("ra_blind_path_green_unwitnessed"),
+            "stable classifier so a poller/SigNoz can demand a witness"
+        );
+    }
+
+    #[test]
+    fn ra_native_payload_real_error_is_unknown_regardless_of_blind() {
+        // A real authoritative error is honored (as the INFRA-36 shim's
+        // unknown) whether or not the path is blind — the blind downgrade
+        // only ever turns a GREEN into unknown, never masks a real error.
+        for blind in [false, true] {
+            let p = ra_native_payload(true, false, blind);
+            assert_eq!(p.verdict, statusfile::Verdict::Unknown, "blind={blind}");
+            assert_eq!(
+                p.analysis_failure_reason.as_deref(),
+                Some("ra_native_unattributed_error"),
+                "real RA error keeps its own classifier; blind={blind}"
+            );
+        }
+    }
+
+    #[test]
+    fn ra_native_payload_timer_settle_wins_over_blind() {
+        // CGLS-9 precedence: a timer-settled empty window is unknown for
+        // the timer reason regardless of the blind bit (RA never ran at
+        // all, which subsumes "RA ran but is macro-blind").
+        for blind in [false, true] {
+            let p = ra_native_payload(false, true, blind);
+            assert_eq!(p.verdict, statusfile::Verdict::Unknown, "blind={blind}");
+            assert_eq!(
+                p.analysis_failure_reason.as_deref(),
+                Some("ra_native_timer_settled_no_flycheck_activity"),
+                "timer-settle classifier takes precedence; blind={blind}"
             );
         }
     }
