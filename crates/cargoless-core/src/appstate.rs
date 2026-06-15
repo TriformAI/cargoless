@@ -241,6 +241,26 @@ impl AppState {
         self.building.as_deref()
     }
 
+    /// Add a new instance (initially `Idle`). No-op if the name already exists.
+    /// Called from the driver when SIGHUP adds an instance to the live set.
+    pub fn add_instance(&mut self, name: String) {
+        self.instances.entry(name).or_default();
+    }
+
+    /// Remove an instance from all state bookkeeping. Must only be called
+    /// after the driver has already stopped any child and the instance is no
+    /// longer serving. Removes the instance from the queue if it is still
+    /// waiting for the build slot.
+    pub fn remove_instance(&mut self, name: &str) {
+        self.instances.remove(name);
+        self.queue.retain(|n| n != name);
+        if self.building.as_deref() == Some(name) {
+            // The build thread is still running but will post a BuildFinished
+            // that the control loop discards (unknown instance → step() no-ops).
+            self.building = None;
+        }
+    }
+
     #[cfg(test)]
     fn queue_contains(&self, instance: &str) -> bool {
         self.queue.iter().any(|n| n == instance)
@@ -1416,5 +1436,103 @@ mod tests {
     fn unknown_instance_is_ignored() {
         let mut s = state(&["dev"]);
         assert_eq!(head(&mut s, "nope", "aaa"), vec![]);
+    }
+
+    // ── CGLS-16: runtime add/remove ──────────────────────────────────────
+
+    /// Adding a new instance puts it in an Idle state and it can immediately
+    /// participate in the build pipeline.
+    #[test]
+    fn add_instance_starts_idle_and_accepts_events() {
+        let mut s = state(&["dev"]);
+        s.add_instance("feature-x".to_string());
+        // The new instance must exist in an Idle state.
+        let inst = s.instance("feature-x").expect("feature-x was added");
+        assert_eq!(inst.pipeline, Pipeline::Idle);
+        assert!(inst.serving.is_none());
+        // It must respond to events normally.
+        let actions = head(&mut s, "feature-x", "f1");
+        assert_eq!(
+            actions.len(),
+            1,
+            "added instance starts building: {actions:?}"
+        );
+        assert!(
+            matches!(&actions[0], Action::StartBuild { instance, sha, .. }
+                if instance == "feature-x" && sha == "f1"),
+            "{actions:?}"
+        );
+    }
+
+    /// Adding an already-present instance name is a no-op (idempotent).
+    #[test]
+    fn add_instance_is_idempotent() {
+        let mut s = state(&["dev"]);
+        drive_to_serving(&mut s, "dev", "aaa");
+        // Re-adding a live instance must not clobber its state.
+        s.add_instance("dev".to_string());
+        assert!(
+            s.instance("dev").unwrap().serving.is_some(),
+            "re-add must not reset a serving instance"
+        );
+    }
+
+    /// Removing an instance removes it from all bookkeeping: the map, the
+    /// queue if it was waiting for the build slot, and the `building` pointer
+    /// if it held the slot.
+    #[test]
+    fn remove_instance_clears_all_bookkeeping() {
+        let mut s = state(&["dev", "feature-x"]);
+        // Put dev in the build slot and feature-x in the queue.
+        head(&mut s, "dev", "d1"); // dev is building
+        head(&mut s, "feature-x", "f1"); // feature-x is queued
+        assert_eq!(s.building(), Some("dev"));
+        assert!(
+            s.queue_contains("feature-x"),
+            "feature-x should be queued before removal"
+        );
+
+        // Remove a queued instance: gone from queue, gone from map.
+        s.remove_instance("feature-x");
+        assert!(
+            s.instance("feature-x").is_none(),
+            "removed instance must not appear in the map"
+        );
+        assert!(
+            !s.queue_contains("feature-x"),
+            "removed instance must not remain in the queue"
+        );
+
+        // Remove the building instance: building slot freed.
+        s.remove_instance("dev");
+        assert!(s.instance("dev").is_none());
+        assert_eq!(
+            s.building(),
+            None,
+            "building slot freed when builder removed"
+        );
+    }
+
+    /// After removing an instance, events for it are silently ignored —
+    /// the stale `BuildFinished` a running detached thread might post
+    /// must not panic.
+    #[test]
+    fn events_for_removed_instance_are_noop() {
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "aaa");
+        let g = build_gen(&a);
+        s.remove_instance("dev");
+        // A stale `BuildFinished` from the detached build thread should no-op.
+        assert_eq!(
+            s.step(
+                "dev",
+                Event::BuildFinished {
+                    generation: g,
+                    outcome: AppBuildOutcome::Green,
+                }
+            ),
+            vec![],
+            "stale event for removed instance is silently ignored"
+        );
     }
 }

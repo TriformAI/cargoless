@@ -378,6 +378,57 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         }
     }
 
+    /// Register a freshly-configured instance that was not present at boot
+    /// (SIGHUP hot-add). The instance starts `Idle`; the ref poller the caller
+    /// starts will post the first `HeadAdvanced` to kick off the build.
+    pub fn add_instance(&mut self, config: InstanceConfig) {
+        self.state.add_instance(config.name.clone());
+        self.runtimes.insert(
+            config.name,
+            Runtime {
+                slot: config.slot,
+                paths: config.paths,
+                env: config.env,
+                children: BTreeMap::new(),
+            },
+        );
+        self.publish();
+    }
+
+    /// Tear down an instance (SIGHUP hot-remove): stop every tracked child
+    /// immediately (no drain grace — the operator explicitly removed it), clear
+    /// the upstream slot, then remove from state and runtime. The call is safe
+    /// to repeat; an unknown instance is silently ignored.
+    pub fn remove_instance(&mut self, instance: &str) {
+        // Kill all tracked children (serving + draining).  We copy the
+        // handles out first to avoid holding the runtime borrow across the
+        // launcher call (the disjoint-fields borrow rule).
+        let handles: Vec<(Generation, ChildHandle)> = self
+            .runtimes
+            .get(instance)
+            .map(|rt| rt.children.iter().map(|(&g, &h)| (g, h)).collect())
+            .unwrap_or_default();
+        for (generation, child) in handles {
+            self.launcher.stop(instance, generation, child.token, false);
+            self.ports.release(child.port);
+        }
+        // Clear the proxy slot so new connections see "no upstream" immediately.
+        if let Some(rt) = self.runtimes.get(instance) {
+            rt.slot.clear();
+        }
+        self.runtimes.remove(instance);
+        self.state.remove_instance(instance);
+        self.publish();
+    }
+
+    /// Update the per-instance env overlay (SIGHUP env change). Takes effect
+    /// on the *next* child spawn; the currently-serving child is not restarted.
+    pub fn update_instance_env(&mut self, instance: &str, env: Vec<(String, String)>) {
+        if let Some(rt) = self.runtimes.get_mut(instance) {
+            rt.env = env;
+        }
+    }
+
     /// Called by the loop when a drain finishes: reclaim the child's port.
     pub fn on_drain_reclaimed(&mut self, instance: &str, generation: Generation) {
         let child = match self.runtimes.get_mut(instance) {
