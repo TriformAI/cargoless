@@ -20,16 +20,21 @@
 //! a successful probe (promote) or the serving child's own exit. A failed
 //! build or boot cannot touch the running app even by accident.
 //!
-//! ## Build-queue arbitration (serialized, newest-sha-wins)
+//! ## Build-queue arbitration (serialized by default, optionally parallel)
 //!
-//! Builds are serialized daemon-wide (one shared `CARGO_TARGET_DIR`; two
-//! concurrent 40 GB-target builds would just contend). The queue is FIFO
-//! across instances; *within* an instance the newest sha always supersedes a
-//! queued older one (a queued build that nobody wants is pure waste), while
-//! a *running* build is never cancelled — its sha was HEAD when it started,
-//! its green is real, and it promotes before the newer sha builds
-//! (latest-green per ref, applied in order). Probing does **not** hold the
-//! build slot: the moment a build finishes, the next instance's build
+//! By default, builds are serialized daemon-wide (one shared
+//! `CARGO_TARGET_DIR`; two concurrent 40 GB-target builds would just contend).
+//! An optional `max_concurrent` > 1 allows up to N instances to build at once;
+//! each such lane must use its own `CARGO_TARGET_DIR` so incremental state and
+//! file locks do not interfere. The default (= 1) is byte-identical to the
+//! original single-slot behaviour.
+//!
+//! The queue is FIFO across instances; *within* an instance the newest sha
+//! always supersedes a queued older one (a queued build that nobody wants is
+//! pure waste), while a *running* build is never cancelled — its sha was HEAD
+//! when it started, its green is real, and it promotes before the newer sha
+//! builds (latest-green per ref, applied in order). Probing does **not** hold
+//! the build slot: the moment a build finishes, the next instance's build
 //! dispatches while the first instance's child boots.
 //!
 //! ## Generations
@@ -55,7 +60,7 @@
 //! **converge to a verdict** (green if the next build is attributable, else a
 //! bounded red) instead of superseding the in-flight build indefinitely.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Daemon-unique activity generation (build/probe attempts).
 pub type Generation = u64;
@@ -209,21 +214,39 @@ pub struct AppState {
     /// Instances waiting for the build slot, FIFO. An instance appears here
     /// iff its pipeline is `Queued` (the sha lives there).
     queue: Vec<String>,
-    /// The instance currently holding the (single) build slot.
-    building: Option<String>,
+    /// Instances currently building. When `max_concurrent == 1` this set has
+    /// at most one element — identical to the old `building: Option<String>`
+    /// invariant. When > 1, up to `max_concurrent` instances may build at once,
+    /// each in its own `CARGO_TARGET_DIR`.
+    building: BTreeSet<String>,
+    /// How many instances may build concurrently. Default 1 = today's
+    /// serialised behaviour. Must be ≥ 1.
+    max_concurrent: usize,
     next_generation: Generation,
 }
 
 impl AppState {
     /// Seed one `Idle` instance per configured name (instances-file order).
+    /// `max_concurrent = 1` is the default (serialised, today's behaviour).
     pub fn new<I: IntoIterator<Item = String>>(names: I) -> Self {
+        Self::with_max_concurrent(names, 1)
+    }
+
+    /// Like `new` but with a configurable concurrency limit. Values < 1 are
+    /// clamped to 1. Values > 1 enable the per-lane `CARGO_TARGET_DIR`
+    /// isolation that the build backend must wire up.
+    pub fn with_max_concurrent<I: IntoIterator<Item = String>>(
+        names: I,
+        max_concurrent: usize,
+    ) -> Self {
         Self {
             instances: names
                 .into_iter()
                 .map(|n| (n, InstanceState::default()))
                 .collect(),
             queue: Vec::new(),
-            building: None,
+            building: BTreeSet::new(),
+            max_concurrent: max_concurrent.max(1),
             next_generation: 1,
         }
     }
@@ -236,9 +259,14 @@ impl AppState {
         self.instances.iter()
     }
 
-    /// Which instance currently holds the build slot, if any.
-    pub fn building(&self) -> Option<&str> {
-        self.building.as_deref()
+    /// The set of instances currently building.
+    pub fn building(&self) -> &BTreeSet<String> {
+        &self.building
+    }
+
+    /// True iff `instance` currently holds a build slot.
+    pub fn is_building(&self, instance: &str) -> bool {
+        self.building.contains(instance)
     }
 
     /// Add a new instance (initially `Idle`). No-op if the name already exists.
@@ -254,11 +282,9 @@ impl AppState {
     pub fn remove_instance(&mut self, name: &str) {
         self.instances.remove(name);
         self.queue.retain(|n| n != name);
-        if self.building.as_deref() == Some(name) {
-            // The build thread is still running but will post a BuildFinished
-            // that the control loop discards (unknown instance → step() no-ops).
-            self.building = None;
-        }
+        // The build thread is still running but will post a BuildFinished
+        // that the control loop discards (unknown instance → step() no-ops).
+        self.building.remove(name);
     }
 
     #[cfg(test)]
@@ -338,9 +364,7 @@ impl AppState {
             _ => return, // stale or out-of-phase result: discard
         };
         // Free the build slot regardless of outcome.
-        if self.building.as_deref() == Some(instance) {
-            self.building = None;
-        }
+        self.building.remove(instance);
         let inst = self.instances.get_mut(instance).expect("checked");
         match outcome {
             AppBuildOutcome::Green => {
@@ -600,28 +624,29 @@ impl AppState {
         }
     }
 
-    /// Hand the (single) build slot to the next queued instance, if free.
+    /// Hand free build slot(s) to the next queued instance(s), up to
+    /// `max_concurrent`. With `max_concurrent == 1` this is identical to the
+    /// old single-slot dispatch: at most one `StartBuild` per call.
     fn dispatch(&mut self, actions: &mut Vec<Action>) {
-        if self.building.is_some() || self.queue.is_empty() {
-            return;
+        while self.building.len() < self.max_concurrent && !self.queue.is_empty() {
+            let instance = self.queue.remove(0);
+            let generation = self.alloc_generation();
+            let inst = self.instances.get_mut(&instance).expect("queued => exists");
+            let sha = match &inst.pipeline {
+                Pipeline::Queued { sha } => sha.clone(),
+                other => unreachable!("queued instance must be in Queued, was {other:?}"),
+            };
+            inst.pipeline = Pipeline::Building {
+                sha: sha.clone(),
+                generation,
+            };
+            self.building.insert(instance.clone());
+            actions.push(Action::StartBuild {
+                instance,
+                sha,
+                generation,
+            });
         }
-        let instance = self.queue.remove(0);
-        let generation = self.alloc_generation();
-        let inst = self.instances.get_mut(&instance).expect("queued => exists");
-        let sha = match &inst.pipeline {
-            Pipeline::Queued { sha } => sha.clone(),
-            other => unreachable!("queued instance must be in Queued, was {other:?}"),
-        };
-        inst.pipeline = Pipeline::Building {
-            sha: sha.clone(),
-            generation,
-        };
-        self.building = Some(instance.clone());
-        actions.push(Action::StartBuild {
-            instance,
-            sha,
-            generation,
-        });
     }
 
     fn record_red(
@@ -906,7 +931,7 @@ mod tests {
                 if instance == "feature-x" && sha == "f1"),
             "{actions:?}"
         );
-        assert_eq!(s.building(), Some("feature-x"));
+        assert!(s.is_building("feature-x"));
     }
 
     #[test]
@@ -1356,7 +1381,7 @@ mod tests {
         let g_dev = drive_to_serving(&mut s, "dev", "d1");
         // feature-x now grabs the (single) build slot…
         head(&mut s, "feature-x", "f1");
-        assert_eq!(s.building(), Some("feature-x"));
+        assert!(s.is_building("feature-x"));
         // …so dev's new HEAD can only queue behind it.
         head(&mut s, "dev", "d2");
         assert_eq!(
@@ -1478,7 +1503,7 @@ mod tests {
     }
 
     /// Removing an instance removes it from all bookkeeping: the map, the
-    /// queue if it was waiting for the build slot, and the `building` pointer
+    /// queue if it was waiting for the build slot, and the `building` set
     /// if it held the slot.
     #[test]
     fn remove_instance_clears_all_bookkeeping() {
@@ -1486,7 +1511,7 @@ mod tests {
         // Put dev in the build slot and feature-x in the queue.
         head(&mut s, "dev", "d1"); // dev is building
         head(&mut s, "feature-x", "f1"); // feature-x is queued
-        assert_eq!(s.building(), Some("dev"));
+        assert!(s.is_building("dev"));
         assert!(
             s.queue_contains("feature-x"),
             "feature-x should be queued before removal"
@@ -1503,12 +1528,11 @@ mod tests {
             "removed instance must not remain in the queue"
         );
 
-        // Remove the building instance: building slot freed.
+        // Remove the building instance: building set freed.
         s.remove_instance("dev");
         assert!(s.instance("dev").is_none());
-        assert_eq!(
-            s.building(),
-            None,
+        assert!(
+            s.building().is_empty(),
             "building slot freed when builder removed"
         );
     }
@@ -1534,5 +1558,101 @@ mod tests {
             vec![],
             "stale event for removed instance is silently ignored"
         );
+    }
+
+    // ── CGLS-15: per-lane build slot ─────────────────────────────────────────
+
+    fn state_parallel(names: &[&str], max_concurrent: usize) -> AppState {
+        AppState::with_max_concurrent(names.iter().map(|s| s.to_string()), max_concurrent)
+    }
+
+    /// With `max_concurrent=2`, two instances can be Building simultaneously.
+    #[test]
+    fn max_concurrent_2_allows_two_simultaneous_builds() {
+        let mut s = state_parallel(&["dev", "feature-x"], 2);
+
+        // dev queues + dispatches immediately (slot 1).
+        let a = head(&mut s, "dev", "d1");
+        assert_eq!(a.len(), 1);
+        assert!(matches!(&a[0], Action::StartBuild { instance, .. } if instance == "dev"));
+        assert!(s.is_building("dev"));
+
+        // feature-x also dispatches immediately — the second slot is free.
+        let a = head(&mut s, "feature-x", "f1");
+        assert_eq!(a.len(), 1);
+        assert!(
+            matches!(&a[0], Action::StartBuild { instance, sha, .. }
+                if instance == "feature-x" && sha == "f1"),
+            "second slot dispatches right away: {a:?}"
+        );
+        assert!(s.is_building("feature-x"), "feature-x now also building");
+        assert!(s.is_building("dev"), "dev is still building too");
+        assert_eq!(s.building().len(), 2, "both slots occupied");
+    }
+
+    /// With `max_concurrent=1`, the second instance must wait (today's behaviour).
+    #[test]
+    fn max_concurrent_1_serialises_builds() {
+        // This is the default — this test asserts byte-identical behaviour to
+        // the original single-slot invariant.
+        let mut s = state(&["dev", "feature-x"]); // default max_concurrent=1
+
+        let a = head(&mut s, "dev", "d1");
+        let g_dev = build_gen(&a);
+        assert!(s.is_building("dev"));
+
+        // feature-x must wait: the single slot is taken.
+        let a = head(&mut s, "feature-x", "f1");
+        assert_eq!(a, vec![], "no StartBuild while dev holds the slot");
+        assert_eq!(
+            s.instance("feature-x").unwrap().pipeline,
+            Pipeline::Queued { sha: "f1".into() }
+        );
+        assert!(!s.is_building("feature-x"));
+
+        // dev finishes: releases the slot, feature-x is dispatched.
+        let a = green(&mut s, "dev", g_dev);
+        assert!(
+            a.iter().any(
+                |x| matches!(x, Action::StartBuild { instance, .. } if instance == "feature-x")
+            ),
+            "slot released → feature-x dispatches: {a:?}"
+        );
+    }
+
+    /// Default (flag unset / max_concurrent=1) — arbitration and target-dir
+    /// resolution are identical to the pre-CGLS-15 baseline.
+    #[test]
+    fn default_off_guard_single_slot_invariant() {
+        // `AppState::new` must produce exactly the same observable sequencing
+        // as the old single-`building: Option<String>` implementation.
+        let mut s = AppState::new(["alpha", "beta"].iter().map(|n| n.to_string()));
+
+        // alpha takes the single slot.
+        let a = s.step("alpha", Event::HeadAdvanced { sha: "a1".into() });
+        let g = build_gen(&a);
+        assert!(s.is_building("alpha"));
+        assert_eq!(s.building().len(), 1, "exactly one builder");
+
+        // beta must queue, not build.
+        let a2 = s.step("beta", Event::HeadAdvanced { sha: "b1".into() });
+        assert_eq!(a2, vec![], "beta queued, not dispatched");
+        assert_eq!(s.building().len(), 1, "still exactly one builder");
+
+        // alpha finishes green: beta is dispatched.
+        let a3 = s.step(
+            "alpha",
+            Event::BuildFinished {
+                generation: g,
+                outcome: AppBuildOutcome::Green,
+            },
+        );
+        assert!(
+            a3.iter()
+                .any(|x| matches!(x, Action::StartBuild { instance, .. } if instance == "beta")),
+            "beta dispatches after alpha frees the slot: {a3:?}"
+        );
+        assert!(!s.is_building("alpha"), "alpha freed the slot");
+        assert!(s.is_building("beta"), "beta now holds it");
     }
 }
