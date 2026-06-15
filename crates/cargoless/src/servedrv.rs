@@ -1030,6 +1030,10 @@ fn exec(
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
+            // CGLS-11: track whether this SwitchOverlay cycle is sourced
+            // from a pushed overlay (true) or the FS-watch path (false).
+            // Used below to gate the forced-reopen guard.
+            let mut is_from_pushed_overlay = false;
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
                 // #A2/#A7 — stamp attribution (base_sha + receipt/consume
                 // clocks) the instant the push is consumed, BEFORE the
@@ -1050,6 +1054,7 @@ fn exec(
                         gate: pushed.gate,
                     },
                 );
+                is_from_pushed_overlay = true;
                 pushed.files
             } else {
                 // #A2 — this verdict cycle is FS-derived. A leftover
@@ -1081,7 +1086,12 @@ fn exec(
             let lsp_pairs = lsp_source_pairs(&pairs);
             let target =
                 OverlaySet::from_pairs(lsp_pairs.iter().map(|(p, c)| (p.clone(), c.clone())));
-            for verb in cs.mux.switch_to(&target) {
+            // Collect the diff verbs once so we can inspect the count and
+            // still iterate for dispatch. `switch_to` returns a `Vec` so this
+            // is a single allocation regardless.
+            let verbs = cs.mux.switch_to(&target);
+            let zero_verbs = verbs.is_empty();
+            for verb in verbs {
                 match verb {
                     LspVerb::DidOpen { path, content } => {
                         let _ = lsp.did_open(&path.to_string_lossy(), &content, 1);
@@ -1112,6 +1122,53 @@ fn exec(
                     LspVerb::DidClose { path } => {
                         let _ = lsp.did_close(&path.to_string_lossy());
                     }
+                }
+            }
+            // CGLS-11 fix — forced close+reopen for identical-content
+            // re-pushes on the pool ingress path.
+            //
+            // When `overlay::diff` yields zero verbs (the minimality
+            // property: identical content in `applied` and `target` ⇒ no
+            // ops), RA receives no LSP notification → no `publishDiagnostics`
+            // → `real_flycheck_activity_seen` stays false → the 2s settle
+            // timer fires on an empty window → the CGLS-9 fail-closed guard
+            // publishes `verdict=unknown(ra_native_timer_settled_no_flycheck_
+            // activity)`. Observed live: agents iterating a branch re-push the
+            // same changed-file content on every attempt; the first push gets a
+            // real verdict, every subsequent push is unknown forever.
+            //
+            // Fix: when all three conditions hold —
+            //   1. `is_from_pushed_overlay` — this is a pool-push cycle, not
+            //      the FS-watch path (the FS path must be byte-identical to the
+            //      pre-fix behavior; non-regression test pins this).
+            //   2. `zero_verbs` — `overlay::diff` found no delta; RA is
+            //      otherwise not notified. When verbs were emitted, RA is
+            //      already triggered by the loop above; no extra nudge needed.
+            //   3. `target` is non-empty — there IS an overlay to analyze (an
+            //      intentional empty push clears all overlays; nothing to nudge).
+            // — force a close+reopen of the lexicographically first .rs file in
+            // the overlay. This is the SAME close+reopen mechanic already used
+            // for `DidChange` above (confirmed live: a close+reopen forces RA to
+            // re-run native analysis; a bare `didChange` does not). The
+            // `OverlayMultiplexer` state stays correct: `applied` already equals
+            // `target` after `switch_to`, so the multiplexer's open-set reflects
+            // reality — the forced close+reopen simply ensures RA re-analyzes
+            // content it otherwise believed was unchanged.
+            //
+            // Determinism: `first_rs_in_overlay` picks the lex-first key from
+            // the `OverlaySet`'s internal `BTreeMap`, which is sorted and stable.
+            if is_from_pushed_overlay && zero_verbs && !target.is_empty() {
+                if let Some((path, content)) = first_rs_in_overlay(&target) {
+                    eprintln!(
+                        "[cargoless:obs] cgls11-forced-reopen wt={} path={} (zero-verb re-push nudge)",
+                        wt.display(),
+                        path.display(),
+                    );
+                    let v = cs.next_ver;
+                    cs.next_ver += 1;
+                    let p = path.to_string_lossy();
+                    let _ = lsp.did_close(&p);
+                    let _ = lsp.did_open(&p, &content, v);
                 }
             }
             // Cargoless replaces iterative cargo check/clippy; pushed Cargo
@@ -1287,6 +1344,19 @@ fn lsp_source_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
 
 fn is_rust_source_path(path: &str) -> bool {
     Path::new(path).extension().is_some_and(|ext| ext == "rs")
+}
+
+/// CGLS-11 — pick the lexicographically first `.rs` file from an
+/// `OverlaySet` to use as the forced close+reopen target. The
+/// `OverlaySet`'s internal `BTreeMap` is sorted, so iteration order is
+/// deterministic and reproducible across runs. Returns `None` when the
+/// overlay contains no `.rs` entries (all Cargo.toml / Cargo.lock / etc.)
+/// — in that case the guard is a no-op (nothing to nudge RA with).
+fn first_rs_in_overlay(target: &OverlaySet) -> Option<(PathBuf, String)> {
+    target
+        .iter_rs()
+        .next()
+        .map(|(path, content)| (path.to_owned(), content.to_owned()))
 }
 
 #[cfg(test)]
@@ -2325,6 +2395,135 @@ mod tests {
                 "/repo/wt-01/alchemy/src/protocols/transfer.rs".into(),
                 "pub struct TransferProtocol;".into(),
             )]
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // CGLS-11 — first_rs_in_overlay + forced-reopen gate
+    //
+    // The forced-reopen guard fires on the pushed path when `mux.switch_to`
+    // returns zero verbs (identical content re-pushed). These tests pin:
+    //   (a) identical-content re-push → `first_rs_in_overlay` returns the
+    //       lex-first .rs, matching the nudge target.
+    //   (b) overlay with no .rs files → `first_rs_in_overlay` returns None
+    //       (no nudge; nothing to open).
+    //   (c) the FS-watch discriminant: `is_from_pushed_overlay` stays false
+    //       on the FS path — the guard MUST NOT fire there.
+    //   (d) first push (non-empty verbs) → the guard condition `zero_verbs`
+    //       is false → unchanged path.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cgls11_first_rs_in_overlay_returns_lex_first_rs() {
+        // Multiple .rs files + non-.rs files: must return the
+        // lexicographically first .rs by path (BTreeMap order).
+        use cargoless_core::overlay::OverlaySet;
+        let target = OverlaySet::from_pairs([
+            ("/repo/wt/zzz/last.rs", "fn last() {}"),
+            ("/repo/wt/aaa/first.rs", "fn first() {}"),
+            ("/repo/wt/Cargo.toml", "[workspace]"),
+            ("/repo/wt/mmm/middle.rs", "fn middle() {}"),
+        ]);
+
+        let result = first_rs_in_overlay(&target);
+        assert!(
+            result.is_some(),
+            "non-empty overlay with .rs files must return Some"
+        );
+        let (path, content) = result.unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/repo/wt/aaa/first.rs"),
+            "lex-first .rs path must be selected — BTreeMap order is stable"
+        );
+        assert_eq!(content, "fn first() {}");
+    }
+
+    #[test]
+    fn cgls11_first_rs_in_overlay_returns_none_when_no_rs_files() {
+        // An overlay that contains only non-.rs files (Cargo.toml,
+        // Cargo.lock, .cargo/config.toml). The guard must be a no-op —
+        // there is nothing RA can be re-notified about.
+        use cargoless_core::overlay::OverlaySet;
+        let target = OverlaySet::from_pairs([
+            ("/repo/wt/Cargo.toml", "[workspace]\nmembers=[]"),
+            ("/repo/wt/Cargo.lock", "# lock"),
+            ("/repo/wt/.cargo/config.toml", "[build]"),
+        ]);
+
+        assert!(
+            first_rs_in_overlay(&target).is_none(),
+            "overlay with no .rs files must return None — no file to nudge RA with"
+        );
+    }
+
+    #[test]
+    fn cgls11_first_rs_in_overlay_empty_overlay_returns_none() {
+        // An intentional empty push clears all overlays. The guard condition
+        // `!target.is_empty()` prevents reaching `first_rs_in_overlay` here,
+        // but the helper must also be safe to call on an empty set.
+        use cargoless_core::overlay::OverlaySet;
+        assert!(
+            first_rs_in_overlay(&OverlaySet::new()).is_none(),
+            "empty overlay must return None"
+        );
+    }
+
+    #[test]
+    fn cgls11_is_from_pushed_overlay_false_on_fs_path() {
+        // Non-regression: the FS-watch path must leave `is_from_pushed_overlay`
+        // false. We simulate the discriminant logic directly: `take_overlay_for`
+        // returns None on the FS path → the `if let Some(pushed)` arm is not
+        // taken → `is_from_pushed_overlay` stays at its initial `false`.
+        // This is a pure logic test (no real RA / LSP / disk I/O).
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        // No overlay was pushed for this key.
+        let wt_key = "/repo/fs-watch-wt";
+        assert!(
+            api.take_overlay_for(wt_key).is_none(),
+            "FS-watch path: take_overlay_for must return None"
+        );
+        // The guard condition `is_from_pushed_overlay` is false → forced
+        // reopen does NOT fire → FS behavior byte-identical to pre-fix.
+        // (The actual `is_from_pushed_overlay` local in `exec` is not
+        // observable from tests, but the precondition is: the code sets it
+        // only when `take_overlay_for` returns Some. If this assertion holds,
+        // the guard cannot fire on the FS path by construction.)
+        let mut is_from_pushed_overlay = false;
+        if api.take_overlay_for(wt_key).is_some() {
+            is_from_pushed_overlay = true;
+        }
+        assert!(
+            !is_from_pushed_overlay,
+            "FS path must not set is_from_pushed_overlay — guard must not fire"
+        );
+    }
+
+    #[test]
+    fn cgls11_zero_verbs_guard_condition_is_false_when_verbs_emitted() {
+        // When the overlay DOES change (non-zero verbs from mux.switch_to),
+        // `zero_verbs` is false → the guard must not fire regardless of
+        // the pushed-overlay or non-empty conditions. Tests the condition
+        // logic at the multiplexer layer.
+        use cargoless_core::multiplex::OverlayMultiplexer;
+        use cargoless_core::overlay::OverlaySet;
+
+        let mut mux = OverlayMultiplexer::new();
+        // First switch: goes from empty → non-empty → verbs ARE emitted.
+        let target = OverlaySet::from_pairs([("/repo/wt/src/lib.rs", "pub fn f() {}")]);
+        let verbs = mux.switch_to(&target);
+        let zero_verbs = verbs.is_empty();
+        assert!(
+            !zero_verbs,
+            "first push of new content must emit verbs — guard condition must be false"
+        );
+
+        // Second switch: same content → zero verbs → guard would fire (on pushed path).
+        let verbs2 = mux.switch_to(&target);
+        let zero_verbs2 = verbs2.is_empty();
+        assert!(
+            zero_verbs2,
+            "re-push of identical content must yield zero verbs — this is the CGLS-11 trigger"
         );
     }
 

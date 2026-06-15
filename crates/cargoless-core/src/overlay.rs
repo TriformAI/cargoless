@@ -93,6 +93,17 @@ impl OverlaySet {
     pub fn get(&self, path: &Path) -> Option<&str> {
         self.files.get(path).map(String::as_str)
     }
+
+    /// Iterate over overlaid `.rs` files in deterministic (sorted) order.
+    /// Used by the CGLS-11 forced-reopen guard to pick a stable nudge
+    /// target when `overlay::diff` yields zero verbs for a re-push of
+    /// identical content. The `BTreeMap` guarantees sorted iteration.
+    pub fn iter_rs(&self) -> impl Iterator<Item = (&Path, &str)> {
+        self.files
+            .iter()
+            .filter(|(path, _)| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|(path, content)| (path.as_path(), content.as_str()))
+    }
 }
 
 /// A minimal LSP overlay operation in a delta. The I/O shell lowers
@@ -316,5 +327,51 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s.get(Path::new("a.rs")), Some("A"));
         assert_eq!(s.get(Path::new("missing.rs")), None);
+    }
+
+    // ─── CGLS-11 — iter_rs ──────────────────────────────────────────────
+
+    #[test]
+    fn iter_rs_returns_only_rs_files_in_sorted_order() {
+        // Mixed overlay: .rs files interleaved with non-.rs files.
+        // iter_rs must return only the .rs entries, in BTreeMap order.
+        let s = set(&[
+            ("zzz/last.rs", "fn last() {}"),
+            ("Cargo.toml", "[workspace]"),
+            ("aaa/first.rs", "fn first() {}"),
+            ("Cargo.lock", "# lock"),
+            ("mmm/middle.rs", "fn middle() {}"),
+        ]);
+        let results: Vec<_> = s.iter_rs().collect();
+        assert_eq!(
+            results,
+            vec![
+                (Path::new("aaa/first.rs"), "fn first() {}"),
+                (Path::new("mmm/middle.rs"), "fn middle() {}"),
+                (Path::new("zzz/last.rs"), "fn last() {}"),
+            ],
+            "iter_rs must skip non-.rs files and return .rs entries in sorted path order"
+        );
+    }
+
+    #[test]
+    fn iter_rs_empty_when_no_rs_files() {
+        let s = set(&[
+            ("Cargo.toml", "[workspace]"),
+            ("Cargo.lock", "# lock"),
+            (".cargo/config.toml", "[build]"),
+        ]);
+        assert!(
+            s.iter_rs().next().is_none(),
+            "iter_rs must yield nothing when the overlay has no .rs files"
+        );
+    }
+
+    #[test]
+    fn iter_rs_empty_on_empty_overlay() {
+        assert!(
+            OverlaySet::new().iter_rs().next().is_none(),
+            "iter_rs on an empty overlay must be immediately exhausted"
+        );
     }
 }
