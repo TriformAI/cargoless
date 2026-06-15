@@ -1087,9 +1087,27 @@ fn exec(
                         let _ = lsp.did_open(&path.to_string_lossy(), &content, 1);
                     }
                     LspVerb::DidChange { path, content } => {
+                        // CGLS verdict-flow fix: a bare `textDocument/didChange`
+                        // does NOT make rust-analyzer re-publish diagnostics for
+                        // an already-open document here (empirically: with
+                        // checkOnSave off / RA-native-only, the first push of a
+                        // file `didOpen`s → RA analyzes → green, but every
+                        // SUBSEQUENT push of the SAME file `didChange`s → RA stays
+                        // silent → the 2s liveness timer settles an empty window →
+                        // verdict=unknown, FOREVER, because agents iterating a
+                        // branch re-push the same changed files. Confirmed live: a
+                        // close+reopen of the path restores analysis (green); a
+                        // didChange does not, even 25s later. So re-open the
+                        // document (close → open) instead of changing it, which
+                        // forces RA to re-run native analysis on the new content.
+                        // The OverlayMultiplexer's proven `applied`/open-set core
+                        // is untouched; we keep `self.open` truthful by closing
+                        // before re-opening at the wire seam.
                         let v = cs.next_ver;
                         cs.next_ver += 1;
-                        let _ = lsp.did_change(&path.to_string_lossy(), &content, v);
+                        let p = path.to_string_lossy();
+                        let _ = lsp.did_close(&p);
+                        let _ = lsp.did_open(&p, &content, v);
                     }
                     LspVerb::DidClose { path } => {
                         let _ = lsp.did_close(&path.to_string_lossy());
