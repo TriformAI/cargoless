@@ -55,10 +55,18 @@ use super::{
 /// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
 /// request body. The body-reading route is *bounded by construction*:
 /// the server `read_exact`s an EXACT, capped `Content-Length` and never
-/// more; a larger declared length is refused `413` before any read. 32
-/// MiB comfortably covers a whole-file overlay-set for a real workspace
-/// while fail-closed-bounding a hostile/runaway client.
-pub const MAX_OVERLAY_BYTES: usize = 32 * 1024 * 1024;
+/// more; a larger declared length is refused `413` before any read. 128
+/// MiB comfortably covers a whole-file overlay-set for a real workspace —
+/// including monorepo codegen changes that rewrite multi-MB generated
+/// aggregators (openapi.yaml, operations_registry.rs, platform_docs_html.rs
+/// each ~2-3 MiB, ×2 physics+portal mirrors) — while still
+/// fail-closed-bounding a hostile/runaway client. Raised from 32 MiB
+/// (2026-06-15) because full-content codegen overlays routinely exceeded it;
+/// the real fix is git-native transport (only the uncommitted delta ships),
+/// after which this ceiling rarely binds. Keep in lockstep with the
+/// client-side preflight defaults in tf-multiverse (scripts/check-remote,
+/// scripts/dev-merge, scripts/cargoless-overlay-preflight).
+pub const MAX_OVERLAY_BYTES: usize = 128 * 1024 * 1024;
 /// Compress large JSON request bodies before applying the fixed HTTP cap.
 /// This targets full-file generated overlays without changing the logical
 /// push protocol or making small same-host requests pay gzip overhead.
