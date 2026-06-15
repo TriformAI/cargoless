@@ -46,6 +46,11 @@ use crate::l4proxy::UpstreamSlot;
 pub struct InstancePaths {
     pub worktree: PathBuf,
     pub bundles: PathBuf,
+    /// Extra environment variables injected into every build step for this
+    /// instance. Used to set a per-lane `CARGO_TARGET_DIR` when
+    /// `max_concurrent > 1`; empty (and ignored) for the default single-slot
+    /// mode — that path is byte-identical to the pre-CGLS-15 behaviour.
+    pub build_env: Vec<(String, String)>,
 }
 
 impl InstancePaths {
@@ -188,6 +193,9 @@ pub struct Backends<B: BuildBackend, L: ChildLauncher, S: EventSink> {
     pub ports: Arc<PortAllocator>,
     /// Clock for state-file heartbeats (injected for test determinism).
     pub now: fn() -> u64,
+    /// How many instances may build concurrently (CGLS-15). Default 1 =
+    /// original serialised behaviour. Values < 1 are clamped to 1.
+    pub max_concurrent_builds: usize,
 }
 
 impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
@@ -198,7 +206,10 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         backends: Backends<B, L, S>,
         state_dir: PathBuf,
     ) -> Self {
-        let state = AppState::new(instances.iter().map(|i| i.name.clone()));
+        let state = AppState::with_max_concurrent(
+            instances.iter().map(|i| i.name.clone()),
+            backends.max_concurrent_builds,
+        );
         let runtimes = instances
             .into_iter()
             .map(|i| {
@@ -560,6 +571,7 @@ mod tests {
                 paths: InstancePaths {
                     worktree: dir.join(n).join("wt"),
                     bundles: dir.join(n).join("bundles"),
+                    build_env: Vec::new(),
                 },
                 env: Vec::new(),
             })
@@ -573,6 +585,7 @@ mod tests {
                 svc,
                 ports,
                 now: || 0,
+                max_concurrent_builds: 1,
             },
             dir,
         )

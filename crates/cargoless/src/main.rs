@@ -134,6 +134,11 @@ struct Opts {
     port_range: Option<String>,
     /// `app-serve --poll-interval-ms <N>` — ref poll cadence (default 2000).
     poll_interval_ms: Option<u64>,
+    /// `app-serve --max-concurrent-builds N` (also `CARGOLESS_APP_PARALLEL_BUILDS`):
+    /// how many instances may build at once. Default 0 = use the env var or
+    /// fall back to 1 (serialised, today's behaviour). Also see
+    /// `AppServeOpts::max_concurrent_builds`.
+    max_concurrent_builds: usize,
     /// `status --remote <url>` — query a remote `serve --bind` fleet
     /// daemon over the shipped HTTP(S) transport instead of the on-disk
     /// `cli-status`. Resolved through `transport::discovery` (explicit
@@ -376,6 +381,13 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .parse()
                         .map_err(|_| ParseError::MissingValue("--poll-interval-ms"))?,
                 );
+            }
+            "--max-concurrent-builds" => {
+                opts.max_concurrent_builds = it
+                    .next()
+                    .ok_or(ParseError::MissingValue("--max-concurrent-builds"))?
+                    .parse()
+                    .map_err(|_| ParseError::MissingValue("--max-concurrent-builds"))?;
             }
             // verdict: --remote is repeatable (failover ladder) — must
             // precede the scalar arm below (match arms are tried in order).
@@ -754,6 +766,7 @@ fn main() -> ExitCode {
                 state_dir: parsed.opts.state_dir.clone(),
                 auth_token: parsed.opts.auth_token.clone(),
                 poll_interval_ms: parsed.opts.poll_interval_ms,
+                max_concurrent_builds: parsed.opts.max_concurrent_builds,
             });
         }
         // `status --remote <url>` queries a remote fleet `serve --bind`

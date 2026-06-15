@@ -68,6 +68,18 @@ pub struct AppServeOpts {
     pub auth_token: Option<String>,
     /// `--poll-interval-ms <N>` — ref poll cadence (default 2000).
     pub poll_interval_ms: Option<u64>,
+    /// `--max-concurrent-builds N` (also `CARGOLESS_APP_PARALLEL_BUILDS=N`):
+    /// how many instances may build at once. **Default 1** = the original
+    /// serialised behaviour (byte-identical). When > 1, each building lane
+    /// gets its own `CARGO_TARGET_DIR` (`<state_dir>/app/<instance>/target`)
+    /// so concurrent builds do not corrupt each other's incremental state or
+    /// fight cargo's file locks. Capped at 2 for the first operator-visible
+    /// release; set to 0 or omit to keep the default of 1.
+    ///
+    /// **Tradeoff**: N× target-dir disk (~40 GB each) on the PVC + CPU/RAM
+    /// contention for parallel cold builds — that is why this is opt-in and
+    /// capped. PVC sizing for N > 1 is a separate follow-up.
+    pub max_concurrent_builds: usize,
 }
 
 /// Parsed `--port-range START-END`.
@@ -430,13 +442,16 @@ impl BuildBackend for ThreadBuildBackend {
             worktree: paths.worktree.clone(),
             bundles: paths.bundles.clone(),
         };
+        // CGLS-15: pass the per-lane build env (contains CARGO_TARGET_DIR
+        // when max_concurrent > 1; empty for the default single-slot mode).
+        let build_env = paths.build_env.clone();
         let (instance, sha, tx) = (
             instance.to_string(),
             sha.to_string(),
             self.events_tx.clone(),
         );
         std::thread::spawn(move || {
-            let report = appbuild::build(&appbuild::RealHooks, &build_paths, &sha, &[]);
+            let report = appbuild::build(&appbuild::RealHooks, &build_paths, &sha, &build_env);
             let outcome = match report {
                 BuildReport::Green { .. } => cargoless_core::appstate::AppBuildOutcome::Green,
                 BuildReport::Red { reason, .. } => {
@@ -468,6 +483,21 @@ impl EventSink for ChannelSink {
     }
 }
 
+/// Resolve the effective max-concurrent-builds limit from opts + env.
+/// - `opts.max_concurrent_builds > 0` overrides everything.
+/// - `CARGOLESS_APP_PARALLEL_BUILDS=N` env var is the second source.
+/// - Default 1 = serialised builds (today's behaviour).
+/// - Capped at 2 for the first operator-visible release.
+fn resolve_max_concurrent(opts: &AppServeOpts) -> usize {
+    const CAP: usize = 2;
+    let from_opts = (opts.max_concurrent_builds > 0).then_some(opts.max_concurrent_builds);
+    let from_env = std::env::var("CARGOLESS_APP_PARALLEL_BUILDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    // Clamp to [1, CAP]: 0 falls back to 1 (default-off); >CAP is capped.
+    from_opts.or(from_env).unwrap_or(1).clamp(1, CAP)
+}
+
 #[allow(clippy::too_many_lines)]
 fn serve_loop(
     repo: &Path,
@@ -479,6 +509,10 @@ fn serve_loop(
 ) -> Result<(), String> {
     let (events_tx, events_rx) = channel::<(String, Event)>();
     let svc = Arc::new(AppServeState::new());
+
+    // CGLS-15: resolve the concurrency limit. Default 1 = serialised (today's
+    // behaviour). When > 1 each lane gets its own CARGO_TARGET_DIR.
+    let max_concurrent = resolve_max_concurrent(opts);
 
     // Bind one L4 proxy per instance + build the per-instance driver config.
     let holding = Arc::new(HoldingResponse::page(
@@ -496,11 +530,26 @@ fn serve_loop(
     for spec in &specs {
         let proxy = L4Proxy::bind(spec.app_bind, holding.clone())
             .map_err(|e| format!("instance `{}` proxy bind {}: {e}", spec.name, spec.app_bind))?;
+        // CGLS-15: when max_concurrent > 1 each lane gets its own
+        // CARGO_TARGET_DIR (`<state_dir>/app/<instance>/target`) so concurrent
+        // builds do not corrupt each other's incremental state or fight cargo's
+        // file locks. Default (=1): empty build_env → process inherits the
+        // pod's ambient CARGO_TARGET_DIR — byte-identical to pre-CGLS-15.
+        let build_env = if max_concurrent > 1 {
+            let lane_target = state_dir.join("app").join(&spec.name).join("target");
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                lane_target.to_string_lossy().into_owned(),
+            )]
+        } else {
+            Vec::new()
+        };
         // The driver flips the SAME slot Arc the proxy reads on every accept,
         // so a promote is visible to new connections immediately.
         let paths = InstancePaths {
             worktree: instance_worktree(state_dir, &spec.name),
             bundles: state_dir.join("app").join(&spec.name).join("bundles"),
+            build_env,
         };
         instance_configs.push(InstanceConfig {
             name: spec.name.clone(),
@@ -558,6 +607,7 @@ fn serve_loop(
             svc: svc.clone(),
             ports,
             now: unix_now,
+            max_concurrent_builds: max_concurrent,
         },
         state_dir.to_path_buf(),
     );
@@ -636,6 +686,7 @@ fn serve_loop(
                 repo,
                 state_dir,
                 poll_ms,
+                max_concurrent,
                 &holding,
                 &mut driver,
                 &launcher_ref,
@@ -732,6 +783,7 @@ fn apply_sighup_reload(
     repo: &Path,
     state_dir: &Path,
     poll_ms: u64,
+    max_concurrent: usize,
     holding: &Arc<HoldingResponse>,
     driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
     launcher_ref: &Arc<ProcLauncher>,
@@ -788,9 +840,19 @@ fn apply_sighup_reload(
                         continue;
                     }
                 };
+                let build_env = if max_concurrent > 1 {
+                    let lane_target = state_dir.join("app").join(name).join("target");
+                    vec![(
+                        "CARGO_TARGET_DIR".to_string(),
+                        lane_target.to_string_lossy().into_owned(),
+                    )]
+                } else {
+                    Vec::new()
+                };
                 let paths = InstancePaths {
                     worktree: instance_worktree(state_dir, name),
                     bundles: state_dir.join("app").join(name).join("bundles"),
+                    build_env,
                 };
                 let env: Vec<(String, String)> = new_spec
                     .env
@@ -863,9 +925,19 @@ fn apply_sighup_reload(
                             continue;
                         }
                     };
+                    let bind_changed_build_env = if max_concurrent > 1 {
+                        let lane_target = state_dir.join("app").join(name).join("target");
+                        vec![(
+                            "CARGO_TARGET_DIR".to_string(),
+                            lane_target.to_string_lossy().into_owned(),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
                     let paths = InstancePaths {
                         worktree: instance_worktree(state_dir, name),
                         bundles: state_dir.join("app").join(name).join("bundles"),
+                        build_env: bind_changed_build_env,
                     };
                     let env: Vec<(String, String)> = new_spec
                         .env
@@ -1431,6 +1503,116 @@ mod tests {
         assert_eq!(
             observed, "origin/feature-x",
             "updated ref must be visible through the shared cell"
+        );
+    }
+
+    // ── CGLS-15: per-lane build slot ─────────────────────────────────────────
+
+    /// `resolve_max_concurrent` returns 1 (default-off) when neither the flag
+    /// nor the env var is set.
+    #[test]
+    fn default_off_guard_max_concurrent_is_1() {
+        // Remove the env var in case a parent process set it.
+        // SAFETY: env mutation is inherently racy with parallel tests; these
+        // tests only assert `resolve_max_concurrent` logic and the window is
+        // minimal. set_var/remove_var are unsafe in Edition 2024.
+        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        let opts = AppServeOpts::default(); // max_concurrent_builds = 0
+        assert_eq!(
+            resolve_max_concurrent(&opts),
+            1,
+            "flag unset + no env → default 1 (serialised)"
+        );
+    }
+
+    /// The CLI flag overrides the default.
+    #[test]
+    fn max_concurrent_flag_overrides_default() {
+        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        let opts = AppServeOpts {
+            max_concurrent_builds: 2,
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_concurrent(&opts), 2);
+    }
+
+    /// The env var is read when the flag is absent.
+    #[test]
+    fn max_concurrent_env_var_is_read() {
+        // SAFETY: single-threaded env mutation; unsafe in Edition 2024.
+        unsafe { std::env::set_var("CARGOLESS_APP_PARALLEL_BUILDS", "2") };
+        let opts = AppServeOpts::default();
+        let result = resolve_max_concurrent(&opts);
+        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        assert_eq!(result, 2);
+    }
+
+    /// The cap of 2 is enforced even if a higher value is requested.
+    #[test]
+    fn max_concurrent_capped_at_2() {
+        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        let opts = AppServeOpts {
+            max_concurrent_builds: 99,
+            ..Default::default()
+        };
+        assert_eq!(resolve_max_concurrent(&opts), 2, "capped at 2");
+    }
+
+    /// Target-dir isolation: when max_concurrent > 1, each lane gets its own
+    /// distinct CARGO_TARGET_DIR under the state dir.
+    #[test]
+    fn target_dir_isolation_per_lane() {
+        let state_dir = std::path::PathBuf::from("/state");
+        // Simulate two instances when max_concurrent = 2.
+        let instances = ["dev", "feature-x"];
+        let max_concurrent: usize = 2;
+        let mut seen: Vec<String> = Vec::new();
+        for name in &instances {
+            let build_env: Vec<(String, String)> = if max_concurrent > 1 {
+                let lane_target = state_dir.join("app").join(name).join("target");
+                vec![(
+                    "CARGO_TARGET_DIR".to_string(),
+                    lane_target.to_string_lossy().into_owned(),
+                )]
+            } else {
+                Vec::new()
+            };
+            let target = build_env
+                .iter()
+                .find(|(k, _)| k == "CARGO_TARGET_DIR")
+                .map(|(_, v)| v.clone())
+                .expect("CARGO_TARGET_DIR must be set per-lane when max_concurrent > 1");
+            assert!(
+                target.contains(name),
+                "per-lane target dir must contain the instance name: {target}"
+            );
+            assert!(
+                !seen.contains(&target),
+                "each lane must have a unique CARGO_TARGET_DIR: {target} already seen"
+            );
+            seen.push(target);
+        }
+    }
+
+    /// Default-off guard for target dir: when max_concurrent = 1, `build_env`
+    /// is empty (no CARGO_TARGET_DIR injection) — the process inherits the pod's
+    /// ambient value unchanged, exactly as before CGLS-15.
+    #[test]
+    fn default_off_no_target_dir_injection() {
+        let state_dir = std::path::PathBuf::from("/state");
+        let max_concurrent: usize = 1; // default
+        let build_env: Vec<(String, String)> = if max_concurrent > 1 {
+            let lane_target = state_dir.join("app").join("dev").join("target");
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                lane_target.to_string_lossy().into_owned(),
+            )]
+        } else {
+            Vec::new()
+        };
+        assert!(
+            build_env.is_empty(),
+            "default-off: build_env must be empty so the pod's ambient env is inherited unchanged"
         );
     }
 }
