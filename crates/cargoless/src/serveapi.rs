@@ -197,7 +197,8 @@ fn parse_macro_blind_globs(raw: &str) -> Vec<String> {
 }
 
 /// #CGLS-12 — the operator's proc-macro call-signature names, comma-separated
-/// in `CARGOLESS_MACRO_BLIND_MACROS` (e.g. `view!,html!`). Used by
+/// in `CARGOLESS_MACRO_BLIND_MACROS` (e.g. `view,html` — WITHOUT the trailing
+/// `!`; the scanner adds it). Used by
 /// [`compute_macro_blind_hit`] to narrow glob hits via content scanning.
 /// Empty / unset ⇒ macro names unconfigured ⇒ content scan is skipped and
 /// behavior is byte-identical to the pre-CGLS-12 pure path-glob path. Read
