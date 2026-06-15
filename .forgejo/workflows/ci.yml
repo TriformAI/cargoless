@@ -5,6 +5,18 @@ on:
   pull_request:
     branches: [main]
 
+# De-dupe concurrent runs for the same ref. Without this, a push to a branch
+# that ALSO has an open PR fires TWO full 5-job matrices (the `push` event and
+# the `pull_request` event) with no cancellation. On a single, occasionally
+# disk-pressured Forgejo runner they contend on the checkout-prereq step and
+# produce contradictory per-context results for an identical tree (e.g. a 19s
+# "build failure" in one matrix while the other builds green in ~2 min). Group
+# by workflow + ref and cancel the older in-flight run so each ref has at most
+# one live matrix; a new push supersedes its own prior run instead of racing it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Split into one job per check. This Forgejo build does not expose run/job
 # logs over the REST API, so job *granularity* is our only failure
 # observability: a red `fmt` job vs a red `build` job is diagnosable from
