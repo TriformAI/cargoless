@@ -109,18 +109,31 @@ extern "C" fn on_term(_sig: core::ffi::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
+// ── SIGHUP: instances-file hot-reload (CGLS-16) ──────────────────────────
+// A SIGHUP from the operator (e.g. a ConfigMap update that triggers a `kill
+// -HUP`) sets this flag. The control loop checks it each tick and, when set,
+// re-reads the instances file, diffs against the live set, and applies the
+// delta — all on the single control thread, so no new locks are needed.
+static RELOAD: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_hup(_sig: core::ffi::c_int) {
+    RELOAD.store(true, Ordering::SeqCst);
+}
+
 #[cfg(unix)]
 fn install_signal_stops() {
     const SIGINT: core::ffi::c_int = 2;
     const SIGTERM: core::ffi::c_int = 15;
+    const SIGHUP: core::ffi::c_int = 1;
     unsafe extern "C" {
         fn signal(signum: core::ffi::c_int, handler: extern "C" fn(core::ffi::c_int)) -> usize;
     }
-    // SAFETY: the handler body is a single atomic store (async-signal-safe) —
+    // SAFETY: the handler bodies are single atomic stores (async-signal-safe) —
     // the same house pattern as servedrv::install_signal_stops.
     unsafe {
         let _ = signal(SIGTERM, on_term);
         let _ = signal(SIGINT, on_term);
+        let _ = signal(SIGHUP, on_hup);
     }
 }
 
@@ -475,7 +488,9 @@ fn serve_loop(
         "<!doctype html><title>starting</title><h1>cargoless app-serve</h1>\
          <p>no green build is serving yet — building…</p>",
     ));
-    let mut proxies: Vec<L4Proxy> = Vec::new();
+    // `proxies` is keyed by instance name so SIGHUP can drop individual
+    // proxies (stopping their accept loop) when an instance is removed.
+    let mut proxies: BTreeMap<String, L4Proxy> = BTreeMap::new();
     let mut instance_configs = Vec::new();
     let mut run_plans: BTreeMap<String, RunPlan> = BTreeMap::new();
     for spec in &specs {
@@ -510,8 +525,12 @@ fn serve_loop(
             .or_else(|| run_plan_from_manifest(repo))
             .unwrap_or_else(default_run_plan);
         run_plans.insert(spec.name.clone(), plan);
-        proxies.push(proxy);
+        proxies.insert(spec.name.clone(), proxy);
     }
+
+    // Track the live spec set for SIGHUP diffing. Keyed by name.
+    let mut live_specs: BTreeMap<String, InstanceSpec> =
+        specs.iter().map(|s| (s.name.clone(), s.clone())).collect();
 
     let launcher = Arc::new(ProcLauncher {
         plans: std::sync::Mutex::new(run_plans),
@@ -586,16 +605,45 @@ fn serve_loop(
     }
 
     // Ref pollers: one thread per instance, posting HeadAdvanced on change.
+    // `live_refs` maps instance name → a shared mutable ref string; SIGHUP
+    // updates the mutex so a changed ref takes effect on the next poll tick
+    // without restarting the poller thread.
     let poll_ms = opts.poll_interval_ms.unwrap_or(2000).max(200);
+    let mut live_refs: BTreeMap<String, Arc<std::sync::Mutex<String>>> = BTreeMap::new();
     for spec in &specs {
-        spawn_ref_poller(repo, spec, poll_ms, events_tx.clone());
+        let cell = Arc::new(std::sync::Mutex::new(spec.git_ref.clone()));
+        live_refs.insert(spec.name.clone(), cell.clone());
+        spawn_ref_poller(repo, &spec.name, cell, poll_ms, events_tx.clone());
     }
 
     // ── the control loop ─────────────────────────────────────────────
-    // Single mutator of the driver; 200ms tick polls the shutdown flag.
+    // Single mutator of the driver; 200ms tick polls the shutdown + reload
+    // flags. All mutations of `driver`, `proxies`, `live_refs`, and
+    // `live_specs` happen on this thread — no new synchronisation needed.
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
+        }
+        // CGLS-16: SIGHUP hot-reload — re-read the instances file, diff
+        // against the live set, and apply the delta without a pod restart.
+        // Fail-safe: a malformed instances file keeps the prior set.
+        if RELOAD
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            apply_sighup_reload(
+                opts,
+                repo,
+                state_dir,
+                poll_ms,
+                &holding,
+                &mut driver,
+                &launcher_ref,
+                &mut proxies,
+                &mut live_specs,
+                &mut live_refs,
+                &events_tx,
+            );
         }
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok((instance, event)) => {
@@ -635,7 +683,246 @@ fn serve_loop(
     // Proxies drop here (accept loops stop); children are SIGTERM-swept by
     // their drain/stop paths. A full ordered child reap is inc-6 hardening.
     drop(proxies);
+    drop(live_specs);
     Ok(())
+}
+
+/// Attempt to reload the instances file. Returns `Some(specs)` on success,
+/// `None` on any failure (absent file, parse error, bad env-var reference).
+/// The fail-safe contract lives here: callers keep the prior set on `None`.
+fn try_reload_instances(opts: &AppServeOpts) -> Option<Vec<InstanceSpec>> {
+    let file = opts.instances.as_ref()?;
+    match load_instances(file, &|k| std::env::var(k).ok()) {
+        Ok(f) => Some(f.instances),
+        Err(e) => {
+            ui::error(format!(
+                "SIGHUP: instances file reload failed — keeping prior set: {e}"
+            ));
+            None
+        }
+    }
+}
+
+/// Apply a SIGHUP-triggered hot-reload: re-read the instances file, diff
+/// against the live set, and update the control-loop state in place.
+///
+/// **Fail-safe**: if the instances file is absent, malformed, or unparseable,
+/// the current live set is left completely unchanged — a bad ConfigMap push
+/// never disrupts serving instances. The error is logged loudly (operator
+/// should notice in pod logs / SigNoz).
+///
+/// **Delta semantics:**
+/// - **Added** instance (name present in new file, absent in live set):
+///   bind a new L4 proxy, register with the driver, start a ref poller.
+/// - **Removed** instance (name absent in new file, present in live set):
+///   immediately stop all children (no graceful drain — operator intent),
+///   drop the proxy (stop accept loop), remove from driver + ref tracking.
+/// - **Same name, changed `ref`**: update the live-ref cell; the poller
+///   picks it up on the next tick. The currently-serving child keeps
+///   running until a *new* build on the updated ref goes green
+///   (never-serve-red holds across a ref change).
+/// - **Same name, changed `env`**: update the driver's env overlay; takes
+///   effect on the next child spawn.
+/// - **Same name, same `ref` + `env`**: no-op (unchanged instance untouched).
+/// - **`app_bind` changed** on an existing name: treated as remove + add
+///   (the old port cannot be reused while the proxy is live).
+#[allow(clippy::too_many_arguments)] // all are mutable control-loop state; bundling adds noise
+fn apply_sighup_reload(
+    opts: &AppServeOpts,
+    repo: &Path,
+    state_dir: &Path,
+    poll_ms: u64,
+    holding: &Arc<HoldingResponse>,
+    driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
+    launcher_ref: &Arc<ProcLauncher>,
+    proxies: &mut BTreeMap<String, L4Proxy>,
+    live_specs: &mut BTreeMap<String, InstanceSpec>,
+    live_refs: &mut BTreeMap<String, Arc<std::sync::Mutex<String>>>,
+    events_tx: &Sender<(String, Event)>,
+) {
+    // Only meaningful when an instances file was configured (zero-config mode
+    // has no file to reload — the single default instance is immutable).
+    if opts.instances.is_none() {
+        ui::warn("SIGHUP received but no --instances file configured — ignoring");
+        return;
+    }
+
+    // Fail-safe: `try_reload_instances` returns None on any parse failure and
+    // logs the error; we keep the prior live set unchanged.
+    let Some(new_specs) = try_reload_instances(opts) else {
+        return;
+    };
+
+    let new_map: BTreeMap<String, InstanceSpec> =
+        new_specs.into_iter().map(|s| (s.name.clone(), s)).collect();
+
+    // ── removed instances ─────────────────────────────────────────────
+    let removed: Vec<String> = live_specs
+        .keys()
+        .filter(|n| !new_map.contains_key(*n))
+        .cloned()
+        .collect();
+    for name in &removed {
+        ui::ok(format!("SIGHUP: removing instance `{name}`"));
+        driver.remove_instance(name);
+        proxies.remove(name); // drop stops the accept loop
+        live_refs.remove(name);
+        live_specs.remove(name);
+        launcher_ref.plans.lock().expect("plans").remove(name);
+    }
+
+    // ── added or changed instances ────────────────────────────────────
+    for (name, new_spec) in &new_map {
+        match live_specs.get(name) {
+            None => {
+                // New instance: bind proxy, set up worktree, add to driver +
+                // ref tracking, start poller.
+                ui::ok(format!("SIGHUP: adding instance `{name}`"));
+                let proxy = match L4Proxy::bind(new_spec.app_bind, holding.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ui::error(format!(
+                            "SIGHUP: could not bind proxy for `{name}` at {}: {e} — skipping",
+                            new_spec.app_bind
+                        ));
+                        continue;
+                    }
+                };
+                let paths = InstancePaths {
+                    worktree: instance_worktree(state_dir, name),
+                    bundles: state_dir.join("app").join(name).join("bundles"),
+                };
+                let env: Vec<(String, String)> = new_spec
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let config = InstanceConfig {
+                    name: name.clone(),
+                    slot: proxy.slot().clone(),
+                    paths,
+                    env,
+                };
+                // Ensure the git worktree exists (same discipline as boot).
+                if let Err(e) = ensure_instance_worktree(
+                    repo,
+                    &instance_worktree(state_dir, name),
+                    &new_spec.git_ref,
+                ) {
+                    ui::warn(format!(
+                        "SIGHUP: instance `{name}`: could not set up worktree: {e}"
+                    ));
+                }
+                // Build the initial run plan for this instance.
+                let wt = instance_worktree(state_dir, name);
+                let plan = run_plan_from_manifest(&wt)
+                    .or_else(|| run_plan_from_manifest(repo))
+                    .unwrap_or_else(default_run_plan);
+                launcher_ref
+                    .plans
+                    .lock()
+                    .expect("plans")
+                    .insert(name.clone(), plan);
+
+                // Start the ref poller before adding to driver, so the first
+                // HeadAdvanced event can be processed as soon as the driver
+                // knows about the instance.
+                let cell = Arc::new(std::sync::Mutex::new(new_spec.git_ref.clone()));
+                live_refs.insert(name.clone(), cell.clone());
+                spawn_ref_poller(repo, name, cell, poll_ms, events_tx.clone());
+
+                driver.add_instance(config);
+                proxies.insert(name.clone(), proxy);
+                live_specs.insert(name.clone(), new_spec.clone());
+            }
+            Some(old_spec) => {
+                // Existing instance: check what changed.
+                let bind_changed = old_spec.app_bind != new_spec.app_bind;
+                if bind_changed {
+                    // `app_bind` change: treat as remove + add (cannot
+                    // rebind an active port in place).
+                    ui::ok(format!(
+                        "SIGHUP: instance `{name}` app_bind changed {} → {} — \
+                         removing and re-adding",
+                        old_spec.app_bind, new_spec.app_bind
+                    ));
+                    driver.remove_instance(name);
+                    proxies.remove(name);
+                    live_refs.remove(name);
+                    live_specs.remove(name);
+                    launcher_ref.plans.lock().expect("plans").remove(name);
+
+                    // Re-add with new bind.
+                    let proxy = match L4Proxy::bind(new_spec.app_bind, holding.clone()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            ui::error(format!(
+                                "SIGHUP: could not bind proxy for `{name}` at {}: {e} — skipping",
+                                new_spec.app_bind
+                            ));
+                            continue;
+                        }
+                    };
+                    let paths = InstancePaths {
+                        worktree: instance_worktree(state_dir, name),
+                        bundles: state_dir.join("app").join(name).join("bundles"),
+                    };
+                    let env: Vec<(String, String)> = new_spec
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let config = InstanceConfig {
+                        name: name.clone(),
+                        slot: proxy.slot().clone(),
+                        paths,
+                        env,
+                    };
+                    let wt = instance_worktree(state_dir, name);
+                    let plan = run_plan_from_manifest(&wt)
+                        .or_else(|| run_plan_from_manifest(repo))
+                        .unwrap_or_else(default_run_plan);
+                    launcher_ref
+                        .plans
+                        .lock()
+                        .expect("plans")
+                        .insert(name.clone(), plan);
+                    let cell = Arc::new(std::sync::Mutex::new(new_spec.git_ref.clone()));
+                    live_refs.insert(name.clone(), cell.clone());
+                    spawn_ref_poller(repo, name, cell, poll_ms, events_tx.clone());
+                    driver.add_instance(config);
+                    proxies.insert(name.clone(), proxy);
+                    live_specs.insert(name.clone(), new_spec.clone());
+                } else {
+                    // Same bind: apply in-place updates.
+                    if old_spec.git_ref != new_spec.git_ref {
+                        ui::ok(format!(
+                            "SIGHUP: instance `{name}` ref {} → {}",
+                            old_spec.git_ref, new_spec.git_ref
+                        ));
+                        if let Some(cell) = live_refs.get(name) {
+                            *cell.lock().expect("live_ref") = new_spec.git_ref.clone();
+                        }
+                    }
+                    if old_spec.env != new_spec.env {
+                        ui::ok(format!("SIGHUP: instance `{name}` env updated"));
+                        let env: Vec<(String, String)> = new_spec
+                            .env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        driver.update_instance_env(name, env);
+                    }
+                    live_specs.insert(name.clone(), new_spec.clone());
+                }
+            }
+        }
+    }
+
+    ui::ok(format!(
+        "SIGHUP: reload complete — {} instance(s) live",
+        live_specs.len()
+    ));
 }
 
 /// Emit one structured telemetry event for an observed lifecycle transition.
@@ -857,17 +1144,27 @@ fn bind_control_plane(
     Ok(Some(server))
 }
 
-/// One ref poller: resolve `spec.git_ref` to a sha on an interval, post
-/// HeadAdvanced when it changes. Uses `git rev-parse` (the same git the build
+/// One ref poller: resolve `live_ref` to a sha on an interval, post
+/// `HeadAdvanced` when it changes. Uses `git rev-parse` (the same git the build
 /// worker uses); a transient git error is skipped (next tick retries).
-fn spawn_ref_poller(repo: &Path, spec: &InstanceSpec, poll_ms: u64, tx: Sender<(String, Event)>) {
-    let (repo, name, git_ref) = (repo.to_path_buf(), spec.name.clone(), spec.git_ref.clone());
+///
+/// `live_ref` is an `Arc<Mutex<String>>` so the control thread can update the
+/// tracked ref on SIGHUP without killing and restarting the poller thread.
+fn spawn_ref_poller(
+    repo: &Path,
+    name: &str,
+    live_ref: Arc<std::sync::Mutex<String>>,
+    poll_ms: u64,
+    tx: Sender<(String, Event)>,
+) {
+    let (repo, name) = (repo.to_path_buf(), name.to_string());
     std::thread::spawn(move || {
         let mut last: Option<String> = None;
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 return;
             }
+            let git_ref = live_ref.lock().expect("live_ref").clone();
             match resolve_ref(&repo, &git_ref) {
                 Some(sha) if last.as_deref() != Some(sha.as_str()) => {
                     last = Some(sha.clone());
@@ -1053,5 +1350,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── CGLS-16: SIGHUP instances hot-reload ─────────────────────────────
+
+    /// `try_reload_instances` returns `None` (fail-safe) when the instances
+    /// file is missing — the caller keeps the prior live set.
+    #[test]
+    fn sighup_missing_file_returns_none() {
+        let opts = AppServeOpts {
+            repo: Some(PathBuf::from("/repo")),
+            instances: Some(PathBuf::from("/nonexistent/instances.yaml")),
+            ..Default::default()
+        };
+        assert!(
+            try_reload_instances(&opts).is_none(),
+            "missing file must return None (fail-safe — prior set kept)"
+        );
+    }
+
+    /// `try_reload_instances` returns `None` for a malformed instances file —
+    /// bad YAML / unknown key / missing `version` all fail loud + return None.
+    #[test]
+    fn sighup_bad_file_returns_none() {
+        let tmp = std::env::temp_dir().join(format!("cargoless-cgls16-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("instances.yaml");
+        // Missing `version:` → parse error.
+        std::fs::write(
+            &file,
+            "instances:\n  - name: dev\n    ref: origin/dev\n    app_bind: \"127.0.0.1:8080\"\n",
+        )
+        .unwrap();
+        let opts = AppServeOpts {
+            repo: Some(PathBuf::from("/repo")),
+            instances: Some(file),
+            ..Default::default()
+        };
+        assert!(
+            try_reload_instances(&opts).is_none(),
+            "malformed instances file must return None (fail-safe)"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `try_reload_instances` returns `Some(specs)` for a valid file.
+    #[test]
+    fn sighup_valid_file_returns_specs() {
+        let tmp =
+            std::env::temp_dir().join(format!("cargoless-cgls16-valid-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join("instances.yaml");
+        std::fs::write(
+            &file,
+            "version: 1\ninstances:\n  - name: dev\n    ref: origin/dev\n    app_bind: \"127.0.0.1:8080\"\n",
+        )
+        .unwrap();
+        let opts = AppServeOpts {
+            repo: Some(PathBuf::from("/repo")),
+            instances: Some(file),
+            ..Default::default()
+        };
+        let specs = try_reload_instances(&opts).expect("valid file returns Some");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "dev");
+        assert_eq!(specs[0].git_ref, "origin/dev");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The live-ref cell (Arc<Mutex<String>>) can be updated by the control
+    /// thread while the poller thread reads it — simulates SIGHUP ref change.
+    #[test]
+    fn live_ref_cell_update_is_visible_to_poller() {
+        let cell = Arc::new(std::sync::Mutex::new("origin/dev".to_string()));
+        let reader = cell.clone();
+        // Simulate control-thread update.
+        *cell.lock().unwrap() = "origin/feature-x".to_string();
+        // Simulate poller-thread read on next tick.
+        let observed = reader.lock().unwrap().clone();
+        assert_eq!(
+            observed, "origin/feature-x",
+            "updated ref must be visible through the shared cell"
+        );
     }
 }
