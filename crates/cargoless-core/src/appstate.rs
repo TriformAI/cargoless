@@ -46,8 +46,14 @@
 //! A red sha is recorded per instance and **never auto-retried**: only a new
 //! HEAD on that ref queues again. The one exception is
 //! [`AppBuildOutcome::Indeterminate`] (the tree-mutated-mid-build backstop):
-//! it requeues the same sha once; a second consecutive indeterminate on the
-//! same instance records red — self-limiting, observable.
+//! it requeues once (the newest pending sha if a commit arrived meanwhile —
+//! newest-sha-wins for the *retry target*), and a second **consecutive**
+//! indeterminate on the same instance records red. Crucially the streak is
+//! **not** reset by a waiting newer commit: on a hot branch a pending sha is
+//! almost always present, and resetting on it would defeat the backstop and
+//! chase HEAD forever. Holding the streak across pending makes the pipeline
+//! **converge to a verdict** (green if the next build is attributable, else a
+//! bounded red) instead of superseding the in-flight build indefinitely.
 
 use std::collections::BTreeMap;
 
@@ -339,12 +345,19 @@ impl AppState {
             AppBuildOutcome::Indeterminate { reason } => {
                 let inst = self.instances.get_mut(instance).expect("checked");
                 inst.pipeline = Pipeline::Idle;
-                if inst.pending.is_some() {
-                    // A newer sha is already waiting; abandon the
-                    // indeterminate attempt in its favor.
-                    inst.indeterminate_streak = 0;
-                    self.settle_idle(instance, actions);
-                } else if inst.indeterminate_streak >= 1 {
+                // Convergence backstop: count consecutive indeterminates and
+                // red out on the second — *regardless* of whether a newer
+                // commit is waiting. A hot branch almost always has a pending
+                // sha, so resetting the streak on `pending` (the old behavior)
+                // defeated the backstop entirely: every indeterminate would
+                // requeue and the instance would chase HEAD forever, never
+                // settling to a verdict. Holding the streak across pending is
+                // what makes a hot branch converge.
+                if inst.indeterminate_streak >= 1 {
+                    // Second consecutive indeterminate: stop requeuing this
+                    // attempt and record red. `settle_idle` below still builds
+                    // any newer pending sha, so even the red-out path converges
+                    // (it just doesn't keep retrying the untrustworthy build).
                     inst.indeterminate_streak = 0;
                     self.record_red(
                         instance,
@@ -354,8 +367,13 @@ impl AppState {
                     );
                     self.settle_idle(instance, actions);
                 } else {
+                    // First indeterminate: requeue once. Prefer the newest
+                    // pending sha if a commit arrived meanwhile (newest-sha-wins
+                    // for the retry target — no point re-attempting a sha we'd
+                    // immediately supersede); otherwise rebuild the same sha.
                     inst.indeterminate_streak += 1;
-                    self.request_build(instance, sha);
+                    let retry = inst.pending.take().unwrap_or(sha);
+                    self.request_build(instance, retry);
                 }
             }
         }
@@ -995,8 +1013,220 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::StartBuild { sha, .. } if sha == "v2")),
-            "newer pending sha wins over retrying the indeterminate one: {actions:?}"
+            "newer pending sha wins as the retry target: {actions:?}"
         );
+        // Convergence fix: the streak is HELD across the pending sha (not reset
+        // to 0). The old code reset it here, which on a hot branch — where a
+        // pending sha is almost always present — defeated the backstop and made
+        // the instance chase HEAD forever without ever settling to a verdict.
+        assert_eq!(
+            s.instance("dev").unwrap().indeterminate_streak,
+            1,
+            "indeterminate streak survives a waiting newer commit"
+        );
+    }
+
+    #[test]
+    fn indeterminate_converges_to_red_even_with_continuous_pending() {
+        // The core convergence guarantee. A hot branch keeps a newer sha
+        // pending across every build. Two *consecutive* indeterminates must
+        // still red out (settle to a verdict) instead of requeuing forever,
+        // and the newest pending sha must still build — the pipeline never
+        // stalls.
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "v1");
+        let g1 = build_gen(&a);
+        head(&mut s, "dev", "v2"); // pending during build 1
+
+        // First indeterminate (pending present): requeues the newest pending
+        // (v2), streak held at 1, NOT red yet.
+        let a = s.step(
+            "dev",
+            Event::BuildFinished {
+                generation: g1,
+                outcome: AppBuildOutcome::Indeterminate {
+                    reason: "tree moved".into(),
+                },
+            },
+        );
+        let g2 = build_gen(&a);
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::StartBuild { sha, .. } if sha == "v2")),
+            "first indeterminate requeues the newest pending sha: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|x| matches!(x, Action::RecordRed { .. })),
+            "first indeterminate is not red: {a:?}"
+        );
+        assert_eq!(s.instance("dev").unwrap().indeterminate_streak, 1);
+
+        head(&mut s, "dev", "v3"); // another commit lands during build 2
+
+        // Second consecutive indeterminate (still pending): MUST red out, and
+        // the newest pending (v3) still builds — convergence, not a stall.
+        let a = s.step(
+            "dev",
+            Event::BuildFinished {
+                generation: g2,
+                outcome: AppBuildOutcome::Indeterminate {
+                    reason: "tree moved".into(),
+                },
+            },
+        );
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::RecordRed { reason, .. }
+                if reason.contains("indeterminate twice"))),
+            "two consecutive indeterminates red out even with pending: {a:?}"
+        );
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::StartBuild { sha, .. } if sha == "v3")),
+            "the newest pending sha still builds — the pipeline converges: {a:?}"
+        );
+        assert_eq!(s.instance("dev").unwrap().indeterminate_streak, 0);
+    }
+
+    #[test]
+    fn green_promotes_even_with_a_newer_sha_pending() {
+        // (a) A build that has STARTED runs to completion and promotes its sha
+        // even though newer commits arrived meanwhile. Serving lags HEAD —
+        // that is fine; the invariant is that it converges, not that it is
+        // always the tip.
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "v1");
+        let g1 = build_gen(&a);
+        head(&mut s, "dev", "v2"); // newer commits land mid-build…
+        head(&mut s, "dev", "v3"); // …newest wins as pending
+        assert_eq!(s.instance("dev").unwrap().pending.as_deref(), Some("v3"));
+
+        // v1 finishes green: spawn+probe v1 regardless of the pending sha.
+        let a = green(&mut s, "dev", g1);
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::SpawnAndProbe { sha, .. } if sha == "v1")),
+            "the started build is carried to spawn+probe despite pending: {a:?}"
+        );
+        // The probe promotes v1 — serving reaches green.
+        let a = s.step("dev", Event::ProbeSucceeded { generation: g1 });
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::Promote { sha, .. } if sha == "v1")),
+            "started build promotes even with a newer sha pending: {a:?}"
+        );
+        assert_eq!(
+            s.instance("dev").unwrap().serving.as_ref().unwrap().sha,
+            "v1"
+        );
+    }
+
+    #[test]
+    fn pending_sha_builds_only_after_the_current_build_settles() {
+        // (b) The pending sha does not build until the in-flight build has
+        // promoted (green) OR failed (red) — it never preempts or aborts the
+        // in-flight build. Covers both the green-then-build and red-then-build
+        // settlements.
+        let mut s = state(&["dev"]);
+        // Keep something serving so the red branch has a serving child to
+        // leave untouched.
+        drive_to_serving(&mut s, "dev", "g0");
+
+        // ── green settlement ──
+        let a = head(&mut s, "dev", "v1");
+        let g1 = build_gen(&a);
+        head(&mut s, "dev", "v2"); // pending while v1 builds
+        let a = green(&mut s, "dev", g1);
+        assert!(
+            !a.iter().any(|x| matches!(x, Action::StartBuild { .. })),
+            "v2 must NOT build while v1 is still probing: {a:?}"
+        );
+        let a = s.step("dev", Event::ProbeSucceeded { generation: g1 });
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::StartBuild { sha, .. } if sha == "v2")),
+            "v2 builds only once v1 has promoted: {a:?}"
+        );
+        let g2 = build_gen(&a);
+
+        // ── red settlement ──
+        head(&mut s, "dev", "v3"); // pending while v2 builds
+        let a = s.step(
+            "dev",
+            Event::BuildFinished {
+                generation: g2,
+                outcome: AppBuildOutcome::Red {
+                    reason: "boom".into(),
+                },
+            },
+        );
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::StartBuild { sha, .. } if sha == "v3")),
+            "v3 builds after the in-flight build fails red, too: {a:?}"
+        );
+        // A red never disturbs the serving child.
+        assert_eq!(
+            s.instance("dev").unwrap().serving.as_ref().unwrap().sha,
+            "v1",
+            "serving (v1) untouched by v2's red"
+        );
+    }
+
+    #[test]
+    fn converges_under_a_rapid_head_advance_stream() {
+        // (c) Five HeadAdvanced during one in-flight build: none start a second
+        // build or abort the first; only the newest survives as pending. The
+        // first build promotes, then the latest pending builds, and serving
+        // eventually reaches the latest sha — full convergence on a hot branch.
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "s1");
+        let g1 = build_gen(&a);
+
+        for sha in ["s2", "s3", "s4", "s5", "s6"] {
+            let a = head(&mut s, "dev", sha);
+            assert!(
+                !a.iter().any(|x| matches!(x, Action::StartBuild { .. })),
+                "a head arriving mid-build never starts a second build: {a:?}"
+            );
+        }
+        assert_eq!(
+            s.instance("dev").unwrap().pending.as_deref(),
+            Some("s6"),
+            "only the newest of the burst survives as pending (s2..s5 dropped)"
+        );
+
+        // s1's build completes and promotes — serving reaches green (lagging).
+        green(&mut s, "dev", g1);
+        let a = s.step("dev", Event::ProbeSucceeded { generation: g1 });
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::Promote { sha, .. } if sha == "s1")),
+            "first build promotes: {a:?}"
+        );
+        assert_eq!(
+            s.instance("dev").unwrap().serving.as_ref().unwrap().sha,
+            "s1"
+        );
+        // Promoting frees the pipeline and the latest pending (s6) builds —
+        // s2..s5 were superseded and are never built.
+        let g6 = build_gen(&a);
+
+        // s6 completes and promotes — serving converges to the latest sha.
+        green(&mut s, "dev", g6);
+        let a = s.step("dev", Event::ProbeSucceeded { generation: g6 });
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::Promote { sha, .. } if sha == "s6")),
+            "the latest pending sha promotes: {a:?}"
+        );
+        let dev = s.instance("dev").unwrap();
+        assert_eq!(dev.serving.as_ref().unwrap().sha, "s6");
+        assert_eq!(
+            dev.pending, None,
+            "fully converged: nothing left pending, serving == latest"
+        );
+        assert_eq!(dev.pipeline, Pipeline::Idle);
     }
 
     #[test]
