@@ -519,6 +519,9 @@ fn serve_loop(
         next_token: std::sync::atomic::AtomicU64::new(1),
         events_tx: events_tx.clone(),
     });
+    // Keep a second Arc handle so the control loop can call refresh_plan
+    // without holding any borrow on `driver` (which owns the first handle).
+    let launcher_ref = launcher.clone();
     let build = Arc::new(ThreadBuildBackend {
         events_tx: events_tx.clone(),
     });
@@ -611,13 +614,15 @@ fn serve_loop(
                 // `health.ready_timeout_ms`) takes effect on the next boot cycle
                 // without a daemon restart. Fail-safe: a bad/missing manifest
                 // leaves the previous plan unchanged (see `refresh_plan_into`).
-                if let Event::BuildFinished {
-                    outcome: cargoless_core::appstate::AppBuildOutcome::Green,
-                    ..
-                } = &event
-                {
+                if matches!(
+                    &event,
+                    Event::BuildFinished {
+                        outcome: cargoless_core::appstate::AppBuildOutcome::Green,
+                        ..
+                    }
+                ) {
                     let wt = instance_worktree(state_dir, &instance);
-                    launcher.refresh_plan(&instance, &wt, repo);
+                    launcher_ref.refresh_plan(&instance, &wt, repo);
                 }
                 driver.drive(&instance, event);
             }
