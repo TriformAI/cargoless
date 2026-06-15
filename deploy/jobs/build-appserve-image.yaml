@@ -1,0 +1,83 @@
+# Build + push the cargoless-APPSERVE image IN-CLUSTER (kaniko Job).
+#
+# Sibling of build-serve-image.yaml, for the app-serve daemon image
+# (deploy/cargoless-appserve.Dockerfile — carries the full WASM build toolchain
+# because app-serve runs the target repo's cargoless.app.yaml build steps).
+#
+# TWO IN-CLUSTER GOTCHAS (see memory: cargoless-incluster-image-build):
+#   1. Git context MUST be Forgejo, not GitHub — the cluster cannot reach
+#      github.com from a build pod. Use git://forgejo.triform.dev/... with
+#      GIT_USERNAME/GIT_PASSWORD from the forgejo-cargoless-auth secret.
+#   2. The build pod needs egress. The NetworkPolicy
+#      `cargoless-appserve-builder-egress` (namespace cargoless-builder) already
+#      selects pods labelled `app: cargoless-appserve-image-builder` and grants
+#      DNS + 0.0.0.0/0:80,443 (except RFC1918) + in-cluster. This Job's pod
+#      carries that exact label, so it inherits egress. Do NOT rename the label
+#      without also updating that policy or the build times out on git clone +
+#      cargo/wasm-bindgen/binaryen/tailwind downloads.
+#
+# USAGE (manual; SOURCE_REF + IMAGE_TAG injected — a raw apply fails closed):
+#   sed -e "s|__SOURCE_REF__|<full-sha>|" -e "s|__IMAGE_TAG__|latest|" \
+#     deploy/jobs/build-appserve-image.yaml | kubectl apply -f -
+#   kubectl -n cargoless-builder logs -f job/build-cargoless-appserve-image
+#
+# Building != deploying. The preview rolls only when the Flux-authoritative
+# image tag changes (or the pod is deleted, imagePullPolicy: Always). Roll
+# sequencing is coordinated separately — do NOT self-roll.
+#
+# Duration: ~15-25 min cold (release cargo build + WASM toolchain); kaniko
+# layer cache makes warm rebuilds faster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-cargoless-appserve-image
+  namespace: cargoless-builder
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        # Load-bearing: matches networkpolicy/cargoless-appserve-builder-egress.
+        app: cargoless-appserve-image-builder
+    spec:
+      restartPolicy: Never
+      # Any healthy node — do NOT pin (a pinned node in DiskPressure wedges the
+      # build, the lesson from the isolation artifact Job).
+      imagePullSecrets:
+        - name: registry-pull
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - "--context=git://forgejo.triform.dev/triform/cargoless.git#__SOURCE_REF__"
+            - "--dockerfile=deploy/cargoless-appserve.Dockerfile"
+            - "--destination=registry.triform.cloud/cargoless/cargoless-appserve:__IMAGE_TAG__"
+            - "--cache=true"
+            - "--cache-repo=registry.triform.cloud/cargoless/cargoless-appserve-cache"
+            - "--snapshot-mode=redo"
+            - "--use-new-run"
+          env:
+            # kaniko reads BOTH pull (base image) and push (destination) creds
+            # from this merged docker config.
+            - { name: DOCKER_CONFIG, value: "/kaniko/.docker" }
+            # Forgejo git-context auth (the cluster cannot reach github.com).
+            - name: GIT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: GIT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+          volumeMounts:
+            - { name: docker-config, mountPath: /kaniko/.docker }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits: { cpu: "12", memory: "24Gi" }
+      volumes:
+        - name: docker-config
+          projected:
+            sources:
+              - secret:
+                  name: registry-push
+                  items:
+                    - { key: .dockerconfigjson, path: config.json }
