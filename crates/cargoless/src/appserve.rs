@@ -219,9 +219,12 @@ fn is_non_loopback(bind: &str) -> bool {
 /// dir with the allocated port in `port_env` + instance env; probe its health
 /// path; SIGTERM-tree on stop.
 struct ProcLauncher {
-    /// Per-instance health spec + run command, captured at bundle build time.
-    /// Keyed by instance; the driver only spawns instances we configured.
-    plans: BTreeMap<String, RunPlan>,
+    /// Per-instance health spec + run command. Refreshed from `cargoless.app.yaml`
+    /// on every green build so a manifest change (e.g. bumping
+    /// `health.ready_timeout_ms`) takes effect on the *next* build, not at daemon
+    /// restart. Protected by a `Mutex` because `start_probe` threads read it while
+    /// the control thread may be writing a new plan.
+    plans: std::sync::Mutex<BTreeMap<String, RunPlan>>,
     children: std::sync::Mutex<BTreeMap<u64, std::process::Child>>,
     next_token: std::sync::atomic::AtomicU64,
     events_tx: Sender<(String, Event)>,
@@ -242,6 +245,24 @@ impl ProcLauncher {
         self.next_token
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Refresh the run plan for `instance` from `cargoless.app.yaml` in
+    /// `worktree` (falling back to `repo`, then the built-in default). Called
+    /// from the control thread on every green build so a manifest change
+    /// (e.g. bumping `health.ready_timeout_ms`) takes effect on the next
+    /// spawn+probe cycle without a daemon restart.
+    ///
+    /// **Fail-safe**: if the new manifest is missing, unreadable, or invalid
+    /// the *previous* plan is kept unchanged — a bad manifest push never
+    /// disrupts a currently-serving instance.
+    fn refresh_plan(&self, instance: &str, worktree: &Path, repo: &Path) {
+        refresh_plan_into(
+            &mut self.plans.lock().expect("plans"),
+            instance,
+            worktree,
+            repo,
+        );
+    }
 }
 
 impl ChildLauncher for ProcLauncher {
@@ -252,10 +273,12 @@ impl ChildLauncher for ProcLauncher {
         port: u16,
         env: &[(String, String)],
     ) -> Result<ChildHandle, String> {
-        let plan = self
-            .plans
+        let plans = self.plans.lock().expect("plans");
+        let plan = plans
             .get(instance)
-            .ok_or_else(|| format!("no run plan for instance `{instance}`"))?;
+            .ok_or_else(|| format!("no run plan for instance `{instance}`"))?
+            .clone();
+        drop(plans);
         let mut cmd = std::process::Command::new(&plan.command[0]);
         cmd.args(&plan.command[1..])
             .current_dir(bundle_dir)
@@ -291,7 +314,7 @@ impl ChildLauncher for ProcLauncher {
     }
 
     fn start_probe(&self, instance: &str, generation: Generation, port: u16) {
-        let plan = match self.plans.get(instance) {
+        let plan = match self.plans.lock().expect("plans").get(instance) {
             Some(p) => p.clone(),
             None => return,
         };
@@ -322,7 +345,12 @@ impl ChildLauncher for ProcLauncher {
     }
 
     fn stop(&self, instance: &str, generation: Generation, token: u64, drain: bool) {
-        let grace = self.plans.get(instance).map_or(0, |p| p.grace_ms);
+        let grace = self
+            .plans
+            .lock()
+            .expect("plans")
+            .get(instance)
+            .map_or(0, |p| p.grace_ms);
         let child = self.children.lock().expect("children").remove(&token);
         let tx = self.events_tx.clone();
         let instance = instance.to_string();
@@ -486,7 +514,7 @@ fn serve_loop(
     }
 
     let launcher = Arc::new(ProcLauncher {
-        plans: run_plans,
+        plans: std::sync::Mutex::new(run_plans),
         children: std::sync::Mutex::new(BTreeMap::new()),
         next_token: std::sync::atomic::AtomicU64::new(1),
         events_tx: events_tx.clone(),
@@ -576,6 +604,20 @@ fn serve_loop(
                 // DrainComplete also reclaims the child's port in the driver.
                 if let Event::DrainComplete { generation } = &event {
                     driver.on_drain_reclaimed(&instance, *generation);
+                }
+                // CGLS-14: on every green build, refresh the run plan from the
+                // freshly-checked-out manifest BEFORE the driver dispatches
+                // SpawnAndProbe. This ensures a manifest change (e.g. bumping
+                // `health.ready_timeout_ms`) takes effect on the next boot cycle
+                // without a daemon restart. Fail-safe: a bad/missing manifest
+                // leaves the previous plan unchanged (see `refresh_plan_into`).
+                if let Event::BuildFinished {
+                    outcome: cargoless_core::appstate::AppBuildOutcome::Green,
+                    ..
+                } = &event
+                {
+                    let wt = instance_worktree(state_dir, &instance);
+                    launcher.refresh_plan(&instance, &wt, repo);
                 }
                 driver.drive(&instance, event);
             }
@@ -713,6 +755,37 @@ fn ensure_instance_worktree(repo: &Path, worktree: &Path, initial_ref: &str) -> 
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+/// Pure core of plan refresh: update the map entry for `instance` from the
+/// manifest in `worktree` (falling back to `repo`, then the existing entry,
+/// then the built-in default). Called from [`ProcLauncher::refresh_plan`] on
+/// every green build so a manifest change takes effect on the next spawn cycle.
+///
+/// **Fail-safe rule**: if the new manifest is missing, unreadable, or invalid,
+/// the existing entry is left *unchanged* — a bad manifest push never disrupts
+/// a currently-serving instance. The fallback chain is:
+/// 1. `worktree/cargoless.app.yaml` (the freshly-checked-out sha)
+/// 2. `repo/cargoless.app.yaml` (the daemon's base checkout)
+/// 3. Existing plan (new: fail-safe — bad manifest leaves the old plan in place)
+/// 4. Built-in default (only if there was no existing plan at all)
+fn refresh_plan_into(
+    plans: &mut BTreeMap<String, RunPlan>,
+    instance: &str,
+    worktree: &Path,
+    repo: &Path,
+) {
+    if let Some(new_plan) =
+        run_plan_from_manifest(worktree).or_else(|| run_plan_from_manifest(repo))
+    {
+        plans.insert(instance.to_string(), new_plan);
+    }
+    // else: keep the existing plan (fail-safe — bad or absent manifest after a
+    // green build leaves the proven-working plan in place).
+    // If there was no prior plan at all, insert the default so spawn never fails.
+    plans
+        .entry(instance.to_string())
+        .or_insert_with(default_run_plan);
 }
 
 /// Build a [`RunPlan`] from a `cargoless.app.yaml` under `root`, if present.
@@ -866,5 +939,114 @@ mod tests {
         let p = default_run_plan();
         assert_eq!(p.port_env, "PORT");
         assert!(p.ready_timeout_ms > 0 && p.interval_ms > 0);
+    }
+
+    // ── CGLS-14: per-build RunPlan refresh ───────────────────────────────
+
+    /// Helper: write a minimal manifest with the given `ready_timeout_ms` into
+    /// `dir/cargoless.app.yaml` and return `dir`.
+    fn write_manifest(dir: &std::path::Path, ready_timeout_ms: u64) {
+        std::fs::write(
+            dir.join("cargoless.app.yaml"),
+            format!(
+                "version: 1\nrun:\n  command: [\"./app\"]\nhealth:\n  ready_timeout_ms: {ready_timeout_ms}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `refresh_plan_into` picks up a new `ready_timeout_ms` from a worktree
+    /// manifest on a second call — simulates a build that checked out a new sha
+    /// whose manifest has a different health timeout.
+    #[test]
+    fn refresh_plan_into_adopts_new_manifest_values() {
+        let tmp =
+            std::env::temp_dir().join(format!("cargoless-cgls14-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wt = tmp.join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // First build: manifest sets timeout = 120_000 (the default).
+        write_manifest(&wt, 120_000);
+        let mut plans: BTreeMap<String, RunPlan> = BTreeMap::new();
+        refresh_plan_into(&mut plans, "dev", &wt, &repo);
+        assert_eq!(
+            plans["dev"].ready_timeout_ms, 120_000,
+            "first build: timeout from manifest"
+        );
+
+        // Second build: branch bumps timeout to 600_000 in the manifest.
+        write_manifest(&wt, 600_000);
+        refresh_plan_into(&mut plans, "dev", &wt, &repo);
+        assert_eq!(
+            plans["dev"].ready_timeout_ms, 600_000,
+            "second build: updated timeout is adopted from the new manifest"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `refresh_plan_into` keeps the *prior* plan when the manifest is absent
+    /// or invalid — a bad push never disrupts a currently-serving instance.
+    #[test]
+    fn refresh_plan_into_keeps_prior_on_bad_manifest() {
+        let tmp =
+            std::env::temp_dir().join(format!("cargoless-cgls14-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wt = tmp.join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let repo = tmp.join("repo"); // no manifest here either
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Establish an initial plan with a distinctive timeout.
+        let initial = RunPlan {
+            ready_timeout_ms: 999_000,
+            ..default_run_plan()
+        };
+        let mut plans: BTreeMap<String, RunPlan> = BTreeMap::new();
+        plans.insert("dev".to_string(), initial);
+
+        // Worktree has an invalid manifest (bad YAML / unknown key).
+        std::fs::write(
+            wt.join("cargoless.app.yaml"),
+            "version: 1\nunknown_key: bad\nrun:\n  command: [\"./app\"]\n",
+        )
+        .unwrap();
+
+        // Refresh: manifest is invalid, repo also has no manifest → prior plan
+        // must be preserved exactly.
+        refresh_plan_into(&mut plans, "dev", &wt, &repo);
+        assert_eq!(
+            plans["dev"].ready_timeout_ms, 999_000,
+            "bad manifest must not clobber the prior plan"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// When there is no prior plan AND the manifest is absent, `refresh_plan_into`
+    /// inserts the built-in default so spawn never fails with "no run plan".
+    #[test]
+    fn refresh_plan_into_inserts_default_when_no_prior_and_no_manifest() {
+        let tmp =
+            std::env::temp_dir().join(format!("cargoless-cgls14-noprior-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wt = tmp.join("worktree");
+        let repo = tmp.join("repo");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut plans: BTreeMap<String, RunPlan> = BTreeMap::new();
+        refresh_plan_into(&mut plans, "dev", &wt, &repo);
+        // The built-in default must have been inserted.
+        assert!(plans.contains_key("dev"), "default plan inserted");
+        assert_eq!(
+            plans["dev"].ready_timeout_ms,
+            default_run_plan().ready_timeout_ms
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
