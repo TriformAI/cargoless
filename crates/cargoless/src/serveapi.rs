@@ -196,6 +196,102 @@ fn parse_macro_blind_globs(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// #CGLS-12 — the operator's proc-macro call-signature names, comma-separated
+/// in `CARGOLESS_MACRO_BLIND_MACROS` (e.g. `view,html` — WITHOUT the trailing
+/// `!`; the scanner adds it). Used by
+/// [`compute_macro_blind_hit`] to narrow glob hits via content scanning.
+/// Empty / unset ⇒ macro names unconfigured ⇒ content scan is skipped and
+/// behavior is byte-identical to the pre-CGLS-12 pure path-glob path. Read
+/// per consume (same policy as `macro_blind_globs`).
+fn macro_blind_macros() -> Vec<String> {
+    parse_macro_blind_macros(&std::env::var("CARGOLESS_MACRO_BLIND_MACROS").unwrap_or_default())
+}
+
+/// Env-free parse body of [`macro_blind_macros`]. Same tolerant split as
+/// [`parse_macro_blind_globs`]: spaces around commas, stray empty segments
+/// ignored. Each entry is a macro name WITHOUT the trailing `!` (e.g.
+/// `"view"`, not `"view!"`).
+fn parse_macro_blind_macros(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// #CGLS-12 — does `content` contain an invocation of any macro in
+/// `macro_names`? Scans for `<name>!` immediately followed by optional
+/// ASCII whitespace and then `{`, `(`, or `[` — the three legal
+/// delimiters for a macro invocation. No regex crate: a simple two-pass
+/// byte scan (find the `!`, walk back to the name, walk forward to the
+/// delimiter) keeps the crate dep-free and allocation-free per call.
+///
+/// Deliberately conservative: unusual formatting (e.g. a comment between
+/// the `!` and the `{`) may be missed, which is fine — the caller's
+/// fail-safe (no content found ⇒ glob hit stands) means this can only
+/// produce false negatives (treat as blind), never false positives (miss
+/// a real blind file).
+fn content_has_macro_call(content: &str, macro_names: &[String]) -> bool {
+    if macro_names.is_empty() {
+        return false;
+    }
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        if bytes[i] != b'!' {
+            i += 1;
+            continue;
+        }
+        // Walk forward past optional ASCII whitespace to find the delimiter.
+        let mut j = i + 1;
+        while j < len
+            && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+        {
+            j += 1;
+        }
+        if j < len && (bytes[j] == b'{' || bytes[j] == b'(' || bytes[j] == b'[') {
+            // Found `!<ws>*[{(\[]`. Now walk backward from i to extract the
+            // identifier before the `!`. Identifiers: ASCII alphanumeric + `_`.
+            let name_end = i; // exclusive: the char at i is `!`
+            let mut k = i;
+            while k > 0 && (bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_') {
+                k -= 1;
+            }
+            if k < name_end {
+                let name = &content[k..name_end];
+                if macro_names.iter().any(|m| m == name) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Resolve the content of `changed_path` (a repo-relative path such as
+/// `"portal/src/app.rs"`) from the push overlay's file pairs. Overlay
+/// paths may be absolute (after `map_repo_relative_files` joins them with
+/// `analysis_root`) or repo-relative (direct push). A suffix match handles
+/// both: the repo-relative path is always a suffix of the absolute form.
+fn overlay_content_for<'a>(
+    changed_path: &str,
+    overlay_files: &'a [(String, String)],
+) -> Option<&'a str> {
+    overlay_files
+        .iter()
+        .find(|(overlay_path, _)| {
+            // Exact match first (repo-relative push, paths are identical).
+            overlay_path == changed_path
+                // Suffix match for absolute overlay paths produced by
+                // map_repo_relative_files: `/root/portal/src/app.rs` ends with
+                // `/portal/src/app.rs` which is `"/" + changed_path`.
+                || overlay_path.ends_with(&format!("/{changed_path}"))
+        })
+        .map(|(_, content)| content.as_str())
+}
+
 /// #A8 — does this push touch a macro-blind path? Matches the push's
 /// repo-relative `changed_files` (the same list project-check triggers
 /// filter on — NOT the overlay file list, which carries extra workspace
@@ -206,15 +302,47 @@ fn parse_macro_blind_globs(raw: &str) -> Vec<String> {
 /// list there is no evidence the push touches a blind path, and the
 /// annotation must never fire on absence of evidence (the same posture
 /// as `base_sha: None` ⇒ unattributed, never a match).
-fn compute_macro_blind_hit(changed_files: Option<&[String]>, blind_globs: &[String]) -> bool {
+///
+/// #CGLS-12 — content-narrowing (fail-safe): when `macro_names` is
+/// non-empty, glob-matched files are additionally scanned for a macro
+/// call invocation (`<name>!\s*[{(\[]`). A glob-matched file whose
+/// content is available AND contains no such call is NOT classified as
+/// blind (reduces ~37% over-fire). Fail-safe: if the file's content is
+/// NOT in the overlay (unreadable edge case), the glob hit stands — a
+/// real blind file must never be missed. When `macro_names` is empty the
+/// content scan is skipped entirely and behavior is byte-identical to the
+/// pre-CGLS-12 pure path-glob path.
+fn compute_macro_blind_hit(
+    changed_files: Option<&[String]>,
+    blind_globs: &[String],
+    overlay_files: &[(String, String)],
+    macro_names: &[String],
+) -> bool {
     if blind_globs.is_empty() {
         return false;
     }
     changed_files.is_some_and(|files| {
         files.iter().any(|path| {
-            blind_globs
+            let glob_hit = blind_globs
                 .iter()
-                .any(|pattern| cargoless_core::project_checks::glob_match_path(pattern, path))
+                .any(|pattern| cargoless_core::project_checks::glob_match_path(pattern, path));
+            if !glob_hit {
+                return false;
+            }
+            // Glob matched. If macro names are configured, try to narrow via
+            // content scan. Fail-safe: absent content ⇒ keep the glob hit.
+            if macro_names.is_empty() {
+                return true;
+            }
+            match overlay_content_for(path, overlay_files) {
+                Some(content) => content_has_macro_call(content, macro_names),
+                None => {
+                    // Content not in overlay (e.g. the overlay only contains
+                    // workspace config files for cluster routing, not the
+                    // Rust source). Fall back to the glob hit — conservative.
+                    true
+                }
+            }
         })
     })
 }
@@ -874,17 +1002,24 @@ impl ServeVerdictState {
     /// blind bit and the `base_sha` travel as one record and can never be
     /// stamped onto a different push's verdict.
     pub(crate) fn record_push_attribution(&self, worktree: &str, pushed: &PushedOverlay) {
-        self.record_push_attribution_with_globs(worktree, pushed, &macro_blind_globs());
+        self.record_push_attribution_with_globs(
+            worktree,
+            pushed,
+            &macro_blind_globs(),
+            &macro_blind_macros(),
+        );
     }
 
     /// Env-free body of [`Self::record_push_attribution`] (the
-    /// `_with_timeout` injection discipline): tests pass globs explicitly
-    /// instead of mutating process env under parallel test threads.
+    /// `_with_timeout` injection discipline): tests pass globs and macro
+    /// names explicitly instead of mutating process env under parallel
+    /// test threads.
     pub(crate) fn record_push_attribution_with_globs(
         &self,
         worktree: &str,
         pushed: &PushedOverlay,
         blind_globs: &[String],
+        macro_names: &[String],
     ) {
         poisoned(&self.push_attribution).insert(
             worktree.to_string(),
@@ -893,6 +1028,8 @@ impl ServeVerdictState {
                 macro_blind_hit: compute_macro_blind_hit(
                     pushed.changed_files.as_deref(),
                     blind_globs,
+                    &pushed.files,
+                    macro_names,
                 ),
                 push_received_unix: pushed.last_push_unix,
                 consumed_unix: crate::statusfile::now_unix(),
@@ -4028,7 +4165,8 @@ checks:
         assert_eq!(globs.len(), 4, "tolerant split incl. space after comma");
         let hit = |files: &[&str]| {
             let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
-            compute_macro_blind_hit(Some(&files), &globs)
+            // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
+            compute_macro_blind_hit(Some(&files), &globs, &[], &[])
         };
         assert!(hit(&["portal/src/app.rs"]));
         assert!(hit(&["chemistry/generated/portal-7/lib.rs"]));
@@ -4045,14 +4183,15 @@ checks:
         // unattributed): no globs configured, no changed_files, or an
         // empty list ⇒ false — the annotation must never be a guess.
         let globs = parse_macro_blind_globs("portal/**");
-        assert!(!compute_macro_blind_hit(None, &globs));
-        assert!(!compute_macro_blind_hit(Some(&[]), &globs));
+        // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
+        assert!(!compute_macro_blind_hit(None, &globs, &[], &[]));
+        assert!(!compute_macro_blind_hit(Some(&[]), &globs, &[], &[]));
         let files = vec!["portal/src/app.rs".to_string()];
         assert!(
-            !compute_macro_blind_hit(Some(&files), &[]),
+            !compute_macro_blind_hit(Some(&files), &[], &[], &[]),
             "unconfigured daemon (no globs) ⇒ annotation inert"
         );
-        assert!(compute_macro_blind_hit(Some(&files), &globs));
+        assert!(compute_macro_blind_hit(Some(&files), &globs, &[], &[]));
     }
 
     #[test]
@@ -4072,10 +4211,12 @@ checks:
             check_profile: None,
             gate: false,
         };
+        // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
         api.record_push_attribution_with_globs(
             "/wt",
             &pushed(Some(vec!["portal/src/app.rs".into()])),
             &globs,
+            &[],
         );
         let attribution = api.take_push_attribution("/wt").expect("recorded");
         assert!(attribution.macro_blind_hit, "portal/** push classifies");
@@ -4084,13 +4225,14 @@ checks:
             "/wt",
             &pushed(Some(vec!["physics/src/lib.rs".into()])),
             &globs,
+            &[],
         );
         let attribution = api.take_push_attribution("/wt").expect("recorded");
         assert!(!attribution.macro_blind_hit, "non-blind push stays clean");
 
         // changed_files: None (legacy client) — overlay FILES touch
         // portal/ but provide no diff evidence; must NOT classify.
-        api.record_push_attribution_with_globs("/wt", &pushed(None), &globs);
+        api.record_push_attribution_with_globs("/wt", &pushed(None), &globs, &[]);
         let attribution = api.take_push_attribution("/wt").expect("recorded");
         assert!(
             !attribution.macro_blind_hit,
@@ -4109,6 +4251,126 @@ checks:
             5,
             "receipt clock ahead of consume clock (NTP step) saturates to analysis-only"
         );
+    }
+
+    // ──────────────── #CGLS-12 — content-based macro detection ────────────────
+
+    #[test]
+    fn content_scan_macro_present_is_blind() {
+        // AC: a glob-matched file that CONTAINS view! ⇒ macro_blind_hit true.
+        let globs = parse_macro_blind_globs("portal/**");
+        let macro_names = parse_macro_blind_macros("view");
+        let changed = vec!["portal/src/app.rs".to_string()];
+        let overlay: Vec<(String, String)> = vec![(
+            "portal/src/app.rs".into(),
+            "pub fn render() { view! { <div/> } }".into(),
+        )];
+        assert!(
+            compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            "glob-matched file with view! must be blind"
+        );
+    }
+
+    #[test]
+    fn content_scan_macro_absent_not_blind() {
+        // AC: a glob-matched file with NO view! invocation ⇒ macro_blind_hit false
+        // (reduces ~37% over-fire; the file is still in the glob zone but
+        // has no proc-macro call).
+        let globs = parse_macro_blind_globs("portal/**");
+        let macro_names = parse_macro_blind_macros("view");
+        let changed = vec!["portal/src/types.rs".to_string()];
+        let overlay: Vec<(String, String)> = vec![(
+            "portal/src/types.rs".into(),
+            "pub struct Foo { pub x: u32 }".into(),
+        )];
+        assert!(
+            !compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            "glob-matched file with no view! must NOT be blind"
+        );
+    }
+
+    #[test]
+    fn content_scan_unreadable_falls_back_to_glob_hit() {
+        // AC: content NOT in overlay (e.g. file exists on disk but was not
+        // pushed) ⇒ fail-safe: treat as blind (glob hit stands). A real
+        // blind file must never be missed.
+        let globs = parse_macro_blind_globs("portal/**");
+        let macro_names = parse_macro_blind_macros("view");
+        let changed = vec!["portal/src/app.rs".to_string()];
+        let overlay: Vec<(String, String)> = vec![]; // content absent
+        assert!(
+            compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            "absent content must fall back to glob hit (blind), never miss a real blind file"
+        );
+    }
+
+    #[test]
+    fn content_scan_empty_macro_list_is_pure_path_glob() {
+        // AC: when CARGOLESS_MACRO_BLIND_MACROS is unset (macro_names empty),
+        // behavior is byte-identical to pre-CGLS-12 pure path-glob — even if
+        // the overlay carries content with no macro invocations.
+        let globs = parse_macro_blind_globs("portal/**");
+        let macro_names: Vec<String> = vec![]; // env var unset
+        let changed = vec!["portal/src/types.rs".to_string()];
+        let overlay: Vec<(String, String)> = vec![(
+            "portal/src/types.rs".into(),
+            "pub struct Foo { pub x: u32 }".into(),
+        )];
+        // Pure path-glob: file is in portal/** ⇒ blind (no content scan).
+        assert!(
+            compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            "empty macro list ⇒ pure path-glob, no content scan"
+        );
+    }
+
+    #[test]
+    fn content_scan_detects_various_invocation_forms() {
+        // `content_has_macro_call` must handle all three delimiter forms
+        // (`{`, `(`, `[`) and tolerate whitespace between `!` and delimiter.
+        let names = parse_macro_blind_macros("view,html");
+        assert!(content_has_macro_call("view! { <div/> }", &names));
+        assert!(content_has_macro_call("view!{ <div/> }", &names));
+        assert!(content_has_macro_call("html!( \"<b/>\" )", &names));
+        assert!(content_has_macro_call("html![ a, b ]", &names));
+        assert!(content_has_macro_call("view!\n{ multiline }", &names));
+        // `view! is not here` — `view!` not followed by `{`/`(`/`[`, so no hit.
+        assert!(!content_has_macro_call("// view! is not here", &names));
+        // Non-matching macro name
+        assert!(!content_has_macro_call("format!(\"{}\", x)", &names));
+        // Empty content
+        assert!(!content_has_macro_call("", &names));
+        assert!(!content_has_macro_call("pub fn foo() {}", &names));
+    }
+
+    #[test]
+    fn parse_macro_blind_macros_tolerant_split() {
+        // Mirrors parse_macro_blind_globs: spaces, empty segments, single token.
+        let names = parse_macro_blind_macros("view, html,,rsx ");
+        assert_eq!(names, vec!["view", "html", "rsx"]);
+        assert!(parse_macro_blind_macros("").is_empty());
+        assert_eq!(parse_macro_blind_macros("view"), vec!["view"]);
+    }
+
+    #[test]
+    fn overlay_content_for_matches_absolute_and_relative_paths() {
+        // overlay_content_for must find content whether the overlay path is
+        // repo-relative (direct push) or absolute (after map_repo_relative_files).
+        let overlay: Vec<(String, String)> = vec![
+            ("portal/src/app.rs".into(), "relative content".into()),
+            (
+                "/workspace/root/portal/src/other.rs".into(),
+                "absolute content".into(),
+            ),
+        ];
+        assert_eq!(
+            overlay_content_for("portal/src/app.rs", &overlay),
+            Some("relative content")
+        );
+        assert_eq!(
+            overlay_content_for("portal/src/other.rs", &overlay),
+            Some("absolute content")
+        );
+        assert_eq!(overlay_content_for("portal/src/missing.rs", &overlay), None);
     }
 
     #[test]
