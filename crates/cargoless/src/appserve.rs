@@ -494,6 +494,7 @@ fn resolve_max_concurrent(opts: &AppServeOpts) -> usize {
     let from_env = std::env::var("CARGOLESS_APP_PARALLEL_BUILDS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
+    // Clamp to [1, CAP]: 0 falls back to 1 (default-off); >CAP is capped.
     from_opts.or(from_env).unwrap_or(1).clamp(1, CAP)
 }
 
