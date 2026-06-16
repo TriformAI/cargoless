@@ -2029,17 +2029,41 @@ fn run_project_checks_and_log(
     if let Some(ctx) = context.as_ref() {
         if ctx.materialize_overlay && !ctx.base_ref.trim().is_empty() {
             if let Some(summary) = api.coalesced_project_check(wt, ctx) {
+                let (verdict_label, reason_label) = match &summary {
+                    ProjectCheckSummary::Green | ProjectCheckSummary::Empty => ("green", ""),
+                    ProjectCheckSummary::Red { .. } => ("red", ""),
+                    // The `reason` is a stable &'static classifier — the SigNoz
+                    // query key that separates an interaction-red retry
+                    // (project_check_interaction_red_not_attributable) from a
+                    // transport/daemon-down unknown. The coalesced early-return
+                    // skips the direct path's `verdict.project_checks` span, so
+                    // without this event the coalesced outcome would be invisible
+                    // to dashboards (only the eprintln below existed).
+                    ProjectCheckSummary::Indeterminate { reason, .. } => ("unknown", *reason),
+                };
+                // INFRA-36 parity: emit the same indexed span event the direct
+                // path emits, so coalesced verdicts are queryable in SigNoz and
+                // not just visible in the stderr obs line.
+                let _span = tracing::info_span!(
+                    "verdict.project_checks",
+                    worktree = %wt.display(),
+                    root = %ctx.root.display(),
+                )
+                .entered();
+                tracing::info!(
+                    outcome = verdict_label,
+                    reason = reason_label,
+                    source = "coalesced",
+                    "coalesced project checks completed"
+                );
                 // Log the coalesced outcome in the same obs format the direct
                 // path uses so SigNoz dashboards stay comparable.
                 eprintln!(
-                    "[cargoless:obs] project-checks wt={} root={} verdict={} source=coalesced",
+                    "[cargoless:obs] project-checks wt={} root={} verdict={} reason={} source=coalesced",
                     wt.display(),
                     ctx.root.display(),
-                    match &summary {
-                        ProjectCheckSummary::Green | ProjectCheckSummary::Empty => "green",
-                        ProjectCheckSummary::Red { .. } => "red",
-                        ProjectCheckSummary::Indeterminate { .. } => "unknown",
-                    }
+                    verdict_label,
+                    reason_label,
                 );
                 return summary;
             }
