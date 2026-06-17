@@ -475,6 +475,30 @@ fn handle(
         write_response(&mut writer, code, reason, "text/plain", body);
         return;
     }
+    // ── GET /app — read-only app-serve status, structurally auth-exempt ──
+    // Same pre-#14-gate placement as /healthz and /readyz: answer + `return`
+    // BEFORE the auth gate so the exemption is structural (cannot widen by
+    // accident — every OTHER path still flows into `auth.authorize`). The
+    // body comes from `svc.app_report()`: on the gate daemon the trait
+    // default yields `None` → 404 + the fixed `"null"` constant (byte-
+    // identical to any other unknown gate route); on the app-serve daemon
+    // `AppServeState::app_report` returns Some(json) → 200 carrying the
+    // per-instance phase/serving_sha/last_green/last_red snapshot.
+    //
+    // Why exempt: agents and operators need to *observe* a rolling preview
+    // (which sha each instance is on, is a build in flight, is a red blocking
+    // promotion) without holding the control-plane bearer. The exposed
+    // fields are already public surface (instance names appear on public
+    // preview hostnames; shas are public on the repo) — exempting them
+    // matches the actual sensitivity, while diagnostic content and worktree
+    // status stay gated on `/status` / `/diagnostics`.
+    if req.path == "/app" {
+        match svc.app_report() {
+            Some(json) => write_response(&mut writer, 200, "OK", "application/json", &json),
+            None => write_response(&mut writer, 404, "Not Found", "application/json", "null"),
+        }
+        return;
+    }
     // #14 seam — AllowAll under #10, so this never denies today; the
     // 401 path exists so #14 is pure policy, not a structural change.
     if !auth.authorize(req.bearer.as_deref()) {
@@ -763,15 +787,11 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
             },
             None => (404, "null".into()),
         },
-        // app-serve report. On the gate daemon `app_report()` is the default
-        // `None`, so this arm yields the SAME `(404, "null")` the fall-through
-        // would — the read plane stays byte-identical (guarded by
-        // `app_route_is_404_on_a_non_appserve_service`). Only the app-serve
-        // daemon's `AppServeState` returns `Some(json)` here.
-        "/app" => match svc.app_report() {
-            Some(json) => (200, json),
-            None => (404, "null".into()),
-        },
+        // NOTE: `/app` is handled BEFORE the #14 auth gate (search "/app"
+        // earlier in this file) so the read surface is publicly observable
+        // for agents/operators watching a rolling preview. It never reaches
+        // this match; do not re-add an arm here, or you would shadow the
+        // pre-auth answer and bring the route back under bearer gating.
         _ => (404, "null".into()),
     }
 }
@@ -1487,22 +1507,69 @@ mod tests {
     }
 
     #[test]
-    fn app_route_is_404_byte_identical_on_a_non_appserve_service() {
+    fn app_route_is_404_null_on_a_non_appserve_service() {
         // The gate-daemon non-regression guard. `MockService` uses the
         // `VerdictService::app_report` default (`None`), so `GET /app` must
-        // be indistinguishable from any other unknown path: a 404 with the
-        // canonical `null` body. If app-serve ever made the gate read plane
-        // diverge here, this fails.
+        // answer with the canonical `null` body at status 404. Note: since
+        // `/app` is now structurally auth-exempt (it answers BEFORE the #14
+        // gate so agents can poll a rolling preview), it is NO LONGER
+        // byte-identical to a generic unknown route on a DenyAll server —
+        // the surgical-exemption test below asserts the new boundary.
         let s = server();
         std::thread::sleep(Duration::from_millis(50));
         let (code_app, body_app) = raw_get(s.addr(), "/app");
-        let (code_unknown, body_unknown) = raw_get(s.addr(), "/no-such-route");
         assert_eq!(code_app, 404, "gate /app is 404");
-        assert_eq!(
-            (code_app, body_app.as_str()),
-            (code_unknown, body_unknown.as_str()),
-            "/app is byte-identical to any other unknown route on the gate"
-        );
+        assert_eq!(body_app, "null", "gate /app body is the canonical null");
+    }
+
+    #[test]
+    fn app_route_is_unauth_on_denyall_appserve_service() {
+        // Structural-exemption guard for `/app`. Same shape as the
+        // /healthz / /readyz exemption tests below: under a DenyAll
+        // authorizer (which 401s every gated route) `/app` still answers
+        // 200 carrying the app-serve JSON, proving the exemption lives
+        // BEFORE the #14 gate and not behind it.
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        struct AppService(String);
+        impl VerdictService for AppService {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+            fn app_report(&self) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+        let json = r#"{"instances":[{"name":"dev","phase":"serving"}],"ready":true}"#;
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(AppService(json.to_string())),
+            Arc::new(DenyAll),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let (code, body) = raw_get(s.addr(), "/app");
+        assert_eq!(code, 200, "DenyAll still answers /app — structural exempt");
+        assert_eq!(body, json);
+        // …and on the SAME DenyAll server every gated route still 401s.
+        let (code_admin, _) = raw_get(s.addr(), "/admin/active");
+        assert_eq!(code_admin, 401, "exemption did not widen to /admin/active");
     }
 
     #[test]
@@ -1592,9 +1659,12 @@ mod tests {
     }
 
     #[test]
-    fn healthz_exemption_is_surgical_every_other_route_still_401() {
-        // The exemption must NOT widen: under DenyAll, every NON-/healthz
-        // route still hits the #14 gate and 401s.
+    fn auth_exemption_is_surgical_every_writeable_route_still_401() {
+        // The exemption set is exactly {/healthz, /readyz, /app}: under
+        // DenyAll, every OTHER route still hits the #14 gate and 401s.
+        // /app joined the exempt set so agents can observe a rolling
+        // preview without holding the control-plane bearer; the
+        // diagnostic/status/worktree/event surfaces stay gated.
         struct DenyAll;
         impl Authorizer for DenyAll {
             fn authorize(&self, _t: Option<&str>) -> bool {
@@ -1611,20 +1681,30 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         for route in [
             "/admin/active",
+            "/admin/quiesce",
             "/status?worktree=green-wt",
             "/verdict?worktree=red-wt",
             "/worktrees",
             "/worktrees/red-wt/diagnostics",
             "/events",
+            "/daemon",
         ] {
             let (code, _) = raw_get(s.addr(), route);
             assert_eq!(
                 code, 401,
-                "{route} must still be auth-gated (exemption is /healthz-only)"
+                "{route} must still be auth-gated (exemption is /healthz, /readyz, /app only)"
             );
         }
-        // …and /healthz on the SAME deny server still answers (200, ready).
+        // …and the three exempt routes on the SAME deny server still answer
+        // (i.e. the bearer gate did not 401 them). MockService inherits the
+        // VerdictService trait defaults (`ready() → true`, `app_report() →
+        // None`), so the bodies are: /healthz → 200 ready, /readyz → 200
+        // ready, /app → 404 + canonical "null".
         assert_eq!(raw_get(s.addr(), "/healthz").0, 200);
+        assert_eq!(raw_get(s.addr(), "/readyz").0, 200);
+        let (code_app, body_app) = raw_get(s.addr(), "/app");
+        assert_eq!(code_app, 404, "/app exempt (returns 404+null on gate)");
+        assert_eq!(body_app, "null");
     }
 
     #[test]

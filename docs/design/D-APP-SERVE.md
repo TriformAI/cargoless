@@ -2,7 +2,7 @@
 
 **Status:** Shipping (Part A inc-1..5 landed on `agent/app-serve`, CI build/clippy/fmt green). inc-6 (hardening) + inc-7 (deploy) in progress; inc-8 (SIGHUP hot-reload) + per-push previews parked. Part B (tf-multiverse integration) goes through that repo's own gate.
 
-**Provenance:** The original `trunk serve` framing in `CLAUDE.md` — cargoless does not just *check* a Cargo workspace, it can *run* the application it certifies. Settled with the operator: multi-instance from day one, latest-green per ref, public `<instance>.preview.triform.dev`, deploys into `triform-staging` to reach the staging data plane.
+**Provenance:** The original `trunk serve` framing in `CLAUDE.md` — cargoless does not just *check* a Cargo workspace, it can *run* the application it certifies. Settled with the operator: multi-instance from day one, latest-green per ref, public hosts per instance — `preview.triform.dev` for the `dev` canary (the bare-host special case) and `<other-instance>.preview.triform.dev` for every other ref. The read-only status surface (the daemon's `/app` + `/readyz`) is published at `cargoless.preview.triform.dev` so agents/operators can poll a rolling preview without holding the control-plane bearer. All preview pods deploy into `triform-staging` to reach the staging data plane.
 
 ---
 

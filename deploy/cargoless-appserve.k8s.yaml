@@ -67,8 +67,8 @@ data:
         ref: origin/dev
         app_bind: "0.0.0.0:8080"
         env:
-          TRIFORM_PUBLIC_BASE_URL: "https://dev.preview.triform.dev"
-          TRIFORM_API_URL: "https://dev.preview.triform.dev"
+          TRIFORM_PUBLIC_BASE_URL: "https://preview.triform.dev"
+          TRIFORM_API_URL: "https://preview.triform.dev"
       - name: feature-x
         ref: origin/feature/x
         app_bind: "0.0.0.0:8081"
@@ -303,9 +303,20 @@ spec:
   ports:
     - { name: ctl, port: 8787, targetPort: ctl }
 ---
-# Public ingress: one host per instance, cloned from triform-ingress'
-# annotations (websocket upgrade, proxy-buffering off for SSE, HTTP/1.1,
-# sticky-cookie), per-host HTTP-01 TLS (no wildcard/DNS-01 infra needed).
+# Public ingress: one host per instance (cloned from triform-ingress'
+# annotations: websocket upgrade, proxy-buffering off for SSE, HTTP/1.1,
+# sticky-cookie), plus a separate read-only STATUS host
+# (cargoless.preview.triform.dev → control-plane :8787) so agents and
+# operators can publicly poll the rolling-preview state without holding
+# the control-plane bearer. The control-plane's /healthz, /readyz, /app
+# routes are structurally auth-exempt in cargoless-core; sensitive
+# surfaces (/admin/*, /status, /diagnostics, /events) stay bearer-gated
+# at the daemon. Per-host HTTP-01 TLS (no wildcard/DNS-01 infra needed).
+#
+# History: the dev instance previously lived at `dev.preview.triform.dev`;
+# renamed to bare `preview.triform.dev` (one less subdomain hop for the
+# canary). The TLS secret name stays `cargoless-preview-dev-tls` —
+# cert-manager re-issues against the new SAN on next renewal.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -326,12 +337,14 @@ metadata:
 spec:
   ingressClassName: nginx
   tls:
-    - hosts: [dev.preview.triform.dev]
+    - hosts: [preview.triform.dev]
       secretName: cargoless-preview-dev-tls
     - hosts: [feature-x.preview.triform.dev]
       secretName: cargoless-preview-feature-x-tls
+    - hosts: [cargoless.preview.triform.dev]
+      secretName: cargoless-preview-status-tls
   rules:
-    - host: dev.preview.triform.dev
+    - host: preview.triform.dev
       http:
         paths:
           - path: /
@@ -349,3 +362,14 @@ spec:
               service:
                 name: cargoless-preview-app
                 port: { name: feature-x }
+    # Read-only observability surface — public access to /app, /readyz,
+    # /healthz only (the daemon enforces this: every other path 401s).
+    - host: cargoless.preview.triform.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: cargoless-preview-ctl
+                port: { name: ctl }
