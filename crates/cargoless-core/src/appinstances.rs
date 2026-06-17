@@ -11,7 +11,7 @@
 //!     ref: origin/dev
 //!     app_bind: "0.0.0.0:8080"
 //!     env:
-//!       TRIFORM_PUBLIC_BASE_URL: "https://dev.preview.triform.dev"
+//!       TRIFORM_PUBLIC_BASE_URL: "https://preview.triform.dev"
 //!   - name: feature-x
 //!     ref: origin/feature/x
 //!     app_bind: "0.0.0.0:8081"
@@ -251,7 +251,7 @@ instances:
     ref: origin/dev
     app_bind: "0.0.0.0:8080"
     env:
-      TRIFORM_PUBLIC_BASE_URL: "https://dev.preview.triform.dev"
+      TRIFORM_PUBLIC_BASE_URL: "https://preview.triform.dev"
   - name: feature-x
     ref: origin/feature/x
     app_bind: "0.0.0.0:8081"
@@ -279,7 +279,7 @@ instances:
         assert_eq!(dev.app_bind, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(
             dev.env["TRIFORM_PUBLIC_BASE_URL"],
-            "https://dev.preview.triform.dev"
+            "https://preview.triform.dev"
         );
 
         let fx = &f.instances[1];

@@ -464,11 +464,16 @@ pub trait VerdictService: Send + Sync {
 
     /// app-serve — the `GET /app` report: a JSON snapshot of every served
     /// instance (its phase, serving sha, last red, drain count). `None` ⇒
-    /// this daemon is **not** an app-serve daemon, so the route 404s exactly
-    /// like any other unknown path. ADDITIVE with a default of `None` so the
-    /// gate daemon's read plane is byte-identical to pre-app-serve (the
-    /// `/app`-404 guard test pins this); only `appsvc::AppServeState`
-    /// overrides it.
+    /// this daemon is **not** an app-serve daemon, so the route answers
+    /// 404 + the canonical `"null"` body. ADDITIVE with a default of `None`
+    /// so the gate daemon's read plane is unchanged from pre-app-serve.
+    /// Only `appsvc::AppServeState` overrides it.
+    ///
+    /// NOTE: `/app` is STRUCTURALLY AUTH-EXEMPT in `transport::http` — it
+    /// answers BEFORE the bearer gate, alongside `/healthz` and `/readyz`,
+    /// so agents/operators can poll the rolling-preview status without
+    /// holding the control-plane bearer. Sensitive surfaces (diagnostics,
+    /// per-worktree status, transition events) stay gated.
     fn app_report(&self) -> Option<String> {
         None
     }
