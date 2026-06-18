@@ -87,6 +87,7 @@ use cargoless_core::multiplex::LspVerb;
 use cargoless_core::multiplex::OverlayMultiplexer;
 use cargoless_core::overlay::OverlaySet;
 use cargoless_core::repo::RepoScope;
+use cargoless_core::repo::topology::WorktreeEntry;
 use cargoless_core::repo::watch::{RepoWatchRouter, WtId, WtRouter};
 
 use crate::orphan::ParentWatch;
@@ -154,6 +155,33 @@ fn ra_native_verdict_mode() -> bool {
 
 fn ready_after_respawn_for_modes(push_only: bool, ra_native: bool) -> bool {
     push_only && ra_native
+}
+
+/// Pure selection for the push-only EAGER BOOT WARM-UP: which cluster to spawn
+/// at boot so `/readyz` latches without inbound traffic. Prefers the BASE
+/// worktree (`wt.path == repo_root`) — the cluster the daemon's own `--repo`
+/// serves — taking its hash + path so the lifecycle key matches what the lazy
+/// push/watch path would compute for that worktree. Falls back to the first
+/// configured cluster (by `cluster_root`) when the base worktree had no
+/// readable workspace config (a split-safe skip at init); warming *some*
+/// cluster still removes the zero-traffic deadlock. Returns `None` only when no
+/// cluster is configured at all (nothing to warm).
+fn select_boot_warm_target(
+    worktrees: &[WorktreeEntry],
+    wt_hash: &BTreeMap<WtId, WorkspaceConfigHash>,
+    cluster_root: &BTreeMap<WorkspaceConfigHash, PathBuf>,
+    repo_root: &Path,
+) -> Option<(WorkspaceConfigHash, PathBuf)> {
+    worktrees
+        .iter()
+        .find(|wt| wt.path == repo_root)
+        .and_then(|wt| wt_hash.get(&wt.path).map(|h| (h.clone(), wt.path.clone())))
+        .or_else(|| {
+            cluster_root
+                .iter()
+                .next()
+                .map(|(h, root)| (h.clone(), root.clone()))
+        })
 }
 
 fn ra_native_settle_delay() -> Duration {
@@ -381,6 +409,36 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         .unwrap_or_else(Instant::now);
     heartbeat_repo_status(&repo_root);
     let mut quiesce_announced = false;
+
+    // A6 follow-up — EAGER BOOT WARM-UP (push-only mode): remove the /readyz
+    // traffic-dependence the lazy-spawn TRADEOFF note below documents. In
+    // push-only mode the FS-watch loop never turns edits into RoutedBatch, so
+    // a cluster's RA is spawned ONLY on the first inbound push — meaning a pod
+    // that has received zero pushes stays NotReady forever, /readyz 503
+    // "warming", and (with readinessProbe=/readyz) the Service loses all
+    // endpoints. That is a live incident (2026-06-18: the warm cargoless-serve
+    // pod sat NotReady ~37 min, gate cut off). Spawn the BASE worktree's
+    // cluster (wt.path == repo_root) eagerly here so its RA handshakes and
+    // `cs.ready` flips at boot — the existing mark_ready check at the bottom of
+    // the loop then latches /readyz on the first iteration, no push required.
+    // Only the base cluster (not every worktree) is warmed, to bound boot cost.
+    if push_only {
+        if let Some((h, root)) =
+            select_boot_warm_target(&scope.worktrees, &wt_hash, &cluster_root, &repo_root)
+        {
+            // Mirror the lazy-path spawn (activate the lifecycle so the
+            // watch/push path treats this cluster as already-spawned, then
+            // spawn its RA and drain the spawn control messages).
+            if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&root), h.clone()) {
+                spawn_cluster(&mut clusters, &h, root.clone(), lsp_tx.clone(), ctrl_tx.clone());
+                drain_spawned(&mut clusters, &ctrl_rx);
+                eprintln!(
+                    "[cargoless:obs] eager-boot-warm — spawned base cluster RA at {} (push-only; /readyz no longer traffic-dependent)",
+                    root.display()
+                );
+            }
+        }
+    }
 
     // ---- the serve loop (single owner ⇒ Judgment A holds composed) ---
     loop {
@@ -2553,6 +2611,66 @@ mod tests {
         assert!(!ready_after_respawn_for_modes(true, false));
         assert!(!ready_after_respawn_for_modes(false, true));
         assert!(!ready_after_respawn_for_modes(false, false));
+    }
+
+    fn wt_entry(path: &str) -> WorktreeEntry {
+        WorktreeEntry {
+            path: PathBuf::from(path),
+            head: None,
+            branch: None,
+            bare: false,
+            detached: false,
+            locked: false,
+            prunable: false,
+        }
+    }
+
+    #[test]
+    fn boot_warm_target_prefers_base_worktree() {
+        // base worktree (path == repo_root) + a sibling, distinct config
+        // hashes. The base must be chosen, with ITS own path as the root.
+        let repo_root = PathBuf::from("/workspace/tf-multiverse");
+        let sib = PathBuf::from("/workspace/tf-multiverse/.claude/worktrees/agent-1");
+        let base_h = WorkspaceConfig::new(Some("[base]".into()), None, None, None).hash();
+        let sib_h = WorkspaceConfig::new(Some("[sib]".into()), None, None, None).hash();
+        let worktrees = vec![wt_entry(sib.to_str().unwrap()), wt_entry(repo_root.to_str().unwrap())];
+        let mut wt_hash = BTreeMap::new();
+        wt_hash.insert(repo_root.clone(), base_h.clone());
+        wt_hash.insert(sib.clone(), sib_h.clone());
+        let mut cluster_root = BTreeMap::new();
+        cluster_root.insert(base_h.clone(), repo_root.clone());
+        cluster_root.insert(sib_h.clone(), sib.clone());
+
+        let got = select_boot_warm_target(&worktrees, &wt_hash, &cluster_root, &repo_root);
+        assert_eq!(got, Some((base_h, repo_root)), "must warm the base worktree's cluster");
+    }
+
+    #[test]
+    fn boot_warm_target_falls_back_to_first_cluster_when_base_unconfigured() {
+        // base worktree present but NOT in wt_hash (its workspace config was
+        // unreadable → split-safe skip at init). Fall back to the first
+        // configured cluster so warming still happens.
+        let repo_root = PathBuf::from("/workspace/tf-multiverse");
+        let sib = PathBuf::from("/workspace/tf-multiverse/.claude/worktrees/agent-1");
+        let sib_h = WorkspaceConfig::new(Some("[sib]".into()), None, None, None).hash();
+        let worktrees = vec![wt_entry(repo_root.to_str().unwrap()), wt_entry(sib.to_str().unwrap())];
+        let wt_hash: BTreeMap<WtId, WorkspaceConfigHash> = {
+            let mut m = BTreeMap::new();
+            m.insert(sib.clone(), sib_h.clone()); // base absent on purpose
+            m
+        };
+        let mut cluster_root = BTreeMap::new();
+        cluster_root.insert(sib_h.clone(), sib.clone());
+
+        let got = select_boot_warm_target(&worktrees, &wt_hash, &cluster_root, &repo_root);
+        assert_eq!(got, Some((sib_h, sib)), "fall back to the one configured cluster");
+    }
+
+    #[test]
+    fn boot_warm_target_none_when_no_cluster_configured() {
+        let repo_root = PathBuf::from("/workspace/tf-multiverse");
+        let got = select_boot_warm_target(&[], &BTreeMap::new(), &BTreeMap::new(), &repo_root);
+        assert_eq!(got, None, "nothing configured ⇒ nothing to warm");
     }
 
     #[test]
