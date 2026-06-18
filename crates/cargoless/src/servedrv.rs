@@ -1687,9 +1687,12 @@ fn compose_hard_mode_payload(
             VerdictPayload::unknown(format!("{reason}: {detail}"))
         }
         (true, _) => VerdictPayload::unknown("ra_native_unattributed_error"),
-        (false, ProjectCheckSummary::Green) | (false, ProjectCheckSummary::Empty) => {
-            VerdictPayload::green()
+        // Green carries the ids of the checks that ran+passed → echo them on
+        // `/status.gated_checks_ran`. Empty (no checks selected) has none.
+        (false, ProjectCheckSummary::Green { ran_check_ids }) => {
+            VerdictPayload::green_with_checks(ran_check_ids)
         }
+        (false, ProjectCheckSummary::Empty) => VerdictPayload::green(),
     }
 }
 
@@ -1717,7 +1720,7 @@ fn spawn_project_checks_warn(
                 "[cargoless:obs] project-checks-warn wt={} gate=false summary={}",
                 wt.display(),
                 match &summary {
-                    ProjectCheckSummary::Green => "green".to_string(),
+                    ProjectCheckSummary::Green { .. } => "green".to_string(),
                     ProjectCheckSummary::Empty => "empty".to_string(),
                     ProjectCheckSummary::Red { error_count } => {
                         format!("red(errors={error_count})")
@@ -1992,8 +1995,16 @@ fn try_acquire_project_checks_warn_slot_with_max(
 /// run the gate at all".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectCheckSummary {
-    /// Checks ran cleanly and the tree is green.
-    Green,
+    /// Checks ran cleanly and the tree is green. `ran_check_ids` are the
+    /// ids of the checks that actually executed and passed (from
+    /// `ProjectCheckReport.results`) — echoed on `/status` as
+    /// `gated_checks_ran` so a merge-gate consumer can assert a *specific*
+    /// witness (e.g. `wasm-compiler-witness`) genuinely ran, not merely
+    /// that *a* green was published. Empty on paths that cannot enumerate
+    /// (the coalesced batch path collapses to a bare green — documented at
+    /// the `member_result_to_summary` Green arm), which is fail-safe: the
+    /// consumer simply does not get confirmation via that path.
+    Green { ran_check_ids: Vec<String> },
     /// Checks ran and at least one required check failed; `error_count`
     /// is the count of error-severity diagnostics.
     Red { error_count: u32 },
@@ -2036,7 +2047,7 @@ fn run_project_checks_and_log(
                     wt.display(),
                     ctx.root.display(),
                     match &summary {
-                        ProjectCheckSummary::Green | ProjectCheckSummary::Empty => "green",
+                        ProjectCheckSummary::Green { .. } | ProjectCheckSummary::Empty => "green",
                         ProjectCheckSummary::Red { .. } => "red",
                         ProjectCheckSummary::Indeterminate { .. } => "unknown",
                     }
@@ -2147,7 +2158,16 @@ fn run_project_checks_and_log(
                     ProjectCheckSummary::Red { error_count }
                 }
             } else {
-                ProjectCheckSummary::Green
+                // Green: every result in this report ran and passed (the
+                // tree is not Red). Capture their ids so `/status` can
+                // attest WHICH checks ran — a merge-gate consumer asserts
+                // its required witness (e.g. wasm-compiler-witness) is in
+                // this list before trusting the green. Skipped checks
+                // (report.skipped) are deliberately excluded: "ran" means
+                // executed, not merely selected.
+                let ran_check_ids =
+                    report.results.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+                ProjectCheckSummary::Green { ran_check_ids }
             }
         }
         Ok(Err(e)) => {
@@ -2565,10 +2585,27 @@ mod tests {
 
     #[test]
     fn compose_clean_clean_is_green() {
-        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Green);
+        let p = compose_hard_mode_payload(
+            false,
+            ProjectCheckSummary::Green {
+                ran_check_ids: vec!["wasm-compiler-witness".to_string()],
+            },
+        );
         assert_eq!(p.verdict, statusfile::Verdict::Green);
         assert_eq!(p.red_diagnostics, 0);
         assert!(p.analysis_failure_reason.is_none());
+        // The ran-check ids ride the green payload through to /status.
+        assert_eq!(p.gated_checks_ran, vec!["wasm-compiler-witness".to_string()]);
+    }
+
+    #[test]
+    fn compose_empty_is_green_with_no_gated_checks() {
+        // Empty (no checks selected) is green for verdict purposes but
+        // names no ran checks — a consumer asserting a witness ran gets
+        // no false confirmation.
+        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Empty);
+        assert_eq!(p.verdict, statusfile::Verdict::Green);
+        assert!(p.gated_checks_ran.is_empty());
     }
 
     #[test]
@@ -2630,7 +2667,12 @@ mod tests {
         // liar state. New behavior: `Unknown(ra_native_unattributed_error)`
         // so the operator can distinguish "the gate is broken" from
         // "the code is broken".
-        for summary in [ProjectCheckSummary::Green, ProjectCheckSummary::Empty] {
+        for summary in [
+            ProjectCheckSummary::Green {
+                ran_check_ids: Vec::new(),
+            },
+            ProjectCheckSummary::Empty,
+        ] {
             let p = compose_hard_mode_payload(true, summary);
             assert_eq!(
                 p.verdict,
@@ -2683,9 +2725,17 @@ mod tests {
             ProjectCheckSummary::Empty
         );
         for require in [false, true] {
+            // Green passes through unchanged, ran-check ids preserved.
             assert_eq!(
-                apply_require_checks(ProjectCheckSummary::Green, require),
-                ProjectCheckSummary::Green
+                apply_require_checks(
+                    ProjectCheckSummary::Green {
+                        ran_check_ids: vec!["ssr-compiler-witness".to_string()],
+                    },
+                    require
+                ),
+                ProjectCheckSummary::Green {
+                    ran_check_ids: vec!["ssr-compiler-witness".to_string()],
+                }
             );
             assert_eq!(
                 apply_require_checks(ProjectCheckSummary::Red { error_count: 3 }, require),

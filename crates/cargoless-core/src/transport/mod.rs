@@ -263,6 +263,16 @@ pub struct WorktreeStatus {
     /// `changed_files` (unattributable — absence of evidence is never a
     /// hit). Additive wire key; absent on the wire when `false`.
     pub ra_blind_paths: bool,
+    /// Ids of the project checks that executed and passed for this verdict
+    /// (non-empty only on a witness-backed `green`). A merge-gate consumer
+    /// asserts its required witness id (e.g. `wasm-compiler-witness`) is in
+    /// this list before trusting the green — so a green published by a path
+    /// that did NOT run that witness (off-mode pod, RA-native-only) is
+    /// machine-readably distinguishable from one that did. Empty on red /
+    /// unknown / empty verdicts and on green paths that cannot enumerate
+    /// (the coalesced batch path). Additive wire key; absent on the wire
+    /// when empty.
+    pub gated_checks_ran: Vec<String>,
     pub heartbeat_age_secs: u64,
     pub published_at: u64,
 }
@@ -1384,6 +1394,19 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
             .expect("status_to_json constructed an object literal")
             .insert("ra_blind_paths".to_string(), serde_json::Value::Bool(true));
     }
+    if !s.gated_checks_ran.is_empty() {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert(
+                "gated_checks_ran".to_string(),
+                serde_json::Value::Array(
+                    s.gated_checks_ran
+                        .iter()
+                        .map(|id| serde_json::Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+    }
     obj.to_string()
 }
 
@@ -1424,6 +1447,15 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("ra_blind_paths")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        gated_checks_ran: v
+            .get("gated_checks_ran")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         heartbeat_age_secs: v
             .get("heartbeat_age_secs")
             .and_then(serde_json::Value::as_u64)
@@ -1830,6 +1862,9 @@ mod tests {
             // #A8 annotation case: a macro-blind-path push must carry the
             // bit across the wire (a consumer keys witness demand on it).
             ra_blind_paths: true,
+            // Red verdict ⇒ no ran-check list (the field is meaningful only
+            // on a witness-backed green); absent on the wire.
+            gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 2,
             published_at: 1234567890,
         };
@@ -1838,7 +1873,36 @@ mod tests {
             wire.contains(r#""ra_blind_paths":true"#),
             "blind-path hit must appear on the wire: {wire}"
         );
+        assert!(
+            !wire.contains("gated_checks_ran"),
+            "empty gated_checks_ran must not appear on the wire (additive contract): {wire}"
+        );
         assert_eq!(status_from_json(&wire), Some(s));
+
+        // Witness-backed green: the ran-check ids must appear on the wire and
+        // survive the round-trip (the merge-gate consumer reads them).
+        let s_green = WorktreeStatus {
+            worktree: "tf-mv-green".into(),
+            verdict: "green".into(),
+            daemon_build_id: "test-build".into(),
+            crates: vec![],
+            red_diagnostics: 0,
+            verdict_failure_reason: None,
+            base_sha: Some("0123abc0123abc0123abc0123abc0123abc01234".into()),
+            ra_blind_paths: false,
+            gated_checks_ran: vec![
+                "ssr-compiler-witness".into(),
+                "wasm-compiler-witness".into(),
+            ],
+            heartbeat_age_secs: 0,
+            published_at: 1234567891,
+        };
+        let wire_green = status_to_json(&s_green);
+        assert!(
+            wire_green.contains(r#""gated_checks_ran":["ssr-compiler-witness","wasm-compiler-witness"]"#),
+            "witness ids must appear on the wire: {wire_green}"
+        );
+        assert_eq!(status_from_json(&wire_green), Some(s_green));
 
         let s2 = WorktreeStatus {
             worktree: "tf-mv-check".into(),
@@ -1860,6 +1924,7 @@ mod tests {
             // (additive contract — old parsers see exactly the old JSON).
             base_sha: None,
             ra_blind_paths: false,
+            gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 0,
             published_at: 42,
         };
