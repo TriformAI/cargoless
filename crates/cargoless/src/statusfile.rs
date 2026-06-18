@@ -115,6 +115,14 @@ pub struct VerdictPayload {
     /// `"overlay_apply_error: <msg>"`, `"red_claimed_without_evidence"`.
     /// Always populated on `Unknown`; always `None` on `Green` and `Red`.
     pub analysis_failure_reason: Option<String>,
+    /// Ids of the project checks that actually executed and passed for a
+    /// `Green` verdict (empty otherwise, and empty on green paths that
+    /// cannot enumerate, e.g. the coalesced batch path). Echoed on
+    /// `/status` as `gated_checks_ran` so a merge-gate consumer can assert
+    /// a *named* witness ran — closing the "a green was published but did
+    /// the witness I asked for actually run?" gap without inferring it
+    /// from absence-of-`base_sha`.
+    pub gated_checks_ran: Vec<String>,
 }
 
 impl VerdictPayload {
@@ -125,6 +133,20 @@ impl VerdictPayload {
             verdict: Verdict::Green,
             red_diagnostics: 0,
             analysis_failure_reason: None,
+            gated_checks_ran: Vec::new(),
+        }
+    }
+
+    /// A `Green` payload that records which checks ran and passed. Used by
+    /// the project-check publish path so `/status.gated_checks_ran` can
+    /// attest a named witness executed. Equivalent to [`Self::green`] with
+    /// `gated_checks_ran` set.
+    pub fn green_with_checks(ran_check_ids: Vec<String>) -> Self {
+        Self {
+            verdict: Verdict::Green,
+            red_diagnostics: 0,
+            analysis_failure_reason: None,
+            gated_checks_ran: ran_check_ids,
         }
     }
 
@@ -145,6 +167,7 @@ impl VerdictPayload {
             verdict: Verdict::Red,
             red_diagnostics: diagnostic_count,
             analysis_failure_reason: None,
+            gated_checks_ran: Vec::new(),
         }
     }
 
@@ -160,6 +183,7 @@ impl VerdictPayload {
             verdict: Verdict::Unknown,
             red_diagnostics: 0,
             analysis_failure_reason: Some(reason.into()),
+            gated_checks_ran: Vec::new(),
         }
     }
 

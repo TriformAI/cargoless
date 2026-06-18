@@ -2235,6 +2235,10 @@ mod tests {
             verdict_failure_reason: None,
             base_sha: None,
             ra_blind_paths: false,
+            // Witness-backed green: the ran-check ids must survive the
+            // status_to_json → wire → status_from_json round-trip so a
+            // merge-gate consumer can read them off /status.
+            gated_checks_ran: vec!["wasm-compiler-witness".into()],
             heartbeat_age_secs: 0,
             published_at: 1,
         });
@@ -2244,7 +2248,13 @@ mod tests {
             .with_header("X-Cargoless-Routing-Key", "tf-mv-route-7")
             .expect("header");
         let got = client.get_status("wt").expect("status");
-        assert_eq!(got.map(|s| s.verdict), Some("green".to_string()));
+        let got = got.expect("status present");
+        assert_eq!(got.verdict, "green".to_string());
+        assert_eq!(
+            got.gated_checks_ran,
+            vec!["wasm-compiler-witness".to_string()],
+            "gated_checks_ran must round-trip across the HTTP wire"
+        );
         let head = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("captured request");

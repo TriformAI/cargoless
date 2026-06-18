@@ -911,6 +911,11 @@ impl ServeVerdictState {
             verdict_failure_reason: failure_reason.clone(),
             base_sha: base_sha.clone(),
             ra_blind_paths,
+            // The ids of the checks this verdict ran+passed (from the
+            // payload composed at the project-check site); non-empty only
+            // on a witness-backed green. Echoed on /status so a merge-gate
+            // consumer can assert a named witness actually ran.
+            gated_checks_ran: payload.gated_checks_ran.clone(),
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -1236,7 +1241,16 @@ impl ServeVerdictState {
                 cargoless_core::batch::BatchVerdict::Green => {
                     // CombinedGreen and SoloGreen both map to Green.
                     // Empty is indistinguishable at this layer (documented above).
-                    crate::servedrv::ProjectCheckSummary::Green
+                    // The coalesced batch path does NOT preserve per-check ids
+                    // (BatchMemberResult carries a verdict, not the ran-check
+                    // list), so `ran_check_ids` is empty here — fail-safe: a
+                    // merge-gate consumer asserting a named witness simply gets
+                    // no confirmation via the coalesced path and falls back to
+                    // its base_sha-attributed await. (Threading ids through the
+                    // batch coalescer is a separate enhancement.)
+                    crate::servedrv::ProjectCheckSummary::Green {
+                        ran_check_ids: Vec::new(),
+                    }
                 }
                 cargoless_core::batch::BatchVerdict::Red => {
                     let error_count = m
@@ -3084,7 +3098,12 @@ checks:
         );
         assert_eq!(
             summary.unwrap(),
-            ProjectCheckSummary::Green,
+            // The coalesced batch path yields a bare green with no enumerated
+            // ran-check ids (it does not preserve per-check detail) — the
+            // documented fail-safe.
+            ProjectCheckSummary::Green {
+                ran_check_ids: Vec::new()
+            },
             "clean overlay over a clean project should yield ProjectCheckSummary::Green"
         );
         // project drops here → Drop removes root + remote dirs.
