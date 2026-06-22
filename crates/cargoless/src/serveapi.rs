@@ -4264,6 +4264,100 @@ checks:
     }
 
     #[test]
+    fn end_to_end_http_green_and_red_pinned_by_sha() {
+        // End-to-end over the REAL HTTP wire (not just the in-process store):
+        // boot an HttpServer over a real ServeVerdictState, publish a GREEN PR
+        // (shaA) and a RED PR (shaB) sharing ONE worktree — the exact hot-trunk
+        // collision — then fetch each verdict back via GET /status?base_sha=…
+        // over an actual TCP request. Pre-fix, the single slot meant the green
+        // poller would read the red. This proves the green and the red each
+        // survive and bind to their own SHA across the full path.
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let wt = "/workspace/hot-trunk-repo";
+        let api = Arc::new(ServeVerdictState::new());
+        api.publish_attributed(
+            Path::new(wt),
+            crate::statusfile::VerdictPayload::green(),
+            Some("shaGREEN".into()),
+            false,
+        );
+        api.publish_attributed(
+            Path::new(wt),
+            crate::statusfile::VerdictPayload::red(2),
+            Some("shaRED".into()),
+            false,
+        );
+
+        let srv = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::clone(&api) as Arc<dyn VerdictService>,
+            Arc::new(AllowAll),
+        )
+        .expect("bind ephemeral");
+        std::thread::sleep(Duration::from_millis(50));
+        let addr = srv.addr();
+
+        // Raw HTTP GET (mirrors the http.rs test helper) so we exercise the
+        // actual /status route + base_sha query handling, not a client shim.
+        let raw_get = |target: &str| -> (u16, String) {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            write!(
+                s,
+                "GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            s.flush().unwrap();
+            let mut raw = String::new();
+            s.read_to_string(&mut raw).unwrap();
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+            let code = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .expect("status code");
+            (code, body.to_string())
+        };
+
+        // The GREEN PR's poller asks for ITS sha and gets green — even though
+        // the RED PR published AFTER it on the same worktree.
+        let (code_g, body_g) = raw_get(&format!("/status?worktree={wt}&base_sha=shaGREEN"));
+        assert_eq!(code_g, 200, "green sha resolves: {body_g}");
+        assert!(
+            body_g.contains("\"verdict\":\"green\"")
+                && body_g.contains("\"base_sha\":\"shaGREEN\""),
+            "green PR retrieves its own green over HTTP: {body_g}"
+        );
+
+        // The RED PR's poller asks for ITS sha and gets red.
+        let (code_r, body_r) = raw_get(&format!("/status?worktree={wt}&base_sha=shaRED"));
+        assert_eq!(code_r, 200, "red sha resolves: {body_r}");
+        assert!(
+            body_r.contains("\"verdict\":\"red\"") && body_r.contains("\"base_sha\":\"shaRED\""),
+            "red PR retrieves its own red over HTTP: {body_r}"
+        );
+
+        // No selector ⇒ latest (the red, last published) — historical contract.
+        let (code_latest, body_latest) = raw_get(&format!("/status?worktree={wt}"));
+        assert_eq!(code_latest, 200);
+        assert!(
+            body_latest.contains("\"verdict\":\"red\""),
+            "no-selector read returns the latest verdict: {body_latest}"
+        );
+
+        // A sha that never published ⇒ 404 (never another branch's verdict).
+        let (code_unknown, _) = raw_get(&format!("/status?worktree={wt}&base_sha=shaNONE"));
+        assert_eq!(
+            code_unknown, 404,
+            "unknown sha is 404, never a wrong verdict"
+        );
+
+        drop(srv);
+    }
+
+    #[test]
     fn verdict_history_evicts_oldest_beyond_bound() {
         // The per-worktree history is bounded; the oldest distinct sha ages
         // out, but the newest AND the latest pointer survive. Exercises the
