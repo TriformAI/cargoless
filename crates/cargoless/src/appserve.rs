@@ -755,6 +755,34 @@ fn serve_loop(
         }
     };
 
+    // The static instance set (instances file / SIGHUP) — excluded from the
+    // runtime-preview registry, which only persists self-serve previews.
+    let static_names: std::collections::BTreeSet<String> =
+        specs.iter().map(|s| s.name.clone()).collect();
+
+    // Restart-survival: re-register runtime self-serve previews persisted to
+    // the durable registry before the loop starts, so a pod restart restores
+    // each preview's proxy port, route, TTL, and last-green — the agent's
+    // `<name>.tryform.wtf` survives instead of silently vanishing.
+    reregister_persisted_previews(
+        repo,
+        state_dir,
+        poll_ms,
+        max_concurrent,
+        opts.preview_domain.as_deref(),
+        &holding,
+        &mut driver,
+        &launcher_ref,
+        &svc,
+        &mut proxies,
+        &mut live_specs,
+        &mut live_refs,
+        &mut poller_stops,
+        &mut expires_at,
+        preview_ports.as_ref(),
+        &events_tx,
+    );
+
     // ── the control loop ─────────────────────────────────────────────
     // Single mutator of the driver; 200ms tick polls the shutdown + reload
     // flags. All mutations of `driver`, `proxies`, `live_refs`, and
@@ -808,6 +836,7 @@ fn serve_loop(
             &mut expires_at,
             preview_ports.as_ref(),
             &events_tx,
+            &static_names,
         );
         // TTL sweep: auto-remove any preview whose lifetime has elapsed. Runs
         // every tick (cheap: a map scan), so an abandoned preview self-cleans
@@ -824,6 +853,7 @@ fn serve_loop(
             &mut poller_stops,
             &mut expires_at,
             preview_ports.as_ref(),
+            &static_names,
         );
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok((instance, event)) => {
@@ -1341,6 +1371,7 @@ fn drain_preview_requests(
     expires_at: &mut BTreeMap<String, u64>,
     preview_ports: Option<&PortAllocator>,
     events_tx: &Sender<(String, Event)>,
+    static_names: &std::collections::BTreeSet<String>,
 ) {
     while let Ok(req) = preview_rx.try_recv() {
         match req {
@@ -1370,6 +1401,7 @@ fn drain_preview_requests(
                         *cell.lock().expect("live_ref") = git_ref.clone();
                     }
                     expires_at.insert(name.clone(), expiry);
+                    persist_preview_registry(state_dir, live_specs, expires_at, static_names);
                     ui::ok(format!(
                         "preview `{name}` ref re-pointed → {git_ref}, TTL renewed (+{ttl}s)"
                     ));
@@ -1505,11 +1537,14 @@ fn drain_preview_requests(
                     PreviewRoute {
                         proxy_port: bound_port,
                         public_host: public_host.clone(),
+                        expires_at: expiry,
                     },
                 );
                 // Record when this preview self-expires (the TTL sweep below
                 // tears it down at/after this instant).
                 expires_at.insert(name.clone(), expiry);
+                // Persist the new preview so it survives a daemon restart.
+                persist_preview_registry(state_dir, live_specs, expires_at, static_names);
 
                 // Kick the first build now (the poller will also detect HEAD).
                 if let Some(sha) = resolve_ref(repo, &git_ref) {
@@ -1551,6 +1586,9 @@ fn drain_preview_requests(
                     expires_at,
                     preview_ports,
                 );
+                // Persist the shrunk set so the removed preview does not come
+                // back on a restart.
+                persist_preview_registry(state_dir, live_specs, expires_at, static_names);
             }
         }
     }
@@ -1600,6 +1638,191 @@ fn teardown_preview(
     ui::ok(format!("preview `{name}` {reason}"));
 }
 
+/// Persist the current runtime-preview set to the durable registry so a daemon
+/// restart can re-register them (see [`reregister_persisted_previews`]). Called
+/// after every add/remove. `static_names` are the instances-file/SIGHUP set —
+/// excluded, because those are recovered from the instances file, not here.
+/// Best-effort: a write failure is logged, never fatal (the previews keep
+/// running; only restart-survival is at risk).
+fn persist_preview_registry(
+    state_dir: &Path,
+    live_specs: &BTreeMap<String, InstanceSpec>,
+    expires_at: &BTreeMap<String, u64>,
+    static_names: &std::collections::BTreeSet<String>,
+) {
+    let records: Vec<cargoless_core::previewreg::PreviewRecord> = live_specs
+        .iter()
+        .filter(|(name, _)| !static_names.contains(*name))
+        .map(|(name, spec)| cargoless_core::previewreg::PreviewRecord {
+            name: name.clone(),
+            git_ref: spec.git_ref.clone(),
+            app_bind: spec.app_bind,
+            expires_at: expires_at.get(name).copied().unwrap_or(0),
+            last_active_unix: 0, // reserved for idle-evict (task #17)
+            own_db: false,       // advisory; not load-bearing on respawn
+            env: spec.env.clone(),
+        })
+        .collect();
+    if let Err(e) = cargoless_core::previewreg::write(state_dir, &records) {
+        ui::warn(format!(
+            "preview registry write failed (restarts won't restore previews): {e}"
+        ));
+    }
+}
+
+/// Re-register runtime previews persisted in the registry, on daemon boot —
+/// before the control loop starts. Each record re-binds its SAVED proxy port
+/// (so the reconciler's Service targetPort stays stable across the restart),
+/// reserves that port in the allocator, re-creates the worktree + run plan +
+/// ref poller, adds the instance to the driver, restores its `/app` route and
+/// its ORIGINAL expiry (TTL is not reset by a restart), and triggers the normal
+/// `appstatefile` last-green recovery via a HeadAdvanced kick. A record that
+/// fails any step is skipped (logged) rather than wedging boot. An already-
+/// expired record is dropped (its route was already pruned, or will be).
+#[allow(clippy::too_many_arguments)] // all are control-loop boot state; bundling adds noise
+fn reregister_persisted_previews(
+    repo: &Path,
+    state_dir: &Path,
+    poll_ms: u64,
+    max_concurrent: usize,
+    preview_domain: Option<&str>,
+    holding: &Arc<HoldingResponse>,
+    driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
+    launcher_ref: &Arc<ProcLauncher>,
+    svc: &Arc<AppServeState>,
+    proxies: &mut BTreeMap<String, L4Proxy>,
+    live_specs: &mut BTreeMap<String, InstanceSpec>,
+    live_refs: &mut BTreeMap<String, Arc<std::sync::Mutex<String>>>,
+    poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
+    expires_at: &mut BTreeMap<String, u64>,
+    preview_ports: Option<&PortAllocator>,
+    events_tx: &Sender<(String, Event)>,
+) {
+    let Some(records) = cargoless_core::previewreg::read(state_dir) else {
+        return; // no registry / unknown scheme ⇒ nothing to restore
+    };
+    let now = unix_now();
+    for rec in records {
+        let name = rec.name.clone();
+        // Skip names that somehow collide with a static/already-live instance.
+        if live_specs.contains_key(&name) {
+            continue;
+        }
+        // Drop already-expired previews — the TTL elapsed while the daemon was
+        // down; do not resurrect them (the reconciler prunes the stale route).
+        if rec.expires_at != 0 && rec.expires_at <= now {
+            ui::ok(format!(
+                "preview `{name}` not restored — TTL expired while down"
+            ));
+            continue;
+        }
+        // Re-reserve the saved port so the allocator won't hand it out again.
+        if let Some(alloc) = preview_ports {
+            let p = rec.app_bind.port();
+            if p != 0 {
+                alloc.reserve(p);
+            }
+        }
+        let proxy = match L4Proxy::bind(rec.app_bind, holding.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                ui::warn(format!(
+                    "preview `{name}`: re-bind {} on restart failed: {e} — skipping",
+                    rec.app_bind
+                ));
+                continue;
+            }
+        };
+        let bound_port = proxy.addr().port();
+        let public_host = preview_domain.map(|d| format!("{name}.{d}"));
+        let build_env = if max_concurrent > 1 {
+            let lane_target = state_dir.join("app").join(&name).join("target");
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                lane_target.to_string_lossy().into_owned(),
+            )]
+        } else {
+            Vec::new()
+        };
+        let paths = InstancePaths {
+            worktree: instance_worktree(state_dir, &name),
+            bundles: state_dir.join("app").join(&name).join("bundles"),
+            build_env,
+        };
+        let config = InstanceConfig {
+            name: name.clone(),
+            slot: proxy.slot().clone(),
+            paths,
+            env: rec
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        if let Err(e) =
+            ensure_instance_worktree(repo, &instance_worktree(state_dir, &name), &rec.git_ref)
+        {
+            ui::warn(format!("preview `{name}`: restart worktree setup: {e}"));
+        }
+        let wt = instance_worktree(state_dir, &name);
+        let plan = run_plan_from_manifest(&wt)
+            .or_else(|| run_plan_from_manifest(repo))
+            .unwrap_or_else(default_run_plan);
+        launcher_ref
+            .plans
+            .lock()
+            .expect("plans")
+            .insert(name.clone(), plan);
+        let stop = Arc::new(AtomicBool::new(false));
+        let cell = Arc::new(std::sync::Mutex::new(rec.git_ref.clone()));
+        live_refs.insert(name.clone(), cell.clone());
+        spawn_ref_poller(
+            repo,
+            &name,
+            cell,
+            poll_ms,
+            events_tx.clone(),
+            Some(stop.clone()),
+        );
+        poller_stops.insert(name.clone(), stop);
+        driver.add_instance(config);
+        proxies.insert(name.clone(), proxy);
+        let env_map: BTreeMap<String, String> = rec.env.clone();
+        live_specs.insert(
+            name.clone(),
+            InstanceSpec {
+                name: name.clone(),
+                git_ref: rec.git_ref.clone(),
+                app_bind: rec.app_bind,
+                env: env_map,
+            },
+        );
+        svc.set_preview_route(
+            &name,
+            PreviewRoute {
+                proxy_port: bound_port,
+                public_host,
+                expires_at: rec.expires_at,
+            },
+        );
+        expires_at.insert(name.clone(), rec.expires_at);
+        // Recover last-green (via appstatefile) immediately; also kick a build
+        // so a moved ref rebuilds. RecoverFromPointer restores service in
+        // seconds; the HeadAdvanced rebuilds if the durable green is stale.
+        if let Some(green) =
+            cargoless_core::appstatefile::read(state_dir, &name).and_then(|s| s.last_green)
+        {
+            driver.drive(&name, Event::RecoverFromPointer { sha: green });
+        }
+        if let Some(sha) = resolve_ref(repo, &rec.git_ref) {
+            driver.drive(&name, Event::HeadAdvanced { sha });
+        }
+        ui::ok(format!(
+            "preview `{name}` restored after restart — proxy :{bound_port}"
+        ));
+    }
+}
+
 /// Sweep expired self-serve previews on the control thread (called each tick).
 /// A preview whose recorded expiry instant is at/before `now` is torn down via
 /// [`teardown_preview`] — so an abandoned preview self-cleans and the reconciler
@@ -1618,6 +1841,7 @@ fn sweep_expired_previews(
     poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
     expires_at: &mut BTreeMap<String, u64>,
     preview_ports: Option<&PortAllocator>,
+    static_names: &std::collections::BTreeSet<String>,
 ) {
     let now = unix_now();
     let expired: Vec<String> = expires_at
@@ -1625,6 +1849,7 @@ fn sweep_expired_previews(
         .filter(|(_, exp)| **exp <= now)
         .map(|(n, _)| n.clone())
         .collect();
+    let mut evicted_any = false;
     for name in expired {
         // Only tear down a still-live preview; a stale expiry entry for an
         // already-removed preview is just dropped.
@@ -1645,9 +1870,15 @@ fn sweep_expired_previews(
                 expires_at,
                 preview_ports,
             );
+            evicted_any = true;
         } else {
             expires_at.remove(&name);
         }
+    }
+    // Persist once if the set shrank, so TTL-expired previews stay gone across
+    // a restart.
+    if evicted_any {
+        persist_preview_registry(state_dir, live_specs, expires_at, static_names);
     }
 }
 

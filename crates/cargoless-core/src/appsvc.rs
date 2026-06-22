@@ -48,6 +48,10 @@ pub struct PreviewRoute {
     /// The public host this preview answers on, e.g. `feat-x.tryform.wtf`.
     /// `None` when no `--preview-domain` is configured (the feature is inert).
     pub public_host: Option<String>,
+    /// Unix-seconds instant this preview self-expires (TTL). `0` ⇒ no expiry
+    /// recorded (e.g. a static instance that somehow got a route). Surfaced on
+    /// `/app` as `expires_at` so agents/operators can see remaining lifetime.
+    pub expires_at: u64,
 }
 
 /// An immutable, cheap-to-clone snapshot of one instance for the report.
@@ -212,6 +216,10 @@ impl AppServeState {
                     "draining": r.draining,
                     "proxy_port": route.map(|x| x.proxy_port),
                     "public_host": route.and_then(|x| x.public_host.clone()),
+                    // Self-serve preview TTL: the unix-seconds expiry instant
+                    // (null/absent for static instances). Lets agents see how
+                    // long their preview has left before auto-removal.
+                    "expires_at": route.and_then(|x| (x.expires_at != 0).then_some(x.expires_at)),
                 })
             })
             .collect();
@@ -389,6 +397,7 @@ mod tests {
             PreviewRoute {
                 proxy_port: 8201,
                 public_host: Some("feat.tryform.wtf".into()),
+                expires_at: 1_700_000_000,
             },
         );
         let v: serde_json::Value = serde_json::from_str(&svc.app_report().unwrap()).unwrap();
@@ -396,10 +405,12 @@ mod tests {
         assert_eq!(inst[0]["name"], "feat");
         assert_eq!(inst[0]["proxy_port"], 8201);
         assert_eq!(inst[0]["public_host"], "feat.tryform.wtf");
+        assert_eq!(inst[0]["expires_at"], 1_700_000_000_u64);
         // The route-less instance reports nulls (not absent keys).
         assert_eq!(inst[1]["name"], "dev");
         assert!(inst[1]["proxy_port"].is_null());
         assert!(inst[1]["public_host"].is_null());
+        assert!(inst[1]["expires_at"].is_null());
         // Clearing drops the fields back to null.
         svc.clear_preview_route("feat");
         let v2: serde_json::Value = serde_json::from_str(&svc.app_report().unwrap()).unwrap();
