@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+#
+# scripts/land-ff — bounded "collapse the queue, then take your turn" wrapper
+# around scripts/ci-gate + scripts/triple-guard-ff.
+#
+# WHY THIS EXISTS
+#
+# triple-guard-ff is correct and intentionally strict: it refuses to land if
+# `origin/main` moved off the branch's recorded base (g2a). That single check
+# is exactly right for safety — a land MUST be a pure fast-forward of a
+# freshly-gated tree. But on a HOT trunk it has no retry: if any other branch
+# lands during your gate→guard window, g2a dies and you must manually
+# re-branch, re-gate, and re-run the guard. Lose that race repeatedly and you
+# starve — the operator-reported "can't land anything on a crowded trunk".
+#
+# This wrapper closes that gap WITHOUT weakening any guard. It applies the
+# same axiom the rest of this work applies to CI and the witness:
+#
+#     never cancel in-progress work; collapse the queue, then take your turn.
+#
+# On a g2a "base moved" loss it does the safe, mechanical thing a human would:
+#   re-fetch origin/main → replay your commits onto the new tip (pure linear
+#   rebase, never a merge) → re-gate that new tree → retry the guard — with
+#   jittered backoff and a bounded attempt count. The guard remains the sole
+#   authority on whether the push is allowed; this only decides whether to try
+#   again. There is NO --force anywhere here, and the rebase is refused unless
+#   it stays linear and conflict-free (a real conflict means the change needs
+#   human coordination, not an automatic retry).
+#
+# USAGE
+#   scripts/land-ff [--max-attempts N] [--dry-run] [--update-lock]
+#
+#   Run from a worktree whose HEAD is the tip of the linear commit range you
+#   want to land (branched off origin/main). The wrapper computes the base
+#   (merge-base with origin/main) and the count itself.
+#
+#   --max-attempts N  bound the gate→guard retries (default 5).
+#   --dry-run         re-gate + run the guard in --dry-run (no push); still
+#                     rebases on a base move so the rehearsal is realistic.
+#   --update-lock     forwarded to ci-gate (regenerate + prove Cargo.lock).
+#
+# EXIT 0 iff the land succeeded (or --dry-run reached a clean would-push).
+# EXIT 1 on a real gate RED, a non-linear/conflicting rebase, or attempts
+#        exhausted. EXIT 2 on usage error.
+set -euo pipefail
+
+prog=${0##*/}
+here=$(cd "$(dirname "$0")" && pwd)
+die()  { printf '%s: FAIL: %s\n' "$prog" "$*" >&2; exit 1; }
+usage(){ printf '%s: %s\n' "$prog" "$*" >&2; exit 2; }
+note() { printf '%s: %s\n'  "$prog" "$*"; }
+
+MAX_ATTEMPTS=5
+DRY_RUN=0
+UPDATE_LOCK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --max-attempts) MAX_ATTEMPTS="${2:-}"; shift 2 ;;
+    --dry-run)      DRY_RUN=1; shift ;;
+    --update-lock)  UPDATE_LOCK=1; shift ;;
+    --help|-h)      usage "usage: $prog [--max-attempts N] [--dry-run] [--update-lock]" ;;
+    *)              usage "unknown argument: $1" ;;
+  esac
+done
+case "$MAX_ATTEMPTS" in
+  ''|*[!0-9]*) usage "--max-attempts must be a positive integer: $MAX_ATTEMPTS" ;;
+esac
+[ "$MAX_ATTEMPTS" -ge 1 ] || usage "--max-attempts must be >= 1"
+
+[ -x "$here/ci-gate" ]         || die "scripts/ci-gate not found/executable next to $prog"
+[ -x "$here/triple-guard-ff" ] || die "scripts/triple-guard-ff not found/executable next to $prog"
+
+# The tree must be clean: the guard's g1 demands HEAD == the gated SHA, and a
+# rebase replay refuses to run over uncommitted work anyway. Fail early and
+# loud rather than mid-retry.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  die "working tree is dirty — commit or stash before landing (g1 needs HEAD == gated SHA)"
+fi
+
+# Jittered backoff so a fleet of waiters de-synchronises instead of
+# thundering the remote in lockstep (same intent as dev-merge's jitter). No
+# Date/RANDOM dependency on a deterministic base: seed from the PID + attempt.
+backoff_sleep() {
+  local attempt="$1" base jitter
+  base=$(( attempt * 3 ))                 # 3s, 6s, 9s, ...
+  jitter=$(( (RANDOM % 4) ))              # 0..3s
+  note "backing off $(( base + jitter ))s before re-gating (attempt $attempt)"
+  sleep "$(( base + jitter ))"
+}
+
+attempt=1
+while : ; do
+  GATED=$(git rev-parse --verify HEAD)
+  # origin/main, freshly fetched — the live tip we must fast-forward from.
+  git fetch origin --quiet || die "git fetch origin failed"
+  OM=$(git rev-parse --verify origin/main) || die "cannot resolve origin/main"
+  BASE=$(git merge-base "$OM" "$GATED")    || die "no merge-base with origin/main"
+  N=$(git rev-list --count "${BASE}..${GATED}")
+
+  note "attempt $attempt/$MAX_ATTEMPTS — gated=$GATED base=$BASE n=$N origin/main=$OM"
+
+  if [ "$N" -eq 0 ]; then
+    die "nothing to land: origin/main..HEAD is empty (already landed?)"
+  fi
+  # A merge commit in the range means the linear-range invariant the guard
+  # enforces (g2b) can't hold — refuse rather than fight it.
+  if [ "$(git rev-list --count --merges "${BASE}..${GATED}")" -ne 0 ]; then
+    die "range ${BASE}..${GATED} contains merge commit(s) — not a linear land; rebase by hand"
+  fi
+
+  # ---- gate the CURRENT tip on the dedicated builder pod ----------------
+  gate_args=("$GATED")
+  [ "$UPDATE_LOCK" -eq 1 ] && gate_args+=(--update-lock)
+  note "ci-gate ${gate_args[*]}"
+  if ! "$here/ci-gate" "${gate_args[@]}"; then
+    # A gate failure is a CODE red (or a real infra fault) — NOT a base-moved
+    # race. Retrying would just re-run the same red. Stop and surface it.
+    die "ci-gate RED for $GATED — fix the code (this is not a hot-trunk retry case)"
+  fi
+
+  # If --update-lock regenerated Cargo.lock, ci-gate captured it to the tree;
+  # fold it into the gated tip so g1 still holds (HEAD == gated SHA).
+  if [ "$UPDATE_LOCK" -eq 1 ] && ! git diff --quiet -- Cargo.lock; then
+    git add Cargo.lock
+    git commit --amend --no-edit >/dev/null
+    GATED=$(git rev-parse --verify HEAD)
+    note "amended regenerated Cargo.lock into the gated tip ($GATED)"
+    # The amend changed the SHA; loop once more to re-gate the amended tree.
+    continue
+  fi
+
+  # ---- run the structural guard (the sole push authority) ---------------
+  guard_args=("$GATED" "$BASE" "$N")
+  [ "$DRY_RUN" -eq 1 ] && guard_args+=(--dry-run)
+  note "triple-guard-ff ${guard_args[*]}"
+  if "$here/triple-guard-ff" "${guard_args[@]}"; then
+    note "LANDED${DRY_RUN:+ (dry-run)}: $GATED"
+    exit 0
+  fi
+
+  # The guard refused. The ONLY retryable reason is a base move (another land
+  # won the race): re-fetch and see if origin/main advanced past our base. Any
+  # other guard failure is structural and must not be retried.
+  git fetch origin --quiet || die "git fetch origin failed (post-guard)"
+  NEW_OM=$(git rev-parse --verify origin/main) || die "cannot resolve origin/main"
+  if [ "$NEW_OM" = "$BASE" ]; then
+    # Base did NOT move ⇒ the guard failed for a non-race reason (divergence,
+    # non-linear range, post-push mismatch). Not ours to retry.
+    die "triple-guard-ff refused and origin/main did not move — a structural guard failure, not a base-moved race. STOP."
+  fi
+
+  if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+    die "base kept moving for $MAX_ATTEMPTS attempts — trunk too hot to win the race; retry later or coordinate a merge-queue slot"
+  fi
+
+  note "base moved ($BASE -> $NEW_OM): a concurrent land won the race; replaying our $N commit(s) onto the new tip"
+  # Pure linear replay onto the new origin/main. --keep-base would keep the
+  # OLD base; we WANT the new tip. No merges, no force. A conflict aborts and
+  # is surfaced — automatic retry must never paper over a real conflict.
+  if ! git rebase --onto "$NEW_OM" "$BASE" "$GATED" 2>&1; then
+    git rebase --abort 2>/dev/null || true
+    die "rebase onto $NEW_OM conflicted — the concurrent change genuinely conflicts with yours; resolve by hand (this is real coordination, not a retry)"
+  fi
+  # Re-assert linearity after the replay (defence-in-depth; --onto of a linear
+  # range onto a tip is linear, but verify rather than assume).
+  RB_HEAD=$(git rev-parse --verify HEAD)
+  if [ "$(git rev-list --count --merges "${NEW_OM}..${RB_HEAD}")" -ne 0 ]; then
+    die "post-rebase range is non-linear — refusing to land"
+  fi
+
+  backoff_sleep "$attempt"
+  attempt=$(( attempt + 1 ))
+done
