@@ -2193,11 +2193,13 @@ mod tests {
             MAX_PREVIEW_TTL_SECS,
             "over-ceiling ⇒ clamped"
         );
-        assert!(
-            DEFAULT_PREVIEW_TTL_SECS <= MAX_PREVIEW_TTL_SECS,
-            "default must not exceed the ceiling"
-        );
     }
+
+    // The default must never exceed the ceiling. Both are consts, so assert it
+    // at compile time — a runtime `assert!` on two consts is `assert!(true)`,
+    // which clippy::assertions_on_constants (in `clippy::all`, -D warnings)
+    // rejects because it can never fire.
+    const _: () = assert!(DEFAULT_PREVIEW_TTL_SECS <= MAX_PREVIEW_TTL_SECS);
 
     #[test]
     fn load_preview_defaults_none_is_empty() {
