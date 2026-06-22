@@ -129,6 +129,14 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Default self-serve preview lifetime when the client requests no explicit
+/// `ttl_secs` — 24h, enough for a day's work on a branch; an agent re-running
+/// `cargoless preview` renews it.
+const DEFAULT_PREVIEW_TTL_SECS: u64 = 24 * 60 * 60;
+/// Upper bound on a client-requested TTL — a preview is ephemeral by design, so
+/// even an explicit request cannot pin one for more than a week. 7 days.
+const MAX_PREVIEW_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 // ── shutdown: SIGTERM/SIGINT → polled flag (the servedrv discipline) ──────
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -723,6 +731,9 @@ fn serve_loop(
     svc.set_control(preview_tx);
     // Per-preview poller stop flags, so a DELETE stops exactly one poller.
     let mut poller_stops: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
+    // Per-preview expiry instants (unix secs). A preview self-removes once its
+    // TTL passes; static/SIGHUP instances never get an entry here.
+    let mut expires_at: BTreeMap<String, u64> = BTreeMap::new();
     // Optional dedicated proxy-port allocator for runtime previews (distinct
     // from the app-child `ports`). Absent ⇒ previews bind an ephemeral port.
     let preview_ports = match opts.preview_port_range.as_deref().map(parse_port_range) {
@@ -794,8 +805,25 @@ fn serve_loop(
             &mut live_specs,
             &mut live_refs,
             &mut poller_stops,
+            &mut expires_at,
             preview_ports.as_ref(),
             &events_tx,
+        );
+        // TTL sweep: auto-remove any preview whose lifetime has elapsed. Runs
+        // every tick (cheap: a map scan), so an abandoned preview self-cleans
+        // within ~200ms of expiry and the reconciler prunes its route next pass.
+        sweep_expired_previews(
+            repo,
+            state_dir,
+            &mut driver,
+            &launcher_ref,
+            &svc,
+            &mut proxies,
+            &mut live_specs,
+            &mut live_refs,
+            &mut poller_stops,
+            &mut expires_at,
+            preview_ports.as_ref(),
         );
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok((instance, event)) => {
@@ -1310,6 +1338,7 @@ fn drain_preview_requests(
     live_specs: &mut BTreeMap<String, InstanceSpec>,
     live_refs: &mut BTreeMap<String, Arc<std::sync::Mutex<String>>>,
     poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
+    expires_at: &mut BTreeMap<String, u64>,
     preview_ports: Option<&PortAllocator>,
     events_tx: &Sender<(String, Event)>,
 ) {
@@ -1320,18 +1349,30 @@ fn drain_preview_requests(
                 git_ref,
                 env,
                 own_db,
+                ttl_secs,
             } => {
                 let Some(name) = preview_instance_name(&name) else {
                     ui::warn(format!("preview: rejected unusable name `{name}`"));
                     continue;
                 };
+                // The lifetime this Add grants, clamped to a sane ceiling so a
+                // client cannot pin a preview forever; `None` ⇒ the default.
+                let ttl = ttl_secs
+                    .unwrap_or(DEFAULT_PREVIEW_TTL_SECS)
+                    .min(MAX_PREVIEW_TTL_SECS);
+                let expiry = unix_now().saturating_add(ttl);
                 if live_specs.contains_key(&name) {
                     // Upsert: re-point the existing preview's ref (like the
-                    // SIGHUP same-name changed-ref arm) — no re-bind, no churn.
+                    // SIGHUP same-name changed-ref arm) — no re-bind, no churn —
+                    // and RENEW its TTL (an agent re-running `preview` on a live
+                    // branch keeps it alive).
                     if let Some(cell) = live_refs.get(&name) {
                         *cell.lock().expect("live_ref") = git_ref.clone();
                     }
-                    ui::ok(format!("preview `{name}` ref re-pointed → {git_ref}"));
+                    expires_at.insert(name.clone(), expiry);
+                    ui::ok(format!(
+                        "preview `{name}` ref re-pointed → {git_ref}, TTL renewed (+{ttl}s)"
+                    ));
                     continue;
                 }
                 if own_db {
@@ -1466,6 +1507,9 @@ fn drain_preview_requests(
                         public_host: public_host.clone(),
                     },
                 );
+                // Record when this preview self-expires (the TTL sweep below
+                // tears it down at/after this instant).
+                expires_at.insert(name.clone(), expiry);
 
                 // Kick the first build now (the poller will also detect HEAD).
                 if let Some(sha) = resolve_ref(repo, &git_ref) {
@@ -1473,10 +1517,12 @@ fn drain_preview_requests(
                 }
                 match &public_host {
                     Some(h) => ui::ok(format!(
-                        "preview `{name}` added — proxy :{bound_port}, public https://{h}"
+                        "preview `{name}` added — proxy :{bound_port}, public https://{h} \
+                         (expires in {ttl}s)"
                     )),
                     None => ui::ok(format!(
-                        "preview `{name}` added — proxy :{bound_port} (no --preview-domain)"
+                        "preview `{name}` added — proxy :{bound_port} (no --preview-domain, \
+                         expires in {ttl}s)"
                     )),
                 }
             }
@@ -1484,31 +1530,123 @@ fn drain_preview_requests(
                 let Some(name) = preview_instance_name(&name) else {
                     continue;
                 };
-                // Stop the poller first so no HeadAdvanced races the teardown.
-                if let Some(stop) = poller_stops.remove(&name) {
-                    stop.store(true, Ordering::SeqCst);
-                }
                 if !live_specs.contains_key(&name) {
+                    expires_at.remove(&name);
+                    poller_stops.remove(&name);
                     ui::warn(format!("preview `{name}`: not found — ignored"));
                     continue;
                 }
-                // Reclaim the proxy port if it came from our allocator.
-                if let (Some(alloc), Some(spec)) = (preview_ports, live_specs.get(&name)) {
-                    let p = spec.app_bind.port();
-                    if p != 0 {
-                        alloc.release(p);
-                    }
-                }
-                driver.remove_instance(&name);
-                proxies.remove(&name); // drop stops the accept loop
-                live_refs.remove(&name);
-                live_specs.remove(&name);
-                launcher_ref.plans.lock().expect("plans").remove(&name);
-                svc.clear_preview_route(&name);
-                let wt = instance_worktree(state_dir, &name);
-                remove_instance_worktree(repo, &wt);
-                ui::ok(format!("preview `{name}` removed"));
+                teardown_preview(
+                    &name,
+                    "removed",
+                    repo,
+                    state_dir,
+                    driver,
+                    launcher_ref,
+                    svc,
+                    proxies,
+                    live_specs,
+                    live_refs,
+                    poller_stops,
+                    expires_at,
+                    preview_ports,
+                );
             }
+        }
+    }
+}
+
+/// Tear a single preview down completely — the shared core of both an explicit
+/// `DELETE /instances/<name>` and a TTL expiry. Stops the poller, reclaims the
+/// proxy port, removes the instance from the driver + every live map + the
+/// `/app` route, and prunes the git worktree. `reason` colours the log line
+/// (`"removed"` vs `"expired"`). Caller guarantees `name` is a live preview.
+#[allow(clippy::too_many_arguments)] // all are control-loop state; bundling adds noise
+fn teardown_preview(
+    name: &str,
+    reason: &str,
+    repo: &Path,
+    state_dir: &Path,
+    driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
+    launcher_ref: &Arc<ProcLauncher>,
+    svc: &Arc<AppServeState>,
+    proxies: &mut BTreeMap<String, L4Proxy>,
+    live_specs: &mut BTreeMap<String, InstanceSpec>,
+    live_refs: &mut BTreeMap<String, Arc<std::sync::Mutex<String>>>,
+    poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
+    expires_at: &mut BTreeMap<String, u64>,
+    preview_ports: Option<&PortAllocator>,
+) {
+    expires_at.remove(name);
+    // Stop the poller first so no HeadAdvanced races the teardown.
+    if let Some(stop) = poller_stops.remove(name) {
+        stop.store(true, Ordering::SeqCst);
+    }
+    // Reclaim the proxy port if it came from our allocator.
+    if let (Some(alloc), Some(spec)) = (preview_ports, live_specs.get(name)) {
+        let p = spec.app_bind.port();
+        if p != 0 {
+            alloc.release(p);
+        }
+    }
+    driver.remove_instance(name);
+    proxies.remove(name); // drop stops the accept loop
+    live_refs.remove(name);
+    live_specs.remove(name);
+    launcher_ref.plans.lock().expect("plans").remove(name);
+    svc.clear_preview_route(name);
+    let wt = instance_worktree(state_dir, name);
+    remove_instance_worktree(repo, &wt);
+    ui::ok(format!("preview `{name}` {reason}"));
+}
+
+/// Sweep expired self-serve previews on the control thread (called each tick).
+/// A preview whose recorded expiry instant is at/before `now` is torn down via
+/// [`teardown_preview`] — so an abandoned preview self-cleans and the reconciler
+/// then prunes its Service/Ingress. Static/SIGHUP instances have no expiry entry
+/// and are never swept.
+#[allow(clippy::too_many_arguments)] // all are control-loop state; bundling adds noise
+fn sweep_expired_previews(
+    repo: &Path,
+    state_dir: &Path,
+    driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
+    launcher_ref: &Arc<ProcLauncher>,
+    svc: &Arc<AppServeState>,
+    proxies: &mut BTreeMap<String, L4Proxy>,
+    live_specs: &mut BTreeMap<String, InstanceSpec>,
+    live_refs: &mut BTreeMap<String, Arc<std::sync::Mutex<String>>>,
+    poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
+    expires_at: &mut BTreeMap<String, u64>,
+    preview_ports: Option<&PortAllocator>,
+) {
+    let now = unix_now();
+    let expired: Vec<String> = expires_at
+        .iter()
+        .filter(|(_, exp)| **exp <= now)
+        .map(|(n, _)| n.clone())
+        .collect();
+    for name in expired {
+        // Only tear down a still-live preview; a stale expiry entry for an
+        // already-removed preview is just dropped.
+        if live_specs.contains_key(&name) {
+            ui::ok(format!("preview `{name}` TTL reached — auto-removing"));
+            teardown_preview(
+                &name,
+                "expired",
+                repo,
+                state_dir,
+                driver,
+                launcher_ref,
+                svc,
+                proxies,
+                live_specs,
+                live_refs,
+                poller_stops,
+                expires_at,
+                preview_ports,
+            );
+        } else {
+            expires_at.remove(&name);
         }
     }
 }
@@ -2037,6 +2175,28 @@ mod tests {
         // Length is capped (DNS label ≤ 63; we cap at 50).
         let long = "x".repeat(80);
         assert_eq!(preview_instance_name(&long).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn preview_ttl_clamps_to_bounds() {
+        // The TTL the Add arm grants: explicit value when sane, default when
+        // absent, never above the ceiling. Mirrors the drain-arm computation.
+        let grant = |ttl_secs: Option<u64>| {
+            ttl_secs
+                .unwrap_or(DEFAULT_PREVIEW_TTL_SECS)
+                .min(MAX_PREVIEW_TTL_SECS)
+        };
+        assert_eq!(grant(None), DEFAULT_PREVIEW_TTL_SECS, "absent ⇒ default");
+        assert_eq!(grant(Some(3600)), 3600, "in-range ⇒ as requested");
+        assert_eq!(
+            grant(Some(u64::MAX)),
+            MAX_PREVIEW_TTL_SECS,
+            "over-ceiling ⇒ clamped"
+        );
+        assert!(
+            DEFAULT_PREVIEW_TTL_SECS <= MAX_PREVIEW_TTL_SECS,
+            "default must not exceed the ceiling"
+        );
     }
 
     #[test]

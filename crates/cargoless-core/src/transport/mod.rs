@@ -507,11 +507,16 @@ pub enum PreviewControl {
     /// overlay (k=v pairs) for the app child. `own_db` requests an isolated
     /// per-branch database; until that increment lands the daemon logs the
     /// request and falls back to the shared preview DB (never fails the add).
+    /// `ttl_secs` is the preview's lifetime in seconds from registration: the
+    /// daemon auto-removes it once it expires (so an abandoned preview cleans
+    /// itself up and the reconciler then prunes its Service/Ingress). `None`
+    /// ⇒ the daemon's default TTL; re-`Add`ing a live preview renews it.
     Add {
         name: String,
         git_ref: String,
         env: Vec<(String, String)>,
         own_db: bool,
+        ttl_secs: Option<u64>,
     },
     /// Remove the named preview (stop its poller + children, free its port,
     /// drop its proxy, remove its worktree). Unknown name ⇒ a safe no-op.
@@ -2281,6 +2286,7 @@ mod tests {
             git_ref: "origin/x".into(),
             env: vec![],
             own_db: false,
+            ttl_secs: None,
         }));
         assert!(!svc.app_preview_control(PreviewControl::Remove { name: "x".into() }));
     }

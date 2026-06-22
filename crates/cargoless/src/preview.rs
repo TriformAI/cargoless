@@ -43,6 +43,9 @@ pub struct PreviewOpts {
     pub own_db: bool,
     /// `--no-wait` — register and return without polling for green.
     pub no_wait: bool,
+    /// `--ttl <secs>` — preview lifetime in seconds; the daemon auto-removes the
+    /// preview when it expires. `None` ⇒ the daemon's default TTL.
+    pub ttl_secs: Option<u64>,
 }
 
 /// Max time to follow a preview build before giving up the poll (the preview
@@ -150,11 +153,19 @@ pub fn run(opts: &PreviewOpts) -> std::process::ExitCode {
     }
     let env = env.expect("checked Ok above");
 
-    if let Err(e) = client.register_preview(&name, &git_ref, &env, opts.own_db) {
+    if let Err(e) = client.register_preview(&name, &git_ref, &env, opts.own_db, opts.ttl_secs) {
         ui::error(format!("preview: register `{name}` failed: {e}"));
         return ExitCode::from(1);
     }
-    ui::ok(format!("preview `{name}` registered"));
+    match opts.ttl_secs {
+        Some(ttl) => ui::ok(format!(
+            "preview `{name}` registered (auto-removes in ~{ttl}s; re-run to renew)"
+        )),
+        None => ui::ok(format!(
+            "preview `{name}` registered (auto-removes after the daemon's default TTL; \
+             re-run to renew, or `--remove` to tear down now)"
+        )),
+    }
 
     if opts.no_wait {
         return ExitCode::from(0);

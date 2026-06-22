@@ -234,6 +234,9 @@ struct Opts {
     /// `preview --no-wait` — register and return immediately, without
     /// polling `/app` for the build to go green.
     preview_no_wait: bool,
+    /// `preview --ttl <secs>` — preview lifetime in seconds; the daemon
+    /// auto-removes the preview at expiry. Unset ⇒ the daemon's default TTL.
+    preview_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -511,6 +514,14 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
             "--remove" => opts.preview_remove = true,
             "--own-db" => opts.preview_own_db = true,
             "--no-wait" => opts.preview_no_wait = true,
+            "--ttl" => {
+                opts.preview_ttl_secs = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--ttl"))?
+                        .parse()
+                        .map_err(|_| ParseError::MissingValue("--ttl (numeric seconds)"))?,
+                );
+            }
             // ── A1 (0.4) `verdict` flags ────────────────────────────
             "--header" if cmd == Cmd::Verdict => {
                 opts.verdict_headers.push(
@@ -588,10 +599,11 @@ fn usage() {
     println!("            [--preview-domain D] [--preview-port-range A-B] [--preview-defaults F]");
     println!("                        Accept self-serve previews: advertise <name>.D,");
     println!("                        bind proxies from the range, seed env from F");
-    println!("  preview --remote <URL> [--name N] [--ref R] [--remove]");
+    println!("  preview --remote <URL> [--name N] [--ref R] [--ttl SECS] [--remove]");
     println!("                        Self-serve: register the current branch as a");
     println!("                        preview on a remote app-serve daemon, follow it");
-    println!("                        to green; --remove tears it down");
+    println!("                        to green; auto-removes after --ttl (default 24h);");
+    println!("                        --remove tears it down now");
     println!("  batch-check --remote <URL> --request-json <PATH>");
     println!("                        Native optimistic batch gate; prints report JSON");
     println!("  verdict --remote <URL> [--remote <URL>...] [-- <REPO>]");
@@ -890,6 +902,7 @@ fn main() -> ExitCode {
                 remove: parsed.opts.preview_remove,
                 own_db: parsed.opts.preview_own_db,
                 no_wait: parsed.opts.preview_no_wait,
+                ttl_secs: parsed.opts.preview_ttl_secs,
             });
         }
         Cmd::Push => {
@@ -1093,6 +1106,8 @@ mod tests {
             "--remove",
             "--own-db",
             "--no-wait",
+            "--ttl",
+            "3600",
         ]))
         .unwrap();
         assert_eq!(p.cmd, Cmd::Preview);
@@ -1103,6 +1118,7 @@ mod tests {
         assert!(p.opts.preview_remove);
         assert!(p.opts.preview_own_db);
         assert!(p.opts.preview_no_wait);
+        assert_eq!(p.opts.preview_ttl_secs, Some(3600));
     }
 
     // -----------------------------------------------------------------------

@@ -893,11 +893,13 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
     }
 }
 
-/// Parse the small `POST /instances` JSON body `{name, ref, env?, own_db?}`
-/// into a [`PreviewControl::Add`]. Hand-validated (no serde derive on the
-/// transport types): `name`/`ref` are required and non-empty; `name` must be a
-/// tame DNS/dir/worktree token (no `/`, no whitespace); `env` is an optional
-/// string→string object; `own_db` an optional bool (default false).
+/// Parse the small `POST /instances` JSON body
+/// `{name, ref, env?, own_db?, ttl_secs?}` into a [`PreviewControl::Add`].
+/// Hand-validated (no serde derive on the transport types): `name`/`ref` are
+/// required and non-empty; `name` must be a tame DNS/dir/worktree token (no
+/// `/`, no whitespace); `env` is an optional string→string object; `own_db`
+/// an optional bool (default false); `ttl_secs` an optional positive integer
+/// (the preview's lifetime; absent ⇒ the daemon's default TTL).
 fn parse_preview_add(body: &str) -> Result<PreviewControl, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -932,11 +934,25 @@ fn parse_preview_add(body: &str) -> Result<PreviewControl, String> {
         Some(_) => return Err("`env` must be an object".to_string()),
     };
     let own_db = v.get("own_db").and_then(|x| x.as_bool()).unwrap_or(false);
+    // `ttl_secs`: optional positive lifetime. A present-but-zero or negative
+    // value is a client error (an immediate-expiry preview is never intended);
+    // absent ⇒ None ⇒ the daemon applies its default TTL.
+    let ttl_secs = match v.get("ttl_secs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(val) => {
+            let n = val
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or("`ttl_secs` must be a positive integer")?;
+            Some(n)
+        }
+    };
     Ok(PreviewControl::Add {
         name,
         git_ref,
         env,
         own_db,
+        ttl_secs,
     })
 }
 
@@ -1333,18 +1349,21 @@ impl HttpClient {
         git_ref: &str,
         env: &[(String, String)],
         own_db: bool,
+        ttl_secs: Option<u64>,
     ) -> Result<(), TransportError> {
         let env_obj: serde_json::Map<String, serde_json::Value> = env
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
-        let body = serde_json::json!({
-            "name": name,
-            "ref": git_ref,
-            "env": env_obj,
-            "own_db": own_db,
-        })
-        .to_string();
+        let mut body_obj = serde_json::Map::new();
+        body_obj.insert("name".into(), serde_json::Value::String(name.into()));
+        body_obj.insert("ref".into(), serde_json::Value::String(git_ref.into()));
+        body_obj.insert("env".into(), serde_json::Value::Object(env_obj));
+        body_obj.insert("own_db".into(), serde_json::Value::Bool(own_db));
+        if let Some(ttl) = ttl_secs {
+            body_obj.insert("ttl_secs".into(), serde_json::Value::from(ttl));
+        }
+        let body = serde_json::Value::Object(body_obj).to_string();
         let (code, _) = self.post_json("/instances", &body, CLIENT_IO_TIMEOUT, "instances")?;
         match code {
             200 | 202 => Ok(()),
@@ -1894,6 +1913,27 @@ mod tests {
         assert_eq!(
             del, 404,
             "DELETE /instances/x 404s on a non-self-serve service"
+        );
+    }
+
+    #[test]
+    fn parse_preview_add_handles_ttl_secs() {
+        // Absent ttl_secs ⇒ None (daemon applies its default).
+        match parse_preview_add("{\"name\":\"feat\",\"ref\":\"origin/feat\"}").unwrap() {
+            PreviewControl::Add { ttl_secs, .. } => assert_eq!(ttl_secs, None),
+            other => panic!("expected Add, got {other:?}"),
+        }
+        // A positive ttl_secs is carried through.
+        match parse_preview_add("{\"name\":\"feat\",\"ref\":\"origin/feat\",\"ttl_secs\":3600}")
+            .unwrap()
+        {
+            PreviewControl::Add { ttl_secs, .. } => assert_eq!(ttl_secs, Some(3600)),
+            other => panic!("expected Add, got {other:?}"),
+        }
+        // Zero / negative ttl_secs is a client error (never an instant-expiry).
+        assert!(parse_preview_add("{\"name\":\"f\",\"ref\":\"origin/f\",\"ttl_secs\":0}").is_err());
+        assert!(
+            parse_preview_add("{\"name\":\"f\",\"ref\":\"origin/f\",\"ttl_secs\":-5}").is_err()
         );
     }
 

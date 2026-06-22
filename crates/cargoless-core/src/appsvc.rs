@@ -365,6 +365,7 @@ mod tests {
             git_ref: "origin/feat".into(),
             env: vec![("K".into(), "v".into())],
             own_db: false,
+            ttl_secs: Some(3600),
         }));
         match rx.recv().expect("enqueued") {
             PreviewControl::Add { name, git_ref, .. } => {
