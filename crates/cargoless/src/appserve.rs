@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cargoless_core::appbuild::{self, BuildReport, InstancePaths as BuildPaths};
@@ -42,10 +42,10 @@ use cargoless_core::appdrv::{
 use cargoless_core::appinstances::{InstanceSpec, load_instances};
 use cargoless_core::appmanifest::load_app_manifest;
 use cargoless_core::appstate::{Event, Generation};
-use cargoless_core::appsvc::AppServeState;
+use cargoless_core::appsvc::{AppServeState, PreviewRoute};
 use cargoless_core::l4proxy::{HoldingResponse, L4Proxy};
 use cargoless_core::transport::http::HttpServer;
-use cargoless_core::transport::{AllowAll, BearerToken, VerdictService};
+use cargoless_core::transport::{AllowAll, BearerToken, PreviewControl, VerdictService};
 
 use crate::ui;
 
@@ -80,6 +80,21 @@ pub struct AppServeOpts {
     /// contention for parallel cold builds — that is why this is opt-in and
     /// capped. PVC sizing for N > 1 is a separate follow-up.
     pub max_concurrent_builds: usize,
+    /// `--preview-domain <domain>` — the public domain self-serve previews are
+    /// reachable under, e.g. `tryform.wtf`. A runtime preview `feat` is
+    /// advertised on `/app` as `feat.<domain>` for the Part-2 reconciler to
+    /// route. Absent ⇒ `public_host` is null and previews are port-forward-only.
+    pub preview_domain: Option<String>,
+    /// `--preview-port-range START-END` — the L4-proxy listen ports for
+    /// runtime-registered previews. Distinct from `--port-range` (the app-child
+    /// ports). Absent ⇒ each preview proxy binds an ephemeral OS-assigned port.
+    pub preview_port_range: Option<String>,
+    /// `--preview-defaults <file>` — an env file (`KEY=VALUE` per line, with
+    /// `${VAR}` resolved from the daemon env) merged into every runtime
+    /// preview's env overlay. This is how previews inherit the shared
+    /// DB/S3/NATS wiring (the same block the `dev`/preview instance uses)
+    /// without the agent client holding any secret.
+    pub preview_defaults: Option<PathBuf>,
 }
 
 /// Parsed `--port-range START-END`.
@@ -451,7 +466,40 @@ impl BuildBackend for ThreadBuildBackend {
             self.events_tx.clone(),
         );
         std::thread::spawn(move || {
+            // Wall-clock the whole build on the thread that owns it. The build
+            // runs synchronously here, so this Instant brackets exactly the
+            // build the `build_finished` telemetry reports — no cross-thread,
+            // per-generation start-time bookkeeping needed.
+            let started = Instant::now();
+            // CGLS-15: pass the per-lane build env (contains CARGO_TARGET_DIR
+            // when max_concurrent > 1; empty for the default single-slot mode).
             let report = appbuild::build(&appbuild::RealHooks, &build_paths, &sha, &build_env);
+            let duration_ms = started.elapsed().as_millis() as u64;
+            // Emit `build_finished` HERE rather than in `trace_event`, because
+            // this is the only point where duration_ms + the built sha + the
+            // verdict/reason all coexist. `Event::BuildFinished` (the pure
+            // state machine's input) deliberately carries none of those, so
+            // routing telemetry through it would mean widening the core event
+            // type with clock-derived, decision-irrelevant fields. The built
+            // sha comes from the report (the sha the build actually checked out
+            // and, for green, re-confirmed) — authoritative over the requested
+            // `sha` on an Indeterminate where they legitimately differ.
+            let (verdict, built_sha, reason): (&str, &str, &str) = match &report {
+                BuildReport::Green { sha, .. } => ("green", sha.as_str(), ""),
+                BuildReport::Red { sha, reason } => ("red", sha.as_str(), reason.as_str()),
+                BuildReport::Indeterminate { sha, reason } => {
+                    ("indeterminate", sha.as_str(), reason.as_str())
+                }
+            };
+            tracing::info!(
+                "cargoless.app.instance" = instance.as_str(),
+                "app.event" = "build_finished",
+                generation = generation,
+                verdict = verdict,
+                reason = reason,
+                sha = built_sha,
+                duration_ms = duration_ms,
+            );
             let outcome = match report {
                 BuildReport::Green { .. } => cargoless_core::appstate::AppBuildOutcome::Green,
                 BuildReport::Red { reason, .. } => {
@@ -663,8 +711,38 @@ fn serve_loop(
     for spec in &specs {
         let cell = Arc::new(std::sync::Mutex::new(spec.git_ref.clone()));
         live_refs.insert(spec.name.clone(), cell.clone());
-        spawn_ref_poller(repo, &spec.name, cell, poll_ms, events_tx.clone());
+        spawn_ref_poller(repo, &spec.name, cell, poll_ms, events_tx.clone(), None);
     }
+
+    // ── self-serve previews (D-SELF-SERVE-PREVIEWS) ───────────────────
+    // Wire the control channel so `POST/DELETE /instances` can drive runtime
+    // add/remove. The HTTP threads only enqueue; this control thread (the sole
+    // `driver` mutator) drains and applies — same single-mutator discipline as
+    // the SIGHUP `RELOAD` flag.
+    let (preview_tx, preview_rx) = channel::<PreviewControl>();
+    svc.set_control(preview_tx);
+    // Per-preview poller stop flags, so a DELETE stops exactly one poller.
+    let mut poller_stops: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
+    // Optional dedicated proxy-port allocator for runtime previews (distinct
+    // from the app-child `ports`). Absent ⇒ previews bind an ephemeral port.
+    let preview_ports = match opts.preview_port_range.as_deref().map(parse_port_range) {
+        Some(Ok(r)) => Some(PortAllocator::new(r.start, r.end)),
+        Some(Err(e)) => {
+            ui::error(format!("--preview-port-range: {e}"));
+            return Err(e);
+        }
+        None => None,
+    };
+    // Env template every runtime preview inherits (the shared DB/S3/NATS wiring
+    // the static preview instance uses), `${VAR}`-resolved from the daemon env.
+    // Fail-fast at startup: a missing var here is an operator config error.
+    let preview_defaults = match load_preview_defaults(opts.preview_defaults.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            ui::error(format!("--preview-defaults: {e}"));
+            return Err(e);
+        }
+    };
 
     // ── the control loop ─────────────────────────────────────────────
     // Single mutator of the driver; 200ms tick polls the shutdown + reload
@@ -696,6 +774,29 @@ fn serve_loop(
                 &events_tx,
             );
         }
+        // Self-serve previews: drain any POST/DELETE /instances requests the
+        // HTTP threads enqueued. Drained BEFORE the lifecycle event below, so a
+        // just-added preview's first build is dispatched this same tick (mirrors
+        // the SIGHUP ordering). A burst all lands in one tick (try_recv loop).
+        drain_preview_requests(
+            &preview_rx,
+            repo,
+            state_dir,
+            poll_ms,
+            max_concurrent,
+            opts.preview_domain.as_deref(),
+            &preview_defaults,
+            &holding,
+            &mut driver,
+            &launcher_ref,
+            &svc,
+            &mut proxies,
+            &mut live_specs,
+            &mut live_refs,
+            &mut poller_stops,
+            preview_ports.as_ref(),
+            &events_tx,
+        );
         match events_rx.recv_timeout(Duration::from_millis(200)) {
             Ok((instance, event)) => {
                 // inc-6 telemetry: one structured event per observed lifecycle
@@ -891,7 +992,7 @@ fn apply_sighup_reload(
                 // knows about the instance.
                 let cell = Arc::new(std::sync::Mutex::new(new_spec.git_ref.clone()));
                 live_refs.insert(name.clone(), cell.clone());
-                spawn_ref_poller(repo, name, cell, poll_ms, events_tx.clone());
+                spawn_ref_poller(repo, name, cell, poll_ms, events_tx.clone(), None);
 
                 driver.add_instance(config);
                 proxies.insert(name.clone(), proxy);
@@ -961,7 +1062,7 @@ fn apply_sighup_reload(
                         .insert(name.clone(), plan);
                     let cell = Arc::new(std::sync::Mutex::new(new_spec.git_ref.clone()));
                     live_refs.insert(name.clone(), cell.clone());
-                    spawn_ref_poller(repo, name, cell, poll_ms, events_tx.clone());
+                    spawn_ref_poller(repo, name, cell, poll_ms, events_tx.clone(), None);
                     driver.add_instance(config);
                     proxies.insert(name.clone(), proxy);
                     live_specs.insert(name.clone(), new_spec.clone());
@@ -1015,27 +1116,13 @@ fn trace_event(instance: &str, event: &Event) {
                 sha = sha.as_str(),
             );
         }
-        Event::BuildFinished {
-            generation,
-            outcome,
-        } => {
-            // Name the build verdict so green/red/indeterminate are filterable.
-            let (verdict, reason) = match outcome {
-                cargoless_core::appstate::AppBuildOutcome::Green => ("green", String::new()),
-                cargoless_core::appstate::AppBuildOutcome::Red { reason } => {
-                    ("red", reason.clone())
-                }
-                cargoless_core::appstate::AppBuildOutcome::Indeterminate { reason } => {
-                    ("indeterminate", reason.clone())
-                }
-            };
-            tracing::info!(
-                "cargoless.app.instance" = instance,
-                "app.event" = "build_finished",
-                generation = *generation,
-                verdict = verdict,
-                reason = reason.as_str(),
-            );
+        Event::BuildFinished { .. } => {
+            // Intentionally NOT emitted here. `build_finished` is emitted at its
+            // source in `ThreadBuildBackend::start`, where it can also carry
+            // `duration_ms` (the build wall-clock) and the built `sha` —
+            // neither of which is present on `Event::BuildFinished` (the pure
+            // state machine's input alphabet). Emitting in both places would
+            // double-count. See the emission site for the full field set.
         }
         Event::ProbeSucceeded { generation } => {
             tracing::info!(
@@ -1118,6 +1205,311 @@ fn ensure_instance_worktree(repo: &Path, worktree: &Path, initial_ref: &str) -> 
             "git worktree add failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ))
+    }
+}
+
+/// Remove a runtime preview's git worktree (the inverse of
+/// [`ensure_instance_worktree`]). Best-effort: `git worktree remove --force`
+/// then a `prune`; a failure is logged, not fatal (the next `prune` sweeps it).
+fn remove_instance_worktree(repo: &Path, worktree: &Path) {
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
+}
+
+/// Load the `--preview-defaults` env file: `KEY=VALUE` lines (blank lines and
+/// `#` comments skipped), each value `${VAR}`-resolved from the daemon's own
+/// environment. Strict, like the instances file: an unresolvable `${VAR}` is a
+/// startup error (a preview silently booting with `DATABASE_URL=""` would fail
+/// far from the cause). `None` path ⇒ an empty template (no shared defaults).
+fn load_preview_defaults(path: Option<&Path>) -> Result<Vec<(String, String)>, String> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, val) = line
+            .split_once('=')
+            .ok_or_else(|| format!("{}:{}: expected KEY=VALUE", path.display(), i + 1))?;
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return Err(format!("{}:{}: empty key", path.display(), i + 1));
+        }
+        let val =
+            cargoless_core::appinstances::interpolate_env(val.trim(), &|k| std::env::var(k).ok())
+                .map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?;
+        out.push((key, val));
+    }
+    Ok(out)
+}
+
+/// Sanitize a requested preview name into a DNS-label-safe instance key:
+/// lowercase, `/`→`-`, drop anything not `[a-z0-9-]`, collapse repeats, trim
+/// leading/trailing `-`, cap at 50 chars. Empty after sanitizing ⇒ `None`.
+fn preview_instance_name(raw: &str) -> Option<String> {
+    let mut s = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for c in raw.to_ascii_lowercase().chars() {
+        let mapped = if c.is_ascii_alphanumeric() {
+            c
+        } else if c == '-' || c == '/' || c == '_' || c == '.' {
+            '-'
+        } else {
+            continue;
+        };
+        if mapped == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        s.push(mapped);
+    }
+    let s = s.trim_matches('-');
+    let s: String = s.chars().take(50).collect();
+    let s = s.trim_matches('-').to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Drain pending self-serve preview control requests onto the single-mutator
+/// control thread. Reuses every existing instance primitive — `L4Proxy::bind`,
+/// `InstanceConfig`, `ensure_instance_worktree`, `run_plan_from_manifest`,
+/// `spawn_ref_poller`, `Driver::add_instance`/`remove_instance` — so a runtime
+/// preview is byte-identical to a boot/SIGHUP instance, plus a dynamic proxy
+/// port and the `/app` route facts the Part-2 reconciler reads.
+#[allow(clippy::too_many_arguments)] // all are control-loop state; bundling adds noise
+fn drain_preview_requests(
+    preview_rx: &Receiver<PreviewControl>,
+    repo: &Path,
+    state_dir: &Path,
+    poll_ms: u64,
+    max_concurrent: usize,
+    preview_domain: Option<&str>,
+    preview_defaults: &[(String, String)],
+    holding: &Arc<HoldingResponse>,
+    driver: &mut Driver<ThreadBuildBackend, ProcLauncher, ChannelSink>,
+    launcher_ref: &Arc<ProcLauncher>,
+    svc: &Arc<AppServeState>,
+    proxies: &mut BTreeMap<String, L4Proxy>,
+    live_specs: &mut BTreeMap<String, InstanceSpec>,
+    live_refs: &mut BTreeMap<String, Arc<std::sync::Mutex<String>>>,
+    poller_stops: &mut BTreeMap<String, Arc<AtomicBool>>,
+    preview_ports: Option<&PortAllocator>,
+    events_tx: &Sender<(String, Event)>,
+) {
+    while let Ok(req) = preview_rx.try_recv() {
+        match req {
+            PreviewControl::Add {
+                name,
+                git_ref,
+                env,
+                own_db,
+            } => {
+                let Some(name) = preview_instance_name(&name) else {
+                    ui::warn(format!("preview: rejected unusable name `{name}`"));
+                    continue;
+                };
+                if live_specs.contains_key(&name) {
+                    // Upsert: re-point the existing preview's ref (like the
+                    // SIGHUP same-name changed-ref arm) — no re-bind, no churn.
+                    if let Some(cell) = live_refs.get(&name) {
+                        *cell.lock().expect("live_ref") = git_ref.clone();
+                    }
+                    ui::ok(format!("preview `{name}` ref re-pointed → {git_ref}"));
+                    continue;
+                }
+                if own_db {
+                    // Per-branch DB provisioning is a later increment; for now
+                    // the preview shares the daemon's DB env. Flagged, not failed.
+                    ui::warn(format!(
+                        "preview `{name}`: own_db requested but per-branch DB \
+                         provisioning is not in this increment — using shared DB"
+                    ));
+                }
+
+                // Public host for the reconciler, e.g. `feat.tryform.wtf`.
+                let public_host = preview_domain.map(|d| format!("{name}.{d}"));
+
+                // Proxy listen port: a dedicated allocator if configured, else
+                // an ephemeral OS-assigned port (bind `:0`).
+                let bind_port = match preview_ports {
+                    Some(alloc) => match alloc.alloc() {
+                        Some(p) => p,
+                        None => {
+                            ui::error(format!(
+                                "preview `{name}`: preview port range exhausted — skipping"
+                            ));
+                            continue;
+                        }
+                    },
+                    None => 0,
+                };
+                let app_bind = match format!("0.0.0.0:{bind_port}").parse() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let proxy = match L4Proxy::bind(app_bind, holding.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        ui::error(format!(
+                            "preview `{name}`: proxy bind {app_bind}: {e} — skipping"
+                        ));
+                        if let (Some(alloc), true) = (preview_ports, bind_port != 0) {
+                            alloc.release(bind_port);
+                        }
+                        continue;
+                    }
+                };
+                let bound_port = proxy.addr().port();
+
+                // Env overlay: the shared defaults first, then the request's
+                // own env (request wins on key collision), then the public
+                // base-URL overrides so the app renders its own host.
+                let mut env_map: BTreeMap<String, String> =
+                    preview_defaults.iter().cloned().collect();
+                for (k, v) in env {
+                    env_map.insert(k, v);
+                }
+                if let Some(host) = &public_host {
+                    let url = format!("https://{host}");
+                    env_map.insert("TRIFORM_PUBLIC_BASE_URL".into(), url.clone());
+                    env_map.insert("TRIFORM_API_URL".into(), url);
+                }
+
+                // CGLS-15: a per-lane CARGO_TARGET_DIR only when the daemon runs
+                // parallel builds; empty (pod-ambient target inherited) otherwise.
+                // A preview is a lane like any other on this axis.
+                let build_env = if max_concurrent > 1 {
+                    let lane_target = state_dir.join("app").join(&name).join("target");
+                    vec![(
+                        "CARGO_TARGET_DIR".to_string(),
+                        lane_target.to_string_lossy().into_owned(),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                let paths = InstancePaths {
+                    worktree: instance_worktree(state_dir, &name),
+                    bundles: state_dir.join("app").join(&name).join("bundles"),
+                    build_env,
+                };
+                let config = InstanceConfig {
+                    name: name.clone(),
+                    slot: proxy.slot().clone(),
+                    paths,
+                    env: env_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                };
+
+                if let Err(e) =
+                    ensure_instance_worktree(repo, &instance_worktree(state_dir, &name), &git_ref)
+                {
+                    ui::warn(format!("preview `{name}`: could not set up worktree: {e}"));
+                }
+                let wt = instance_worktree(state_dir, &name);
+                let plan = run_plan_from_manifest(&wt)
+                    .or_else(|| run_plan_from_manifest(repo))
+                    .unwrap_or_else(default_run_plan);
+                launcher_ref
+                    .plans
+                    .lock()
+                    .expect("plans")
+                    .insert(name.clone(), plan);
+
+                // Poller with a per-instance stop flag (so DELETE can stop it).
+                let stop = Arc::new(AtomicBool::new(false));
+                let cell = Arc::new(std::sync::Mutex::new(git_ref.clone()));
+                live_refs.insert(name.clone(), cell.clone());
+                spawn_ref_poller(
+                    repo,
+                    &name,
+                    cell,
+                    poll_ms,
+                    events_tx.clone(),
+                    Some(stop.clone()),
+                );
+                poller_stops.insert(name.clone(), stop);
+
+                driver.add_instance(config);
+                proxies.insert(name.clone(), proxy);
+                live_specs.insert(
+                    name.clone(),
+                    InstanceSpec {
+                        name: name.clone(),
+                        git_ref: git_ref.clone(),
+                        app_bind,
+                        env: env_map,
+                    },
+                );
+                svc.set_preview_route(
+                    &name,
+                    PreviewRoute {
+                        proxy_port: bound_port,
+                        public_host: public_host.clone(),
+                    },
+                );
+
+                // Kick the first build now (the poller will also detect HEAD).
+                if let Some(sha) = resolve_ref(repo, &git_ref) {
+                    driver.drive(&name, Event::HeadAdvanced { sha });
+                }
+                match &public_host {
+                    Some(h) => ui::ok(format!(
+                        "preview `{name}` added — proxy :{bound_port}, public https://{h}"
+                    )),
+                    None => ui::ok(format!(
+                        "preview `{name}` added — proxy :{bound_port} (no --preview-domain)"
+                    )),
+                }
+            }
+            PreviewControl::Remove { name } => {
+                let Some(name) = preview_instance_name(&name) else {
+                    continue;
+                };
+                // Stop the poller first so no HeadAdvanced races the teardown.
+                if let Some(stop) = poller_stops.remove(&name) {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                if !live_specs.contains_key(&name) {
+                    ui::warn(format!("preview `{name}`: not found — ignored"));
+                    continue;
+                }
+                // Reclaim the proxy port if it came from our allocator.
+                if let (Some(alloc), Some(spec)) = (preview_ports, live_specs.get(&name)) {
+                    let p = spec.app_bind.port();
+                    if p != 0 {
+                        alloc.release(p);
+                    }
+                }
+                driver.remove_instance(&name);
+                proxies.remove(&name); // drop stops the accept loop
+                live_refs.remove(&name);
+                live_specs.remove(&name);
+                launcher_ref.plans.lock().expect("plans").remove(&name);
+                svc.clear_preview_route(&name);
+                let wt = instance_worktree(state_dir, &name);
+                remove_instance_worktree(repo, &wt);
+                ui::ok(format!("preview `{name}` removed"));
+            }
+        }
     }
 }
 
@@ -1222,18 +1614,26 @@ fn bind_control_plane(
 ///
 /// `live_ref` is an `Arc<Mutex<String>>` so the control thread can update the
 /// tracked ref on SIGHUP without killing and restarting the poller thread.
+///
+/// `stop` is an optional per-instance stop flag: a self-serve preview's
+/// `DELETE /instances/<name>` sets it so that one poller exits promptly
+/// (without waiting for the global `SHUTDOWN`). Boot/SIGHUP pass `None` (their
+/// instances live for the daemon's lifetime, gated by the global flag).
 fn spawn_ref_poller(
     repo: &Path,
     name: &str,
     live_ref: Arc<std::sync::Mutex<String>>,
     poll_ms: u64,
     tx: Sender<(String, Event)>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let (repo, name) = (repo.to_path_buf(), name.to_string());
     std::thread::spawn(move || {
         let mut last: Option<String> = None;
         loop {
-            if SHUTDOWN.load(Ordering::SeqCst) {
+            if SHUTDOWN.load(Ordering::SeqCst)
+                || stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst))
+            {
                 return;
             }
             let git_ref = live_ref.lock().expect("live_ref").clone();
@@ -1614,5 +2014,71 @@ mod tests {
             build_env.is_empty(),
             "default-off: build_env must be empty so the pod's ambient env is inherited unchanged"
         );
+    }
+
+    // ── self-serve previews ──────────────────────────────────────────────
+
+    #[test]
+    fn preview_instance_name_sanitizes_to_dns_label() {
+        // Branch-ish inputs → DNS-label-safe instance keys.
+        assert_eq!(
+            preview_instance_name("feature/My_Cool-Branch"),
+            Some("feature-my-cool-branch".to_string())
+        );
+        assert_eq!(
+            preview_instance_name("origin/dev"),
+            Some("origin-dev".into())
+        );
+        // Collapsing + trimming of separators.
+        assert_eq!(preview_instance_name("--a//b__c--"), Some("a-b-c".into()));
+        // Nothing usable ⇒ None (caller rejects).
+        assert_eq!(preview_instance_name("///"), None);
+        assert_eq!(preview_instance_name(""), None);
+        // Length is capped (DNS label ≤ 63; we cap at 50).
+        let long = "x".repeat(80);
+        assert_eq!(preview_instance_name(&long).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn load_preview_defaults_none_is_empty() {
+        assert!(load_preview_defaults(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_preview_defaults_parses_and_interpolates() {
+        // Use a process env var the test sets, to exercise ${VAR} resolution.
+        // SAFETY: single-threaded test setup; the var name is test-unique.
+        unsafe {
+            std::env::set_var("CGLS_TEST_PREVIEW_DB", "postgres://shared/db");
+        }
+        let tmp = std::env::temp_dir().join(format!("cgls-pdefaults-{}", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "# a comment\n\nDATABASE_URL=${CGLS_TEST_PREVIEW_DB}\nRUST_LOG=info\n",
+        )
+        .unwrap();
+        let got = load_preview_defaults(Some(&tmp)).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "DATABASE_URL".to_string(),
+                    "postgres://shared/db".to_string()
+                ),
+                ("RUST_LOG".to_string(), "info".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_preview_defaults_unresolved_var_is_error() {
+        let tmp = std::env::temp_dir().join(format!("cgls-pdefaults-bad-{}", std::process::id()));
+        std::fs::write(&tmp, "X=${CGLS_DEFINITELY_UNSET_VAR_42}\n").unwrap();
+        assert!(
+            load_preview_defaults(Some(&tmp)).is_err(),
+            "an unresolvable ${{VAR}} must be a startup error, not an empty value"
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }
