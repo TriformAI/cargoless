@@ -36,6 +36,7 @@ pub mod lsp;
 pub mod model;
 pub mod multiplex;
 pub mod overlay;
+pub mod previewreg;
 pub mod procmacro;
 pub mod project_checks;
 pub mod recovery;

@@ -150,6 +150,31 @@ impl PortAllocator {
             g.free.push(port);
         }
     }
+
+    /// Claim a SPECIFIC port so a later `alloc()` will not hand it out — used
+    /// at daemon boot to re-pin the ports persisted previews were bound to
+    /// (keeping the reconciler's Service targetPort stable across a restart).
+    /// If `port` is at/above the bump cursor, the cursor advances past it and
+    /// any ports skipped over become free (still allocatable); if it was
+    /// already on the free-list, it is removed. Out-of-range ports are ignored.
+    pub fn reserve(&self, port: u16) {
+        let mut g = self.inner.lock().expect("port alloc");
+        // Already handed out (below the cursor and not free) ⇒ nothing to do.
+        if let Some(pos) = g.free.iter().position(|&p| p == port) {
+            g.free.swap_remove(pos);
+            return;
+        }
+        if port >= g.next && port <= g.end {
+            // Everything from the cursor up to (not including) `port` stays
+            // allocatable via the free-list; the cursor jumps past `port`.
+            for p in g.next..port {
+                if !g.free.contains(&p) {
+                    g.free.push(p);
+                }
+            }
+            g.next = port.saturating_add(1);
+        }
+    }
 }
 
 /// One instance's driver-side resources (the pure phase lives in `AppState`).
