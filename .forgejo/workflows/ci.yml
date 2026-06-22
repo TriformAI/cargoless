@@ -5,17 +5,28 @@ on:
   pull_request:
     branches: [main]
 
-# De-dupe concurrent runs for the same ref. Without this, a push to a branch
-# that ALSO has an open PR fires TWO full 5-job matrices (the `push` event and
-# the `pull_request` event) with no cancellation. On a single, occasionally
-# disk-pressured Forgejo runner they contend on the checkout-prereq step and
-# produce contradictory per-context results for an identical tree (e.g. a 19s
-# "build failure" in one matrix while the other builds green in ~2 min). Group
-# by workflow + ref and cancel the older in-flight run so each ref has at most
-# one live matrix; a new push supersedes its own prior run instead of racing it.
+# COLLAPSE THE QUEUE, NEVER KILL AN ONGOING RUN.
+#
+# `cancel-in-progress: false` is deliberate and load-bearing. Forgejo records a
+# CANCELLED run as permanently not-green, so `cancel-in-progress: true` turns a
+# re-push — or a hot-trunk push storm — into an unsatisfiable required gate:
+# every attempt gets cancelled by the next push before it can conclude, and the
+# branch can never go green. We group by workflow + ref so a *queued* duplicate
+# is coalesced (collapse the queue), but a run that is already EXECUTING is
+# never cancelled. tf-multiverse's incremental-compile-check.yml documents the
+# same rule for the witness gate.
+#
+# Note: the `group` does NOT collapse the push-vs-pull_request double-fire — a
+# `push` event's ref is `refs/heads/<branch>` while a `pull_request` event's ref
+# is `refs/pull/N/merge`, so the two land in DIFFERENT groups. The previous
+# `cancel-in-progress: true` was justified as de-duping that double matrix, but
+# it never could (different keys); all it actually did was cancel a branch's own
+# in-flight re-pushes. If the double matrix is genuinely unwanted, scope the
+# triggers (e.g. drop the bare `push:` for PR'd branches) — do not re-enable
+# cancellation.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # Split into one job per check. This Forgejo build does not expose run/job
 # logs over the REST API, so job *granularity* is our only failure
