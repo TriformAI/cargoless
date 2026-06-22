@@ -353,11 +353,15 @@ fn compute_macro_blind_hit(
 /// the four `Mutex`-guarded fields satisfy that by construction.
 #[derive(Default)]
 pub struct ServeVerdictState {
-    /// worktree-key → last published status. Keyed by the SAME string
+    /// worktree-key → bounded verdict history. Keyed by the SAME string
     /// `servedrv::publish_verdict` uses (`wt.to_string_lossy()`), so a
     /// remote `get_status(<wt>)` resolves the exact tree the loop
-    /// attributed.
-    statuses: Mutex<BTreeMap<String, WorktreeStatus>>,
+    /// attributed. [`RecentVerdicts`] keeps the latest verdict (the
+    /// historical single-slot read) PLUS a small per-`base_sha` history,
+    /// so a SHA-pinned poller can retrieve ITS verdict even after newer
+    /// pushes for the same worktree have published — the hot-trunk fix
+    /// (never let a different PR's push erase yours).
+    statuses: Mutex<BTreeMap<String, RecentVerdicts>>,
     /// Live transition-event subscribers (the SSE / in-proc fan-out).
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
@@ -412,14 +416,100 @@ pub struct ServeVerdictState {
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
     project_check_state_dir: Option<PathBuf>,
-    /// Per-worktree Hard-witness generation counter. The latest generation
-    /// for each wt-key is the only witness that may publish; stale witnesses
-    /// (from a prior push whose EmitVerdict fired while a newer push's witness
-    /// is already running) are detected by `finish_hard_witness` and dropped.
-    /// The counter values are sourced from the module-level
-    /// `HARD_WITNESS_SEQ` atomic, which is globally monotonic and never
-    /// recycled, so a recycled match is structurally impossible.
-    hard_witness_generation: Mutex<BTreeMap<String, u64>>,
+    /// Per-`(worktree, base_sha)` Hard-witness generation counter. The
+    /// latest generation for each [`WitnessKey`] is the only witness that
+    /// may publish; stale witnesses (a genuine re-push of the SAME overlay
+    /// whose EmitVerdict fired while a newer same-overlay witness is already
+    /// running) are detected by `finish_hard_witness` and dropped.
+    ///
+    /// **Hot-trunk fix:** keying by `(worktree, base_sha)` — not worktree
+    /// alone — means a newer push for a DIFFERENT base_sha (another PR
+    /// sharing this analysis worktree) inserts under its own key and leaves
+    /// an older witness's claim intact, so the older witness still publishes
+    /// instead of being silently dropped (`stale-witness-dropped`). A push
+    /// with no base_sha (FS-watch / legacy) collapses to the historical
+    /// wt-only supersession. The counter values are sourced from the
+    /// module-level `HARD_WITNESS_SEQ` atomic, which is globally monotonic
+    /// and never recycled, so a recycled match is structurally impossible.
+    hard_witness_generation: Mutex<BTreeMap<WitnessKey, u64>>,
+}
+
+/// Identity of an in-flight Hard-mode witness: the analysis worktree plus
+/// the overlay's client-resolved base SHA. Two witnesses with different
+/// `base_sha` for the same worktree are independent (different PRs) and must
+/// not cancel each other; two with the same `base_sha` are the same logical
+/// overlay (a re-push) and the latter supersedes. `base_sha: None` ⇒
+/// FS-watch / legacy push with no SHA ⇒ historical wt-only supersession.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WitnessKey {
+    pub wt: String,
+    pub base_sha: Option<String>,
+}
+
+impl WitnessKey {
+    pub(crate) fn new(wt: impl Into<String>, base_sha: Option<String>) -> Self {
+        Self {
+            wt: wt.into(),
+            base_sha: base_sha.filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// Bounded per-worktree verdict history (the value type of `statuses`).
+///
+/// `latest` preserves the historical single-slot read: `get_status` /
+/// `get_verdict` / `list_worktrees` with no SHA selector return exactly what
+/// they returned before this change (byte-identical). `by_sha` is an
+/// additive, bounded FIFO that lets a SHA-pinned poller retrieve ITS verdict
+/// after newer pushes for the same worktree have published — without it, a
+/// concurrent PR's verdict would overwrite the single slot and the older
+/// poller would never see its own answer (the hot-trunk attribution bug).
+///
+/// A publish with no `base_sha` only updates `latest` (nothing to key on).
+#[derive(Default, Debug, Clone)]
+struct RecentVerdicts {
+    latest: Option<WorktreeStatus>,
+    /// `(base_sha, status)` in insertion order, bounded to
+    /// `recent_verdicts_max()`. A re-push of the same sha replaces in place
+    /// (latest-wins), keeping one entry per distinct sha.
+    by_sha: VecDeque<(String, WorktreeStatus)>,
+}
+
+impl RecentVerdicts {
+    fn insert(&mut self, status: WorktreeStatus, max: usize) {
+        if let Some(sha) = status.base_sha.clone().filter(|s| !s.is_empty()) {
+            self.by_sha.retain(|(s, _)| s != &sha);
+            self.by_sha.push_back((sha, status.clone()));
+            let cap = max.max(1);
+            while self.by_sha.len() > cap {
+                self.by_sha.pop_front();
+            }
+        }
+        self.latest = Some(status);
+    }
+
+    /// `None` selector ⇒ the latest verdict (historical behavior). A `Some`
+    /// selector ⇒ the verdict published for exactly that base_sha, or `None`
+    /// if it never published / has aged out of the bounded history.
+    fn get(&self, base_sha: Option<&str>) -> Option<&WorktreeStatus> {
+        match base_sha.filter(|s| !s.is_empty()) {
+            None => self.latest.as_ref(),
+            Some(sha) => self
+                .by_sha
+                .iter()
+                .rev()
+                .find(|(s, _)| s == sha)
+                .map(|(_, st)| st),
+        }
+    }
+}
+
+/// Per-worktree verdict-history bound. 16 distinct concurrent in-flight
+/// base_shas for one analysis worktree is already an extreme trunk; the
+/// witness that asked about sha X retrieves X as long as fewer than this
+/// many *distinct other* shas published after it. Env-overridable.
+fn recent_verdicts_max() -> usize {
+    configured_batch_usize("CARGOLESS_VERDICT_HISTORY_MAX", 16)
 }
 
 #[derive(Default)]
@@ -916,7 +1006,10 @@ impl ServeVerdictState {
             heartbeat_age_secs: 0,
             published_at,
         };
-        poisoned(&self.statuses).insert(worktree.clone(), status);
+        poisoned(&self.statuses)
+            .entry(worktree.clone())
+            .or_default()
+            .insert(status, recent_verdicts_max());
         let ev = TransitionEvent {
             worktree: worktree.clone(),
             verdict: verdict_color,
@@ -1042,25 +1135,28 @@ impl ServeVerdictState {
         poisoned(&self.push_attribution).remove(worktree)
     }
 
-    /// #A4.3 — claim the hard-witness slot for `wt_key`. Returns the new
-    /// generation; a previously claimed (still-running) witness for the
-    /// same key is implicitly invalidated (its `finish_hard_witness` will
-    /// return `false`). Generations come from a global never-recycled
-    /// sequence, so an ABA match is structurally impossible.
-    pub(crate) fn begin_hard_witness(&self, wt_key: &str) -> u64 {
+    /// #A4.3 — claim the hard-witness slot for `key` (`(worktree,
+    /// base_sha)`). Returns the new generation; a previously claimed
+    /// (still-running) witness for the SAME key is implicitly invalidated
+    /// (its `finish_hard_witness` will return `false`) — that is a genuine
+    /// re-push of the same overlay. A claim for a DIFFERENT `base_sha` on
+    /// the same worktree (a concurrent PR) is independent and leaves this
+    /// claim intact: the hot-trunk fix. Generations come from a global
+    /// never-recycled sequence, so an ABA match is structurally impossible.
+    pub(crate) fn begin_hard_witness(&self, key: &WitnessKey) -> u64 {
         let generation = HARD_WITNESS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-        poisoned(&self.hard_witness_generation).insert(wt_key.to_string(), generation);
+        poisoned(&self.hard_witness_generation).insert(key.clone(), generation);
         generation
     }
 
-    /// `true` iff `generation` is still the latest claim for `wt_key` —
+    /// `true` iff `generation` is still the latest claim for `key` —
     /// the caller may publish. Consumes the claim on success so a
     /// duplicate finish (watchdog already published, worker completes
     /// later) reports `false` and stays silent.
-    pub(crate) fn finish_hard_witness(&self, wt_key: &str, generation: u64) -> bool {
+    pub(crate) fn finish_hard_witness(&self, key: &WitnessKey, generation: u64) -> bool {
         let mut map = poisoned(&self.hard_witness_generation);
-        if map.get(wt_key) == Some(&generation) {
-            map.remove(wt_key);
+        if map.get(key) == Some(&generation) {
+            map.remove(key);
             true
         } else {
             false
@@ -1424,8 +1520,12 @@ impl VerdictService for ServeVerdictState {
     }
 
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
+        self.get_status_for(worktree, None)
+    }
+
+    fn get_status_for(&self, worktree: &str, base_sha: Option<&str>) -> Option<WorktreeStatus> {
         let g = poisoned(&self.statuses);
-        let mut s = g.get(worktree).cloned()?;
+        let mut s = g.get(worktree)?.get(base_sha)?.clone();
         // Age is derived at read time from the publish timestamp — the
         // stored `heartbeat_age_secs` is a placeholder; the honest age is
         // "seconds since this verdict was attributed".
@@ -1437,6 +1537,7 @@ impl VerdictService for ServeVerdictState {
     fn get_verdict(&self, worktree: &str) -> Option<String> {
         poisoned(&self.statuses)
             .get(worktree)
+            .and_then(|r| r.get(None))
             .map(|s| s.verdict.clone())
     }
 
@@ -1452,6 +1553,7 @@ impl VerdictService for ServeVerdictState {
     fn list_worktrees(&self) -> Vec<WorktreeSummary> {
         poisoned(&self.statuses)
             .values()
+            .filter_map(|r| r.get(None))
             .map(|s| WorktreeSummary {
                 worktree: s.worktree.clone(),
                 verdict: s.verdict.clone(),
@@ -4123,6 +4225,134 @@ checks:
     }
 
     #[test]
+    fn pinned_sha_retrievable_after_newer_push() {
+        // THE hot-trunk verdict-store regression: PR A publishes green for
+        // shaA, then a concurrent PR B publishes red for shaB on the SAME
+        // worktree. A SHA-pinned poller for shaA must still retrieve A's
+        // green — the single-slot store would have returned B's red.
+        let api = ServeVerdictState::new();
+        api.publish_attributed(
+            Path::new("/wt"),
+            crate::statusfile::VerdictPayload::green(),
+            Some("shaA".into()),
+            false,
+        );
+        api.publish_attributed(
+            Path::new("/wt"),
+            crate::statusfile::VerdictPayload::red(3),
+            Some("shaB".into()),
+            false,
+        );
+        // Pinned reads return each PR's own verdict.
+        assert_eq!(
+            api.get_status_for("/wt", Some("shaA")).map(|s| s.verdict),
+            Some("green".to_string()),
+            "PR A's verdict survives PR B's publish"
+        );
+        assert_eq!(
+            api.get_status_for("/wt", Some("shaB")).map(|s| s.verdict),
+            Some("red".to_string()),
+        );
+        // No selector ⇒ latest (PR B). Byte-identical to historical behavior.
+        assert_eq!(
+            api.get_status("/wt").map(|s| s.verdict),
+            Some("red".to_string()),
+            "no selector returns the latest verdict (historical contract)"
+        );
+        // An unknown sha ⇒ None (never another branch's verdict).
+        assert!(api.get_status_for("/wt", Some("nope")).is_none());
+    }
+
+    #[test]
+    fn verdict_history_evicts_oldest_beyond_bound() {
+        // The per-worktree history is bounded; the oldest distinct sha ages
+        // out, but the newest AND the latest pointer survive. Exercises the
+        // RecentVerdicts data structure directly with an explicit bound so it
+        // is parallel-safe (no process-global env mutation).
+        let mk = |sha: &str| WorktreeStatus {
+            worktree: "/wt".into(),
+            verdict: "green".into(),
+            daemon_build_id: "test".into(),
+            crates: Vec::new(),
+            red_diagnostics: 0,
+            verdict_failure_reason: None,
+            base_sha: Some(sha.into()),
+            ra_blind_paths: false,
+            heartbeat_age_secs: 0,
+            published_at: 0,
+        };
+        let mut rv = RecentVerdicts::default();
+        rv.insert(mk("s1"), 2);
+        rv.insert(mk("s2"), 2);
+        rv.insert(mk("s3"), 2);
+        assert!(
+            rv.get(Some("s1")).is_none(),
+            "oldest sha evicted beyond the bound of 2"
+        );
+        assert!(rv.get(Some("s2")).is_some());
+        assert!(rv.get(Some("s3")).is_some());
+        assert_eq!(
+            rv.get(None).map(|s| s.base_sha.clone()),
+            Some(Some("s3".to_string())),
+            "latest pointer is the most recent insert"
+        );
+        // A bound of 0 normalizes to 1 (never panics, keeps the newest).
+        let mut rv0 = RecentVerdicts::default();
+        rv0.insert(mk("a"), 0);
+        rv0.insert(mk("b"), 0);
+        assert!(rv0.get(Some("a")).is_none());
+        assert!(rv0.get(Some("b")).is_some());
+    }
+
+    #[test]
+    fn same_sha_republish_replaces_in_history() {
+        // A re-push of the same sha replaces in place (latest-wins), keeping
+        // one entry per distinct sha — a red fix-up over a prior green.
+        let api = ServeVerdictState::new();
+        api.publish_attributed(
+            Path::new("/wt"),
+            crate::statusfile::VerdictPayload::green(),
+            Some("shaA".into()),
+            false,
+        );
+        api.publish_attributed(
+            Path::new("/wt"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("shaA".into()),
+            false,
+        );
+        assert_eq!(
+            api.get_status_for("/wt", Some("shaA")).map(|s| s.verdict),
+            Some("red".to_string()),
+            "same-sha re-push replaces the prior verdict for that sha"
+        );
+    }
+
+    #[test]
+    fn unattributed_publish_only_moves_latest_keeps_history() {
+        // An unattributed (FS-watch) publish has no sha to key on — it
+        // updates `latest` but must not disturb a prior sha-pinned entry.
+        let api = ServeVerdictState::new();
+        api.publish_attributed(
+            Path::new("/wt"),
+            crate::statusfile::VerdictPayload::green(),
+            Some("shaA".into()),
+            false,
+        );
+        api.publish(Path::new("/wt"), crate::statusfile::VerdictPayload::red(2));
+        assert_eq!(
+            api.get_status_for("/wt", Some("shaA")).map(|s| s.verdict),
+            Some("green".to_string()),
+            "the sha-pinned entry survives an unattributed publish"
+        );
+        assert_eq!(
+            api.get_status("/wt").map(|s| s.verdict),
+            Some("red".to_string()),
+            "latest reflects the unattributed publish"
+        );
+    }
+
+    #[test]
     fn push_attribution_records_and_pops_per_worktree() {
         // #A2 — the record→take handoff mirrors project_check_context:
         // recorded at SwitchOverlay consume, popped exactly once at
@@ -4511,31 +4741,80 @@ checks:
     }
 
     #[test]
-    fn stale_hard_witness_never_overwrites_fresher() {
-        // #A4.3 publish-once / last-writer-wins ordering: two hard
-        // witnesses for the same wt-key can coexist (push2's EmitVerdict
-        // fires while push1's witness still runs). Only the LATEST
-        // generation may publish; a consumed claim cannot publish twice.
+    fn stale_hard_witness_never_overwrites_fresher_same_base() {
+        // #A4.3 publish-once / last-writer-wins for the SAME logical overlay
+        // (same base_sha): a genuine re-push supersedes. Two hard witnesses
+        // for the same (wt, base_sha) can coexist (push2's EmitVerdict fires
+        // while push1's witness still runs). Only the LATEST generation may
+        // publish; a consumed claim cannot publish twice.
         let api = ServeVerdictState::new();
-        let g1 = api.begin_hard_witness("/wt");
-        let g2 = api.begin_hard_witness("/wt");
+        let key = WitnessKey::new("/wt", Some("shaA".to_string()));
+        let g1 = api.begin_hard_witness(&key);
+        let g2 = api.begin_hard_witness(&key);
         assert!(g2 > g1, "generations are monotonic");
         assert!(
-            !api.finish_hard_witness("/wt", g1),
-            "stale witness (older push) must not publish"
+            !api.finish_hard_witness(&key, g1),
+            "stale witness (re-push of same overlay) must not publish"
         );
         assert!(
-            api.finish_hard_witness("/wt", g2),
+            api.finish_hard_witness(&key, g2),
             "latest witness publishes"
         );
         assert!(
-            !api.finish_hard_witness("/wt", g2),
+            !api.finish_hard_witness(&key, g2),
             "a consumed claim cannot publish twice (watchdog-vs-late-worker)"
         );
         // Keys are independent: a witness on another worktree is
         // unaffected by /wt's churn.
-        let g3 = api.begin_hard_witness("/other");
-        assert!(api.finish_hard_witness("/other", g3));
+        let other = WitnessKey::new("/other", Some("shaA".to_string()));
+        let g3 = api.begin_hard_witness(&other);
+        assert!(api.finish_hard_witness(&other, g3));
+    }
+
+    #[test]
+    fn different_base_witness_not_cancelled_by_newer_push() {
+        // THE hot-trunk regression: two concurrent PRs share one analysis
+        // worktree but carry DIFFERENT base_shas. A newer push (PR B) must
+        // NOT cancel an in-flight witness for an older base_sha (PR A) — both
+        // must be able to publish their own verdict. Before keying by
+        // (wt, base_sha), B's begin bumped the single wt-keyed generation and
+        // A's finish returned false → A's verdict was silently dropped
+        // (stale-witness-dropped) → PR A's poller timed out → exit 1.
+        let api = ServeVerdictState::new();
+        let key_a = WitnessKey::new("/wt", Some("shaA".to_string()));
+        let key_b = WitnessKey::new("/wt", Some("shaB".to_string()));
+        let ga = api.begin_hard_witness(&key_a);
+        let gb = api.begin_hard_witness(&key_b); // PR B arrives while A still runs
+        assert!(gb > ga, "generations are globally monotonic");
+        assert!(
+            api.finish_hard_witness(&key_a, ga),
+            "PR A's witness must still publish — a different-base push must not cancel it"
+        );
+        assert!(
+            api.finish_hard_witness(&key_b, gb),
+            "PR B's witness publishes too"
+        );
+    }
+
+    #[test]
+    fn none_base_witness_preserves_wt_only_supersession() {
+        // FS-watch / legacy pushes carry no base_sha. They collapse to the
+        // historical wt-only supersession: a newer one supersedes the older.
+        let api = ServeVerdictState::new();
+        let key = WitnessKey::new("/wt", None);
+        let g1 = api.begin_hard_witness(&key);
+        let g2 = api.begin_hard_witness(&key);
+        assert!(
+            !api.finish_hard_witness(&key, g1),
+            "older no-sha witness superseded"
+        );
+        assert!(
+            api.finish_hard_witness(&key, g2),
+            "newer no-sha witness publishes"
+        );
+        // An empty-string base_sha normalizes to None (same bucket).
+        let empty = WitnessKey::new("/wt", Some(String::new()));
+        assert_eq!(empty, key, "empty base_sha normalizes to None");
     }
 
     #[test]

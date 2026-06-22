@@ -367,6 +367,20 @@ pub trait VerdictService: Send + Sync {
     /// per-crate breakdown). `None` ⇒ unknown worktree.
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus>;
 
+    /// Status for a worktree pinned to a specific overlay `base_sha`.
+    /// ADDITIVE with a **default body** that ignores the selector and
+    /// returns the latest status (so existing impls — `MockService`, the
+    /// adapters' inner read paths — keep compiling untouched). The serve
+    /// loop's `VerdictService` overrides this to consult its bounded
+    /// per-`base_sha` verdict history, so a SHA-pinned poller can retrieve
+    /// ITS verdict even after a concurrent PR (different `base_sha`,
+    /// same worktree) has published. `base_sha = None` ⇒ identical to
+    /// `get_status`. `Some(sha)` with no matching verdict ⇒ `None`.
+    fn get_status_for(&self, worktree: &str, base_sha: Option<&str>) -> Option<WorktreeStatus> {
+        let _ = base_sha;
+        self.get_status(worktree)
+    }
+
     /// Just the verdict string (light — no per-crate, no heartbeat).
     /// `None` ⇒ unknown worktree.
     fn get_verdict(&self, worktree: &str) -> Option<String>;

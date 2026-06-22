@@ -71,9 +71,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
@@ -96,8 +96,23 @@ use crate::statusfile::{self, Status, Verdict};
 /// order as the v0 single-watch default; runtime-tunable later).
 const QUIET: Duration = Duration::from_millis(200);
 const DEFAULT_PROJECT_CHECKS_WARN_MAX_PARALLEL: usize = 2;
+const DEFAULT_PROJECT_CHECKS_HARD_MAX_PARALLEL: usize = 4;
 
 static PROJECT_CHECKS_WARN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Hard-mode (gate/witness) concurrency permit. Unlike the Warn slot, this
+/// is a BLOCKING counting semaphore: a gate push must always resolve, so it
+/// is never silently skipped on backpressure — it waits its turn. Acquired
+/// inside the witness supervisor thread (off the serve loop), held across
+/// the worker compile, released on supervisor exit.
+///
+/// Once different-`base_sha` witnesses stopped cancelling each other (the
+/// hot-trunk fix), N concurrent gate pushes would otherwise each run a full
+/// `cargo check` simultaneously — a CPU/memory blowout on a busy trunk. This
+/// bounds that fan-out. `(count, Condvar)` rather than an atomic because the
+/// acquire side must block until a slot frees.
+static PROJECT_CHECKS_HARD_ACTIVE: Mutex<usize> = Mutex::new(0);
+static PROJECT_CHECKS_HARD_CV: Condvar = Condvar::new();
 
 /// One cluster's live state. Constructed at exactly one site (the
 /// `SpawnRa` arm); the `ClusterDriver`/`OverlayMultiplexer` are mutated
@@ -1811,15 +1826,20 @@ fn spawn_project_checks_hard(
 ///
 /// Publish-once: only `finish_hard_witness(generation) == true` may
 /// publish, so a watchdog publish consumes the claim and the wedged
-/// worker's late result is dropped; a NEWER gate push for the same
-/// wt-key invalidates this claim entirely (last-writer-wins ordering).
+/// worker's late result is dropped; a re-push of the SAME `base_sha` for
+/// the same worktree invalidates this claim (last-writer-wins for the same
+/// logical overlay). A concurrent push for a DIFFERENT `base_sha` (another
+/// PR sharing this analysis worktree) claims a separate `(wt, base_sha)`
+/// key and does NOT invalidate this witness — the hot-trunk fix.
 ///
-/// Deliberately NO warn-style slot permit: a gate push must never be
-/// silently skipped on backpressure; the BatchCoalescer already dedupes
-/// the physical check runs for same-plan pushes. Rust cannot kill a
-/// thread, so a watchdog-fired witness leaks its worker until the
-/// wedged call returns — bounded in practice by the per-check timeouts
-/// and the bounded-git work (#A4.1).
+/// Concurrency: a BLOCKING Hard-mode permit
+/// ([`acquire_project_checks_hard_slot`]) bounds how many witnesses compile
+/// at once. A gate push is never silently skipped — it waits for a slot —
+/// but it cannot fan out N simultaneous `cargo check`s on a busy trunk. The
+/// BatchCoalescer still dedupes the physical check runs for same-plan
+/// pushes. Rust cannot kill a thread, so a watchdog-fired witness leaks its
+/// worker until the wedged call returns — bounded in practice by the
+/// per-check timeouts and the bounded-git work (#A4.1).
 fn spawn_project_checks_hard_with_timeout(
     wt: PathBuf,
     authoritative_error: bool,
@@ -1829,14 +1849,27 @@ fn spawn_project_checks_hard_with_timeout(
     timeout: Duration,
     require_checks: bool,
 ) {
-    let wt_key = wt.to_string_lossy().into_owned();
-    let generation = api.begin_hard_witness(&wt_key);
+    // #A4.3 / hot-trunk — the witness identity is (worktree, base_sha). The
+    // base_sha rides the attribution, captured BY VALUE at the EmitVerdict
+    // arm before this witness runs (ClusterDriver serializes SwitchOverlay,
+    // so record/take alternate on the loop thread); the worker never touches
+    // the attribution map. So this key is stable for this witness even as
+    // newer pushes for other base_shas arrive.
+    let witness_key = crate::serveapi::WitnessKey::new(
+        wt.to_string_lossy().into_owned(),
+        attribution.as_ref().and_then(|a| a.base_sha.clone()),
+    );
+    let generation = api.begin_hard_witness(&witness_key);
     let attribution_fallback = attribution.clone();
     let supervisor = {
         let wt = wt.clone();
-        let wt_key = wt_key.clone();
+        let witness_key = witness_key.clone();
         let api = Arc::clone(&api);
         move || {
+            // Bound concurrent witness compiles (blocking — a gate push must
+            // resolve, so wait rather than skip). Held until the supervisor
+            // returns, covering the worker's whole compile.
+            let _hard_permit = acquire_project_checks_hard_slot();
             let (tx, rx) = channel::<ProjectCheckSummary>();
             let worker = std::thread::Builder::new()
                 .name("cargoless-witness".to_string())
@@ -1899,13 +1932,14 @@ fn spawn_project_checks_hard_with_timeout(
             }
             let summary = apply_require_checks(summary, require_checks);
             let payload = compose_hard_mode_payload(authoritative_error, summary);
-            if api.finish_hard_witness(&wt_key, generation) {
+            if api.finish_hard_witness(&witness_key, generation) {
                 publish_verdict(&wt, payload, attribution, &api);
             } else {
                 eprintln!(
-                    "[cargoless:obs] project-checks-hard wt={} verdict=stale-witness-dropped generation={} (#A4.3)",
+                    "[cargoless:obs] project-checks-hard wt={} verdict=stale-witness-dropped generation={} base_sha={} (#A4.3)",
                     wt.display(),
-                    generation
+                    generation,
+                    witness_key.base_sha.as_deref().unwrap_or("<none>"),
                 );
             }
         }
@@ -1926,7 +1960,7 @@ fn spawn_project_checks_hard_with_timeout(
                 detail: format!("spawn failed: {e}"),
             },
         );
-        if api.finish_hard_witness(&wt_key, generation) {
+        if api.finish_hard_witness(&witness_key, generation) {
             publish_verdict(&wt, payload, attribution_fallback, &api);
         }
     }
@@ -1970,6 +2004,52 @@ fn try_acquire_project_checks_warn_slot_with_max(
             Err(next) => current = next,
         }
     }
+}
+
+/// RAII permit for a Hard-mode (gate/witness) slot. Decrements the active
+/// count and wakes one waiter on drop. Held by the supervisor thread for the
+/// lifetime of the witness worker.
+struct ProjectChecksHardPermit;
+
+impl Drop for ProjectChecksHardPermit {
+    fn drop(&mut self) {
+        let mut active = PROJECT_CHECKS_HARD_ACTIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        // One slot freed ⇒ wake exactly one blocked acquirer.
+        PROJECT_CHECKS_HARD_CV.notify_one();
+    }
+}
+
+fn project_checks_hard_max_parallel() -> usize {
+    std::env::var("CARGOLESS_PROJECT_CHECKS_HARD_MAX_PARALLEL")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_PROJECT_CHECKS_HARD_MAX_PARALLEL)
+}
+
+/// Blocking acquire of a Hard-mode slot — waits until the active count is
+/// below `max_parallel`, never returns empty-handed (a gate push must
+/// resolve). Called from the supervisor thread, so blocking here delays only
+/// this witness, never other worktrees' verdicts.
+fn acquire_project_checks_hard_slot() -> ProjectChecksHardPermit {
+    acquire_project_checks_hard_slot_with_max(project_checks_hard_max_parallel())
+}
+
+fn acquire_project_checks_hard_slot_with_max(max_parallel: usize) -> ProjectChecksHardPermit {
+    let cap = max_parallel.max(1);
+    let mut active = PROJECT_CHECKS_HARD_ACTIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *active >= cap {
+        active = PROJECT_CHECKS_HARD_CV
+            .wait(active)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *active += 1;
+    ProjectChecksHardPermit
 }
 
 /// Outcome of a Hard-mode project-checks run, in a shape that
@@ -2288,6 +2368,53 @@ mod tests {
             "slot should be available again after the permit drops"
         );
         PROJECT_CHECKS_WARN_ACTIVE.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn hard_project_check_slot_blocks_then_releases() {
+        // The Hard permit is a BLOCKING semaphore (a gate push must resolve,
+        // never skip). With a cap of 1: the first acquire succeeds; a second
+        // acquire on another thread BLOCKS until the first drops, then
+        // proceeds. Verified via a channel ordering check.
+        {
+            let mut active = PROJECT_CHECKS_HARD_ACTIVE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *active = 0;
+        }
+        let first = acquire_project_checks_hard_slot_with_max(1);
+        let (tx, rx) = channel::<()>();
+        let waiter = std::thread::spawn(move || {
+            // This must block until `first` is dropped on the main thread.
+            let _second = acquire_project_checks_hard_slot_with_max(1);
+            tx.send(()).expect("send after acquiring the freed slot");
+            // hold briefly so the permit count is observably 1 here
+        });
+        // The waiter should NOT have acquired yet (cap is full).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "second hard acquire must block while the only slot is held"
+        );
+        drop(first); // frees the slot; the waiter's blocked acquire wins
+        assert!(
+            rx.recv_timeout(Duration::from_millis(2000)).is_ok(),
+            "second hard acquire proceeds once the first permit drops"
+        );
+        waiter.join().expect("waiter thread");
+        {
+            let mut active = PROJECT_CHECKS_HARD_ACTIVE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *active = 0;
+        }
+    }
+
+    #[test]
+    fn hard_project_check_max_parallel_default_is_positive() {
+        assert!(
+            project_checks_hard_max_parallel() >= 1,
+            "the hard-witness cap must be a positive bound"
+        );
     }
 
     #[test]

@@ -774,10 +774,19 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         "/admin/active" => (200, daemon_activity_to_json(&svc.daemon_activity())),
         "/worktrees" => (200, summaries_to_json(&svc.list_worktrees())),
         "/status" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
-            Some(w) => match svc.get_status(&w) {
-                Some(s) => (200, status_to_json(&s)),
-                None => (404, "null".into()),
-            },
+            // Optional `base_sha` selector (additive, backward-compatible):
+            // absent ⇒ latest verdict (identical to before); present ⇒ the
+            // verdict published for exactly that SHA, or 404 if it never
+            // published / aged out of the bounded history. Lets a SHA-pinned
+            // poller retrieve ITS verdict even after a concurrent PR
+            // (different base_sha, same worktree) has published.
+            Some(w) => {
+                let base_sha = query_param(&req.query, "base_sha").map(|s| pct_decode(&s));
+                match svc.get_status_for(&w, base_sha.as_deref()) {
+                    Some(s) => (200, status_to_json(&s)),
+                    None => (404, "null".into()),
+                }
+            }
             None => (404, "null".into()),
         },
         "/verdict" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
@@ -1504,6 +1513,41 @@ mod tests {
             .and_then(|c| c.parse::<u16>().ok())
             .expect("status code");
         (code, body.to_string())
+    }
+
+    #[test]
+    fn status_route_without_base_sha_is_unchanged() {
+        // Backward-compat contract: `/status?worktree=W` with no base_sha is
+        // byte-identical to before — it routes through the default
+        // get_status_for(W, None) → get_status(W). MockService does NOT
+        // override get_status_for, so this also proves the trait default
+        // keeps legacy impls working.
+        let s = server();
+        std::thread::sleep(Duration::from_millis(50));
+        let (code, body) = raw_get(s.addr(), "/status?worktree=green-wt");
+        assert_eq!(code, 200, "no-selector /status still 200");
+        assert!(
+            body.contains("\"verdict\":\"green\""),
+            "latest verdict served unchanged: {body}"
+        );
+        let (code_unknown, _) = raw_get(s.addr(), "/status?worktree=nope");
+        assert_eq!(code_unknown, 404, "unknown worktree still 404");
+    }
+
+    #[test]
+    fn status_route_with_base_sha_delegates_to_latest_on_legacy_service() {
+        // A service that does NOT override get_status_for (MockService) must
+        // still answer a base_sha-qualified request — the default ignores the
+        // selector and returns the latest. This is the transition-safety
+        // contract: adding the param never wedges a pre-history daemon image.
+        let s = server();
+        std::thread::sleep(Duration::from_millis(50));
+        let (code, body) = raw_get(s.addr(), "/status?worktree=red-wt&base_sha=anything");
+        assert_eq!(code, 200, "legacy service answers base_sha-qualified read");
+        assert!(
+            body.contains("\"verdict\":\"red\""),
+            "default-delegate returns the latest verdict: {body}"
+        );
     }
 
     #[test]
