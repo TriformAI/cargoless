@@ -45,11 +45,11 @@ use flate2::write::GzEncoder;
 use native_tls::{HandshakeError, TlsConnector, TlsStream};
 
 use super::{
-    Authorizer, BatchCheckRequest, BatchReport, DaemonActivity, PushOverlayAck, PushOverlayOptions,
-    Request, TransitionEvent, TransportClient, TransportError, VerdictService, WorktreeStatus,
-    WorktreeSummary, batchreport_from_json, batchreport_to_json, event_from_json, event_to_json,
-    pushoverlayack_from_json, pushoverlayack_to_json, status_from_json, status_to_json,
-    summaries_from_json, summaries_to_json,
+    Authorizer, BatchCheckRequest, BatchReport, DaemonActivity, PreviewControl, PushOverlayAck,
+    PushOverlayOptions, Request, TransitionEvent, TransportClient, TransportError, VerdictService,
+    WorktreeStatus, WorktreeSummary, batchreport_from_json, batchreport_to_json, event_from_json,
+    event_to_json, pushoverlayack_from_json, pushoverlayack_to_json, status_from_json,
+    status_to_json, summaries_from_json, summaries_to_json,
 };
 
 /// Increment 2 (D-PUSHOVERLAY §2.5) — hard cap on a `POST /overlay`
@@ -703,6 +703,103 @@ fn handle(
         return;
     }
 
+    // ── self-serve previews: POST /instances, DELETE /instances/<name> ──
+    // Bearer-gated (the #14 auth gate above already ran). The daemon enqueues
+    // the request onto the single-mutator control loop and answers 202
+    // Accepted — the actual add/teardown (proxy bind, port alloc, git
+    // worktree) is async on the control thread. A non-self-serve daemon (the
+    // `app_preview_control` default ⇒ false, e.g. the gate or a daemon with no
+    // control channel wired) answers 404, byte-identical to any unknown route.
+    if req.method == "POST" && req.path == "/instances" {
+        // Small JSON body: {"name","ref","env"?,"own_db"?}. Capped hard — this
+        // is a control verb, not a payload route, so a generous-but-small cap.
+        let body = match req.content_length {
+            Some(n) if n <= 64 * 1024 => {
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() {
+                    write_response(
+                        &mut writer,
+                        400,
+                        "Bad Request",
+                        "text/plain",
+                        "instances body shorter than its Content-Length",
+                    );
+                    return;
+                }
+                buf
+            }
+            Some(_) => {
+                write_response(
+                    &mut writer,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    "instances payload exceeds the size cap",
+                );
+                return;
+            }
+            None => {
+                write_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    "POST /instances requires a numeric Content-Length",
+                );
+                return;
+            }
+        };
+        match parse_preview_add(&String::from_utf8_lossy(&body)) {
+            Ok(control) => {
+                if svc.app_preview_control(control) {
+                    write_response(
+                        &mut writer,
+                        202,
+                        "Accepted",
+                        "application/json",
+                        "{\"accepted\":true}",
+                    );
+                } else {
+                    // No control channel ⇒ not a self-serve daemon. 404 keeps
+                    // the gate read plane byte-identical to an unknown route.
+                    write_response(&mut writer, 404, "Not Found", "application/json", "null");
+                }
+            }
+            Err(msg) => {
+                write_response(&mut writer, 400, "Bad Request", "text/plain", &msg);
+            }
+        }
+        return;
+    }
+    let delete_target = (req.method == "DELETE")
+        .then(|| req.path.strip_prefix("/instances/"))
+        .flatten();
+    if let Some(raw_name) = delete_target {
+        let name = pct_decode(raw_name);
+        if name.is_empty() || name.contains('/') {
+            write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "text/plain",
+                "bad instance name",
+            );
+            return;
+        }
+        if svc.app_preview_control(PreviewControl::Remove { name }) {
+            write_response(
+                &mut writer,
+                202,
+                "Accepted",
+                "application/json",
+                "{\"accepted\":true}",
+            );
+        } else {
+            write_response(&mut writer, 404, "Not Found", "application/json", "null");
+        }
+        return;
+    }
+
     // SSE stream route.
     if req.path == "/events" {
         let _ = write!(
@@ -794,6 +891,69 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         // pre-auth answer and bring the route back under bearer gating.
         _ => (404, "null".into()),
     }
+}
+
+/// Parse the small `POST /instances` JSON body
+/// `{name, ref, env?, own_db?, ttl_secs?}` into a [`PreviewControl::Add`].
+/// Hand-validated (no serde derive on the transport types): `name`/`ref` are
+/// required and non-empty; `name` must be a tame DNS/dir/worktree token (no
+/// `/`, no whitespace); `env` is an optional string→string object; `own_db`
+/// an optional bool (default false); `ttl_secs` an optional positive integer
+/// (the preview's lifetime; absent ⇒ the daemon's default TTL).
+fn parse_preview_add(body: &str) -> Result<PreviewControl, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let name = v
+        .get("name")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("`name` is required")?
+        .to_string();
+    // Names key worktrees, dirs, and hostnames — keep them tame.
+    if name.contains('/') || name.contains(char::is_whitespace) {
+        return Err("`name` must not contain `/` or whitespace".to_string());
+    }
+    let git_ref = v
+        .get("ref")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("`ref` is required")?
+        .to_string();
+    let env = match v.get("env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Object(map)) => map
+            .iter()
+            .map(|(k, val)| {
+                let s = val
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| val.to_string());
+                (k.clone(), s)
+            })
+            .collect(),
+        Some(_) => return Err("`env` must be an object".to_string()),
+    };
+    let own_db = v.get("own_db").and_then(|x| x.as_bool()).unwrap_or(false);
+    // `ttl_secs`: optional positive lifetime. A present-but-zero or negative
+    // value is a client error (an immediate-expiry preview is never intended);
+    // absent ⇒ None ⇒ the daemon applies its default TTL.
+    let ttl_secs = match v.get("ttl_secs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(val) => {
+            let n = val
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or("`ttl_secs` must be a positive integer")?;
+            Some(n)
+        }
+    };
+    Ok(PreviewControl::Add {
+        name,
+        git_ref,
+        env,
+        own_db,
+        ttl_secs,
+    })
 }
 
 /// Minimal percent-decoding for `%XX` + `+`→space (worktree ids are
@@ -1148,6 +1308,106 @@ impl HttpClient {
             .and_then(|c| c.parse::<u16>().ok())
             .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
         Ok((code, body.to_string()))
+    }
+
+    /// Bodyless DELETE (mirrors `get`): used by the self-serve preview
+    /// teardown route `DELETE /instances/<name>`.
+    fn delete(&self, path: &str) -> Result<(u16, String), TransportError> {
+        let mut stream = self.connect()?;
+        write!(
+            stream,
+            "DELETE {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            self.host
+        )?;
+        if let Some(tok) = &self.token {
+            write!(stream, "Authorization: Bearer {tok}\r\n")?;
+        }
+        write!(stream, "{}", self.extra_header_lines())?;
+        write!(stream, "\r\n")?;
+        stream.flush()?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw)?;
+        let (head, body) = raw
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
+        let code = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| TransportError::Protocol("no status code".into()))?;
+        Ok((code, body.to_string()))
+    }
+
+    /// self-serve previews — `POST /instances`. Builds the small JSON body by
+    /// hand (the transport types are serde-free) and accepts on `202`. `404`
+    /// ⇒ the daemon is not self-serve (no control channel); surfaced as a
+    /// clear protocol error so the CLI can tell the user.
+    pub fn register_preview(
+        &self,
+        name: &str,
+        git_ref: &str,
+        env: &[(String, String)],
+        own_db: bool,
+        ttl_secs: Option<u64>,
+    ) -> Result<(), TransportError> {
+        let env_obj: serde_json::Map<String, serde_json::Value> = env
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        let mut body_obj = serde_json::Map::new();
+        body_obj.insert("name".into(), serde_json::Value::String(name.into()));
+        body_obj.insert("ref".into(), serde_json::Value::String(git_ref.into()));
+        body_obj.insert("env".into(), serde_json::Value::Object(env_obj));
+        body_obj.insert("own_db".into(), serde_json::Value::Bool(own_db));
+        if let Some(ttl) = ttl_secs {
+            body_obj.insert("ttl_secs".into(), serde_json::Value::from(ttl));
+        }
+        let body = serde_json::Value::Object(body_obj).to_string();
+        let (code, _) = self.post_json("/instances", &body, CLIENT_IO_TIMEOUT, "instances")?;
+        match code {
+            200 | 202 => Ok(()),
+            400 => Err(TransportError::Protocol(
+                "daemon rejected the preview request (400 — bad name/ref?)".into(),
+            )),
+            401 => Err(TransportError::Unauthorized),
+            404 => Err(TransportError::Protocol(
+                "daemon does not support self-serve previews (404)".into(),
+            )),
+            other => Err(TransportError::Protocol(format!(
+                "unexpected status {other} from POST /instances"
+            ))),
+        }
+    }
+
+    /// self-serve previews — `DELETE /instances/<name>`. Accepts on `202`;
+    /// `404` ⇒ unknown preview or non-self-serve daemon.
+    pub fn remove_preview(&self, name: &str) -> Result<(), TransportError> {
+        let (code, _) = self.delete(&format!("/instances/{name}"))?;
+        match code {
+            200 | 202 => Ok(()),
+            401 => Err(TransportError::Unauthorized),
+            404 => Err(TransportError::Protocol(
+                "no such preview, or daemon is not self-serve (404)".into(),
+            )),
+            other => Err(TransportError::Protocol(format!(
+                "unexpected status {other} from DELETE /instances/{name}"
+            ))),
+        }
+    }
+
+    /// Read the `/app` report (the app-serve read plane) — the CLI polls this
+    /// to follow a preview's build phase. `None` ⇒ not an app-serve daemon.
+    pub fn app_report(&self) -> Result<Option<String>, TransportError> {
+        let (code, body) = self.get("/app")?;
+        match code {
+            200 => Ok(Some(body)),
+            404 => Ok(None),
+            401 => Err(TransportError::Unauthorized),
+            other => Err(TransportError::Protocol(format!(
+                "unexpected status {other} from GET /app"
+            ))),
+        }
     }
 
     pub fn daemon_build_id(&self) -> Result<Option<String>, TransportError> {
@@ -1608,6 +1868,142 @@ mod tests {
         let (code, body) = raw_get(s.addr(), "/app");
         assert_eq!(code, 200);
         assert_eq!(body, json);
+    }
+
+    /// Raw request with an explicit method + body (POST/DELETE), returning the
+    /// status code. Mirrors `raw_get` but lets the self-serve route tests drive
+    /// the write verbs.
+    fn raw_req(addr: std::net::SocketAddr, method: &str, target: &str, body: &str) -> u16 {
+        let mut s = TcpStream::connect(addr).expect("connect");
+        write!(
+            s,
+            "{method} {target} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        s.flush().unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).unwrap();
+        raw.lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse::<u16>().ok())
+            .expect("status code")
+    }
+
+    #[test]
+    fn instances_routes_404_on_a_non_selfserve_service() {
+        // Gate non-regression: MockService uses the `app_preview_control`
+        // default (`false`), so POST /instances and DELETE /instances/<name>
+        // 404 — indistinguishable from any unknown route.
+        let s = server();
+        std::thread::sleep(Duration::from_millis(50));
+        let post = raw_req(
+            s.addr(),
+            "POST",
+            "/instances",
+            "{\"name\":\"x\",\"ref\":\"origin/x\"}",
+        );
+        let del = raw_req(s.addr(), "DELETE", "/instances/x", "");
+        assert_eq!(
+            post, 404,
+            "POST /instances 404s on a non-self-serve service"
+        );
+        assert_eq!(
+            del, 404,
+            "DELETE /instances/x 404s on a non-self-serve service"
+        );
+    }
+
+    #[test]
+    fn parse_preview_add_handles_ttl_secs() {
+        // Absent ttl_secs ⇒ None (daemon applies its default).
+        match parse_preview_add("{\"name\":\"feat\",\"ref\":\"origin/feat\"}").unwrap() {
+            PreviewControl::Add { ttl_secs, .. } => assert_eq!(ttl_secs, None),
+            other => panic!("expected Add, got {other:?}"),
+        }
+        // A positive ttl_secs is carried through.
+        match parse_preview_add("{\"name\":\"feat\",\"ref\":\"origin/feat\",\"ttl_secs\":3600}")
+            .unwrap()
+        {
+            PreviewControl::Add { ttl_secs, .. } => assert_eq!(ttl_secs, Some(3600)),
+            other => panic!("expected Add, got {other:?}"),
+        }
+        // Zero / negative ttl_secs is a client error (never an instant-expiry).
+        assert!(parse_preview_add("{\"name\":\"f\",\"ref\":\"origin/f\",\"ttl_secs\":0}").is_err());
+        assert!(
+            parse_preview_add("{\"name\":\"f\",\"ref\":\"origin/f\",\"ttl_secs\":-5}").is_err()
+        );
+    }
+
+    #[test]
+    fn instances_routes_202_when_control_accepts_and_400_on_bad_body() {
+        // A service that accepts control returns 202; a malformed add body is a
+        // 400 (the parse rejected it before the control call).
+        struct AcceptCtl;
+        impl VerdictService for AcceptCtl {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+            fn app_preview_control(&self, _r: PreviewControl) -> bool {
+                true
+            }
+        }
+        let s = HttpServer::bind("127.0.0.1:0", Arc::new(AcceptCtl), Arc::new(AllowAll)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let ok = raw_req(
+            s.addr(),
+            "POST",
+            "/instances",
+            "{\"name\":\"feat\",\"ref\":\"origin/feat\"}",
+        );
+        assert_eq!(ok, 202, "accepted add ⇒ 202");
+        let del = raw_req(s.addr(), "DELETE", "/instances/feat", "");
+        assert_eq!(del, 202, "accepted remove ⇒ 202");
+        let bad = raw_req(s.addr(), "POST", "/instances", "{\"ref\":\"origin/feat\"}");
+        assert_eq!(
+            bad, 400,
+            "missing name ⇒ 400 (parse rejects before control)"
+        );
+    }
+
+    #[test]
+    fn instances_route_is_auth_gated() {
+        // The self-serve routes sit below the #14 auth gate: a DenyAll daemon
+        // 401s POST /instances (not 404/202) — the bearer gate covers it.
+        struct DenyAll;
+        impl Authorizer for DenyAll {
+            fn authorize(&self, _t: Option<&str>) -> bool {
+                false
+            }
+        }
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(DenyAll),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let code = raw_req(
+            s.addr(),
+            "POST",
+            "/instances",
+            "{\"name\":\"x\",\"ref\":\"origin/x\"}",
+        );
+        assert_eq!(code, 401, "auth gate covers POST /instances");
     }
 
     #[test]

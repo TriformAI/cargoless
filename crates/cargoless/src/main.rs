@@ -32,6 +32,7 @@ mod clean;
 mod config;
 mod cratemap;
 mod orphan;
+mod preview; // self-serve previews — thin client (POST/DELETE /instances).
 mod push; // #240/2c — thin push-client (POST /overlay).
 mod serve;
 mod serveapi;
@@ -68,6 +69,10 @@ enum Cmd {
     /// Owns routing-header injection (C1) and the endpoint failover
     /// ladder so gate wrappers collapse to a single binary call.
     Verdict,
+    /// Self-serve previews — register the current branch as a runtime
+    /// preview on a remote `app-serve` daemon and follow it to green
+    /// (`preview --remote <url>`), or tear one down (`preview --remove`).
+    Preview,
     Help,
     Version,
 }
@@ -139,6 +144,19 @@ struct Opts {
     /// fall back to 1 (serialised, today's behaviour). Also see
     /// `AppServeOpts::max_concurrent_builds`.
     max_concurrent_builds: usize,
+    /// `app-serve --preview-domain <domain>` — public domain self-serve
+    /// previews are advertised under (e.g. `tryform.wtf`). Unset ⇒ previews
+    /// have no `public_host` and are port-forward-only. See
+    /// `AppServeOpts::preview_domain`.
+    preview_domain: Option<String>,
+    /// `app-serve --preview-port-range START-END` — L4-proxy ports for
+    /// runtime-registered previews (distinct from `--port-range`). Unset ⇒
+    /// ephemeral OS-assigned proxy ports. See `AppServeOpts::preview_port_range`.
+    preview_port_range: Option<String>,
+    /// `app-serve --preview-defaults <file>` — env template merged into every
+    /// runtime preview's overlay (`${VAR}` resolved from the daemon env). See
+    /// `AppServeOpts::preview_defaults`.
+    preview_defaults: Option<PathBuf>,
     /// `status --remote <url>` — query a remote `serve --bind` fleet
     /// daemon over the shipped HTTP(S) transport instead of the on-disk
     /// `cli-status`. Resolved through `transport::discovery` (explicit
@@ -197,6 +215,28 @@ struct Opts {
     /// `checks run --report-json <path>` — write machine-readable check
     /// decision data for repo-specific ticketing wrappers.
     checks_report_json: Option<PathBuf>,
+    // ── self-serve preview flags ─────────────────────────────────────
+    /// `preview --name <name>` — explicit preview name (default: derived
+    /// from the current branch, DNS-label-sanitized).
+    preview_name: Option<String>,
+    /// `preview --ref <ref>` — git ref the preview tracks (default: the
+    /// current branch as `origin/<branch>`).
+    preview_ref: Option<String>,
+    /// `preview --env KEY=VALUE` repeatable — extra non-secret env for the
+    /// preview app child (merged over the daemon's shared defaults).
+    preview_env: Vec<String>,
+    /// `preview --remove` — tear down the named/derived preview instead of
+    /// registering one.
+    preview_remove: bool,
+    /// `preview --own-db` — request an isolated per-branch database (daemon
+    /// may decline until that increment ships; falls back to the shared DB).
+    preview_own_db: bool,
+    /// `preview --no-wait` — register and return immediately, without
+    /// polling `/app` for the build to go green.
+    preview_no_wait: bool,
+    /// `preview --ttl <secs>` — preview lifetime in seconds; the daemon
+    /// auto-removes the preview at expiry. Unset ⇒ the daemon's default TTL.
+    preview_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -231,6 +271,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
         "checks" => Cmd::Checks,
         "serve" => Cmd::Serve,
         "app-serve" => Cmd::AppServe,
+        "preview" => Cmd::Preview,
         "push" => Cmd::Push,
         "batch-check" => Cmd::BatchCheck,
         "verdict" => Cmd::Verdict,
@@ -389,6 +430,26 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                     .parse()
                     .map_err(|_| ParseError::MissingValue("--max-concurrent-builds"))?;
             }
+            "--preview-domain" => {
+                opts.preview_domain = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--preview-domain"))?
+                        .clone(),
+                );
+            }
+            "--preview-port-range" => {
+                opts.preview_port_range = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--preview-port-range"))?
+                        .clone(),
+                );
+            }
+            "--preview-defaults" => {
+                opts.preview_defaults = Some(PathBuf::from(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--preview-defaults"))?,
+                ));
+            }
             // verdict: --remote is repeatable (failover ladder) — must
             // precede the scalar arm below (match arms are tried in order).
             "--remote" if cmd == Cmd::Verdict => {
@@ -436,6 +497,30 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 opts.push_await_timeout_secs = Some(v.parse::<u64>().map_err(|_| {
                     ParseError::MissingValue("--await-timeout-secs (numeric seconds)")
                 })?);
+            }
+            // ── self-serve `preview` flags ──────────────────────────
+            "--name" => {
+                opts.preview_name =
+                    Some(it.next().ok_or(ParseError::MissingValue("--name"))?.clone());
+            }
+            "--ref" => {
+                opts.preview_ref =
+                    Some(it.next().ok_or(ParseError::MissingValue("--ref"))?.clone());
+            }
+            "--env" => {
+                opts.preview_env
+                    .push(it.next().ok_or(ParseError::MissingValue("--env"))?.clone());
+            }
+            "--remove" => opts.preview_remove = true,
+            "--own-db" => opts.preview_own_db = true,
+            "--no-wait" => opts.preview_no_wait = true,
+            "--ttl" => {
+                opts.preview_ttl_secs = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--ttl"))?
+                        .parse()
+                        .map_err(|_| ParseError::MissingValue("--ttl (numeric seconds)"))?,
+                );
             }
             // ── A1 (0.4) `verdict` flags ────────────────────────────
             "--header" if cmd == Cmd::Verdict => {
@@ -511,6 +596,14 @@ fn usage() {
     println!("  app-serve --repo <DIR> --instances <FILE> --port-range A-B");
     println!("                        Run the apps the checker certifies: one");
     println!("                        L4-proxied instance per ref, never serve red");
+    println!("            [--preview-domain D] [--preview-port-range A-B] [--preview-defaults F]");
+    println!("                        Accept self-serve previews: advertise <name>.D,");
+    println!("                        bind proxies from the range, seed env from F");
+    println!("  preview --remote <URL> [--name N] [--ref R] [--ttl SECS] [--remove]");
+    println!("                        Self-serve: register the current branch as a");
+    println!("                        preview on a remote app-serve daemon, follow it");
+    println!("                        to green; auto-removes after --ttl (default 24h);");
+    println!("                        --remove tears it down now");
     println!("  batch-check --remote <URL> --request-json <PATH>");
     println!("                        Native optimistic batch gate; prints report JSON");
     println!("  verdict --remote <URL> [--remote <URL>...] [-- <REPO>]");
@@ -767,6 +860,9 @@ fn main() -> ExitCode {
                 auth_token: parsed.opts.auth_token.clone(),
                 poll_interval_ms: parsed.opts.poll_interval_ms,
                 max_concurrent_builds: parsed.opts.max_concurrent_builds,
+                preview_domain: parsed.opts.preview_domain.clone(),
+                preview_port_range: parsed.opts.preview_port_range.clone(),
+                preview_defaults: parsed.opts.preview_defaults.clone(),
             });
         }
         // `status --remote <url>` queries a remote fleet `serve --bind`
@@ -784,6 +880,31 @@ fn main() -> ExitCode {
         // front-door (same rationale as serve/status --remote): push is
         // a server-protocol command, not a local-WASM-project command.
         // --remote is REQUIRED for push (no local fallback).
+        Cmd::Preview => {
+            let Some(remote) = parsed.opts.remote.clone() else {
+                ui::error("preview: --remote <url> is required");
+                return ExitCode::from(2);
+            };
+            let repo = parsed
+                .opts
+                .repo
+                .clone()
+                .or_else(|| parsed.opts.root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            return preview::run(&preview::PreviewOpts {
+                remote,
+                auth_token: auth_token_for_push(parsed.opts.auth_token.clone()),
+                repo,
+                name: parsed.opts.preview_name.clone(),
+                git_ref: parsed.opts.preview_ref.clone(),
+                env: parsed.opts.preview_env.clone(),
+                remove: parsed.opts.preview_remove,
+                own_db: parsed.opts.preview_own_db,
+                no_wait: parsed.opts.preview_no_wait,
+                ttl_secs: parsed.opts.preview_ttl_secs,
+            });
+        }
         Cmd::Push => {
             let Some(remote) = parsed.opts.remote.clone() else {
                 ui::error("push: --remote <url> is required");
@@ -926,6 +1047,7 @@ fn main() -> ExitCode {
         | Cmd::Version
         | Cmd::Serve
         | Cmd::AppServe
+        | Cmd::Preview
         | Cmd::Push
         | Cmd::BatchCheck
         | Cmd::Verdict => {
@@ -959,12 +1081,44 @@ mod tests {
             ("clean", Cmd::Clean),
             ("checks", Cmd::Checks),
             ("serve", Cmd::Serve),
+            ("app-serve", Cmd::AppServe),
+            ("preview", Cmd::Preview),
             ("push", Cmd::Push),
             ("verdict", Cmd::Verdict),
             ("version", Cmd::Version),
         ] {
             assert_eq!(parse(&v(&[s])).unwrap().cmd, c);
         }
+    }
+
+    #[test]
+    fn preview_flags_parse() {
+        let p = parse(&v(&[
+            "preview",
+            "--remote",
+            "http://d:8787",
+            "--name",
+            "feat",
+            "--ref",
+            "origin/feat",
+            "--env",
+            "K=V",
+            "--remove",
+            "--own-db",
+            "--no-wait",
+            "--ttl",
+            "3600",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::Preview);
+        assert_eq!(p.opts.remote.as_deref(), Some("http://d:8787"));
+        assert_eq!(p.opts.preview_name.as_deref(), Some("feat"));
+        assert_eq!(p.opts.preview_ref.as_deref(), Some("origin/feat"));
+        assert_eq!(p.opts.preview_env, vec!["K=V".to_string()]);
+        assert!(p.opts.preview_remove);
+        assert!(p.opts.preview_own_db);
+        assert!(p.opts.preview_no_wait);
+        assert_eq!(p.opts.preview_ttl_secs, Some(3600));
     }
 
     // -----------------------------------------------------------------------

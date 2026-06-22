@@ -477,6 +477,50 @@ pub trait VerdictService: Send + Sync {
     fn app_report(&self) -> Option<String> {
         None
     }
+
+    /// self-serve previews — apply a runtime instance [`PreviewControl`]
+    /// (add/remove). The HTTP `POST /instances` / `DELETE /instances/<name>`
+    /// routes call this; the stateless HTTP thread only expresses *intent*,
+    /// so the implementor (`appsvc::AppServeState`) enqueues the request onto
+    /// the single-mutator control loop and returns immediately.
+    ///
+    /// Returns `true` when the request was accepted (a control channel is
+    /// wired); `false` ⇒ this daemon is not a self-serve app-serve daemon (no
+    /// channel), so the route 404s exactly like any other unknown path.
+    /// ADDITIVE with a default of `false` so the gate daemon + every test mock
+    /// keep compiling untouched (the `/instances`-404 guard test pins this);
+    /// only `appsvc::AppServeState` overrides it.
+    fn app_preview_control(&self, _request: PreviewControl) -> bool {
+        false
+    }
+}
+
+/// A runtime instance-set mutation requested over the control plane
+/// (`POST /instances` / `DELETE /instances/<name>`). Serde-free, like the
+/// rest of this seam — the HTTP layer parses the small JSON body into this by
+/// hand and the control loop matches on it. ONE type end-to-end: the HTTP
+/// handler, the `app_preview_control` trait method, and the app-serve control
+/// loop all speak `PreviewControl` (no parallel "request" twin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewControl {
+    /// Add a preview named `name` tracking `git_ref`, with an optional `env`
+    /// overlay (k=v pairs) for the app child. `own_db` requests an isolated
+    /// per-branch database; until that increment lands the daemon logs the
+    /// request and falls back to the shared preview DB (never fails the add).
+    /// `ttl_secs` is the preview's lifetime in seconds from registration: the
+    /// daemon auto-removes it once it expires (so an abandoned preview cleans
+    /// itself up and the reconciler then prunes its Service/Ingress). `None`
+    /// ⇒ the daemon's default TTL; re-`Add`ing a live preview renews it.
+    Add {
+        name: String,
+        git_ref: String,
+        env: Vec<(String, String)>,
+        own_db: bool,
+        ttl_secs: Option<u64>,
+    },
+    /// Remove the named preview (stop its poller + children, free its port,
+    /// drop its proxy, remove its worktree). Unknown name ⇒ a safe no-op.
+    Remove { name: String },
 }
 
 /// The **client** counterpart of [`VerdictService`] — the uniform
@@ -2228,5 +2272,22 @@ mod tests {
                 .message
                 .contains("unsupported")
         );
+    }
+
+    #[test]
+    fn verdict_service_default_preview_control_refuses() {
+        // The self-serve seam default: a service that did not opt into
+        // runtime instance control reports `false` ⇒ the route 404s, exactly
+        // like the `app_report` default makes `/app` 404 on a gate daemon.
+        use super::inproc::testmock::MockService;
+        let svc = MockService::new();
+        assert!(!svc.app_preview_control(PreviewControl::Add {
+            name: "x".into(),
+            git_ref: "origin/x".into(),
+            env: vec![],
+            own_db: false,
+            ttl_secs: None,
+        }));
+        assert!(!svc.app_preview_control(PreviewControl::Remove { name: "x".into() }));
     }
 }

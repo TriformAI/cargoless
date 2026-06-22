@@ -198,6 +198,17 @@ fn parse_inner(
     Ok(InstancesFile { instances })
 }
 
+/// Public `${VAR}` resolver, shared with the app-serve daemon's
+/// `--preview-defaults` env-template loader so the preview env inherits the
+/// SAME strict interpolation as the instances file. Thin re-export of the
+/// internal [`interpolate`].
+pub fn interpolate_env(
+    raw: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    interpolate(raw, lookup)
+}
+
 /// Resolve every `${VAR}` in `raw` via `lookup`. Strict: an unknown var or a
 /// malformed reference is an `Err(message)`. No escape syntax — a literal
 /// `${` cannot appear in a value (acceptable for this config surface, and

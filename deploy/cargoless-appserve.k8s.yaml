@@ -13,11 +13,17 @@
 # NATS, Iggy — which already live there. This is the SAME risk class as a long
 # rolling staging deploy (the `dev` instance is a full canary).
 #
-# Multi-instance from day one. First rollout = two instances:
+# Multi-instance from day one. First rollout = two instances + self-serve N more:
 #   - `dev`        : full canary, shares staging's DB/NATS/Iggy/RustFS.
 #   - `feature-x`  : own database `preview_feature_x` in the same staging
 #                    Postgres (DB isolation; queues still shared — a known
 #                    limitation until physics grows isolation knobs).
+#   - any agent branch, registered at runtime via `cargoless preview` (one
+#     command, no manifest edit, no pod restart). The control plane enqueues
+#     a register → the daemon binds an L4 proxy port from the preview range,
+#     spawns a ref poller, and reports the new instance on `/app`. A separate
+#     reconciler (Flux-managed in tf-multiverse) reads `/app` and ensures a
+#     Service + Ingress per instance at `<name>.tryform.wtf` (HTTP-01 TLS).
 #
 # Required out-of-band secrets in triform-staging (Secrets are namespace-local):
 #   kubectl -n triform-staging create secret generic cargoless-serve-auth \
@@ -77,6 +83,44 @@ data:
           MIGRATION_DATABASE_URL: "${PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL}"
           TRIFORM_PUBLIC_BASE_URL: "https://feature-x.preview.triform.dev"
           TRIFORM_API_URL: "https://feature-x.preview.triform.dev"
+---
+# Env template that every self-serve preview inherits at registration time.
+# The daemon reads it at startup; `${VAR}` refs resolve from the pod env
+# (cargoless-preview-dbs + staging secrets) per the same idiom the instances
+# file already uses. The client cannot hold pod-side secrets, so this is how
+# `cargoless preview` previews get the SAME DB/S3/NATS/JWT wiring as
+# preview.triform.dev — without the agent ever seeing the values.
+#
+# TRIFORM_PUBLIC_BASE_URL / TRIFORM_API_URL are auto-overridden by the daemon
+# at register time to `https://<name>.tryform.wtf` (the preview's own host);
+# omit them here, or set them to the canary base — they will be replaced.
+#
+# Note: shape this block to match the canonical staging Deployment env (see
+# tf-multiverse `apps/staging/triform.yaml`); only the literal values that
+# must differ per preview belong in the per-instance overlay.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cargoless-preview-defaults
+  namespace: triform-staging
+  labels:
+    app.kubernetes.io/name: cargoless-preview
+    app.kubernetes.io/part-of: cargoless
+data:
+  preview-env: |
+    # Shared base env for every self-serve preview. KEY=VALUE per line.
+    # ${VAR} is interpolated strictly from the daemon's process env (no fallback).
+    # ── data plane ──
+    DATABASE_URL=${PREVIEW_DEFAULT_DATABASE_URL}
+    MIGRATION_DATABASE_URL=${PREVIEW_DEFAULT_MIGRATION_DATABASE_URL}
+    # ── observability ──
+    RUST_LOG=info
+    TRIFORM_ENV=staging
+    OTEL_SERVICE_NAME=cargoless-preview
+    # ── replace with the canonical staging block (S3 / NATS / Iggy / JWT
+    #     / master keys / COOKIE_SECURE etc.) from the live tf-multiverse
+    #     manifest. This reference copy intentionally leaves them blank so a
+    #     stale snapshot here can never silently shadow production wiring. ──
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -166,6 +210,9 @@ spec:
                 --bind 0.0.0.0:8787 \
                 --instances /etc/cargoless/instances.yaml \
                 --port-range 8090-8190 \
+                --preview-domain tryform.wtf \
+                --preview-port-range 8200-8300 \
+                --preview-defaults /etc/cargoless/preview-defaults/preview-env \
                 --state-dir /workspace/cargoless-state
           env:
             # --- cargoless control plane auth ---
@@ -179,6 +226,16 @@ spec:
             - name: PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL
               valueFrom:
                 secretKeyRef: { name: cargoless-preview-dbs, key: PREVIEW_FEATURE_X_MIGRATION_DATABASE_URL }
+            # --- shared DBs for self-serve previews (the cargoless-preview-defaults
+            #     template's ${VAR} refs resolve from these). The live manifest
+            #     reuses preview.triform.dev's DB pair; add a per-branch override
+            #     in cargoless-preview-dbs to give a self-serve preview its own DB. ---
+            - name: PREVIEW_DEFAULT_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: cargoless-preview-dbs, key: PREVIEW_DEFAULT_DATABASE_URL }
+            - name: PREVIEW_DEFAULT_MIGRATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: cargoless-preview-dbs, key: PREVIEW_DEFAULT_MIGRATION_DATABASE_URL }
             # --- the dev (canary) instance's base environment = the staging
             #     `triform` Deployment env block. Copy it here from
             #     apps/staging/triform.yaml: DATABASE_URL / MIGRATION_DATABASE_URL
@@ -226,6 +283,7 @@ spec:
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
             - { name: instances, mountPath: /etc/cargoless, readOnly: true }
+            - { name: preview-defaults, mountPath: /etc/cargoless/preview-defaults, readOnly: true }
         # repo-sync sidecar: FETCH-ONLY of the configured refs (the DAEMON owns
         # checkouts — it moves the per-instance worktrees, not this sidecar).
         - name: repo-sync
@@ -250,8 +308,10 @@ spec:
                     || git -C "$repo" remote add origin "$url" 2>/dev/null || true
                   # Fetch-only: update remote-tracking refs; the daemon's ref
                   # pollers see the new sha and drive the build. NEVER checkout here.
-                  git -C "$repo" fetch origin dev:refs/remotes/origin/dev --quiet || true
-                  git -C "$repo" fetch origin feature/x:refs/remotes/origin/feature/x --quiet || true
+                  # Fetch every head so self-serve previews can track any
+                  # `origin/<branch>` the daemon is asked to follow. The named
+                  # canary refs above are subsumed but listed for documentation.
+                  git -C "$repo" fetch origin '+refs/heads/*:refs/remotes/origin/*' --quiet || true
                 fi
                 sleep 30
               done
@@ -269,6 +329,11 @@ spec:
             name: cargoless-preview-instances
             items:
               - { key: instances.yaml, path: instances.yaml }
+        - name: preview-defaults
+          configMap:
+            name: cargoless-preview-defaults
+            items:
+              - { key: preview-env, path: preview-env }
 ---
 # One Service per instance app port (the k8s Service targets the fixed
 # app_bind; the Ingress routes the public host to it). Plus a control Service.
@@ -373,3 +438,60 @@ spec:
               service:
                 name: cargoless-preview-ctl
                 port: { name: ctl }
+# -----------------------------------------------------------------------------
+# Self-serve previews — k8s routing reconciler (lives in tf-multiverse, NOT here)
+# -----------------------------------------------------------------------------
+#
+# The OSS `cargoless` binary is deliberately k8s-agnostic: it never shells out
+# to `kubectl`. When an agent runs `cargoless preview`, the daemon binds an
+# L4 proxy port from --preview-port-range and reports the new instance on
+# `/app` with `{ name, proxy_port, public_host }`. A separate **level-triggered**
+# reconciler turns that into Service + Ingress objects:
+#
+#   1. Every ~10s, GET http://cargoless-preview-ctl:8787/app (bearer token).
+#   2. For each instance with a non-null `public_host` + `proxy_port`:
+#        - ensure a Service { type: ClusterIP, selector: matchLabels of the
+#          preview pod, ports: [{ port: <proxy_port>, targetPort: <proxy_port> }] }
+#        - ensure an Ingress { ingressClassName: nginx,
+#          rules: [{ host: <public_host>, paths: [{ path: /, backend: <svc> }] }],
+#          tls: [{ hosts: [<public_host>], secretName: cargoless-preview-<name>-tls }],
+#          annotations: cert-manager.io/cluster-issuer=letsencrypt-prod + the same
+#          websocket/proxy-buffering set this manifest's `cargoless-preview`
+#          Ingress already uses }
+#        - both labeled app.kubernetes.io/managed-by=cargoless-preview-reconciler
+#   3. Delete labeled Service/Ingress objects whose `name` no longer appears
+#      in /app.instances.
+#
+# DNS: *.tryform.wtf → 95.217.169.216 (Hetzner FIP → hostNetwork nginx). TLS
+# is per-host HTTP-01 via the existing `letsencrypt-prod` ClusterIssuer (no
+# wildcard cert, no DNS-01 issuer required).
+#
+# RBAC (also lives in tf-multiverse, alongside the reconciler manifest):
+#
+#   apiVersion: v1
+#   kind: ServiceAccount
+#   metadata: { name: cargoless-preview-reconciler, namespace: triform-staging }
+#   ---
+#   apiVersion: rbac.authorization.k8s.io/v1
+#   kind: Role
+#   metadata: { name: cargoless-preview-reconciler, namespace: triform-staging }
+#   rules:
+#     - apiGroups: [""]
+#       resources: ["services"]
+#       verbs: ["get","list","watch","create","update","patch","delete"]
+#     - apiGroups: ["networking.k8s.io"]
+#       resources: ["ingresses"]
+#       verbs: ["get","list","watch","create","update","patch","delete"]
+#   ---
+#   apiVersion: rbac.authorization.k8s.io/v1
+#   kind: RoleBinding
+#   metadata: { name: cargoless-preview-reconciler, namespace: triform-staging }
+#   subjects: [{ kind: ServiceAccount, name: cargoless-preview-reconciler,
+#                namespace: triform-staging }]
+#   roleRef: { kind: Role, name: cargoless-preview-reconciler,
+#              apiGroup: rbac.authorization.k8s.io }
+#
+# The reconciler pod is small (bash + kubectl + jq is sufficient at the
+# 1–3 concurrent-preview scale we sized for) and needs the daemon's bearer
+# token mounted from `cargoless-serve-auth`. It does NOT need Secret access
+# in this namespace — cert-manager owns the TLS Secret creation.

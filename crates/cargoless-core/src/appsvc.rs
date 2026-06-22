@@ -24,13 +24,31 @@
 //! the read plane can never be blocked by the build worker (the sync_lock
 //! lesson, applied to app-serve).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::Diagnostic;
 use crate::appstate::{InstanceState, Pipeline};
-use crate::transport::{TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary};
+use crate::transport::{
+    PreviewControl, TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
+};
+
+/// The public routing facts for one runtime-registered preview, set by the
+/// control loop when it binds the instance's proxy. Held in a side-map keyed
+/// by instance name (NOT on `InstanceReport`, so the pure `appstate`/`appdrv`
+/// cores stay free of proxy-port/host concerns). The Part-2 reconciler reads
+/// these off `/app` to ensure one Service+Ingress per preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRoute {
+    /// The loopback/host port the instance's `L4Proxy` actually bound (the
+    /// reconciler's Service `targetPort`).
+    pub proxy_port: u16,
+    /// The public host this preview answers on, e.g. `feat-x.tryform.wtf`.
+    /// `None` when no `--preview-domain` is configured (the feature is inert).
+    pub public_host: Option<String>,
+}
 
 /// An immutable, cheap-to-clone snapshot of one instance for the report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +112,14 @@ fn phase_label(inst: &InstanceState) -> &'static str {
 pub struct AppServeState {
     reports: std::sync::Mutex<Arc<Vec<InstanceReport>>>,
     ready: AtomicBool,
+    /// Self-serve control channel to the single-mutator control loop. The
+    /// `POST/DELETE /instances` routes enqueue a [`PreviewControl`] here; the
+    /// loop drains it. Wired after the channel exists (`set_control`); a daemon
+    /// that never calls it stays read-only and `app_preview_control` ⇒ false.
+    control: std::sync::Mutex<Option<Sender<PreviewControl>>>,
+    /// Public routing facts per runtime preview, keyed by instance name. Set by
+    /// the control loop at proxy-bind, cleared on remove. Merged into `/app`.
+    routes: std::sync::Mutex<BTreeMap<String, PreviewRoute>>,
 }
 
 impl Default for AppServeState {
@@ -101,6 +127,8 @@ impl Default for AppServeState {
         Self {
             reports: std::sync::Mutex::new(Arc::new(Vec::new())),
             ready: AtomicBool::new(false),
+            control: std::sync::Mutex::new(None),
+            routes: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -108,6 +136,39 @@ impl Default for AppServeState {
 impl AppServeState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wire the control channel (called once at daemon startup, after the
+    /// loop's `Sender<PreviewControl>` exists). Until this is called,
+    /// `app_preview_control` refuses (→ 404) — the self-serve routes are
+    /// inert on a daemon that did not opt in.
+    pub fn set_control(&self, tx: Sender<PreviewControl>) {
+        *self.control.lock().expect("appsvc control lock") = Some(tx);
+    }
+
+    /// Enqueue a runtime preview request for the control loop. `false` ⇒ no
+    /// channel wired (not a self-serve daemon) or the loop is gone. The work
+    /// (proxy bind, port alloc, worktree) happens on the control thread; this
+    /// only hands off intent.
+    fn enqueue_control(&self, request: PreviewControl) -> bool {
+        match &*self.control.lock().expect("appsvc control lock") {
+            Some(tx) => tx.send(request).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Record the public routing facts for a freshly-bound preview (control
+    /// loop, at proxy-bind). Surfaced on `/app` for the Part-2 reconciler.
+    pub fn set_preview_route(&self, name: &str, route: PreviewRoute) {
+        self.routes
+            .lock()
+            .expect("appsvc routes lock")
+            .insert(name.to_string(), route);
+    }
+
+    /// Drop a preview's routing facts (control loop, on remove). Idempotent.
+    pub fn clear_preview_route(&self, name: &str) {
+        self.routes.lock().expect("appsvc routes lock").remove(name);
     }
 
     /// Publish a fresh snapshot (the driver calls this after every
@@ -131,9 +192,15 @@ impl AppServeState {
     /// Render the `/app` JSON body.
     fn render_json(&self) -> String {
         let reports = self.snapshot();
+        let routes = self.routes.lock().expect("appsvc routes lock").clone();
         let instances: Vec<serde_json::Value> = reports
             .iter()
             .map(|r| {
+                // Merge the per-preview routing side-map: `proxy_port` +
+                // `public_host` are present for runtime previews (what the
+                // reconciler reads) and null for the static/zero-config
+                // instances that have no dynamic route.
+                let route = routes.get(&r.name);
                 serde_json::json!({
                     "name": r.name,
                     "phase": r.phase,
@@ -143,6 +210,8 @@ impl AppServeState {
                     "last_red_reason": r.last_red_reason,
                     "pending_sha": r.pending_sha,
                     "draining": r.draining,
+                    "proxy_port": route.map(|x| x.proxy_port),
+                    "public_host": route.and_then(|x| x.public_host.clone()),
                 })
             })
             .collect();
@@ -202,6 +271,12 @@ impl VerdictService for AppServeState {
     /// `/readyz` latch.
     fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// Self-serve override: enqueue the runtime instance request for the
+    /// control loop. `false` (→ 404) until `set_control` is wired.
+    fn app_preview_control(&self, request: PreviewControl) -> bool {
+        self.enqueue_control(request)
     }
 }
 
@@ -275,6 +350,60 @@ mod tests {
         assert_eq!(instances[1]["name"], "feature-x");
         assert_eq!(instances[1]["last_red_sha"], "bad");
         assert_eq!(v["ready"], true, "dev serving ⇒ ready");
+    }
+
+    #[test]
+    fn preview_control_refuses_until_wired_then_enqueues() {
+        let svc = AppServeState::new();
+        // Not wired ⇒ refuse (→ the route 404s).
+        assert!(!svc.app_preview_control(PreviewControl::Remove { name: "x".into() }));
+        // Wire it; the request now lands on the channel.
+        let (tx, rx) = channel::<PreviewControl>();
+        svc.set_control(tx);
+        assert!(svc.app_preview_control(PreviewControl::Add {
+            name: "feat".into(),
+            git_ref: "origin/feat".into(),
+            env: vec![("K".into(), "v".into())],
+            own_db: false,
+            ttl_secs: Some(3600),
+        }));
+        match rx.recv().expect("enqueued") {
+            PreviewControl::Add { name, git_ref, .. } => {
+                assert_eq!(name, "feat");
+                assert_eq!(git_ref, "origin/feat");
+            }
+            other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_json_merges_preview_route_fields() {
+        let svc = AppServeState::new();
+        svc.publish(vec![
+            report("feat", Some("g1"), Some("g1")),
+            report("dev", None, None),
+        ]);
+        // A runtime preview has a route; the static `dev` does not.
+        svc.set_preview_route(
+            "feat",
+            PreviewRoute {
+                proxy_port: 8201,
+                public_host: Some("feat.tryform.wtf".into()),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&svc.app_report().unwrap()).unwrap();
+        let inst = v["instances"].as_array().unwrap();
+        assert_eq!(inst[0]["name"], "feat");
+        assert_eq!(inst[0]["proxy_port"], 8201);
+        assert_eq!(inst[0]["public_host"], "feat.tryform.wtf");
+        // The route-less instance reports nulls (not absent keys).
+        assert_eq!(inst[1]["name"], "dev");
+        assert!(inst[1]["proxy_port"].is_null());
+        assert!(inst[1]["public_host"].is_null());
+        // Clearing drops the fields back to null.
+        svc.clear_preview_route("feat");
+        let v2: serde_json::Value = serde_json::from_str(&svc.app_report().unwrap()).unwrap();
+        assert!(v2["instances"][0]["proxy_port"].is_null());
     }
 
     #[test]
