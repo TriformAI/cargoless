@@ -144,6 +144,19 @@ struct Opts {
     /// fall back to 1 (serialised, today's behaviour). Also see
     /// `AppServeOpts::max_concurrent_builds`.
     max_concurrent_builds: usize,
+    /// `app-serve --preview-domain <domain>` — public domain self-serve
+    /// previews are advertised under (e.g. `tryform.wtf`). Unset ⇒ previews
+    /// have no `public_host` and are port-forward-only. See
+    /// `AppServeOpts::preview_domain`.
+    preview_domain: Option<String>,
+    /// `app-serve --preview-port-range START-END` — L4-proxy ports for
+    /// runtime-registered previews (distinct from `--port-range`). Unset ⇒
+    /// ephemeral OS-assigned proxy ports. See `AppServeOpts::preview_port_range`.
+    preview_port_range: Option<String>,
+    /// `app-serve --preview-defaults <file>` — env template merged into every
+    /// runtime preview's overlay (`${VAR}` resolved from the daemon env). See
+    /// `AppServeOpts::preview_defaults`.
+    preview_defaults: Option<PathBuf>,
     /// `status --remote <url>` — query a remote `serve --bind` fleet
     /// daemon over the shipped HTTP(S) transport instead of the on-disk
     /// `cli-status`. Resolved through `transport::discovery` (explicit
@@ -414,6 +427,26 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                     .parse()
                     .map_err(|_| ParseError::MissingValue("--max-concurrent-builds"))?;
             }
+            "--preview-domain" => {
+                opts.preview_domain = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--preview-domain"))?
+                        .clone(),
+                );
+            }
+            "--preview-port-range" => {
+                opts.preview_port_range = Some(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--preview-port-range"))?
+                        .clone(),
+                );
+            }
+            "--preview-defaults" => {
+                opts.preview_defaults = Some(PathBuf::from(
+                    it.next()
+                        .ok_or(ParseError::MissingValue("--preview-defaults"))?,
+                ));
+            }
             // verdict: --remote is repeatable (failover ladder) — must
             // precede the scalar arm below (match arms are tried in order).
             "--remote" if cmd == Cmd::Verdict => {
@@ -552,6 +585,9 @@ fn usage() {
     println!("  app-serve --repo <DIR> --instances <FILE> --port-range A-B");
     println!("                        Run the apps the checker certifies: one");
     println!("                        L4-proxied instance per ref, never serve red");
+    println!("            [--preview-domain D] [--preview-port-range A-B] [--preview-defaults F]");
+    println!("                        Accept self-serve previews: advertise <name>.D,");
+    println!("                        bind proxies from the range, seed env from F");
     println!("  preview --remote <URL> [--name N] [--ref R] [--remove]");
     println!("                        Self-serve: register the current branch as a");
     println!("                        preview on a remote app-serve daemon, follow it");
@@ -812,6 +848,9 @@ fn main() -> ExitCode {
                 auth_token: parsed.opts.auth_token.clone(),
                 poll_interval_ms: parsed.opts.poll_interval_ms,
                 max_concurrent_builds: parsed.opts.max_concurrent_builds,
+                preview_domain: parsed.opts.preview_domain.clone(),
+                preview_port_range: parsed.opts.preview_port_range.clone(),
+                preview_defaults: parsed.opts.preview_defaults.clone(),
             });
         }
         // `status --remote <url>` queries a remote fleet `serve --bind`
