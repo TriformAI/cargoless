@@ -98,6 +98,59 @@ The daemon's `--bind` control plane reuses the **same** hand-rolled HTTP server 
 
 ---
 
-## 8. Non-goals / parking lot
+## 8. Self-serve previews — `cargoless preview` → `<branch>.tryform.wtf`
+
+Beyond the operator-curated static instances (dev / feature-x / merge), any agent
+can register a **runtime** preview of its branch with one command — without
+editing the instances ConfigMap or restarting the pod.
+
+- **Client**: `cargoless preview --remote <ctl-url> [--ttl <secs>] [--name N]
+  [--ref R] [--env K=V] [--remove] [--no-wait]` (`crates/cargoless/src/preview.rs`).
+  It validates preconditions (branch pushed, `cargoless.app.yaml` present),
+  `POST`s the request, and follows `/app` to green.
+- **Control plane**: `POST /instances` (register) and `DELETE /instances/<name>`
+  (teardown), both **below the bearer auth gate** (mutating; the read-plane
+  `/app`,`/healthz`,`/readyz` stay structurally auth-exempt). The HTTP thread only
+  *enqueues* a `PreviewControl`; the single-mutator control loop drains and
+  applies it — same discipline as the SIGHUP reload. Serde-free `PreviewControl`
+  type end-to-end.
+- **Runtime add** (`drain_preview_requests` in `appserve.rs`): allocate an L4
+  proxy port from `--preview-port-range` (default-absent ⇒ ephemeral), bind the
+  proxy, ensure a per-instance git worktree, load the run plan, spawn a ref
+  poller (with a per-instance stop flag so DELETE/TTL can stop exactly one), add
+  the instance to the driver, and record `{proxy_port, public_host}` in a `/app`
+  side-map (`public_host = <name>.<--preview-domain>`). Env: the child inherits
+  the daemon's full process env (the staging data plane, like `dev`) plus an
+  optional `--preview-defaults` template plus the request's `--env`, with
+  `TRIFORM_PUBLIC_BASE_URL`/`TRIFORM_API_URL` overridden to the preview's host.
+- **TTL**: `PreviewControl::Add.ttl_secs` (CLI `--ttl`, default 24h, hard ceiling
+  7d; re-registering a live preview renews it). The control loop sweeps expired
+  previews each tick and tears them down via the same path as an explicit DELETE
+  — so an abandoned preview self-cleans. This is the single source of truth for
+  lifetime; the reconciler just follows `/app`.
+- **k8s routing stays out of the daemon**: the OSS binary never calls `kubectl`.
+  A separate level-triggered **reconciler** (Flux-managed in tf-multiverse) reads
+  `/app` and ensures a `Service` (→ the dynamic `proxy_port`) + `Ingress`
+  (`<name>.tryform.wtf`, per-host HTTP-01 TLS via `letsencrypt-prod`) per preview,
+  pruning objects whose instance no longer appears (DELETE or TTL expiry). Two
+  infra prerequisites it needs (both in tf-multiverse): the ctl Service must set
+  `publishNotReadyAddresses: true` (the reconciler polls `/app` before the daemon
+  is "ready" = first green build), and the Calico
+  `allow-host-to-pods-ingress-ports` GlobalNetworkPolicy must allow the preview
+  port range (`8200:8300`) so cross-node ingress→pod traffic isn't dropped
+  (otherwise: 503/200 same-node, 504 from remote ingress nodes).
+- **Flags**: `--preview-domain <domain>`, `--preview-port-range START-END`,
+  `--preview-defaults <env-file>` on `app-serve`. All absent ⇒ the feature is
+  inert (zero-config / static-instance behaviour unchanged).
+
+**Approval posture**: self-serve previews are **approval-gated by the bearer
+token** — `CARGOLESS_AUTH_TOKEN` is operator-held and not in an agent's default
+env, so an agent must ask a human before using this path. Agent-facing usage +
+the approval norm live in tf-multiverse
+`.triform/guides/cargoless-self-serve-previews.md`.
+
+---
+
+## 9. Non-goals / parking lot
 
 Per-push (per-overlay) previews; SIGHUP hot-reload of the instance set (restart-to-reconfigure for now); seeding a feature DB from a staging snapshot; queue/stream isolation per instance; parallel per-instance target dirs (revisit only if serialized builds hurt at N>2); Windows.
