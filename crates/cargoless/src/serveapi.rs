@@ -1954,23 +1954,58 @@ fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
         .strip_prefix("origin/")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(base_ref);
-    // The fetch is the only network step here: transient hiccups get 2
-    // retries (1s then 3s) before the error fails the whole push/batch.
-    // The reset/clean below stay single-shot — they are local-only.
-    retry_with_sleeps(
-        &[Duration::from_secs(1), Duration::from_secs(3)],
-        |attempt| {
-            if attempt > 0 {
-                eprintln!(
-                    "[cargoless:git] fetch retry attempt={attempt} worktree-root={}",
-                    root.display()
-                );
-            }
-            run_git(root, &["fetch", "--prune", "origin", fetch_ref])
-        },
-    )?;
+    // Skip the network fetch when `base_ref` is a bare commit hash that is
+    // ALREADY in the local object store. A push pins `base_sha` to the exact
+    // commit it diffed against — almost never a branch tip, because dev moves
+    // constantly — and `git fetch origin <sha>` asks the remote to serve that
+    // commit *by hash*. Forgejo/GitHub `upload-pack` refuse a non-advertised
+    // object by default (`uploadpack.allowAnySHA1InWant` off), returning
+    // `fatal: remote error: upload-pack: not our ref <sha>` and failing the
+    // whole push — EVEN THOUGH the serve shard's repo-sync sidecar keeps deep
+    // `origin/dev` history precisely so these bases resolve locally. So if the
+    // object is present, trust the mirror and go straight to reset/clean; only
+    // hit the network when the base is genuinely absent. A symbolic ref
+    // (`origin/dev`, a branch/tag name) is NOT short-circuited — it must fetch
+    // to observe upstream advances.
+    let base_present_locally = is_commit_hash(base_ref) && local_commit_exists(root, base_ref);
+    if !base_present_locally {
+        // The fetch is the only network step here: transient hiccups get 2
+        // retries (1s then 3s) before the error fails the whole push/batch.
+        // The reset/clean below stay single-shot — they are local-only.
+        retry_with_sleeps(
+            &[Duration::from_secs(1), Duration::from_secs(3)],
+            |attempt| {
+                if attempt > 0 {
+                    eprintln!(
+                        "[cargoless:git] fetch retry attempt={attempt} worktree-root={}",
+                        root.display()
+                    );
+                }
+                run_git(root, &["fetch", "--prune", "origin", fetch_ref])
+            },
+        )?;
+    }
     reset_analysis_root(root, base_ref)?;
     Ok(())
+}
+
+/// `true` when `s` is a full git object hash (40-hex SHA-1 or 64-hex
+/// SHA-256) — the only shape we trust the local mirror for. A symbolic
+/// ref (branch/tag name, `origin/dev`, an abbreviated hash) returns
+/// `false` so [`sync_analysis_root`] still fetches it: a name must hit the
+/// network to observe upstream advances, and an abbreviation can't be
+/// safely round-tripped through `reset --hard` without resolution.
+fn is_commit_hash(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `true` when `sha` names a commit object already present in `root`'s
+/// local object store. Used to skip a doomed `git fetch <sha>` (Forgejo
+/// `upload-pack: not our ref`) when the repo-sync sidecar's deep history
+/// already has the base. `^{commit}` forces commit-peeling so a stray blob
+/// or tree sharing the hex can never be mistaken for a usable base.
+fn local_commit_exists(root: &Path, sha: &str) -> bool {
+    run_git_success(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).unwrap_or(false)
 }
 
 fn ensure_analysis_root(
@@ -2345,6 +2380,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn git_capture(root: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a repo whose `origin` remote advertises only `main`, but which
+    /// locally holds a SECOND commit reachable from no remote ref — exactly
+    /// the shape of a push pinning `base_sha` to a non-tip dev commit the
+    /// remote will not serve by hash.
+    fn repo_with_unreferenced_local_commit(label: &str) -> (PathBuf, PathBuf, String, String) {
+        let root = temp_root(label);
+        let remote = temp_root(&format!("{label}-remote"));
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "c@example.invalid"]);
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+
+        std::fs::write(root.join("marker.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        // Publish ONLY this first commit as origin/main (the advertised tip).
+        git(&root, &["push", "origin", "HEAD:main"]);
+        let base_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        // A second commit that exists locally but is pushed to NO remote ref.
+        std::fs::write(root.join("marker.txt"), "advanced\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "advanced (local only)"]);
+        let local_only_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        // Reset the worktree back to base so a later reset-to(local_only_sha)
+        // is observable via the marker file content.
+        git(&root, &["reset", "--hard", &base_sha]);
+        (root, remote, base_sha, local_only_sha)
+    }
+
+    #[test]
+    fn is_commit_hash_only_matches_full_object_hashes() {
+        // 40-hex SHA-1 and 64-hex SHA-256 are the trusted shapes.
+        assert!(is_commit_hash(&"a".repeat(40)));
+        assert!(is_commit_hash(&"0".repeat(64)));
+        assert!(is_commit_hash("e0f8f9396117d2214946199d0b5e63adb9ec6132"));
+        // Symbolic refs and abbreviations must NOT short-circuit the fetch.
+        assert!(!is_commit_hash("origin/dev"));
+        assert!(!is_commit_hash("dev"));
+        assert!(!is_commit_hash("HEAD"));
+        assert!(!is_commit_hash("e0f8f93")); // abbreviated
+        assert!(!is_commit_hash(&"a".repeat(41))); // wrong length
+        assert!(!is_commit_hash(&"g".repeat(40))); // non-hex
+        assert!(!is_commit_hash(""));
+    }
+
+    #[test]
+    fn sync_analysis_root_uses_local_base_without_fetching_unadvertised_sha() {
+        // THE production bug (serve-shard `not our ref`): a base_sha that is
+        // present locally but advertised by no remote ref. The old code ran
+        // `git fetch origin <sha>`, which a real Forgejo/GitHub upload-pack
+        // rejects; here `origin` is a bare repo that likewise has never seen
+        // the commit. The fix must short-circuit on the local object and
+        // reset to it WITHOUT consulting the remote.
+        let (root, remote, base_sha, local_only_sha) =
+            repo_with_unreferenced_local_commit("sync-local-base");
+
+        // Precondition: the unadvertised commit is genuinely local-only.
+        assert!(local_commit_exists(&root, &local_only_sha));
+        assert!(is_commit_hash(&local_only_sha));
+
+        // Sync to the local-only SHA. Pre-fix this errored with the remote's
+        // equivalent of `upload-pack: not our ref`; post-fix it must succeed
+        // off the local object store alone.
+        sync_analysis_root(&root, &local_only_sha)
+            .unwrap_or_else(|e| panic!("sync to local-only base must not fetch: {e}"));
+
+        // And it must have actually moved the tree to that commit.
+        assert_eq!(git_capture(&root, &["rev-parse", "HEAD"]), local_only_sha);
+        assert_eq!(
+            std::fs::read_to_string(root.join("marker.txt")).unwrap(),
+            "advanced\n",
+            "tree must be reset to the local-only base content"
+        );
+        assert_ne!(local_only_sha, base_sha);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
     }
 
     #[test]
