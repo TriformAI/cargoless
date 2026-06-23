@@ -26,3 +26,13 @@ target set for a future S1-harness mode that injects each file into the
 module tree and asserts the daemon publishes `ra_blind_paths: true` —
 and, under `CARGOLESS_MACRO_BLIND_ESCALATE=1`, a witness-backed verdict
 instead of an RA-native green.
+
+A third, *non-macro* blind class also rides `ra_blind_paths`: **cross-crate
+type resolution** in a generated twin — a `generated/ui-frozen/*.rs`
+referencing an unimported type (`cannot find type DonutSlice`, E0425), which
+RA-native greened and a later rustc/SSR compile caught. It is covered by the
+content-exempt `CARGOLESS_BLIND_PATHS` glob set (always blind, no `view!` for
+a content scan to key on), not `CARGOLESS_MACRO_BLIND_PATHS` — see
+`docs/design/D-PROJECT-CHECKS.md` § Blind-path coverage. A fixture for this
+class is not added here (it would need a sibling crate to import from, unlike
+the self-contained macro-expansion files above).

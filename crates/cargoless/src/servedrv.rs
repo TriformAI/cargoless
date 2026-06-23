@@ -1242,13 +1242,13 @@ fn exec(
             // default stays Warn — the deployed posture keeps ~2s
             // RA-native verdicts for plain pushes; only gate pushes wait.
             let gate_requested = project_check_context.as_ref().is_some_and(|ctx| ctx.gate);
-            // #A8 escalation: a push whose changed_files hit the
-            // macro-blind globs is promoted like a gate push — but only
-            // under the explicit opt-in, because it trades the ~2s
-            // RA-native verdict for the witness on those paths.
-            let macro_blind_hit = attribution.as_ref().is_some_and(|a| a.macro_blind_hit);
-            let macro_blind_escalation = macro_blind_hit && macro_blind_escalate();
-            if macro_blind_escalation && !gate_requested {
+            // #A8/#DONUT escalation: a push whose changed_files hit a
+            // blind glob (macro-narrowed OR content-exempt) is promoted like
+            // a gate push — but only under the explicit opt-in, because it
+            // trades the ~2s RA-native verdict for the witness on those paths.
+            let blind_hit = attribution.as_ref().is_some_and(|a| a.blind_hit);
+            let blind_escalation = blind_hit && macro_blind_escalate();
+            if blind_escalation && !gate_requested {
                 eprintln!(
                     "[cargoless:obs] macro-blind-escalate wt={} reason=blind-path-push mode-request=hard (#A8)",
                     wt.display()
@@ -1257,36 +1257,29 @@ fn exec(
             let payload = match effective_project_checks_mode(
                 project_checks_mode(),
                 gate_requested,
-                macro_blind_escalation,
+                blind_escalation,
             ) {
                 ProjectChecksMode::Off => {
                     // No project-check signal; the only input is the
                     // RA-native bool. Routed through the legacy shim
                     // which produces Green-or-Unknown (never an
-                    // unattributed Red). #A8-closer: a blind-path GREEN is
-                    // downgraded to honest-unknown here (RA cannot witness
-                    // a proc-macro it could not expand — see
+                    // unattributed Red). #A8/#DONUT-closer: a blind-path
+                    // GREEN is downgraded to honest-unknown here (RA cannot
+                    // witness a proc-macro it could not expand, nor a
+                    // cross-crate type it could not resolve — see
                     // `ra_native_payload`).
-                    ra_native_payload(
-                        authoritative_error,
-                        timer_settled_no_flycheck,
-                        macro_blind_hit,
-                    )
+                    ra_native_payload(authoritative_error, timer_settled_no_flycheck, blind_hit)
                 }
                 ProjectChecksMode::Warn => {
                     // Warn mode: RA-native is the publish input;
                     // project-checks run advisory in a background
                     // thread (logged + telemetered, but cannot change
-                    // the published verdict by design). #A8-closer: same
-                    // blind-path GREEN → honest-unknown downgrade as Off
+                    // the published verdict by design). #A8/#DONUT-closer:
+                    // same blind-path GREEN → honest-unknown downgrade as Off
                     // (the advisory witness here never feeds the verdict,
                     // so RA-native green on a blind path is unwitnessed).
                     spawn_project_checks_warn(wt.clone(), project_check_context, Arc::clone(api));
-                    ra_native_payload(
-                        authoritative_error,
-                        timer_settled_no_flycheck,
-                        macro_blind_hit,
-                    )
+                    ra_native_payload(authoritative_error, timer_settled_no_flycheck, blind_hit)
                 }
                 ProjectChecksMode::Hard => {
                     // Hard mode (#A4.3): the witness runs OFF the serve
@@ -1433,7 +1426,7 @@ fn publish_verdict(
     // rides the same popped attribution as base_sha, so it can never be
     // another push's classification. FS-watch verdicts (no attribution)
     // are never blind-annotated: no changed_files evidence exists.
-    let ra_blind_paths = attribution.as_ref().is_some_and(|a| a.macro_blind_hit);
+    let ra_blind_paths = attribution.as_ref().is_some_and(|a| a.blind_hit);
     // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
     // This span MUST be the only emission of `verdict.publish`, mirroring
     // the structural invariant that publish_verdict fires exactly once per
@@ -1578,31 +1571,33 @@ fn project_checks_mode() -> ProjectChecksMode {
 /// push to Hard. `Off` stays `Off` (an operator kill-switch outranks a
 /// client request); `Hard` is already the requested strength.
 ///
-/// #A8 — `macro_blind_escalation` is the second promotion input: the
-/// consumed push touched a macro-blind path (`PushAttribution::
-/// macro_blind_hit`) AND the operator opted in via
-/// `CARGOLESS_MACRO_BLIND_ESCALATE=1`. Same strengthen-only semantics as
-/// the gate bit: RA-native green on a blind path is necessary-not-
-/// sufficient, so the push is promoted to the witness-gated verdict
-/// rather than publishing a green RA cannot stand behind. `Off` still
-/// outranks both (the kill-switch posture is unchanged).
+/// #A8/#DONUT — `blind_escalation` is the second promotion input: the
+/// consumed push touched a blind path (`PushAttribution::blind_hit` — by
+/// EITHER the macro-narrowed or the content-exempt glob set) AND the
+/// operator opted in via `CARGOLESS_MACRO_BLIND_ESCALATE=1`. Same
+/// strengthen-only semantics as the gate bit: RA-native green on a blind
+/// path is necessary-not-sufficient, so the push is promoted to the
+/// witness-gated verdict rather than publishing a green RA cannot stand
+/// behind. `Off` still outranks both (the kill-switch posture is unchanged).
 fn effective_project_checks_mode(
     mode: ProjectChecksMode,
     gate_requested: bool,
-    macro_blind_escalation: bool,
+    blind_escalation: bool,
 ) -> ProjectChecksMode {
-    match (mode, gate_requested || macro_blind_escalation) {
+    match (mode, gate_requested || blind_escalation) {
         (ProjectChecksMode::Warn, true) => ProjectChecksMode::Hard,
         (mode, _) => mode,
     }
 }
 
-/// #A8 — opt-in switch for macro-blind escalation. Annotation
-/// (`ra_blind_paths` on the wire) is ALWAYS on once globs are configured;
-/// promotion to the witness-gated verdict additionally requires this
-/// explicit `=1`, because it changes verdict latency for those pushes
+/// #A8/#DONUT — opt-in switch for blind-path escalation. Annotation
+/// (`ra_blind_paths` on the wire) is ALWAYS on once either glob set is
+/// configured; promotion to the witness-gated verdict additionally requires
+/// this explicit `=1`, because it changes verdict latency for those pushes
 /// from ~2s RA-native to the minutes-scale witness — an enforcement-point
-/// decision the operator makes, never a default.
+/// decision the operator makes, never a default. The single switch governs
+/// both blind-path glob sets (`CARGOLESS_MACRO_BLIND_PATHS` and
+/// `CARGOLESS_BLIND_PATHS`); the env name is retained for compatibility.
 fn macro_blind_escalate() -> bool {
     std::env::var("CARGOLESS_MACRO_BLIND_ESCALATE").is_ok_and(|v| v == "1")
 }
@@ -1620,14 +1615,17 @@ fn macro_blind_escalate() -> bool {
 ///    window → the legacy shim renders it as
 ///    `unknown(ra_native_unattributed_error)` (never a fabricated Red —
 ///    no per-diagnostic detail is available at this seam).
-/// 3. `macro_blind_hit` (#A8 false-GREEN closer): the push touched a
-///    configured proc-macro-blind path. RA-native is structurally blind
-///    to errors that only exist after proc-macro expansion (the
-///    tf-mv #4070 class: a Leptos `view!` that fails to compile but for
-///    which RA — unable to expand the macro — emits no rustc error). A
-///    clean RA-native window over such a push is therefore
-///    *necessary-not-sufficient*; publishing GREEN would be the
-///    false-GREEN this closes. Fail closed:
+/// 3. `blind_hit` (#A8/#DONUT false-GREEN closer): the push touched a
+///    configured blind path, by EITHER mechanism. (#A8) a proc-macro-blind
+///    path — RA-native is structurally blind to errors that only exist
+///    after proc-macro expansion (the tf-mv #4070 class: a Leptos `view!`
+///    that fails to compile but for which RA, unable to expand the macro,
+///    emits no rustc error). (#DONUT) a content-exempt path — RA-native is
+///    blind to cross-crate type resolution in a generated twin (the
+///    `cannot find type DonutSlice` E0425 class, which RA greened and a
+///    later rustc/SSR compile caught). A clean RA-native window over such a
+///    push is therefore *necessary-not-sufficient*; publishing GREEN would
+///    be the false-GREEN this closes. Fail closed:
 ///    `unknown(ra_blind_path_green_unwitnessed)` — an honest "RA cannot
 ///    stand behind green here; demand a witness". The `ra_blind_paths`
 ///    annotation that already rides the verdict (status file + wire +
@@ -1641,17 +1639,20 @@ fn macro_blind_escalate() -> bool {
 fn ra_native_payload(
     authoritative_error: bool,
     timer_settled_no_flycheck: bool,
-    macro_blind_hit: bool,
+    blind_hit: bool,
 ) -> statusfile::VerdictPayload {
     if timer_settled_no_flycheck {
         return statusfile::VerdictPayload::unknown("ra_native_timer_settled_no_flycheck_activity");
     }
     let payload = statusfile::VerdictPayload::from_bool_unattributed(authoritative_error);
-    // #A8 — only a GREEN can be a macro-blind false-GREEN; a real error
-    // (already `unknown` via the shim) is honored as-is. Downgrade a
-    // blind-path green to honest-unknown: RA could not witness the
-    // expanded macro, so its green is unwitnessed.
-    if macro_blind_hit && payload.verdict == statusfile::Verdict::Green {
+    // #A8/#DONUT — only a GREEN can be a blind-path false-GREEN; a real
+    // error (already `unknown` via the shim) is honored as-is. Downgrade a
+    // blind-path green to honest-unknown: RA could not witness it — either
+    // an expanded proc-macro (#A8) or a cross-crate type it could not
+    // resolve in a generated twin (#DONUT). Same stable classifier string
+    // for both (a poller/SigNoz query demands a witness regardless of which
+    // blindness applies).
+    if blind_hit && payload.verdict == statusfile::Verdict::Green {
         return statusfile::VerdictPayload::unknown("ra_blind_path_green_unwitnessed");
     }
     payload
@@ -2820,12 +2821,12 @@ mod tests {
     }
 
     #[test]
-    fn macro_blind_escalation_promotes_like_gate_and_off_still_wins() {
-        // #A8 truth table: the blind-escalation bit is a second
-        // strengthen-only input with identical semantics to the gate
-        // bit — Warn promotes to Hard, Off (operator kill-switch) and
-        // Hard stay fixed points. Either input alone suffices; the
-        // caller has already ANDed the opt-in env into this bit.
+    fn blind_escalation_promotes_like_gate_and_off_still_wins() {
+        // #A8/#DONUT truth table: the blind-escalation bit (set by EITHER
+        // glob set) is a second strengthen-only input with identical
+        // semantics to the gate bit — Warn promotes to Hard, Off (operator
+        // kill-switch) and Hard stay fixed points. Either input alone
+        // suffices; the caller has already ANDed the opt-in env into this bit.
         use ProjectChecksMode::*;
         for (mode, gate, blind, want) in [
             (Off, false, true, Off),
@@ -2867,7 +2868,7 @@ mod tests {
     fn test_attribution(base_sha: &str) -> crate::serveapi::PushAttribution {
         crate::serveapi::PushAttribution {
             base_sha: Some(base_sha.to_string()),
-            macro_blind_hit: false,
+            blind_hit: false,
             push_received_unix: statusfile::now_unix(),
             consumed_unix: statusfile::now_unix(),
             consumed_at: Instant::now(),

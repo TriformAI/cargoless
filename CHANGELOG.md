@@ -39,6 +39,19 @@ canonical, in this order):
   reproducing the two incident patterns lives in
   `bench/fixture/src/known_blind/` (deliberately unreachable from the
   fixture module tree).
+- **Content-exempt blind paths (`CARGOLESS_BLIND_PATHS`, #DONUT)** — a second
+  blind-path glob set whose hits downgrade an RA-native green to
+  `unknown(ra_blind_path_green_unwitnessed)` *regardless* of macro content.
+  Where `CARGOLESS_MACRO_BLIND_PATHS` is narrowed by
+  `CARGOLESS_MACRO_BLIND_MACROS` (a path is only blind if it contains a
+  configured `view!`-style call), `CARGOLESS_BLIND_PATHS` is for the
+  cross-crate type-resolution class — a generated twin referencing an
+  unimported type (the `cannot find type DonutSlice` E0425 incident, which
+  RA-native greened and a later rustc/SSR compile caught) — where no
+  proc-macro exists for the content scan to key on. Hits ride the same
+  additive `ra_blind_paths` wire key and inherit the same
+  `CARGOLESS_MACRO_BLIND_ESCALATE=1` witness escalation. Inert until set;
+  empty/unset behaves byte-identically to the prior path.
 
 ## [0.3.0] - 2026-06-08
 

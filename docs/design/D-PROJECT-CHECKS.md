@@ -281,6 +281,39 @@ worktrees, but it must be explicit for product safety:
   `CARGOLESS_CHANGED_FILES`. The current implementation inherits the operator
   environment; a minimal-env daemon mode is a follow-up hardening step.
 
+## Blind-path coverage
+
+The daemon's fast verdict is **RA-native only** — it does not run `cargo
+check` (a deliberate product invariant: cargoless replaces iterative
+check/clippy, it does not run them from a verdict request). RA-native is
+structurally blind to some error classes that only a real compile surfaces.
+A push touching such a path can publish a clean RA-native green that a later
+compile contradicts. Two operator glob sets close this by downgrading an
+RA-native green on a matching push to `unknown(ra_blind_path_green_unwitnessed)`
+— a machine-readable "necessary-not-sufficient; demand a witness" rather than
+a false green. Both ride an additive `ra_blind_paths` annotation on the
+status file and the wire.
+
+| Env | Blindness class | Content narrowing |
+|---|---|---|
+| `CARGOLESS_MACRO_BLIND_PATHS` | **Proc-macro expansion** — a Leptos `view!` that fails to compile but for which RA, unable to expand the macro, emits no rustc error (the tf-mv #4070 class). | Optional: `CARGOLESS_MACRO_BLIND_MACROS=view,html` narrows a glob hit to files that actually contain a configured `name!` invocation (reduces over-fire). |
+| `CARGOLESS_BLIND_PATHS` | **Cross-crate type resolution** — a generated twin referencing an unimported type (the `cannot find type DonutSlice` E0425 incident; RA greened it, the SSR/rustc compile caught it). | **None** — a hit is always blind. There is no `view!`-style macro for a content scan to key on, so narrowing would wrongly clear a macro-free generated `.rs` to green. |
+
+Choose the set by *why* RA is blind: a `view!`-heavy hand-authored tree →
+`CARGOLESS_MACRO_BLIND_PATHS` (narrowable); a `generated/`-style tree whose
+twins reference cross-crate types → `CARGOLESS_BLIND_PATHS` (content-exempt).
+Both glob sets are read per consume (a fleet env edit needs no daemon
+restart) and are comma-separated with tolerant splitting.
+
+`CARGOLESS_MACRO_BLIND_ESCALATE=1` is the single opt-in that promotes any
+blind-path push (either set) from the ~2s RA-native verdict to the
+witness-gated (Hard) project-checks path, so a real witness runs instead of
+publishing unknown. Strengthen-only: `CARGOLESS_PROJECT_CHECKS_MODE=off`
+still wins. **The witness is only as strong as the manifest it runs** — to
+catch an E0425 in a generated twin the Hard project check must actually
+compile that crate (e.g. a `cargo check` over the generated workspace);
+a witness that does not compile the twin cannot witness its error.
+
 ## tf-multiverse Mapping
 
 tf-multiverse should consume this as data, not as Cargoless code:

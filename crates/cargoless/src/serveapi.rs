@@ -133,14 +133,17 @@ pub(crate) struct PushAttribution {
     /// [`WorktreeStatus`] so a poller sharing a status key with other
     /// branches accepts only verdicts stamped with its own commit.
     pub base_sha: Option<String>,
-    /// #A8 — `true` iff the push's `changed_files` matched the daemon's
-    /// macro-blind path globs (`CARGOLESS_MACRO_BLIND_PATHS`) at consume
-    /// time. Rides the attribution so it stays paired with `base_sha`
-    /// through the record→pop lifecycle (incl. the Hard-mode supervisor
-    /// thread), is echoed as the additive `ra_blind_paths` wire key, and
-    /// — with `CARGOLESS_MACRO_BLIND_ESCALATE=1` — promotes this push's
-    /// project-check mode Warn → Hard at the EmitVerdict dispatch.
-    pub macro_blind_hit: bool,
+    /// #A8/#DONUT — `true` iff the push's `changed_files` matched a daemon
+    /// blind-path glob at consume time, by EITHER mechanism: the
+    /// macro-narrowed `CARGOLESS_MACRO_BLIND_PATHS` (proc-macro-expansion
+    /// blindness, #A8) OR the content-exempt `CARGOLESS_BLIND_PATHS`
+    /// (cross-crate type-resolution blindness — the generated-twin E0425
+    /// class, #DONUT). Rides the attribution so it stays paired with
+    /// `base_sha` through the record→pop lifecycle (incl. the Hard-mode
+    /// supervisor thread), is echoed as the additive `ra_blind_paths` wire
+    /// key, and — with `CARGOLESS_MACRO_BLIND_ESCALATE=1` — promotes this
+    /// push's project-check mode Warn → Hard at the EmitVerdict dispatch.
+    pub blind_hit: bool,
     /// `PushedOverlay::last_push_unix` — wall-clock push receipt (seconds).
     pub push_received_unix: u64,
     /// Wall-clock + monotonic pair captured together at overlay-apply, so
@@ -183,6 +186,23 @@ fn macro_blind_globs() -> Vec<String> {
     parse_macro_blind_globs(&std::env::var("CARGOLESS_MACRO_BLIND_PATHS").unwrap_or_default())
 }
 
+/// #DONUT — the operator's CONTENT-EXEMPT blind path globs, comma-separated
+/// in `CARGOLESS_BLIND_PATHS` (e.g. `chemistry/generated/**`). A hit here is
+/// blind REGARDLESS of `CARGOLESS_MACRO_BLIND_MACROS` content narrowing —
+/// for the cross-crate type-resolution class (a generated twin referencing
+/// an unimported type, the `cannot find type DonutSlice` E0425 incident)
+/// there is no `view!`-style macro for the content scan to key on, so a
+/// macro filter would wrongly clear such a file to green. Distinct from
+/// `CARGOLESS_MACRO_BLIND_PATHS`, which IS macro-narrowed (#CGLS-12).
+///
+/// Same tolerant split and read-per-consume policy as [`macro_blind_globs`]
+/// (a fleet env edit during an incident must not require a daemon restart).
+/// Empty / unset ⇒ the content-exempt class is inert; behavior is
+/// byte-identical to the pre-#DONUT path.
+fn content_exempt_globs() -> Vec<String> {
+    parse_macro_blind_globs(&std::env::var("CARGOLESS_BLIND_PATHS").unwrap_or_default())
+}
+
 /// Env-free parse body of [`macro_blind_globs`] (testable without
 /// process-env mutation under parallel test threads). Tolerant of
 /// spaces around commas and stray empty segments (`a/**,,b/**` ⇒ two
@@ -199,7 +219,7 @@ fn parse_macro_blind_globs(raw: &str) -> Vec<String> {
 /// #CGLS-12 — the operator's proc-macro call-signature names, comma-separated
 /// in `CARGOLESS_MACRO_BLIND_MACROS` (e.g. `view,html` — WITHOUT the trailing
 /// `!`; the scanner adds it). Used by
-/// [`compute_macro_blind_hit`] to narrow glob hits via content scanning.
+/// [`compute_blind_hit`] to narrow glob hits via content scanning.
 /// Empty / unset ⇒ macro names unconfigured ⇒ content scan is skipped and
 /// behavior is byte-identical to the pre-CGLS-12 pure path-glob path. Read
 /// per consume (same policy as `macro_blind_globs`).
@@ -292,45 +312,68 @@ fn overlay_content_for<'a>(
         .map(|(_, content)| content.as_str())
 }
 
-/// #A8 — does this push touch a macro-blind path? Matches the push's
-/// repo-relative `changed_files` (the same list project-check triggers
-/// filter on — NOT the overlay file list, which carries extra workspace
-/// config files for cluster routing) against the operator globs with the
-/// manifest-trigger matcher, so one pattern language serves both.
+/// #A8 — does this push touch a blind path (by EITHER mechanism)? Matches
+/// the push's repo-relative `changed_files` (the same list project-check
+/// triggers filter on — NOT the overlay file list, which carries extra
+/// workspace config files for cluster routing) against the operator globs
+/// with the manifest-trigger matcher, so one pattern language serves both.
+///
+/// Two glob sets, distinct blindness mechanisms:
+///
+/// * `blind_globs` (`CARGOLESS_MACRO_BLIND_PATHS`) — the proc-macro-blind
+///   surface, optionally content-narrowed by `macro_names` (#CGLS-12).
+/// * `exempt_globs` (`CARGOLESS_BLIND_PATHS`) — **content-exempt** paths
+///   where RA-native is unconditionally insufficient (cross-crate type
+///   resolution, e.g. a generated twin referencing an unimported type:
+///   the `DonutSlice` E0425 class). A hit here is blind REGARDLESS of
+///   macro content, because the blindness has nothing to do with a `view!`
+///   the content scan could key on — so `macro_names` narrowing must NOT
+///   apply, or a macro-free generated `.rs` would wrongly clear to green.
 ///
 /// `None`/empty `changed_files` ⇒ `false`: with no attributable change
 /// list there is no evidence the push touches a blind path, and the
 /// annotation must never fire on absence of evidence (the same posture
 /// as `base_sha: None` ⇒ unattributed, never a match).
 ///
-/// #CGLS-12 — content-narrowing (fail-safe): when `macro_names` is
-/// non-empty, glob-matched files are additionally scanned for a macro
-/// call invocation (`<name>!\s*[{(\[]`). A glob-matched file whose
-/// content is available AND contains no such call is NOT classified as
-/// blind (reduces ~37% over-fire). Fail-safe: if the file's content is
-/// NOT in the overlay (unreadable edge case), the glob hit stands — a
-/// real blind file must never be missed. When `macro_names` is empty the
-/// content scan is skipped entirely and behavior is byte-identical to the
-/// pre-CGLS-12 pure path-glob path.
-fn compute_macro_blind_hit(
+/// #CGLS-12 — content-narrowing (fail-safe), applies to `blind_globs`
+/// ONLY: when `macro_names` is non-empty, macro-glob-matched files are
+/// additionally scanned for a macro call invocation (`<name>!\s*[{(\[]`).
+/// A macro-glob-matched file whose content is available AND contains no
+/// such call is NOT classified as blind (reduces ~37% over-fire).
+/// Fail-safe: if the file's content is NOT in the overlay (unreadable edge
+/// case), the glob hit stands — a real blind file must never be missed.
+/// When `macro_names` is empty the content scan is skipped entirely and
+/// behavior is byte-identical to the pre-CGLS-12 pure path-glob path.
+fn compute_blind_hit(
     changed_files: Option<&[String]>,
     blind_globs: &[String],
+    exempt_globs: &[String],
     overlay_files: &[(String, String)],
     macro_names: &[String],
 ) -> bool {
-    if blind_globs.is_empty() {
+    if blind_globs.is_empty() && exempt_globs.is_empty() {
         return false;
     }
+    let glob_match = |patterns: &[String], path: &str| {
+        patterns
+            .iter()
+            .any(|pattern| cargoless_core::project_checks::glob_match_path(pattern, path))
+    };
     changed_files.is_some_and(|files| {
         files.iter().any(|path| {
-            let glob_hit = blind_globs
-                .iter()
-                .any(|pattern| cargoless_core::project_checks::glob_match_path(pattern, path));
-            if !glob_hit {
+            // Content-exempt class first: an `exempt_globs` hit is ALWAYS
+            // blind, with no content scan — this is the cross-crate
+            // type-resolution blindness (the generated-twin E0425 class) that
+            // has no proc-macro for `macro_names` to narrow on.
+            if glob_match(exempt_globs, path) {
+                return true;
+            }
+            if !glob_match(blind_globs, path) {
                 return false;
             }
-            // Glob matched. If macro names are configured, try to narrow via
-            // content scan. Fail-safe: absent content ⇒ keep the glob hit.
+            // Macro-narrowed class. If macro names are configured, try to
+            // narrow via content scan. Fail-safe: absent content ⇒ keep the
+            // glob hit.
             if macro_names.is_empty() {
                 return true;
             }
@@ -1122,6 +1165,7 @@ impl ServeVerdictState {
             worktree,
             pushed,
             &macro_blind_globs(),
+            &content_exempt_globs(),
             &macro_blind_macros(),
         );
     }
@@ -1135,15 +1179,17 @@ impl ServeVerdictState {
         worktree: &str,
         pushed: &PushedOverlay,
         blind_globs: &[String],
+        exempt_globs: &[String],
         macro_names: &[String],
     ) {
         poisoned(&self.push_attribution).insert(
             worktree.to_string(),
             PushAttribution {
                 base_sha: pushed.base_sha.clone(),
-                macro_blind_hit: compute_macro_blind_hit(
+                blind_hit: compute_blind_hit(
                     pushed.changed_files.as_deref(),
                     blind_globs,
+                    exempt_globs,
                     &pushed.files,
                     macro_names,
                 ),
@@ -4494,8 +4540,8 @@ checks:
         assert_eq!(globs.len(), 4, "tolerant split incl. space after comma");
         let hit = |files: &[&str]| {
             let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
-            // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
-            compute_macro_blind_hit(Some(&files), &globs, &[], &[])
+            // No exempt globs, no macro names ⇒ pure macro-path-glob.
+            compute_blind_hit(Some(&files), &globs, &[], &[], &[])
         };
         assert!(hit(&["portal/src/app.rs"]));
         assert!(hit(&["chemistry/generated/portal-7/lib.rs"]));
@@ -4512,15 +4558,15 @@ checks:
         // unattributed): no globs configured, no changed_files, or an
         // empty list ⇒ false — the annotation must never be a guess.
         let globs = parse_macro_blind_globs("portal/**");
-        // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
-        assert!(!compute_macro_blind_hit(None, &globs, &[], &[]));
-        assert!(!compute_macro_blind_hit(Some(&[]), &globs, &[], &[]));
+        // No exempt globs, no macro names ⇒ pure macro-path-glob.
+        assert!(!compute_blind_hit(None, &globs, &[], &[], &[]));
+        assert!(!compute_blind_hit(Some(&[]), &globs, &[], &[], &[]));
         let files = vec!["portal/src/app.rs".to_string()];
         assert!(
-            !compute_macro_blind_hit(Some(&files), &[], &[], &[]),
-            "unconfigured daemon (no globs) ⇒ annotation inert"
+            !compute_blind_hit(Some(&files), &[], &[], &[], &[]),
+            "unconfigured daemon (no globs of either set) ⇒ annotation inert"
         );
-        assert!(compute_macro_blind_hit(Some(&files), &globs, &[], &[]));
+        assert!(compute_blind_hit(Some(&files), &globs, &[], &[], &[]));
     }
 
     #[test]
@@ -4540,31 +4586,33 @@ checks:
             check_profile: None,
             gate: false,
         };
-        // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
+        // No exempt globs, no macro names ⇒ pure macro-path-glob.
         api.record_push_attribution_with_globs(
             "/wt",
             &pushed(Some(vec!["portal/src/app.rs".into()])),
             &globs,
             &[],
+            &[],
         );
         let attribution = api.take_push_attribution("/wt").expect("recorded");
-        assert!(attribution.macro_blind_hit, "portal/** push classifies");
+        assert!(attribution.blind_hit, "portal/** push classifies");
 
         api.record_push_attribution_with_globs(
             "/wt",
             &pushed(Some(vec!["physics/src/lib.rs".into()])),
             &globs,
             &[],
+            &[],
         );
         let attribution = api.take_push_attribution("/wt").expect("recorded");
-        assert!(!attribution.macro_blind_hit, "non-blind push stays clean");
+        assert!(!attribution.blind_hit, "non-blind push stays clean");
 
         // changed_files: None (legacy client) — overlay FILES touch
         // portal/ but provide no diff evidence; must NOT classify.
-        api.record_push_attribution_with_globs("/wt", &pushed(None), &globs, &[]);
+        api.record_push_attribution_with_globs("/wt", &pushed(None), &globs, &[], &[]);
         let attribution = api.take_push_attribution("/wt").expect("recorded");
         assert!(
-            !attribution.macro_blind_hit,
+            !attribution.blind_hit,
             "overlay file list must not substitute for changed_files"
         );
     }
@@ -4595,7 +4643,7 @@ checks:
             "pub fn render() { view! { <div/> } }".into(),
         )];
         assert!(
-            compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            compute_blind_hit(Some(&changed), &globs, &[], &overlay, &macro_names),
             "glob-matched file with view! must be blind"
         );
     }
@@ -4613,7 +4661,7 @@ checks:
             "pub struct Foo { pub x: u32 }".into(),
         )];
         assert!(
-            !compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            !compute_blind_hit(Some(&changed), &globs, &[], &overlay, &macro_names),
             "glob-matched file with no view! must NOT be blind"
         );
     }
@@ -4628,7 +4676,7 @@ checks:
         let changed = vec!["portal/src/app.rs".to_string()];
         let overlay: Vec<(String, String)> = vec![]; // content absent
         assert!(
-            compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            compute_blind_hit(Some(&changed), &globs, &[], &overlay, &macro_names),
             "absent content must fall back to glob hit (blind), never miss a real blind file"
         );
     }
@@ -4647,9 +4695,130 @@ checks:
         )];
         // Pure path-glob: file is in portal/** ⇒ blind (no content scan).
         assert!(
-            compute_macro_blind_hit(Some(&changed), &globs, &overlay, &macro_names),
+            compute_blind_hit(Some(&changed), &globs, &[], &overlay, &macro_names),
             "empty macro list ⇒ pure path-glob, no content scan"
         );
+    }
+
+    // ──────────── #DONUT — content-exempt blind paths (CARGOLESS_BLIND_PATHS) ────────────
+
+    #[test]
+    fn content_exempt_glob_is_blind_even_with_no_macro_call() {
+        // THE regression: the `cannot find type DonutSlice` E0425 incident.
+        // A GENERATED twin (no `view!` anywhere) referenced an unimported
+        // cross-crate type; RA-native greened it and it self-merged. With
+        // the macro content filter ACTIVE (`macro_names = ["view"]`), the
+        // pre-#DONUT macro-narrowed path would clear this macro-free file to
+        // green (no `view!` ⇒ not blind). A content-exempt glob must classify
+        // it blind REGARDLESS of macro content.
+        let exempt = parse_macro_blind_globs("chemistry/generated/**");
+        let macro_names = parse_macro_blind_macros("view"); // narrowing ON
+        let changed = vec!["chemistry/generated/ui-frozen/donut_chart_frozen.rs".to_string()];
+        let overlay: Vec<(String, String)> = vec![(
+            "chemistry/generated/ui-frozen/donut_chart_frozen.rs".into(),
+            // No macro call anywhere — exactly the generated-twin shape.
+            "pub struct Chart { pub slices: Vec<DonutSlice> }".into(),
+        )];
+        assert!(
+            compute_blind_hit(Some(&changed), &[], &exempt, &overlay, &macro_names),
+            "content-exempt glob hit must be blind even with macro narrowing active and no view!"
+        );
+    }
+
+    #[test]
+    fn content_exempt_coexists_with_macro_narrowed_set() {
+        // Both glob sets configured at once: a macro-narrowed file with no
+        // view! is NOT blind (narrowing applies there), but a content-exempt
+        // file with no view! IS blind (narrowing does not apply there). One
+        // call, both rules.
+        let macro_globs = parse_macro_blind_globs("portal/**");
+        let exempt = parse_macro_blind_globs("chemistry/generated/**");
+        let macro_names = parse_macro_blind_macros("view");
+        // Macro-narrowed path, no view! ⇒ not blind.
+        let portal = vec!["portal/src/types.rs".to_string()];
+        let portal_overlay: Vec<(String, String)> =
+            vec![("portal/src/types.rs".into(), "pub struct Foo;".into())];
+        assert!(
+            !compute_blind_hit(
+                Some(&portal),
+                &macro_globs,
+                &exempt,
+                &portal_overlay,
+                &macro_names
+            ),
+            "macro-narrowed file with no view! stays non-blind even when an exempt set exists"
+        );
+        // Content-exempt path, no view! ⇒ blind.
+        let generated = vec!["chemistry/generated/x_frozen.rs".to_string()];
+        let generated_overlay: Vec<(String, String)> = vec![(
+            "chemistry/generated/x_frozen.rs".into(),
+            "pub struct X { f: Vec<Missing> }".into(),
+        )];
+        assert!(
+            compute_blind_hit(
+                Some(&generated),
+                &macro_globs,
+                &exempt,
+                &generated_overlay,
+                &macro_names
+            ),
+            "content-exempt file is blind regardless of the macro set's narrowing"
+        );
+    }
+
+    #[test]
+    fn empty_exempt_set_is_byte_identical_to_pre_donut() {
+        // Non-regression: with no CARGOLESS_BLIND_PATHS configured, the
+        // content-exempt class is inert and the macro-narrowed path behaves
+        // exactly as before. (Mirrors content_scan_macro_absent_not_blind
+        // with an explicit empty exempt arg.)
+        let globs = parse_macro_blind_globs("portal/**");
+        let macro_names = parse_macro_blind_macros("view");
+        let changed = vec!["portal/src/types.rs".to_string()];
+        let overlay: Vec<(String, String)> =
+            vec![("portal/src/types.rs".into(), "pub struct Foo;".into())];
+        assert!(
+            !compute_blind_hit(Some(&changed), &globs, &[], &overlay, &macro_names),
+            "empty exempt set ⇒ pre-#DONUT behavior (macro narrowing decides)"
+        );
+    }
+
+    #[test]
+    fn content_exempt_glob_records_blind_hit_at_consume() {
+        // End-to-end through the attribution recorder: a content-exempt push
+        // stamps blind_hit=true on the popped attribution, so the downstream
+        // ra_native_payload downgrade and escalation engage — exactly the
+        // path that would have caught the DonutSlice push.
+        let api = ServeVerdictState::new();
+        let exempt = parse_macro_blind_globs("chemistry/generated/**");
+        let macro_names = parse_macro_blind_macros("view"); // narrowing ON
+        let pushed = PushedOverlay {
+            base_ref: "origin/dev".into(),
+            files: vec![(
+                "chemistry/generated/ui-frozen/donut_chart_frozen.rs".into(),
+                "pub struct Chart { pub slices: Vec<DonutSlice> }".into(),
+            )],
+            analysis_root: None,
+            base_sha: Some("cafe1234".into()),
+            last_push_unix: crate::statusfile::now_unix(),
+            changed_files: Some(vec![
+                "chemistry/generated/ui-frozen/donut_chart_frozen.rs".into(),
+            ]),
+            check_profile: None,
+            gate: false,
+        };
+        // Empty macro-narrowed set, exempt set configured.
+        api.record_push_attribution_with_globs("/wt", &pushed, &[], &exempt, &macro_names);
+        let attribution = api.take_push_attribution("/wt").expect("recorded");
+        assert!(
+            attribution.blind_hit,
+            "content-exempt generated twin must classify blind at consume"
+        );
+        // The downgrade leg — blind_hit=true ⇒ ra_native_payload publishes
+        // unknown(ra_blind_path_green_unwitnessed), not green — is a single
+        // bool with no provenance at that seam, so it is already covered by
+        // servedrv::tests::ra_native_payload_clean_blind_path_downgrades_to_unknown.
+        // A content-exempt hit feeds that identical proven path.
     }
 
     #[test]
