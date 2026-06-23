@@ -1801,6 +1801,7 @@ mod tests {
                     // Echo the routed param so the test can assert it arrived.
                     base_sha: base_sha.map(str::to_string),
                     ra_blind_paths: false,
+                    gated_checks_ran: Vec::new(),
                     heartbeat_age_secs: 0,
                     published_at: 1000,
                 })
@@ -2712,6 +2713,7 @@ mod tests {
             verdict_failure_reason: None,
             base_sha: None,
             ra_blind_paths: false,
+            gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 0,
             published_at: 1,
         });

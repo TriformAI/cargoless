@@ -263,6 +263,19 @@ pub struct WorktreeStatus {
     /// `changed_files` (unattributable — absence of evidence is never a
     /// hit). Additive wire key; absent on the wire when `false`.
     pub ra_blind_paths: bool,
+    /// The ids of the project checks that actually RAN for this verdict
+    /// (the witness's positive "the gated check executed" proof). The
+    /// tf-multiverse incremental witness asserts a specific check id (e.g.
+    /// `wasm-compiler-witness`) is present before accepting an attributed
+    /// green, so absence ⇒ "couldn't enumerate" ⇒ the witness falls back to
+    /// plain base_sha attribution (transition-safe, never blocks).
+    ///
+    /// Populated only on the Hard-witness publish path, which has the
+    /// enumerated `ProjectCheckReport`. The coalesced/batched path "cannot
+    /// enumerate" and leaves this empty by design; FS-watch / RA-native
+    /// verdicts ran no project checks and leave it empty too. Additive wire
+    /// key; omitted on the wire when empty (same discipline as `base_sha`).
+    pub gated_checks_ran: Vec<String>,
     pub heartbeat_age_secs: u64,
     pub published_at: u64,
 }
@@ -1453,6 +1466,19 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
             .expect("status_to_json constructed an object literal")
             .insert("ra_blind_paths".to_string(), serde_json::Value::Bool(true));
     }
+    if !s.gated_checks_ran.is_empty() {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert(
+                "gated_checks_ran".to_string(),
+                serde_json::Value::Array(
+                    s.gated_checks_ran
+                        .iter()
+                        .map(|id| serde_json::Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+    }
     obj.to_string()
 }
 
@@ -1493,6 +1519,15 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("ra_blind_paths")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        gated_checks_ran: v
+            .get("gated_checks_ran")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
         heartbeat_age_secs: v
             .get("heartbeat_age_secs")
             .and_then(serde_json::Value::as_u64)
@@ -1899,6 +1934,9 @@ mod tests {
             // #A8 annotation case: a macro-blind-path push must carry the
             // bit across the wire (a consumer keys witness demand on it).
             ra_blind_paths: true,
+            // gated_checks_ran case: the witness asserts a specific id is
+            // present; a populated list must survive the wire in order.
+            gated_checks_ran: vec!["wasm-compiler-witness".into(), "fmt".into()],
             heartbeat_age_secs: 2,
             published_at: 1234567890,
         };
@@ -1906,6 +1944,10 @@ mod tests {
         assert!(
             wire.contains(r#""ra_blind_paths":true"#),
             "blind-path hit must appear on the wire: {wire}"
+        );
+        assert!(
+            wire.contains(r#""gated_checks_ran":["wasm-compiler-witness","fmt"]"#),
+            "ran-check ids must appear on the wire in order: {wire}"
         );
         assert_eq!(status_from_json(&wire), Some(s));
 
@@ -1929,6 +1971,9 @@ mod tests {
             // (additive contract — old parsers see exactly the old JSON).
             base_sha: None,
             ra_blind_paths: false,
+            // Empty ran-checks (coalesced / RA-native) ⇒ key absent on the
+            // wire, same additive discipline as base_sha.
+            gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 0,
             published_at: 42,
         };
@@ -1940,6 +1985,10 @@ mod tests {
         assert!(
             !wire.contains("ra_blind_paths"),
             "false ra_blind_paths must not appear on the wire (#A8 additive contract): {wire}"
+        );
+        assert!(
+            !wire.contains("gated_checks_ran"),
+            "empty gated_checks_ran must not appear on the wire (additive contract): {wire}"
         );
         assert_eq!(status_from_json(&wire), Some(s2));
     }

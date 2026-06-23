@@ -920,6 +920,29 @@ impl ServeVerdictState {
         base_sha: Option<String>,
         ra_blind_paths: bool,
     ) {
+        self.publish_attributed_with_checks(wt, payload, base_sha, ra_blind_paths, Vec::new());
+    }
+
+    /// [`Self::publish_attributed`] carrying the ids of the project checks
+    /// that actually RAN for this verdict (`gated_checks_ran`). Additive-
+    /// default variant (mirrors `push_overlay` → `push_overlay_with_profile`)
+    /// so the unattributed wrapper and every test caller stay on the 4-arg
+    /// form; only servedrv's Hard-witness publish path — the one with an
+    /// enumerated `ProjectCheckReport` — threads the ran ids through here.
+    ///
+    /// The witness asserts a specific check id (e.g. `wasm-compiler-witness`)
+    /// is present before accepting an attributed green; an empty list ⇒ the
+    /// witness falls back to plain base_sha attribution (transition-safe).
+    /// The coalesced/batched path and the RA-native path pass an empty Vec
+    /// (they "cannot enumerate"), and the wire key stays absent.
+    pub fn publish_attributed_with_checks(
+        &self,
+        wt: &Path,
+        payload: crate::statusfile::VerdictPayload,
+        base_sha: Option<String>,
+        ra_blind_paths: bool,
+        gated_checks_ran: Vec<String>,
+    ) {
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
         let red_diagnostics = payload.red_diagnostics;
@@ -939,6 +962,10 @@ impl ServeVerdictState {
             verdict_failure_reason: failure_reason.clone(),
             base_sha: base_sha.clone(),
             ra_blind_paths,
+            // The witness's positive "the gated check ran" proof. Empty for
+            // FS-watch / coalesced / RA-native verdicts (no enumerated
+            // report) ⇒ absent on the wire (additive, same as base_sha).
+            gated_checks_ran,
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -4918,6 +4945,61 @@ checks:
         assert!(
             ring_len <= HARD_WITNESS_HISTORY_CAP,
             "ring stays bounded at the cap (was {ring_len})"
+        );
+    }
+
+    #[test]
+    fn gated_checks_ran_stamps_through_to_attributed_status() {
+        // Commit-2: the witness needs a positive "the gated check ran" proof.
+        // `publish_attributed_with_checks` must stamp the ran ids onto the
+        // status retrievable by base_sha (the ring) AND the live slot, and
+        // the JSON wire must carry them only when non-empty (additive).
+        let api = ServeVerdictState::new();
+        let wt = Path::new("/workspace/tf-multiverse");
+        api.publish_attributed_with_checks(
+            wt,
+            crate::statusfile::VerdictPayload::green(),
+            Some("abc123".into()),
+            false,
+            vec!["wasm-compiler-witness".into(), "fmt".into()],
+        );
+
+        // Retrievable by base_sha with the ran ids intact (the witness polls
+        // /status?base_sha=COMMIT and reads gated_checks_ran from the body).
+        let by_sha = api
+            .get_status_attributed("/workspace/tf-multiverse", Some("abc123"))
+            .expect("verdict retrievable by its base_sha");
+        assert_eq!(
+            by_sha.gated_checks_ran,
+            vec!["wasm-compiler-witness".to_string(), "fmt".to_string()],
+            "ran-check ids survive into the base_sha-addressable status"
+        );
+        // And on the wire, in order, only because the list is non-empty.
+        let wire = cargoless_core::transport::status_to_json(&by_sha);
+        assert!(
+            wire.contains(r#""gated_checks_ran":["wasm-compiler-witness","fmt"]"#),
+            "ran ids appear on the wire in order: {wire}"
+        );
+
+        // The 4-arg `publish_attributed` (the unattributed wrapper / every
+        // pre-Commit-2 caller) must leave the list empty ⇒ absent on the wire.
+        let api2 = ServeVerdictState::new();
+        api2.publish_attributed(
+            Path::new("/wt2"),
+            crate::statusfile::VerdictPayload::green(),
+            Some("def456".into()),
+            false,
+        );
+        let plain = api2
+            .get_status_attributed("/wt2", Some("def456"))
+            .expect("verdict present");
+        assert!(
+            plain.gated_checks_ran.is_empty(),
+            "the 4-arg form leaves gated_checks_ran empty"
+        );
+        assert!(
+            !cargoless_core::transport::status_to_json(&plain).contains("gated_checks_ran"),
+            "empty ran-checks list is absent on the wire (additive contract)"
         );
     }
 
