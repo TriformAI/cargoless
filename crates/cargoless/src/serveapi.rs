@@ -481,10 +481,7 @@ impl Default for BatchCoalesceConfig {
             max_wait: configured_batch_duration("CARGOLESS_BATCH_MAX_WAIT_MS", 1000),
             max_members: configured_batch_usize("CARGOLESS_BATCH_MAX_MEMBERS", 40),
             global_inflight_limit: configured_batch_u32("CARGOLESS_BATCH_GLOBAL_INFLIGHT", 1),
-            eject_cooldown_rounds: configured_batch_u64(
-                "CARGOLESS_BATCH_EJECT_COOLDOWN_ROUNDS",
-                1,
-            ),
+            eject_cooldown_rounds: configured_batch_u64("CARGOLESS_BATCH_EJECT_COOLDOWN_ROUNDS", 1),
         }
     }
 }
@@ -838,7 +835,10 @@ impl BatchCoalescer {
         // Remove admitted waiters in REVERSE index order so earlier indices remain
         // valid across each VecDeque::remove call.
         let mut group: Vec<Arc<BatchWaiter>> = Vec::with_capacity(admit_indices.len());
-        let queue = state.queues.get_mut(key).expect("key present, checked above");
+        let queue = state
+            .queues
+            .get_mut(key)
+            .expect("key present, checked above");
         for &idx in admit_indices.iter().rev() {
             let waiter = queue.waiters.remove(idx).expect("index valid");
             group.push(waiter);
@@ -1923,9 +1923,7 @@ impl ServeBatchChecker<'_> {
                 // that runs ONLY the witness and drops every other check — wrong
                 // for a gate, and on a manifest without that id it selects
                 // nothing → vacuous green.)
-                cargoless_core::project_checks::run_profile_with_changes(
-                    root, "dev", None, None,
-                )
+                cargoless_core::project_checks::run_profile_with_changes(root, "dev", None, None)
             })
             .and_then(|report| report.map_err(|e| format!("project checks failed: {e}")))
     }
@@ -3407,7 +3405,11 @@ checks:
                 // Block until the test says go.
                 let _ = poisoned(&unblock_rx_a).recv();
                 poisoned(&runs_a).push(
-                    combined.members.iter().map(|m| m.worktree.clone()).collect(),
+                    combined
+                        .members
+                        .iter()
+                        .map(|m| m.worktree.clone())
+                        .collect(),
                 );
                 green_report_for(combined)
             })
@@ -3428,8 +3430,13 @@ checks:
             );
             followers.push(thread::spawn(move || {
                 coalescer_f.submit(key_f, &req_f, move |combined| {
-                    poisoned(&runs_f)
-                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    poisoned(&runs_f).push(
+                        combined
+                            .members
+                            .iter()
+                            .map(|m| m.worktree.clone())
+                            .collect(),
+                    );
                     green_report_for(combined)
                 })
             }));
@@ -3467,7 +3474,9 @@ checks:
         // Barrier: both threads start submitting at the same time.
         let start = Arc::new(Barrier::new(2));
         // Each run records its (enter, exit) wall-clock time.
-        let timeline = Arc::new(Mutex::new(Vec::<(std::time::Instant, std::time::Instant)>::new()));
+        let timeline = Arc::new(Mutex::new(
+            Vec::<(std::time::Instant, std::time::Instant)>::new(),
+        ));
 
         let mut handles = Vec::new();
         for (key, batch_id, member) in [
@@ -3534,10 +3543,13 @@ checks:
         let run_sizes = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let runs_1 = Arc::clone(&run_sizes);
         let report_r1 = coalescer.submit(key.clone(), &req_red, move |combined| {
-            runs_1
-                .lock()
-                .unwrap()
-                .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+            runs_1.lock().unwrap().push(
+                combined
+                    .members
+                    .iter()
+                    .map(|m| m.worktree.clone())
+                    .collect(),
+            );
             solo_red_report_for(combined)
         });
         assert_eq!(report_r1.verdict, BatchVerdict::Red);
@@ -3567,8 +3579,11 @@ checks:
             thread::spawn(move || {
                 coalescer_r2.submit(key_r2, &req_green, move |combined| {
                     barrier_r2_t.wait(); // let "red-member" enqueue first
-                    let members: Vec<String> =
-                        combined.members.iter().map(|m| m.worktree.clone()).collect();
+                    let members: Vec<String> = combined
+                        .members
+                        .iter()
+                        .map(|m| m.worktree.clone())
+                        .collect();
                     runs_r2.lock().unwrap().push(members.clone());
                     // "red-member" must NOT appear in this run.
                     assert!(
@@ -3589,8 +3604,11 @@ checks:
             // Slight delay so green-member wins leader election.
             thread::sleep(Duration::from_millis(5));
             let r = coalescer_red2.submit(key_red2, &req_red2, move |combined| {
-                let members: Vec<String> =
-                    combined.members.iter().map(|m| m.worktree.clone()).collect();
+                let members: Vec<String> = combined
+                    .members
+                    .iter()
+                    .map(|m| m.worktree.clone())
+                    .collect();
                 runs_red2.lock().unwrap().push(members);
                 green_report_for(combined)
             });
@@ -3642,9 +3660,13 @@ checks:
         let run_log = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let rl = Arc::clone(&run_log);
         let _ = coalescer.submit(key.clone(), &req_red, move |combined| {
-            rl.lock()
-                .unwrap()
-                .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+            rl.lock().unwrap().push(
+                combined
+                    .members
+                    .iter()
+                    .map(|m| m.worktree.clone())
+                    .collect(),
+            );
             solo_red_report_for(combined)
         });
 
@@ -3667,9 +3689,13 @@ checks:
             let rl_r = Arc::clone(&rl2);
             thread::spawn(move || {
                 coalescer2.submit(key2, &req_red2, move |combined| {
-                    rl_r.lock()
-                        .unwrap()
-                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    rl_r.lock().unwrap().push(
+                        combined
+                            .members
+                            .iter()
+                            .map(|m| m.worktree.clone())
+                            .collect(),
+                    );
                     green_report_for(combined) // red admitted in round 3 → green verdict
                 })
             })
@@ -3687,9 +3713,13 @@ checks:
             let req_g = coalescer_request(&format!("r2-g{idx}"), &format!("green-{idx}"));
             thread::spawn(move || {
                 let _ = coalescer_g.submit(key_g, &req_g, move |combined| {
-                    rl_g.lock()
-                        .unwrap()
-                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    rl_g.lock().unwrap().push(
+                        combined
+                            .members
+                            .iter()
+                            .map(|m| m.worktree.clone())
+                            .collect(),
+                    );
                     green_report_for(combined)
                 });
                 drop(r2_tx);
@@ -3714,7 +3744,10 @@ checks:
         let admitted = last_two
             .iter()
             .any(|run| run.contains(&"persistent-red".to_string()));
-        assert!(admitted, "persistent-red must be admitted within 2 drains; log={log:?}");
+        assert!(
+            admitted,
+            "persistent-red must be admitted within 2 drains; log={log:?}"
+        );
     }
 
     /// Ejection does not disturb positional attribution: when a member is held
@@ -3744,9 +3777,13 @@ checks:
         let rl = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let rl1 = Arc::clone(&rl);
         let _ = coalescer.submit(key.clone(), &req_culprit, move |combined| {
-            rl1.lock()
-                .unwrap()
-                .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+            rl1.lock().unwrap().push(
+                combined
+                    .members
+                    .iter()
+                    .map(|m| m.worktree.clone())
+                    .collect(),
+            );
             solo_red_report_for(combined)
         });
 
@@ -3772,9 +3809,13 @@ checks:
                     thread::sleep(Duration::from_millis(5));
                 }
                 let report = c.submit(k, &req, move |combined| {
-                    rl_t.lock()
-                        .unwrap()
-                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    rl_t.lock().unwrap().push(
+                        combined
+                            .members
+                            .iter()
+                            .map(|m| m.worktree.clone())
+                            .collect(),
+                    );
                     green_report_for(combined)
                 });
                 poisoned(&rr).insert(member_str, report.members[0].verdict);
@@ -3974,7 +4015,7 @@ checks:
         // still gets its own correct per-WT slice (asserted below).
         let final_run_count = run_count.load(Ordering::SeqCst);
         assert!(
-            final_run_count >= 1 && final_run_count < 3,
+            (1..3).contains(&final_run_count),
             "3 concurrent pushers sharing the same (base_ref, analysis_root) must \
              coalesce into fewer than 3 physical runs — got {final_run_count}"
         );
