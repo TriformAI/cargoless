@@ -68,6 +68,12 @@ static PROJECT_CHECK_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(1);
 /// recycled across worktrees, so `finish_hard_witness`'s equality check
 /// can never be fooled by a reused value.
 static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Cap on the per-worktree base_sha-addressable verdict ring
+/// ([`ServeVerdictState::verdict_history`]). The witness hardcodes ONE
+/// worktree key for every PR, so a handful of distinct in-flight commits
+/// can share that key during a landing flood; 16 is far past the realistic
+/// concurrent fan-in and the oldest entry is front-evicted past the cap.
+const HARD_WITNESS_HISTORY_CAP: usize = 16;
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 
 /// A pushed overlay set carried in `ServeVerdictState::pushed`. Stored
@@ -412,14 +418,36 @@ pub struct ServeVerdictState {
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
     project_check_state_dir: Option<PathBuf>,
-    /// Per-worktree Hard-witness generation counter. The latest generation
-    /// for each wt-key is the only witness that may publish; stale witnesses
-    /// (from a prior push whose EmitVerdict fired while a newer push's witness
-    /// is already running) are detected by `finish_hard_witness` and dropped.
-    /// The counter values are sourced from the module-level
-    /// `HARD_WITNESS_SEQ` atomic, which is globally monotonic and never
-    /// recycled, so a recycled match is structurally impossible.
-    hard_witness_generation: Mutex<BTreeMap<String, u64>>,
+    /// Per-`(worktree, base_sha)` Hard-witness generation counter. The latest
+    /// generation for each key is the only witness that may publish; stale
+    /// witnesses (from a prior push whose EmitVerdict fired while a newer
+    /// push's witness is already running) are detected by
+    /// `finish_hard_witness` and dropped. The counter values are sourced from
+    /// the module-level `HARD_WITNESS_SEQ` atomic, which is globally monotonic
+    /// and never recycled, so a recycled match is structurally impossible.
+    ///
+    /// **The base_sha is part of the key** (was: worktree-only). The witness
+    /// hardcodes one worktree string for every PR, so a worktree-only latch
+    /// let a *newer commit's* push supersede an *older commit's* in-flight
+    /// witness — the older witness's correct GREEN was dropped
+    /// ("stale-witness-dropped") and the superseded SHA's poller timed out
+    /// (the `<absent>` attribution bug). Keying by `(worktree, base_sha)`
+    /// makes two distinct commits independent: each publishes on its own
+    /// merit; only a *re-push of the same commit* supersedes. FS-watch /
+    /// unattributed witnesses (`base_sha: None`) still share one key per
+    /// worktree, matching their pre-existing semantics.
+    hard_witness_generation: Mutex<BTreeMap<(String, Option<String>), u64>>,
+    /// #A2-keystone — base_sha-addressable verdict ring per worktree. Because
+    /// the witness shares one worktree key across all PRs, the single
+    /// `statuses` slot can only hold the *last* publisher's verdict; a poller
+    /// for a superseded commit would never see its own verdict echoed even
+    /// when that verdict was correctly computed. This ring retains the last
+    /// [`HARD_WITNESS_HISTORY_CAP`] *attributed* (base_sha = `Some`) verdicts
+    /// per worktree so `get_status_attributed(wt, Some(sha))` resolves the
+    /// exact commit the poller asked about, independent of what landed in the
+    /// `statuses` slot afterward. Unattributed (FS-watch) verdicts never enter
+    /// the ring — they have no SHA to address.
+    verdict_history: Mutex<BTreeMap<String, VecDeque<WorktreeStatus>>>,
 }
 
 #[derive(Default)]
@@ -916,7 +944,40 @@ impl ServeVerdictState {
             heartbeat_age_secs: 0,
             published_at,
         };
-        poisoned(&self.statuses).insert(worktree.clone(), status);
+        // #A2-keystone — retain every ATTRIBUTED verdict in the
+        // base_sha-addressable ring. The witness shares one worktree key
+        // across all PRs, so the single `statuses` slot only ever holds the
+        // last publisher's verdict; a poller for a commit that has since been
+        // superseded in the slot can still retrieve its own verdict here.
+        // Unattributed (FS-watch) verdicts carry no SHA to address by and
+        // never enter the ring.
+        if let Some(sha) = base_sha.as_deref().filter(|s| !s.is_empty()) {
+            let mut hist = poisoned(&self.verdict_history);
+            let ring = hist.entry(worktree.clone()).or_default();
+            // A re-push of the SAME commit replaces its prior entry (latest
+            // verdict for that sha wins) rather than accumulating duplicates.
+            ring.retain(|s| s.base_sha.as_deref() != Some(sha));
+            ring.push_back(status.clone());
+            while ring.len() > HARD_WITNESS_HISTORY_CAP {
+                ring.pop_front();
+            }
+        }
+        // The slot is last-writer-wins, but never regresses to a STRICTLY
+        // staler timestamp — two Hard-witness supervisor threads can publish
+        // out of order, and a plain `get_status` reader (e.g. `cargoless
+        // status`) should see the freshest verdict, not whichever thread won
+        // the lock race. `>=` (not `>`) preserves the clear-on-unattributed
+        // contract: an FS-watch `None` publish in the same wall-clock second
+        // as the prior attributed publish must still clear the stale SHA.
+        {
+            let mut slot = poisoned(&self.statuses);
+            let fresher = slot
+                .get(&worktree)
+                .is_none_or(|prev| published_at >= prev.published_at);
+            if fresher {
+                slot.insert(worktree.clone(), status);
+            }
+        }
         let ev = TransitionEvent {
             worktree: worktree.clone(),
             verdict: verdict_color,
@@ -1042,25 +1103,38 @@ impl ServeVerdictState {
         poisoned(&self.push_attribution).remove(worktree)
     }
 
-    /// #A4.3 — claim the hard-witness slot for `wt_key`. Returns the new
-    /// generation; a previously claimed (still-running) witness for the
-    /// same key is implicitly invalidated (its `finish_hard_witness` will
+    /// #A4.3 — claim the hard-witness slot for `(wt_key, base_sha)`. Returns
+    /// the new generation; a previously claimed (still-running) witness for
+    /// the same key is implicitly invalidated (its `finish_hard_witness` will
     /// return `false`). Generations come from a global never-recycled
     /// sequence, so an ABA match is structurally impossible.
-    pub(crate) fn begin_hard_witness(&self, wt_key: &str) -> u64 {
+    ///
+    /// `base_sha` is part of the key (the `<absent>` fix): two distinct
+    /// commits sharing one worktree key each get an independent latch, so a
+    /// newer commit's push no longer supersedes an older commit's in-flight
+    /// witness. `None` (FS-watch / unattributed) keeps the historical
+    /// one-latch-per-worktree behavior.
+    pub(crate) fn begin_hard_witness(&self, wt_key: &str, base_sha: Option<&str>) -> u64 {
         let generation = HARD_WITNESS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-        poisoned(&self.hard_witness_generation).insert(wt_key.to_string(), generation);
+        let key = (wt_key.to_string(), base_sha.map(str::to_string));
+        poisoned(&self.hard_witness_generation).insert(key, generation);
         generation
     }
 
-    /// `true` iff `generation` is still the latest claim for `wt_key` —
-    /// the caller may publish. Consumes the claim on success so a
-    /// duplicate finish (watchdog already published, worker completes
-    /// later) reports `false` and stays silent.
-    pub(crate) fn finish_hard_witness(&self, wt_key: &str, generation: u64) -> bool {
+    /// `true` iff `generation` is still the latest claim for
+    /// `(wt_key, base_sha)` — the caller may publish. Consumes the claim on
+    /// success so a duplicate finish (watchdog already published, worker
+    /// completes later) reports `false` and stays silent.
+    pub(crate) fn finish_hard_witness(
+        &self,
+        wt_key: &str,
+        base_sha: Option<&str>,
+        generation: u64,
+    ) -> bool {
+        let key = (wt_key.to_string(), base_sha.map(str::to_string));
         let mut map = poisoned(&self.hard_witness_generation);
-        if map.get(wt_key) == Some(&generation) {
-            map.remove(wt_key);
+        if map.get(&key) == Some(&generation) {
+            map.remove(&key);
             true
         } else {
             false
@@ -1424,14 +1498,58 @@ impl VerdictService for ServeVerdictState {
     }
 
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
-        let g = poisoned(&self.statuses);
-        let mut s = g.get(worktree).cloned()?;
-        // Age is derived at read time from the publish timestamp — the
-        // stored `heartbeat_age_secs` is a placeholder; the honest age is
-        // "seconds since this verdict was attributed".
+        self.get_status_attributed(worktree, None)
+    }
+
+    /// Resolution rule (the `<absent>` fix's read half):
+    /// - `base_sha = Some(sha)` → the ring entry attributed to exactly that
+    ///   commit, if retained; else the live slot IFF the slot is itself that
+    ///   commit; else `None`. A poll for commit X NEVER returns commit Y's
+    ///   verdict — that cross-attribution is the bug the strict witness
+    ///   exists to refuse.
+    /// - `base_sha = None`/empty → the current live slot (plain
+    ///   `cargoless status`, unattributed readers).
+    ///
+    /// Age is derived at read time from the publish timestamp regardless of
+    /// which source answered, so a remote reader always sees an honest age.
+    fn get_status_attributed(
+        &self,
+        worktree: &str,
+        base_sha: Option<&str>,
+    ) -> Option<WorktreeStatus> {
         let now = crate::statusfile::now_unix();
-        s.heartbeat_age_secs = now.saturating_sub(s.published_at);
-        Some(s)
+        let stamp_age = |mut s: WorktreeStatus| {
+            s.heartbeat_age_secs = now.saturating_sub(s.published_at);
+            s
+        };
+        match base_sha.filter(|s| !s.is_empty()) {
+            Some(want) => {
+                // Ring first: the exact commit, even if superseded in the slot.
+                if let Some(hit) = poisoned(&self.verdict_history)
+                    .get(worktree)
+                    .and_then(|ring| {
+                        ring.iter()
+                            .rev()
+                            .find(|s| s.base_sha.as_deref() == Some(want))
+                            .cloned()
+                    })
+                {
+                    return Some(stamp_age(hit));
+                }
+                // Fall back to the live slot ONLY when it is that same commit
+                // (a verdict published before the ring existed, or one that
+                // is still current) — never cross-attribute another commit.
+                poisoned(&self.statuses)
+                    .get(worktree)
+                    .filter(|s| s.base_sha.as_deref() == Some(want))
+                    .cloned()
+                    .map(stamp_age)
+            }
+            None => poisoned(&self.statuses)
+                .get(worktree)
+                .cloned()
+                .map(stamp_age),
+        }
     }
 
     fn get_verdict(&self, worktree: &str) -> Option<String> {
@@ -4644,29 +4762,163 @@ checks:
     #[test]
     fn stale_hard_witness_never_overwrites_fresher() {
         // #A4.3 publish-once / last-writer-wins ordering: two hard
-        // witnesses for the same wt-key can coexist (push2's EmitVerdict
-        // fires while push1's witness still runs). Only the LATEST
-        // generation may publish; a consumed claim cannot publish twice.
+        // witnesses for the same (wt, base_sha) can coexist (a re-push of
+        // the SAME commit fires its EmitVerdict while the first witness still
+        // runs). Only the LATEST generation may publish; a consumed claim
+        // cannot publish twice.
         let api = ServeVerdictState::new();
-        let g1 = api.begin_hard_witness("/wt");
-        let g2 = api.begin_hard_witness("/wt");
+        let sha = Some("deadbeef");
+        let g1 = api.begin_hard_witness("/wt", sha);
+        let g2 = api.begin_hard_witness("/wt", sha);
         assert!(g2 > g1, "generations are monotonic");
         assert!(
-            !api.finish_hard_witness("/wt", g1),
-            "stale witness (older push) must not publish"
+            !api.finish_hard_witness("/wt", sha, g1),
+            "stale witness (older claim, same commit) must not publish"
         );
         assert!(
-            api.finish_hard_witness("/wt", g2),
+            api.finish_hard_witness("/wt", sha, g2),
             "latest witness publishes"
         );
         assert!(
-            !api.finish_hard_witness("/wt", g2),
+            !api.finish_hard_witness("/wt", sha, g2),
             "a consumed claim cannot publish twice (watchdog-vs-late-worker)"
         );
         // Keys are independent: a witness on another worktree is
         // unaffected by /wt's churn.
-        let g3 = api.begin_hard_witness("/other");
-        assert!(api.finish_hard_witness("/other", g3));
+        let g3 = api.begin_hard_witness("/other", sha);
+        assert!(api.finish_hard_witness("/other", sha, g3));
+    }
+
+    #[test]
+    fn distinct_base_sha_witnesses_both_publish_under_one_worktree_key() {
+        // THE `<absent>` FIX (core half): the witness hardcodes ONE worktree
+        // key for every PR, so before this fix a newer commit's push bumped
+        // the worktree-only generation and DROPPED an older commit's
+        // in-flight witness ("stale-witness-dropped") — the superseded SHA's
+        // poller then timed out at ~33min. Keying the latch by
+        // (worktree, base_sha) makes two distinct commits independent: each
+        // publishes on its own merit even though they share the worktree key.
+        let api = ServeVerdictState::new();
+        let g_old = api.begin_hard_witness("/workspace/tf-multiverse", Some("aaa111"));
+        // A newer commit's push arrives for the SAME worktree key while the
+        // older witness is still running.
+        let g_new = api.begin_hard_witness("/workspace/tf-multiverse", Some("bbb222"));
+        assert!(g_new > g_old, "generations stay globally monotonic");
+        // The newer commit's witness finishes and publishes — fine.
+        assert!(
+            api.finish_hard_witness("/workspace/tf-multiverse", Some("bbb222"), g_new),
+            "newer commit's witness publishes"
+        );
+        // The OLDER commit's witness finishes LATER and — the fix — STILL
+        // publishes, because its (wt, aaa111) latch was never superseded by
+        // the bbb222 push. Pre-fix this returned false and the green was lost.
+        assert!(
+            api.finish_hard_witness("/workspace/tf-multiverse", Some("aaa111"), g_old),
+            "older commit's witness still publishes — not dropped by a newer commit's push"
+        );
+        // An unattributed (FS-watch) witness keeps its own one-per-worktree
+        // latch, independent of either attributed commit.
+        let g_fs = api.begin_hard_witness("/workspace/tf-multiverse", None);
+        assert!(api.finish_hard_witness("/workspace/tf-multiverse", None, g_fs));
+    }
+
+    #[test]
+    fn verdict_retrievable_by_base_sha_after_supersession() {
+        // THE `<absent>` FIX (read half): a poller for commit X must retrieve
+        // X's verdict from the base_sha-addressable ring even after a newer
+        // commit Y overwrote the single live `statuses` slot. A bare lookup
+        // (None) sees only the latest; an X-addressed lookup sees X; a lookup
+        // for a commit that never published sees None (never cross-attributed).
+        let api = ServeVerdictState::new();
+        let wt = Path::new("/workspace/tf-multiverse");
+        api.publish_attributed(
+            wt,
+            crate::statusfile::VerdictPayload::green(),
+            Some("xxx".into()),
+            false,
+        );
+        api.publish_attributed(
+            wt,
+            crate::statusfile::VerdictPayload::green(),
+            Some("yyy".into()),
+            false,
+        );
+
+        // The live slot holds the latest commit (yyy).
+        assert_eq!(
+            api.get_status_attributed("/workspace/tf-multiverse", None)
+                .and_then(|s| s.base_sha),
+            Some("yyy".into()),
+            "bare lookup returns the latest-published commit"
+        );
+        // The superseded commit (xxx) is still retrievable by its sha.
+        assert_eq!(
+            api.get_status_attributed("/workspace/tf-multiverse", Some("xxx"))
+                .and_then(|s| s.base_sha),
+            Some("xxx".into()),
+            "superseded commit's verdict survives in the ring"
+        );
+        // The latest commit is also retrievable by its sha.
+        assert_eq!(
+            api.get_status_attributed("/workspace/tf-multiverse", Some("yyy"))
+                .and_then(|s| s.base_sha),
+            Some("yyy".into()),
+        );
+        // A commit that never published is None — never another commit's verdict.
+        assert!(
+            api.get_status_attributed("/workspace/tf-multiverse", Some("zzz"))
+                .is_none(),
+            "a poll for an unknown commit never cross-attributes a different commit's verdict"
+        );
+    }
+
+    #[test]
+    fn verdict_ring_evicts_past_cap_and_dedupes_same_sha() {
+        // The ring is bounded (oldest front-evicted past CAP) and a re-push
+        // of the same commit replaces its prior entry rather than accumulating.
+        let api = ServeVerdictState::new();
+        let wt = Path::new("/wt");
+        for i in 0..(HARD_WITNESS_HISTORY_CAP + 5) {
+            api.publish_attributed(
+                wt,
+                crate::statusfile::VerdictPayload::green(),
+                Some(format!("sha-{i}")),
+                false,
+            );
+        }
+        // The oldest 5 are gone; the most recent CAP remain addressable.
+        assert!(
+            api.get_status_attributed("/wt", Some("sha-0")).is_none(),
+            "oldest commit evicted past the cap"
+        );
+        let newest = format!("sha-{}", HARD_WITNESS_HISTORY_CAP + 4);
+        assert!(
+            api.get_status_attributed("/wt", Some(newest.as_str()))
+                .is_some(),
+            "newest commit retained"
+        );
+        // Re-push the same commit: it must not grow the ring beyond CAP nor
+        // duplicate — the latest verdict for that sha wins.
+        api.publish_attributed(
+            wt,
+            crate::statusfile::VerdictPayload::green(),
+            Some("sha-repeat".into()),
+            false,
+        );
+        api.publish_attributed(
+            wt,
+            crate::statusfile::VerdictPayload::green(),
+            Some("sha-repeat".into()),
+            false,
+        );
+        let ring_len = poisoned(&api.verdict_history)
+            .get("/wt")
+            .map(|r| r.len())
+            .unwrap_or(0);
+        assert!(
+            ring_len <= HARD_WITNESS_HISTORY_CAP,
+            "ring stays bounded at the cap (was {ring_len})"
+        );
     }
 
     #[test]

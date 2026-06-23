@@ -1830,11 +1830,21 @@ fn spawn_project_checks_hard_with_timeout(
     require_checks: bool,
 ) {
     let wt_key = wt.to_string_lossy().into_owned();
-    let generation = api.begin_hard_witness(&wt_key);
+    // #A2-keystone — the witness latch is keyed by (worktree, base_sha), so a
+    // newer commit's push for the SAME hardcoded worktree key no longer
+    // supersedes this older commit's in-flight witness (the `<absent>` bug).
+    // Captured here and threaded into both finish sites; the attribution is
+    // moved into the supervisor below, so we can't read it back there.
+    let witness_base_sha = attribution
+        .as_ref()
+        .and_then(|a| a.base_sha.clone())
+        .filter(|s| !s.is_empty());
+    let generation = api.begin_hard_witness(&wt_key, witness_base_sha.as_deref());
     let attribution_fallback = attribution.clone();
     let supervisor = {
         let wt = wt.clone();
         let wt_key = wt_key.clone();
+        let witness_base_sha = witness_base_sha.clone();
         let api = Arc::clone(&api);
         move || {
             let (tx, rx) = channel::<ProjectCheckSummary>();
@@ -1899,7 +1909,7 @@ fn spawn_project_checks_hard_with_timeout(
             }
             let summary = apply_require_checks(summary, require_checks);
             let payload = compose_hard_mode_payload(authoritative_error, summary);
-            if api.finish_hard_witness(&wt_key, generation) {
+            if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
                 publish_verdict(&wt, payload, attribution, &api);
             } else {
                 eprintln!(
@@ -1926,7 +1936,7 @@ fn spawn_project_checks_hard_with_timeout(
                 detail: format!("spawn failed: {e}"),
             },
         );
-        if api.finish_hard_witness(&wt_key, generation) {
+        if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
             publish_verdict(&wt, payload, attribution_fallback, &api);
         }
     }

@@ -367,6 +367,26 @@ pub trait VerdictService: Send + Sync {
     /// per-crate breakdown). `None` ⇒ unknown worktree.
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus>;
 
+    /// Status for a worktree addressed by the commit it should answer for.
+    /// `base_sha = Some(sha)` resolves the verdict that was attributed to
+    /// exactly that commit (never another commit's verdict), even after a
+    /// newer push for the same worktree key superseded the live slot;
+    /// `None`/empty falls back to the current-slot [`Self::get_status`].
+    ///
+    /// ADDITIVE with a **default body** so no existing impl is forced to
+    /// change (the `MockService` and in-proc read paths keep compiling
+    /// untouched); the serve loop's `VerdictService` overrides it with a
+    /// base_sha-addressable lookup. The default ignores `base_sha` — a
+    /// service with no per-commit retention can only answer "the latest",
+    /// which a caller polling for a specific sha simply won't match.
+    fn get_status_attributed(
+        &self,
+        worktree: &str,
+        _base_sha: Option<&str>,
+    ) -> Option<WorktreeStatus> {
+        self.get_status(worktree)
+    }
+
     /// Just the verdict string (light — no per-crate, no heartbeat).
     /// `None` ⇒ unknown worktree.
     fn get_verdict(&self, worktree: &str) -> Option<String>;
