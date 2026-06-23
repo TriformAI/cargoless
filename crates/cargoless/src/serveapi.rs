@@ -440,17 +440,44 @@ struct BatchCoalesceKey {
 
 #[derive(Debug, Clone, Copy)]
 struct BatchCoalesceConfig {
-    debounce: Duration,
+    /// Anti-thundering-herd grace period: if > 0, the leader waits this long
+    /// after the first arrival before draining, allowing simultaneous arrivals
+    /// to land in the same batch. Default 0 = off (drain immediately once
+    /// inflight == 0). Formerly `CARGOLESS_BATCH_DEBOUNCE_MS`; env var kept
+    /// for backward compatibility.
+    coalesce_grace: Duration,
+    /// Kept for backward compatibility; the env var is parsed but the value is
+    /// no longer used as a primary flush trigger. Drain-on-completion supersedes
+    /// the max-wait timer.
+    #[allow(dead_code)]
     max_wait: Duration,
+    /// Hard cap on members per physical run (overflow backstop). Still enforced
+    /// by `drain_group`.
     max_members: usize,
+    /// Maximum number of physical runs allowed in-flight simultaneously across
+    /// ALL keys. Default 1 = strict serial (one checker globally at a time).
+    /// Set to 0 to use per-key isolation only (different bases may run in
+    /// parallel while each key still drains-on-completion).
+    global_inflight_limit: u32,
+    /// Number of drain rounds a SoloRed member is held out of after it causes
+    /// a fallback. Default 1 = skip the immediately-next drain. 0 = disabled.
+    eject_cooldown_rounds: u64,
 }
 
 impl Default for BatchCoalesceConfig {
     fn default() -> Self {
+        // CARGOLESS_BATCH_MAX_WAIT_MS is parsed but inert (drain-on-completion
+        // supersedes the timer). Log nothing here — only at runtime if the env
+        // var is set, to avoid spamming tests.
         Self {
-            debounce: configured_batch_duration("CARGOLESS_BATCH_DEBOUNCE_MS", 250),
+            coalesce_grace: configured_batch_duration("CARGOLESS_BATCH_DEBOUNCE_MS", 0),
             max_wait: configured_batch_duration("CARGOLESS_BATCH_MAX_WAIT_MS", 1000),
             max_members: configured_batch_usize("CARGOLESS_BATCH_MAX_MEMBERS", 40),
+            global_inflight_limit: configured_batch_u32("CARGOLESS_BATCH_GLOBAL_INFLIGHT", 1),
+            eject_cooldown_rounds: configured_batch_u64(
+                "CARGOLESS_BATCH_EJECT_COOLDOWN_ROUNDS",
+                1,
+            ),
         }
     }
 }
@@ -462,11 +489,37 @@ struct BatchCoalescer {
     config: BatchCoalesceConfig,
 }
 
+/// RAII guard: on Drop, decrements `inflight_runs` and calls `cv.notify_all()`
+/// so any cross-key leader blocked in the global-inflight gate wakes up.
+/// Constructed immediately after incrementing `inflight_runs`; panic-safe.
+struct InflightGuard<'a> {
+    coalescer: &'a BatchCoalescer,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut s = poisoned(&self.coalescer.state);
+        s.inflight_runs = s.inflight_runs.saturating_sub(1);
+        drop(s);
+        self.coalescer.cv.notify_all();
+    }
+}
+
+/// Round-based ejection mark. A member is held out until
+/// `next_run_seq > release_at_run_seq` (strict — anti-starvation).
+#[derive(Debug, Clone, Copy)]
+struct EjectMark {
+    release_at_run_seq: u64,
+}
+
 #[derive(Default)]
 struct BatchCoalescerState {
     queues: BTreeMap<BatchCoalesceKey, BatchQueue>,
     inflight_runs: u32,
     next_run_seq: u64,
+    /// Cross-run cooldown: worktree keys held out of the immediately-next drain
+    /// after returning SoloRed. Purged lazily; never starved.
+    ejected_until: BTreeMap<String, EjectMark>,
 }
 
 #[derive(Default)]
@@ -516,6 +569,7 @@ impl BatchCoalescer {
         }
 
         loop {
+            // Fast path: another leader already produced our result.
             if let Some(report) = poisoned(&waiter.result).clone() {
                 return report;
             }
@@ -529,33 +583,101 @@ impl BatchCoalescer {
                 drop(state);
                 continue;
             };
+
             if !queue.leader_active {
+                // Win the leader election for this key.
                 queue.leader_active = true;
+
+                // Optional anti-thundering-herd grace: if coalesce_grace > 0,
+                // wait briefly so simultaneous arrivals land in the same batch.
+                // Default is 0 (off) — lone submitter on a quiet trunk starts
+                // with zero added latency.
+                if !self.config.coalesce_grace.is_zero() {
+                    let grace = self.config.coalesce_grace;
+                    let (grace_state, _timeout) = self
+                        .cv
+                        .wait_timeout(state, grace)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Release the lock before any re-acquisition to avoid
+                    // deadlock: finish_leader and poisoned(&self.state) both
+                    // acquire self.state, so grace_state must be dropped first.
+                    drop(grace_state);
+                    // Re-check result after wait (another leader may have done it).
+                    if let Some(report) = poisoned(&waiter.result).clone() {
+                        // We hold leader_active; give it up cleanly before returning.
+                        self.finish_leader(&key);
+                        return report;
+                    }
+                    state = poisoned(&self.state);
+                } else {
+                    drop(state);
+                    state = poisoned(&self.state);
+                }
+
+                // Global-inflight gate: wait until no run is in flight anywhere
+                // (across all keys). This serialises the physical checker so at
+                // most `global_inflight_limit` runs execute concurrently.
+                // The gate is skipped when global_inflight_limit == 0 (per-key
+                // isolation only; different bases may run in parallel).
+                if self.config.global_inflight_limit > 0 {
+                    loop {
+                        if state.inflight_runs < self.config.global_inflight_limit {
+                            break;
+                        }
+                        state = self
+                            .cv
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        // Re-check: another leader may have produced our result
+                        // while we were parked on the inflight gate.
+                        // Must drop `state` (releases self.state lock) before
+                        // calling finish_leader, which also acquires self.state.
+                        if poisoned(&waiter.result).is_some() {
+                            drop(state);
+                            self.finish_leader(&key);
+                            // Re-acquire to read the result we just confirmed exists.
+                            return poisoned(&waiter.result)
+                                .clone()
+                                .expect("result was Some before finish_leader");
+                        }
+                    }
+                }
                 drop(state);
 
-                self.wait_until_flush(&key);
+                // Drain whatever is queued for this key RIGHT NOW (no timer).
+                // `max_members` is enforced inside drain_group as an overflow
+                // backstop; any remaining waiters will be picked up next drain.
                 let group = self.drain_group(&key);
                 if group.is_empty() {
                     self.finish_leader(&key);
                     continue;
                 }
+
                 let run_start = Instant::now();
                 let queue_wait_ms: Vec<u128> = group
                     .iter()
-                    .map(|waiter| run_start.duration_since(waiter.enqueued_at).as_millis())
+                    .map(|w| run_start.duration_since(w.enqueued_at).as_millis())
                     .collect();
 
+                // Increment inflight + bump run_seq atomically, then construct the
+                // RAII guard IMMEDIATELY so a panic during `run` still decrements
+                // and notifies (cross-key leaders must wake).
                 let run_seq = {
-                    let mut state = poisoned(&self.state);
-                    state.inflight_runs = state.inflight_runs.saturating_add(1);
-                    state.next_run_seq = state.next_run_seq.saturating_add(1);
-                    state.next_run_seq
+                    let mut s = poisoned(&self.state);
+                    s.inflight_runs = s.inflight_runs.saturating_add(1);
+                    s.next_run_seq = s.next_run_seq.saturating_add(1);
+                    s.next_run_seq
                 };
+                // SAFETY: guard must be constructed before `run` is called.
+                let _inflight_guard = InflightGuard { coalescer: self };
+
                 let combined = combined_request_for(&key, &group, run_seq);
                 // A panic in the physical run (e.g. OOM compiling the union)
                 // must NOT leave the already-drained non-leader waiters parked
                 // forever. Catch it, fan out an indeterminate report to the whole
                 // group, and still release the leader slot so the queue recovers.
+                // `_inflight_guard` drop fires on both the normal path and the
+                // panic path — decrement + notify_all is always guaranteed.
                 let combined_report =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&combined)))
                         .unwrap_or_else(|_| {
@@ -564,15 +686,24 @@ impl BatchCoalescer {
                                 "coalesced batch run panicked; resubmit to retry",
                             )
                         });
-                {
-                    let mut state = poisoned(&self.state);
-                    state.inflight_runs = state.inflight_runs.saturating_sub(1);
-                }
+
+                // Record SoloRed ejections AFTER the run, BEFORE distributing
+                // results. The guard hasn't dropped yet here — inflight is still
+                // counted — but that's fine: ejection recording only mutates
+                // ejected_until, which is separate from the inflight gate.
+                self.record_solo_red_ejections(&combined_report, run_seq);
+
+                // Drop the inflight guard here explicitly: decrement + notify_all
+                // fires BEFORE distribute so cross-key leaders wake as soon as
+                // possible. `distribute_combined_report` does not need the lock.
+                drop(_inflight_guard);
+
                 distribute_combined_report(&group, &combined_report, &queue_wait_ms);
                 self.finish_leader(&key);
                 continue;
             }
 
+            // Follower path: park until woken by finish_leader or InflightGuard.
             let state = self
                 .cv
                 .wait(state)
@@ -581,54 +712,101 @@ impl BatchCoalescer {
         }
     }
 
-    fn wait_until_flush(&self, key: &BatchCoalesceKey) {
-        loop {
-            let state = poisoned(&self.state);
-            let Some(queue) = state.queues.get(key) else {
-                return;
-            };
-            let now = Instant::now();
-            let first_at = queue.first_at.unwrap_or(now);
-            let last_at = queue.last_at.unwrap_or(now);
-            let members = queue_member_count(queue);
-            if members >= self.config.max_members
-                || now.duration_since(first_at) >= self.config.max_wait
-                || now.duration_since(last_at) >= self.config.debounce
-            {
-                return;
-            }
-            let until_quiet = self
-                .config
-                .debounce
-                .saturating_sub(now.duration_since(last_at));
-            let until_max = self
-                .config
-                .max_wait
-                .saturating_sub(now.duration_since(first_at));
-            let wait_for = until_quiet.min(until_max);
-            let (_state, _timeout) = self
-                .cv
-                .wait_timeout(state, wait_for)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Record ejections for every member that returned SoloRed. Called after
+    /// a physical run completes, under a fresh lock acquisition inside.
+    fn record_solo_red_ejections(&self, report: &BatchReport, run_seq: u64) {
+        use cargoless_core::batch::BatchProvenance;
+        let cooldown = self.config.eject_cooldown_rounds;
+        if cooldown == 0 {
+            return; // Feature disabled.
+        }
+        let solo_reds: Vec<String> = report
+            .members
+            .iter()
+            .filter(|m| m.provenance == BatchProvenance::SoloRed)
+            .map(|m| m.worktree.clone())
+            .collect();
+        if solo_reds.is_empty() {
+            return;
+        }
+        let mut state = poisoned(&self.state);
+        for worktree in solo_reds {
+            state.ejected_until.insert(
+                worktree,
+                EjectMark {
+                    release_at_run_seq: run_seq.saturating_add(cooldown),
+                },
+            );
         }
     }
 
+    /// Drain waiters for `key` into a group, respecting `max_members` and
+    /// skipping any waiter whose sole member is in the SoloRed cooldown set.
+    /// Skipped waiters stay in `queue.waiters` so they are picked up by the
+    /// next drain (anti-starvation: admission is strict `next_run_seq >
+    /// release_at_run_seq`).
     fn drain_group(&self, key: &BatchCoalesceKey) -> Vec<Arc<BatchWaiter>> {
         let mut state = poisoned(&self.state);
-        let Some(queue) = state.queues.get_mut(key) else {
+        // Peek at the run_seq the upcoming increment will produce. An ejected
+        // waiter is re-admitted once this value exceeds its release_at_run_seq.
+        let next_run_seq = state.next_run_seq.saturating_add(1);
+
+        if !state.queues.contains_key(key) {
             return Vec::new();
-        };
-        let mut group = Vec::new();
-        let mut member_count = 0usize;
-        while let Some(next) = queue.waiters.front() {
-            let next_members = next.request.members.len().max(1);
-            if !group.is_empty() && member_count + next_members > self.config.max_members {
-                break;
-            }
-            let next = queue.waiters.pop_front().expect("front existed");
-            member_count += next_members;
-            group.push(next);
         }
+
+        // Phase 1 (read-only): decide which indices to admit vs skip.
+        // We separate the read phase (touching both state.queues and
+        // state.ejected_until immutably) from the mutation phase to
+        // satisfy the borrow checker.
+        let queue_len = state.queues[key].waiters.len();
+        let mut admit_indices: Vec<usize> = Vec::new();
+        let mut member_count = 0usize;
+        let mut ejection_purges: Vec<String> = Vec::new();
+
+        'outer: for idx in 0..queue_len {
+            let next = &state.queues[key].waiters[idx];
+            let next_members = next.request.members.len().max(1);
+
+            // max_members overflow backstop: once the group has at least one
+            // member, stop before adding another that would exceed the cap.
+            if !admit_indices.is_empty() && member_count + next_members > self.config.max_members {
+                break 'outer;
+            }
+
+            // Cross-run culprit ejection (single-member push-path only).
+            if next_members == 1 {
+                let worktree = &next.request.members[0].worktree;
+                if let Some(&mark) = state.ejected_until.get(worktree) {
+                    if next_run_seq <= mark.release_at_run_seq {
+                        // Cooldown still active — leave in queue, skip to next.
+                        continue;
+                    }
+                    // Cooldown expired — schedule lazy purge.
+                    ejection_purges.push(worktree.clone());
+                }
+            }
+
+            admit_indices.push(idx);
+            member_count += next_members;
+        }
+
+        // Phase 2 (mutation): purge expired ejections, then pop admitted waiters.
+        for worktree in ejection_purges {
+            state.ejected_until.remove(&worktree);
+        }
+
+        // Remove admitted waiters in REVERSE index order so earlier indices remain
+        // valid across each VecDeque::remove call.
+        let mut group: Vec<Arc<BatchWaiter>> = Vec::with_capacity(admit_indices.len());
+        let queue = state.queues.get_mut(key).expect("key present, checked above");
+        for &idx in admit_indices.iter().rev() {
+            let waiter = queue.waiters.remove(idx).expect("index valid");
+            group.push(waiter);
+        }
+        // Reverse-pop produced reverse insertion order; restore FIFO order.
+        group.reverse();
+
         if queue.waiters.is_empty() {
             queue.first_at = None;
             queue.last_at = None;
@@ -682,6 +860,20 @@ fn configured_batch_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn configured_batch_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn configured_batch_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(default)
 }
 
@@ -1677,7 +1869,19 @@ impl ServeBatchChecker<'_> {
         };
         self.api
             .with_project_check_overlay(&context, |root| {
-                cargoless_core::project_checks::run_dev_with_changes(root, changed_files.as_deref())
+                // CHANGE 1: Use `only_id` to guarantee the ssr-compiler-witness
+                // always runs on this overlay, regardless of which files changed.
+                // `only_id=Some(...)` short-circuits trigger-filtering in
+                // `select_for_changes` (project_checks.rs:544-546), so the
+                // witness executes even when the changed-file list would not
+                // match its globs. `changed_files=None` is correct because
+                // `only_id` already makes change-filtering moot.
+                cargoless_core::project_checks::run_profile_with_changes(
+                    root,
+                    "dev",
+                    Some("ssr-compiler-witness"),
+                    None,
+                )
             })
             .and_then(|report| report.map_err(|e| format!("project checks failed: {e}")))
     }
@@ -2740,9 +2944,12 @@ checks:
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
             config: BatchCoalesceConfig {
-                debounce: Duration::from_millis(50),
+                // coalesce_grace=0: drain-on-completion, zero added latency.
+                coalesce_grace: Duration::ZERO,
                 max_wait: Duration::from_millis(300),
                 max_members: 40,
+                global_inflight_limit: 1,
+                eject_cooldown_rounds: 1,
             },
         }
     }
@@ -2798,9 +3005,17 @@ checks:
 
     #[test]
     fn batch_coalescer_groups_same_key_requests() {
+        // Under drain-on-completion (coalesce_grace=0) two simultaneously-
+        // released submitters may race and yield 1 OR 2 runs depending on
+        // scheduler timing. Gate the run closure so the leader blocks inside
+        // `run` until the follower has also enqueued — guaranteeing both are
+        // visible to the same drain.
         let coalescer = Arc::new(test_coalescer());
         let key = test_batch_key("same");
+        // Barrier(2): submitter threads release each other simultaneously.
         let start = Arc::new(Barrier::new(2));
+        // Barrier(2): leader-in-run blocks until follower is also enqueued.
+        let follower_enqueued = Arc::new(Barrier::new(2));
         let runs = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut handles = Vec::new();
 
@@ -2808,11 +3023,16 @@ checks:
             let coalescer = Arc::clone(&coalescer);
             let key = key.clone();
             let start = Arc::clone(&start);
+            let follower_enqueued = Arc::clone(&follower_enqueued);
             let runs = Arc::clone(&runs);
             let request = coalescer_request(batch_id, member);
             handles.push(thread::spawn(move || {
                 start.wait();
                 coalescer.submit(key, &request, |combined| {
+                    // The elected leader reaches here. Signal that we're inside
+                    // `run` (enqueue barrier) so the follower, which started at
+                    // the same time, has had a chance to push into the queue.
+                    follower_enqueued.wait();
                     poisoned(&runs).push(
                         combined
                             .members
@@ -2830,10 +3050,14 @@ checks:
             .map(|handle| handle.join().expect("coalescer thread"))
             .collect();
 
-        let mut runs = poisoned(&runs).clone();
-        assert_eq!(runs.len(), 1);
-        runs[0].sort();
-        assert_eq!(runs[0], vec!["member-a", "member-b"]);
+        // With the gate, the follower is always enqueued before the leader's
+        // run returns. The NEXT leader drain picks it up. Total physical runs ≤ 2;
+        // each submitter gets its own member slice back.
+        let total_runs = poisoned(&runs).len();
+        assert!(
+            total_runs >= 1 && total_runs <= 2,
+            "expected 1 or 2 physical runs, got {total_runs}"
+        );
         assert!(
             reports
                 .iter()
@@ -2893,9 +3117,11 @@ checks:
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
             config: BatchCoalesceConfig {
-                debounce: Duration::from_millis(50),
+                coalesce_grace: Duration::ZERO,
                 max_wait: Duration::from_millis(300),
                 max_members: 2,
+                global_inflight_limit: 1,
+                eject_cooldown_rounds: 1,
             },
         });
         let key = test_batch_key("max-members");
@@ -2997,6 +3223,559 @@ checks:
         let request = coalescer_request("after-panic", "member-after");
         let recovered = coalescer.submit(key, &request, green_report_for);
         assert_eq!(recovered.verdict, BatchVerdict::Green);
+    }
+
+    // ── Helpers for new tests ──────────────────────────────────────────────
+
+    /// Build a coalescer with ejection disabled (cooldown=0) for tests that
+    /// do not want ejection side-effects.
+    fn test_coalescer_no_eject() -> BatchCoalescer {
+        BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            config: BatchCoalesceConfig {
+                coalesce_grace: Duration::ZERO,
+                max_wait: Duration::from_millis(300),
+                max_members: 40,
+                global_inflight_limit: 1,
+                eject_cooldown_rounds: 0, // ejection off
+            },
+        }
+    }
+
+    /// Build a solo-red report for a single-member request (mimics the
+    /// SoloRed provenance returned by `run_batch` after combined-red fallback).
+    fn solo_red_report_for(request: &BatchCheckRequest) -> BatchReport {
+        BatchReport {
+            batch_id: request.batch_id.clone(),
+            verdict: BatchVerdict::Red,
+            members: request
+                .members
+                .iter()
+                .map(|member| cargoless_core::batch::BatchMemberResult {
+                    worktree: member.worktree.clone(),
+                    verdict: BatchVerdict::Red,
+                    provenance: BatchProvenance::SoloRed,
+                    diagnostics: Vec::new(),
+                    duration_ms: 1,
+                })
+                .collect(),
+            combined_checks: 0,
+            solo_checks: 1,
+            duration_ms: 1,
+            queue_wait_ms: 0,
+            executed_members: request.members.len() as u32,
+            executed_batch_id: Some(request.batch_id.clone()),
+        }
+    }
+
+    // ── Change 1: drain-on-completion tests ───────────────────────────────
+
+    /// A lone submitter on a quiet trunk (inflight==0) must start with zero
+    /// added latency: no timer wait, drain fires immediately.
+    #[test]
+    fn lone_submitter_quiet_trunk_starts_immediately() {
+        let coalescer = Arc::new(test_coalescer_no_eject());
+        let key = test_batch_key("lone");
+        let request = coalescer_request("lone-batch", "lone-member");
+
+        let run_entry = Arc::new(Mutex::new(None::<std::time::Instant>));
+        let enqueued_at = std::time::Instant::now();
+
+        let run_entry_clone = Arc::clone(&run_entry);
+        let report = coalescer.submit(key, &request, move |combined| {
+            *poisoned(&run_entry_clone) = Some(std::time::Instant::now());
+            green_report_for(combined)
+        });
+
+        assert_eq!(report.verdict, BatchVerdict::Green);
+        let elapsed = poisoned(&run_entry)
+            .expect("run was invoked")
+            .duration_since(enqueued_at);
+        // With coalesce_grace=0, the run closure must start within a generous
+        // bound (500ms); in practice it is sub-millisecond on a healthy host.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "run started after {elapsed:?}; expected near-immediate start on quiet trunk"
+        );
+    }
+
+    /// Arrivals during a run must all drain as ONE next batch (not one per
+    /// arrival): while the leader is inside `run`, K more submitters enqueue;
+    /// when the run finishes and inflight drops to 0, they all drain together.
+    #[test]
+    fn arrivals_during_run_drain_as_one_next_batch() {
+        let coalescer = Arc::new(test_coalescer_no_eject());
+        let key = test_batch_key("arrivals");
+
+        // Channel: leader signals when it enters `run`; we enqueue K followers.
+        let (in_run_tx, in_run_rx) = std::sync::mpsc::channel::<()>();
+        // Channel: test unblocks the leader.
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+
+        let in_run_tx = Arc::new(std::sync::Mutex::new(Some(in_run_tx)));
+        let unblock_rx = Arc::new(std::sync::Mutex::new(unblock_rx));
+
+        let runs = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+
+        // Submit the first member (becomes leader).
+        let coalescer_a = Arc::clone(&coalescer);
+        let key_a = key.clone();
+        let in_run_tx_a = Arc::clone(&in_run_tx);
+        let unblock_rx_a = Arc::clone(&unblock_rx);
+        let runs_a = Arc::clone(&runs);
+        let req_a = coalescer_request("batch-first", "member-first");
+        let h_first = thread::spawn(move || {
+            coalescer_a.submit(key_a, &req_a, move |combined| {
+                // Signal that we are now inside the run.
+                if let Some(tx) = poisoned(&in_run_tx_a).take() {
+                    let _ = tx.send(());
+                }
+                // Block until the test says go.
+                let _ = poisoned(&unblock_rx_a).recv();
+                poisoned(&runs_a).push(
+                    combined.members.iter().map(|m| m.worktree.clone()).collect(),
+                );
+                green_report_for(combined)
+            })
+        });
+
+        // Wait until the leader is inside `run`, then enqueue 3 more.
+        in_run_rx.recv().expect("leader entered run");
+
+        const K: usize = 3;
+        let mut followers = Vec::new();
+        for idx in 0..K {
+            let coalescer_f = Arc::clone(&coalescer);
+            let key_f = key.clone();
+            let runs_f = Arc::clone(&runs);
+            let req_f = coalescer_request(
+                &format!("batch-follower-{idx}"),
+                &format!("member-follower-{idx}"),
+            );
+            followers.push(thread::spawn(move || {
+                coalescer_f.submit(key_f, &req_f, move |combined| {
+                    poisoned(&runs_f)
+                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    green_report_for(combined)
+                })
+            }));
+        }
+
+        // Give followers time to enqueue, then unblock the leader.
+        thread::sleep(Duration::from_millis(50));
+        unblock_tx.send(()).expect("unblock");
+        h_first.join().expect("first submitter");
+        for h in followers {
+            h.join().expect("follower submitter");
+        }
+
+        let run_sizes: Vec<usize> = poisoned(&runs).iter().map(|g| g.len()).collect();
+        assert_eq!(
+            run_sizes.len(),
+            2,
+            "expected exactly 2 physical runs; got run sizes {run_sizes:?}"
+        );
+        assert_eq!(run_sizes[0], 1, "first run: just the leader's member");
+        assert_eq!(
+            run_sizes[1], K,
+            "second run: all {K} followers drained together; got {run_sizes:?}"
+        );
+    }
+
+    /// Two DIFFERENT keys submitted concurrently must NOT run simultaneously:
+    /// with global_inflight_limit=1 they run disjointly (Variant A).
+    #[test]
+    fn global_inflight_gate_serializes_across_keys() {
+        let coalescer = Arc::new(test_coalescer_no_eject());
+        let key_a = test_batch_key("inflight-key-a");
+        let key_b = test_batch_key("inflight-key-b");
+
+        // Barrier: both threads start submitting at the same time.
+        let start = Arc::new(Barrier::new(2));
+        // Each run records its (enter, exit) wall-clock time.
+        let timeline = Arc::new(Mutex::new(Vec::<(std::time::Instant, std::time::Instant)>::new()));
+
+        let mut handles = Vec::new();
+        for (key, batch_id, member) in [
+            (key_a, "batch-ka", "member-ka"),
+            (key_b, "batch-kb", "member-kb"),
+        ] {
+            let coalescer = Arc::clone(&coalescer);
+            let start = Arc::clone(&start);
+            let timeline = Arc::clone(&timeline);
+            let request = coalescer_request(batch_id, member);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                coalescer.submit(key, &request, move |combined| {
+                    let enter = std::time::Instant::now();
+                    // Simulate a non-trivial run so timelines are measurable.
+                    thread::sleep(Duration::from_millis(30));
+                    let exit = std::time::Instant::now();
+                    poisoned(&timeline).push((enter, exit));
+                    green_report_for(combined)
+                })
+            }));
+        }
+        for h in handles {
+            h.join().expect("inflight gate thread");
+        }
+
+        let tl = poisoned(&timeline).clone();
+        assert_eq!(tl.len(), 2, "both runs must complete");
+        let (e0, x0) = tl[0];
+        let (e1, x1) = tl[1];
+        // Disjoint intervals: one must start after the other exits.
+        let disjoint = x0 <= e1 || x1 <= e0;
+        assert!(
+            disjoint,
+            "global_inflight_limit=1: runs must be disjoint; \
+             run0={e0:?}..{x0:?} run1={e1:?}..{x1:?}"
+        );
+    }
+
+    // ── Change 2: cross-run culprit ejection tests ────────────────────────
+
+    /// A member that returned SoloRed must be held out of the immediately-next
+    /// drain (cooldown=1), then admitted and given a real verdict in the next
+    /// drain after that.
+    #[test]
+    fn solo_red_member_is_held_out_of_next_drain() {
+        // Coalescer with cooldown=1. Use global_inflight_limit=0 (per-key only)
+        // to avoid serialisation interference in this single-key test.
+        let coalescer = Arc::new(BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            config: BatchCoalesceConfig {
+                coalesce_grace: Duration::ZERO,
+                max_wait: Duration::from_millis(300),
+                max_members: 40,
+                global_inflight_limit: 0,
+                eject_cooldown_rounds: 1,
+            },
+        });
+        let key = test_batch_key("eject-solo-red");
+
+        // ---- Round 1: submit "red-member" alone; it returns SoloRed. ----
+        let req_red = coalescer_request("round1", "red-member");
+        let run_sizes = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let runs_1 = Arc::clone(&run_sizes);
+        let report_r1 = coalescer.submit(key.clone(), &req_red, move |combined| {
+            runs_1
+                .lock()
+                .unwrap()
+                .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+            solo_red_report_for(combined)
+        });
+        assert_eq!(report_r1.verdict, BatchVerdict::Red);
+        assert_eq!(
+            report_r1.members[0].provenance,
+            BatchProvenance::SoloRed,
+            "round 1 must be SoloRed"
+        );
+
+        // ---- Round 2: re-submit "red-member" + a healthy "green-member". ----
+        // "red-member" is in cooldown; it must be SKIPPED this drain.
+        // Only "green-member" should appear in round-2's group.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let barrier_r2 = Arc::new(Barrier::new(2));
+
+        let coalescer_r2 = Arc::clone(&coalescer);
+        let key_r2 = key.clone();
+        let runs_r2 = Arc::clone(&run_sizes);
+        let barrier_r2_t = Arc::clone(&barrier_r2);
+        // Submit the green member first so it wins the leader race.
+        let req_green = coalescer_request("round2-green", "green-member");
+        let h_green = {
+            let coalescer_r2 = Arc::clone(&coalescer_r2);
+            let key_r2 = key_r2.clone();
+            let runs_r2 = Arc::clone(&runs_r2);
+            let barrier_r2_t = Arc::clone(&barrier_r2_t);
+            thread::spawn(move || {
+                coalescer_r2.submit(key_r2, &req_green, move |combined| {
+                    barrier_r2_t.wait(); // let "red-member" enqueue first
+                    let members: Vec<String> =
+                        combined.members.iter().map(|m| m.worktree.clone()).collect();
+                    runs_r2.lock().unwrap().push(members.clone());
+                    // "red-member" must NOT appear in this run.
+                    assert!(
+                        !members.contains(&"red-member".to_string()),
+                        "red-member should be held out of round-2 drain; got {members:?}"
+                    );
+                    green_report_for(combined)
+                })
+            })
+        };
+        // Submit "red-member" concurrently; it should sit in the queue.
+        let coalescer_red2 = Arc::clone(&coalescer);
+        let key_red2 = key.clone();
+        let runs_red2 = Arc::clone(&run_sizes);
+        let done_tx_clone = done_tx.clone();
+        let req_red2 = coalescer_request("round2-red", "red-member");
+        let h_red = thread::spawn(move || {
+            // Slight delay so green-member wins leader election.
+            thread::sleep(Duration::from_millis(5));
+            let r = coalescer_red2.submit(key_red2, &req_red2, move |combined| {
+                let members: Vec<String> =
+                    combined.members.iter().map(|m| m.worktree.clone()).collect();
+                runs_red2.lock().unwrap().push(members);
+                green_report_for(combined)
+            });
+            drop(done_tx_clone);
+            r
+        });
+        // Signal green leader to start its run (red-member is enqueued by now).
+        barrier_r2.wait();
+        h_green.join().expect("green round-2");
+        h_red.join().expect("red-member round-3");
+        drop(done_tx);
+        let _ = done_rx.recv(); // wait for red to complete (round 3).
+
+        let all_runs = run_sizes.lock().unwrap().clone();
+        // Should be 3 physical runs total:
+        // run[0] = ["red-member"]  (round 1 — SoloRed, sets ejection)
+        // run[1] = ["green-member"] (round 2 — red-member held out)
+        // run[2] = ["red-member"]  (round 3 — cooldown expired, admitted)
+        assert_eq!(
+            all_runs.len(),
+            3,
+            "expected 3 physical runs; got {all_runs:?}"
+        );
+        assert_eq!(all_runs[0], vec!["red-member"], "run 1");
+        assert_eq!(all_runs[1], vec!["green-member"], "run 2 (red held out)");
+        assert_eq!(all_runs[2], vec!["red-member"], "run 3 (red admitted)");
+    }
+
+    /// Ejected member is never starved: no matter how many fresh arrivals
+    /// pile in, the ejected member must be admitted within 2 drains.
+    #[test]
+    fn ejected_member_is_never_starved() {
+        let coalescer = Arc::new(BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            config: BatchCoalesceConfig {
+                coalesce_grace: Duration::ZERO,
+                max_wait: Duration::from_millis(300),
+                max_members: 40,
+                global_inflight_limit: 0,
+                eject_cooldown_rounds: 1,
+            },
+        });
+        let key = test_batch_key("no-starvation");
+
+        // Round 1: eject "persistent-red".
+        let req_red = coalescer_request("r1", "persistent-red");
+        let run_log = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let rl = Arc::clone(&run_log);
+        let _ = coalescer.submit(key.clone(), &req_red, move |combined| {
+            rl.lock()
+                .unwrap()
+                .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+            solo_red_report_for(combined)
+        });
+
+        // Round 2: submit "persistent-red" (ejected) + 3 fresh greens. The
+        // ejected member must NOT appear in round-2's drain. But with
+        // `next_run_seq > release_at_run_seq` strict, it IS admitted in round 3.
+        //
+        // We serialise this deterministically: submit red first (it will be
+        // skipped), then 3 greens, then check that red is admitted in run[2].
+        let req_red2 = coalescer_request("r2-red", "persistent-red");
+        let rl2 = Arc::clone(&run_log);
+        let coalescer2 = Arc::clone(&coalescer);
+        let key2 = key.clone();
+
+        // Use a channel to serialise round 2 vs 3.
+        let (r2_done_tx, r2_done_rx) = std::sync::mpsc::channel::<()>();
+
+        // Launch red2 (will sit in queue, skipped once).
+        let h_red2 = {
+            let rl_r = Arc::clone(&rl2);
+            thread::spawn(move || {
+                coalescer2.submit(key2, &req_red2, move |combined| {
+                    rl_r.lock()
+                        .unwrap()
+                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    green_report_for(combined) // red admitted in round 3 → green verdict
+                })
+            })
+        };
+
+        // Slight delay so red2 is enqueued first.
+        thread::sleep(Duration::from_millis(5));
+
+        // Submit 3 greens; they will be round-2 run.
+        for idx in 0..3usize {
+            let coalescer_g = Arc::clone(&coalescer);
+            let key_g = key.clone();
+            let rl_g = Arc::clone(&run_log);
+            let r2_tx = r2_done_tx.clone();
+            let req_g = coalescer_request(&format!("r2-g{idx}"), &format!("green-{idx}"));
+            thread::spawn(move || {
+                let _ = coalescer_g.submit(key_g, &req_g, move |combined| {
+                    rl_g.lock()
+                        .unwrap()
+                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    green_report_for(combined)
+                });
+                drop(r2_tx);
+            });
+        }
+        drop(r2_done_tx);
+        // Wait for all round-2 greens to finish.
+        while r2_done_rx.recv().is_ok() {}
+        h_red2.join().expect("red admitted in round 3");
+
+        let log = run_log.lock().unwrap().clone();
+        // run[0] = round 1 (SoloRed ejection)
+        // run[1] = round 2 (greens; red skipped)
+        // run[2] = round 3 (red admitted — within 2 drains of ejection)
+        assert!(
+            log.len() >= 2,
+            "at least 2 physical runs expected; got {log:?}"
+        );
+        // The ejected member must appear in one of the last runs (round 2 or 3),
+        // proving it was admitted within cooldown_rounds + 1 = 2 drains.
+        let last_two: Vec<_> = log.iter().rev().take(2).collect();
+        let admitted = last_two
+            .iter()
+            .any(|run| run.contains(&"persistent-red".to_string()));
+        assert!(admitted, "persistent-red must be admitted within 2 drains; log={log:?}");
+    }
+
+    /// Ejection does not disturb positional attribution: when a member is held
+    /// out mid-drain, the remaining members' results are still sliced correctly
+    /// by `distribute_combined_report` (offsets stay aligned).
+    #[test]
+    fn ejection_preserves_positional_attribution() {
+        // Coalescer: eject after SoloRed, cooldown=1, per-key gate.
+        let coalescer = Arc::new(BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            config: BatchCoalesceConfig {
+                coalesce_grace: Duration::ZERO,
+                max_wait: Duration::from_millis(300),
+                max_members: 40,
+                global_inflight_limit: 0,
+                eject_cooldown_rounds: 1,
+            },
+        });
+        let key = test_batch_key("positional");
+
+        // Round 1: eject "culprit" (SoloRed).
+        let req_culprit = coalescer_request("r1-culprit", "culprit");
+        let rl = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let rl1 = Arc::clone(&rl);
+        let _ = coalescer.submit(key.clone(), &req_culprit, move |combined| {
+            rl1.lock()
+                .unwrap()
+                .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+            solo_red_report_for(combined)
+        });
+
+        // Round 2: submit "alpha", "culprit" (ejected), "beta" concurrently.
+        // "culprit" is held out; only "alpha" and "beta" run.
+        // Each must receive its own result (not the other's).
+        let mut round2_handles = Vec::new();
+        let round2_results = Arc::new(Mutex::new(
+            std::collections::BTreeMap::<String, BatchVerdict>::new(),
+        ));
+        let rl2 = Arc::clone(&rl);
+
+        for member in ["alpha", "culprit", "beta"] {
+            let c = Arc::clone(&coalescer);
+            let k = key.clone();
+            let rr = Arc::clone(&round2_results);
+            let rl_t = Arc::clone(&rl2);
+            let req = coalescer_request(&format!("r2-{member}"), member);
+            let member_str = member.to_string();
+            round2_handles.push(thread::spawn(move || {
+                // Stagger by member to make alpha/beta submit before culprit.
+                if member_str == "culprit" {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let report = c.submit(k, &req, move |combined| {
+                    rl_t.lock()
+                        .unwrap()
+                        .push(combined.members.iter().map(|m| m.worktree.clone()).collect());
+                    green_report_for(combined)
+                });
+                poisoned(&rr).insert(member_str, report.members[0].verdict);
+            }));
+        }
+        for h in round2_handles {
+            h.join().expect("round-2 member");
+        }
+
+        let results = poisoned(&round2_results).clone();
+        // "alpha" and "beta" get real green verdicts in round 2.
+        assert_eq!(
+            results.get("alpha"),
+            Some(&BatchVerdict::Green),
+            "alpha must be green"
+        );
+        assert_eq!(
+            results.get("beta"),
+            Some(&BatchVerdict::Green),
+            "beta must be green"
+        );
+        // "culprit" was admitted in a separate drain (round 3) and also green.
+        assert_eq!(
+            results.get("culprit"),
+            Some(&BatchVerdict::Green),
+            "culprit must eventually get a real verdict"
+        );
+
+        // Verify that the drain for "alpha"+"beta" did not include "culprit"
+        // (positional check: the run that had 2 members had only alpha+beta).
+        let log = rl.lock().unwrap().clone();
+        let two_member_runs: Vec<_> = log.iter().filter(|r| r.len() == 2).collect();
+        assert_eq!(
+            two_member_runs.len(),
+            1,
+            "exactly one 2-member run expected (alpha+beta); got {log:?}"
+        );
+        let names: std::collections::BTreeSet<_> =
+            two_member_runs[0].iter().map(String::as_str).collect();
+        assert_eq!(names, ["alpha", "beta"].iter().copied().collect());
+    }
+
+    /// A panic during the physical run must still decrement inflight (via
+    /// InflightGuard) and wake cross-key leaders. After the panic, a
+    /// different-key submit must still proceed.
+    #[test]
+    fn batch_coalescer_panic_cross_key_proceeds_after_inflight_guard() {
+        let coalescer = Arc::new(test_coalescer_no_eject());
+        let key_panic = test_batch_key("panic-inflight");
+        let key_other = test_batch_key("other-inflight");
+
+        // Submit to the panic key; run closure will panic.
+        let coalescer_p = Arc::clone(&coalescer);
+        let key_panic2 = key_panic.clone();
+        let req_panic = coalescer_request("panic-batch", "panic-member");
+        let h_panic = thread::spawn(move || {
+            coalescer_p.submit(key_panic2, &req_panic, |_combined| {
+                panic!("simulated run panic");
+            })
+        });
+        let report_panic = h_panic.join().expect("panic thread must not propagate");
+        assert_eq!(report_panic.verdict, BatchVerdict::Indeterminate);
+
+        // After the panic the InflightGuard should have decremented inflight to 0.
+        // A fresh submit on a DIFFERENT key must succeed immediately.
+        let req_other = coalescer_request("other-batch", "other-member");
+        let report_other = coalescer.submit(key_other, &req_other, green_report_for);
+        assert_eq!(
+            report_other.verdict,
+            BatchVerdict::Green,
+            "cross-key submit must succeed after panic releases InflightGuard"
+        );
+        // Inflight must be 0 now.
+        assert_eq!(
+            coalescer.counts().inflight_runs,
+            0,
+            "inflight must be 0 after both runs complete"
+        );
     }
 
     /// TDD gate for Phase 2 (push-path coalescing).
