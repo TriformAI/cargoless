@@ -871,10 +871,19 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         "/admin/active" => (200, daemon_activity_to_json(&svc.daemon_activity())),
         "/worktrees" => (200, summaries_to_json(&svc.list_worktrees())),
         "/status" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
-            Some(w) => match svc.get_status(&w) {
-                Some(s) => (200, status_to_json(&s)),
-                None => (404, "null".into()),
-            },
+            // Optional `&base_sha=<commit>` addresses the verdict for exactly
+            // that commit (the `<absent>` fix): the witness shares one
+            // worktree key across PRs, so a bare `worktree` lookup can return
+            // a *newer* commit's verdict. With `base_sha` the daemon resolves
+            // the asking commit's own verdict (or 404 if it has none yet) and
+            // never cross-attributes. Absent/empty → current-slot behavior.
+            Some(w) => {
+                let base_sha = query_param(&req.query, "base_sha").map(|s| pct_decode(&s));
+                match svc.get_status_attributed(&w, base_sha.as_deref()) {
+                    Some(s) => (200, status_to_json(&s)),
+                    None => (404, "null".into()),
+                }
+            }
             None => (404, "null".into()),
         },
         "/verdict" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
@@ -1767,6 +1776,79 @@ mod tests {
     }
 
     #[test]
+    fn status_route_threads_base_sha_into_get_status_attributed() {
+        // The `<absent>` fix at the wire: `GET /status?worktree=W&base_sha=X`
+        // must reach `get_status_attributed(W, Some("X"))`, and an absent
+        // param must reach `(W, None)`. A bare-bones service echoes whichever
+        // base_sha it was asked for so the routing is observable.
+        struct EchoBaseSha;
+        impl VerdictService for EchoBaseSha {
+            fn get_status(&self, w: &str) -> Option<WorktreeStatus> {
+                self.get_status_attributed(w, None)
+            }
+            fn get_status_attributed(
+                &self,
+                w: &str,
+                base_sha: Option<&str>,
+            ) -> Option<WorktreeStatus> {
+                Some(WorktreeStatus {
+                    worktree: w.into(),
+                    verdict: "green".into(),
+                    daemon_build_id: crate::build_id().to_string(),
+                    crates: vec![],
+                    red_diagnostics: 0,
+                    verdict_failure_reason: None,
+                    // Echo the routed param so the test can assert it arrived.
+                    base_sha: base_sha.map(str::to_string),
+                    ra_blind_paths: false,
+                    gated_checks_ran: Vec::new(),
+                    heartbeat_age_secs: 0,
+                    published_at: 1000,
+                })
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+        }
+        let req = |query: &str| HttpReq {
+            method: "GET".into(),
+            path: "/status".into(),
+            query: query.into(),
+            bearer: None,
+            content_length: None,
+            content_encoding: None,
+        };
+        // With base_sha: it must round-trip through the route.
+        let (code, body) = route_oneshot(&EchoBaseSha, &req("worktree=/wt&base_sha=abc123"));
+        assert_eq!(code, 200);
+        assert!(
+            body.contains("\"base_sha\":\"abc123\""),
+            "routed base_sha must reach get_status_attributed: {body}"
+        );
+        // Percent-encoded base_sha decodes before the lookup.
+        let (_c, body) = route_oneshot(&EchoBaseSha, &req("worktree=/wt&base_sha=a%2Fb"));
+        assert!(
+            body.contains("\"base_sha\":\"a/b\""),
+            "base_sha is pct-decoded: {body}"
+        );
+        // Absent base_sha → None → wire omits the key (status_to_json skips None).
+        let (_c, body) = route_oneshot(&EchoBaseSha, &req("worktree=/wt"));
+        assert!(
+            !body.contains("base_sha"),
+            "absent base_sha omits the wire key (None): {body}"
+        );
+    }
+
+    #[test]
     fn app_route_is_404_null_on_a_non_appserve_service() {
         // The gate-daemon non-regression guard. `MockService` uses the
         // `VerdictService::app_report` default (`None`), so `GET /app` must
@@ -2631,6 +2713,7 @@ mod tests {
             verdict_failure_reason: None,
             base_sha: None,
             ra_blind_paths: false,
+            gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 0,
             published_at: 1,
         });

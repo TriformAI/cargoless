@@ -1307,7 +1307,9 @@ fn exec(
                     return;
                 }
             };
-            publish_verdict(&wt, payload, attribution, api);
+            // Off / Warn / RA-native publish: no Hard witness ran here, so
+            // there are no enumerable gated checks to report.
+            publish_verdict(&wt, payload, attribution, Vec::new(), api);
         }
     }
 }
@@ -1414,6 +1416,10 @@ fn publish_verdict(
     wt: &Path,
     payload: statusfile::VerdictPayload,
     attribution: Option<crate::serveapi::PushAttribution>,
+    // The ids of the project checks that RAN for this verdict (the
+    // witness's `gated_checks_ran` proof). Empty for FS-watch / RA-native /
+    // coalesced / timed-out verdicts — those publish with the key absent.
+    gated_checks_ran: Vec<String>,
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     let now = statusfile::now_unix();
@@ -1536,11 +1542,12 @@ fn publish_verdict(
     // Same site, mirror sink: feed the read-plane VerdictService + emit
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.
-    api.publish_attributed(
+    api.publish_attributed_with_checks(
         wt,
         payload,
         attribution.and_then(|a| a.base_sha),
         ra_blind_paths,
+        gated_checks_ran,
     );
 }
 
@@ -1712,7 +1719,9 @@ fn spawn_project_checks_warn(
         .name("cargoless-project-checks-warn".to_string())
         .spawn(move || {
             let _permit = permit;
-            let summary = run_project_checks_and_log(&wt, context, &api);
+            // Warn mode never publishes a verdict, so the ran-check ids
+            // (the witness's gate proof) are irrelevant here — discard them.
+            let (summary, _ran_check_ids) = run_project_checks_and_log(&wt, context, &api);
             eprintln!(
                 "[cargoless:obs] project-checks-warn wt={} gate=false summary={}",
                 wt.display(),
@@ -1830,22 +1839,36 @@ fn spawn_project_checks_hard_with_timeout(
     require_checks: bool,
 ) {
     let wt_key = wt.to_string_lossy().into_owned();
-    let generation = api.begin_hard_witness(&wt_key);
+    // #A2-keystone — the witness latch is keyed by (worktree, base_sha), so a
+    // newer commit's push for the SAME hardcoded worktree key no longer
+    // supersedes this older commit's in-flight witness (the `<absent>` bug).
+    // Captured here and threaded into both finish sites; the attribution is
+    // moved into the supervisor below, so we can't read it back there.
+    let witness_base_sha = attribution
+        .as_ref()
+        .and_then(|a| a.base_sha.clone())
+        .filter(|s| !s.is_empty());
+    let generation = api.begin_hard_witness(&wt_key, witness_base_sha.as_deref());
     let attribution_fallback = attribution.clone();
     let supervisor = {
         let wt = wt.clone();
         let wt_key = wt_key.clone();
+        let witness_base_sha = witness_base_sha.clone();
         let api = Arc::clone(&api);
         move || {
-            let (tx, rx) = channel::<ProjectCheckSummary>();
+            // The channel carries the verdict AND the ran-check ids (the
+            // witness's `gated_checks_ran` proof) back from the detached
+            // worker — the ids are computed inside the worker and have no
+            // other path to the supervisor's publish.
+            let (tx, rx) = channel::<(ProjectCheckSummary, Vec<String>)>();
             let worker = std::thread::Builder::new()
                 .name("cargoless-witness".to_string())
                 .spawn({
                     let wt = wt.clone();
                     let api = Arc::clone(&api);
                     move || {
-                        let summary = run_project_checks_and_log(&wt, context, &api);
-                        if tx.send(summary).is_err() {
+                        let result = run_project_checks_and_log(&wt, context, &api);
+                        if tx.send(result).is_err() {
                             // rx dropped ⇒ the watchdog already published
                             // and the supervisor exited; this late result
                             // has no claim to the verdict.
@@ -1856,37 +1879,49 @@ fn spawn_project_checks_hard_with_timeout(
                         }
                     }
                 });
-            let summary = match worker {
+            // `ran_check_ids` is empty for every non-Ok arm: a timed-out,
+            // dead, or unspawnable witness ran no enumerable check, so the
+            // witness's gate-proof list is correctly absent.
+            let (summary, ran_check_ids) = match worker {
                 // Dropping the JoinHandle detaches the worker on purpose:
                 // never join a possibly-wedged witness.
                 Ok(_detached) => match rx.recv_timeout(timeout) {
-                    Ok(summary) => summary,
+                    Ok(result) => result,
                     Err(RecvTimeoutError::Timeout) => {
                         eprintln!(
                             "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=timeout timeout_ms={} (#A4.3)",
                             wt.display(),
                             timeout.as_millis()
                         );
-                        ProjectCheckSummary::Indeterminate {
-                            reason: "witness",
-                            detail: format!("timeout after {}ms", timeout.as_millis()),
-                        }
+                        (
+                            ProjectCheckSummary::Indeterminate {
+                                reason: "witness",
+                                detail: format!("timeout after {}ms", timeout.as_millis()),
+                            },
+                            Vec::new(),
+                        )
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         eprintln!(
                             "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=worker-died (#A4.3)",
                             wt.display()
                         );
-                        ProjectCheckSummary::Indeterminate {
-                            reason: "witness",
-                            detail: "worker exited without a result".to_string(),
-                        }
+                        (
+                            ProjectCheckSummary::Indeterminate {
+                                reason: "witness",
+                                detail: "worker exited without a result".to_string(),
+                            },
+                            Vec::new(),
+                        )
                     }
                 },
-                Err(e) => ProjectCheckSummary::Indeterminate {
-                    reason: "witness",
-                    detail: format!("spawn failed: {e}"),
-                },
+                Err(e) => (
+                    ProjectCheckSummary::Indeterminate {
+                        reason: "witness",
+                        detail: format!("spawn failed: {e}"),
+                    },
+                    Vec::new(),
+                ),
             };
             if matches!(summary, ProjectCheckSummary::Empty) {
                 // Loud vacuous-green marker even when REQUIRE is off —
@@ -1899,8 +1934,8 @@ fn spawn_project_checks_hard_with_timeout(
             }
             let summary = apply_require_checks(summary, require_checks);
             let payload = compose_hard_mode_payload(authoritative_error, summary);
-            if api.finish_hard_witness(&wt_key, generation) {
-                publish_verdict(&wt, payload, attribution, &api);
+            if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
+                publish_verdict(&wt, payload, attribution, ran_check_ids, &api);
             } else {
                 eprintln!(
                     "[cargoless:obs] project-checks-hard wt={} verdict=stale-witness-dropped generation={} (#A4.3)",
@@ -1926,8 +1961,9 @@ fn spawn_project_checks_hard_with_timeout(
                 detail: format!("spawn failed: {e}"),
             },
         );
-        if api.finish_hard_witness(&wt_key, generation) {
-            publish_verdict(&wt, payload, attribution_fallback, &api);
+        if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
+            // No supervisor thread spawned ⇒ no witness ran ⇒ no gated checks.
+            publish_verdict(&wt, payload, attribution_fallback, Vec::new(), &api);
         }
     }
 }
@@ -2010,11 +2046,20 @@ pub(crate) enum ProjectCheckSummary {
     Empty,
 }
 
+/// Returns the verdict summary AND the ids of the project checks that
+/// actually RAN (`report.results[].id`) — the witness's positive
+/// `gated_checks_ran` proof. The ran ids are an OUTPUT of executing the
+/// checks (unlike the inbound `base_sha` attribution), so they cannot ride
+/// the `PushAttribution`; they travel back to `publish_verdict` via this
+/// return tuple (and, in Hard mode, the worker→supervisor channel). The
+/// coalesced fast-path and every report-less arm return an empty Vec — the
+/// witness reads that as "cannot enumerate" and falls back to plain
+/// base_sha attribution (transition-safe).
 fn run_project_checks_and_log(
     wt: &Path,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
     api: &Arc<crate::serveapi::ServeVerdictState>,
-) -> ProjectCheckSummary {
+) -> (ProjectCheckSummary, Vec<String>) {
     // Fast-path: when the context carries a non-empty base_ref and the
     // overlay needs materializing (central-daemon push mode), route through
     // the BatchCoalescer so that N concurrent pushers with the same
@@ -2041,7 +2086,12 @@ fn run_project_checks_and_log(
                         ProjectCheckSummary::Indeterminate { .. } => "unknown",
                     }
                 );
-                return summary;
+                // The coalesced batch path shares ONE physical run across N
+                // pushers and returns a verdict slice, not the enumerated
+                // per-check report — it "cannot enumerate" the ran ids, so
+                // `gated_checks_ran` stays empty (the witness's documented
+                // fallback to plain base_sha attribution).
+                return (summary, Vec::new());
             }
         }
     }
@@ -2079,9 +2129,14 @@ fn run_project_checks_and_log(
                 "[cargoless:obs] project-checks wt={} verdict=vacuous-green checks=0 source=direct (#A10)",
                 wt.display()
             );
-            ProjectCheckSummary::Empty
+            // No check ran ⇒ nothing to enumerate.
+            (ProjectCheckSummary::Empty, Vec::new())
         }
         Ok(Ok(report)) => {
+            // The witness's positive proof: the ids of the checks that
+            // actually executed for this verdict. Order-preserving so a
+            // consumer can read "the wasm witness ran first", etc.
+            let ran_check_ids: Vec<String> = report.results.iter().map(|r| r.id.clone()).collect();
             let cache_hits = report.results.iter().filter(|r| r.cache_hit).count();
             let slowest = slowest_project_checks(&report.results);
             let error_count = report
@@ -2136,18 +2191,21 @@ fn run_project_checks_and_log(
                 // `VerdictPayload::red(0)`'s downgrade at the
                 // project-check layer.
                 if error_count == 0 {
-                    ProjectCheckSummary::Indeterminate {
-                        reason: "project_check_red_without_diagnostics",
-                        detail: format!(
-                            "tree=red but error_count=0 across {} results",
-                            report.results.len()
-                        ),
-                    }
+                    (
+                        ProjectCheckSummary::Indeterminate {
+                            reason: "project_check_red_without_diagnostics",
+                            detail: format!(
+                                "tree=red but error_count=0 across {} results",
+                                report.results.len()
+                            ),
+                        },
+                        ran_check_ids,
+                    )
                 } else {
-                    ProjectCheckSummary::Red { error_count }
+                    (ProjectCheckSummary::Red { error_count }, ran_check_ids)
                 }
             } else {
-                ProjectCheckSummary::Green
+                (ProjectCheckSummary::Green, ran_check_ids)
             }
         }
         Ok(Err(e)) => {
@@ -2166,10 +2224,13 @@ fn run_project_checks_and_log(
                 wt.display(),
                 e
             );
-            ProjectCheckSummary::Indeterminate {
-                reason: "project_check_setup_error",
-                detail: e.to_string(),
-            }
+            (
+                ProjectCheckSummary::Indeterminate {
+                    reason: "project_check_setup_error",
+                    detail: e.to_string(),
+                },
+                Vec::new(),
+            )
         }
         Err(e) => {
             tracing::warn!(
@@ -2184,10 +2245,13 @@ fn run_project_checks_and_log(
                 root.display(),
                 e
             );
-            ProjectCheckSummary::Indeterminate {
-                reason: "project_check_overlay_error",
-                detail: e.to_string(),
-            }
+            (
+                ProjectCheckSummary::Indeterminate {
+                    reason: "project_check_overlay_error",
+                    detail: e.to_string(),
+                },
+                Vec::new(),
+            )
         }
     }
 }
@@ -2984,6 +3048,60 @@ checks:
         assert_eq!(
             st_after.verdict_failure_reason.as_deref(),
             Some(reason.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hard_witness_green_stamps_gated_checks_ran_end_to_end() {
+        // Commit-2 end-to-end: a passing project check must publish green
+        // AND carry its id in `gated_checks_ran` all the way out to the
+        // attributed status — the positive proof the tf-multiverse witness
+        // asserts (`<check> ∈ gated_checks_ran`) before accepting a green.
+        // This exercises the real flow: manifest → run_dev_with_changes →
+        // report.results[].id → worker→supervisor channel → publish_verdict
+        // → publish_attributed_with_checks → status.
+        let root = temp_root("hard-gated-green");
+        std::fs::write(
+            root.join("cargoless.checks.yaml"),
+            r#"
+version: 1
+checks:
+  - id: smoke
+    kind: command
+    read_only: true
+    timeout_ms: 10000
+    command: ["bash", "-lc", "true"]
+"#,
+        )
+        .unwrap();
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        // Attribution carries the commit so the status is base_sha-addressable
+        // exactly as the witness polls it.
+        spawn_project_checks_hard_with_timeout(
+            root.clone(),
+            false,
+            None,
+            Some(test_attribution("c0ffee")),
+            Arc::clone(&api),
+            Duration::from_secs(30),
+            true, // REQUIRE on: a real check ran, so this stays green (not vacuous)
+        );
+        let st = await_verdict(&api, &root.to_string_lossy(), Duration::from_secs(30));
+        assert_eq!(st.verdict, "green", "a passing command check is green");
+        assert!(
+            st.gated_checks_ran.iter().any(|id| id == "smoke"),
+            "the ran check id must be present in gated_checks_ran: {:?}",
+            st.gated_checks_ran
+        );
+        // And it must be retrievable+stamped by base_sha (the witness's poll).
+        let by_sha = api
+            .get_status_attributed(&root.to_string_lossy(), Some("c0ffee"))
+            .expect("verdict retrievable by base_sha");
+        assert!(
+            by_sha.gated_checks_ran.iter().any(|id| id == "smoke"),
+            "ran ids survive base_sha-addressed retrieval: {:?}",
+            by_sha.gated_checks_ran
         );
         let _ = std::fs::remove_dir_all(&root);
     }
