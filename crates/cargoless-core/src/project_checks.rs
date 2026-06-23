@@ -1169,14 +1169,15 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
                 .any(|d| d.severity == Severity::Error)
             {
                 let tail = tail_lines(&combined, 12);
+                let (code, message) = classify_exit(s, &tail);
                 command_diagnostics.push(diag(
                     &ctx.root,
                     check,
                     MANIFEST_NAME,
                     1,
                     1,
-                    "command.failed",
-                    &format!("command exited with {s}; output:\n{tail}"),
+                    code,
+                    &message,
                 ));
             }
             result_from_diags(check, command_diagnostics, 0)
@@ -1194,6 +1195,65 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             )],
             0,
         ),
+    }
+}
+
+/// Translate a wrapped check command's non-zero exit into a structured
+/// diagnostic. Generic across check kinds (rustc, python, bash) — the bash
+/// idiom `exit "$rc"` propagates a signal-coded child as a 128+N exit code,
+/// which lands here as a numeric exit, NOT a unix signal on the bash process.
+///
+/// Calling this out separately matters for verdict trust: a 141 (SIGPIPE) /
+/// 137 (SIGKILL) is the OS killing the wrapped command, not an honest tool-
+/// reported failure. Rendering both as `command.failed` hides that distinction
+/// and forces an operator to grep the source code to know whether a witness
+/// found a real RED or merely got pipe-raced on a deadline. The synthetic
+/// `command.process_killed` code surfaces it as a discrete class.
+fn classify_exit(status: std::process::ExitStatus, tail: &str) -> (&'static str, String) {
+    // Unix-signal-terminated child: ExitStatus::signal() returns Some(N).
+    // (`s.code()` is None in that case; bash also re-encodes as 128+N when it
+    // propagates its child's signal — we cover that case below.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = signal_name(sig);
+            return (
+                "command.process_killed",
+                format!(
+                    "command was killed by SIG{name} (signal {sig}); not an honest tool verdict.\noutput:\n{tail}"
+                ),
+            );
+        }
+    }
+    // Numeric exit codes from `bash -c '... ; exit "$rc"'` carry the wrapped
+    // child's signal as 128+N (SIGPIPE=13 → 141, SIGKILL=9 → 137,
+    // SIGTERM=15 → 143). Treat those exactly like the signal() case.
+    if let Some(code) = status.code().filter(|c| (128..192).contains(c)) {
+        let sig = code - 128;
+        let name = signal_name(sig);
+        return (
+            "command.process_killed",
+            format!(
+                "command exited with status {code} (wrapped child killed by SIG{name}, signal {sig}); not an honest tool verdict.\noutput:\n{tail}"
+            ),
+        );
+    }
+    (
+        "command.failed",
+        format!("command exited with {status}; output:\n{tail}"),
+    )
+}
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "HUP",
+        2 => "INT",
+        3 => "QUIT",
+        9 => "KILL",
+        13 => "PIPE",
+        15 => "TERM",
+        _ => "?",
     }
 }
 
@@ -2441,5 +2501,58 @@ checks:
             "grandchild kept writing after timeout — process tree NOT killed \
              (orphan leak): {size_after_kill} -> {size_later}"
         );
+    }
+
+    #[cfg(unix)]
+    fn exit_with_code(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
+    fn exit_with_signal(sig: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(sig)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_treats_141_as_process_killed_sigpipe() {
+        let (code, msg) = classify_exit(exit_with_code(141), "tail content");
+        assert_eq!(code, "command.process_killed");
+        assert!(msg.contains("SIGPIPE"), "msg: {msg}");
+        assert!(msg.contains("141"), "msg: {msg}");
+        assert!(msg.contains("not an honest tool verdict"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_treats_137_as_process_killed_sigkill() {
+        let (code, msg) = classify_exit(exit_with_code(137), "");
+        assert_eq!(code, "command.process_killed");
+        assert!(msg.contains("SIGKILL"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_treats_raw_unix_signal_as_process_killed() {
+        let (code, msg) = classify_exit(exit_with_signal(13), "tail");
+        assert_eq!(code, "command.process_killed");
+        assert!(msg.contains("SIGPIPE"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_preserves_command_failed_for_normal_nonzero() {
+        let (code, msg) = classify_exit(exit_with_code(1), "honest red");
+        assert_eq!(code, "command.failed");
+        assert!(msg.contains("honest red"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_preserves_command_failed_for_high_nonsignal_code() {
+        let (code, _) = classify_exit(exit_with_code(200), "");
+        assert_eq!(code, "command.failed");
     }
 }
