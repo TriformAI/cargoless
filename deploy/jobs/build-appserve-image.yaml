@@ -1,0 +1,63 @@
+# Build + push the cargoless-APPSERVE image IN-CLUSTER via kaniko (amd64 node,
+# no local Docker, no arch emulation). Adapted from build-serve-image.yaml for
+# the app-serve daemon image (carries the WASM toolchain; cargoless-appserve.Dockerfile).
+#
+# WHY in-cluster: local `docker build` on an arm64 Mac produces an arm64 image
+# the amd64 cluster cannot run; emulated amd64 builds crash mid-cargo (rpc EOF).
+# kaniko on a cluster node builds the correct arch natively.
+#
+# USAGE (SOURCE_REF + IMAGE_TAG injected; raw apply fails closed):
+#   sed -e "s|__SOURCE_REF__|<full-sha>|" -e "s|__IMAGE_TAG__|<tag>|" \
+#     deploy/jobs/build-appserve-image.yaml | kubectl apply -f -
+#   kubectl -n cargoless-builder logs -f job/build-cargoless-appserve-image
+#
+#   Then roll the daemon: the preview Deployment pins
+#   registry.triform.cloud/cargoless/cargoless-appserve:latest (imagePullPolicy:
+#   Always) — `kubectl -n triform-staging rollout restart deploy/cargoless-preview`
+#   pulls the new :latest. Building != deploying.
+#
+# Duration: ~10-15 min cold (release cargo build is the bottleneck); kaniko
+#   layer cache makes warm rebuilds much faster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-cargoless-appserve-image
+  namespace: cargoless-builder
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: cargoless-appserve-image-builder
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: registry-pull
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - "--context=git://github.com/TriformAI/cargoless.git#__SOURCE_REF__"
+            - "--dockerfile=deploy/cargoless-appserve.Dockerfile"
+            - "--destination=registry.triform.cloud/cargoless/cargoless-appserve:__IMAGE_TAG__"
+            - "--destination=registry.triform.cloud/cargoless/cargoless-appserve:latest"
+            - "--cache=true"
+            - "--cache-repo=registry.triform.cloud/cargoless/cargoless-appserve-cache"
+            - "--snapshot-mode=redo"
+            - "--use-new-run"
+          env:
+            - { name: DOCKER_CONFIG, value: "/kaniko/.docker" }
+          volumeMounts:
+            - { name: docker-config, mountPath: /kaniko/.docker }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits: { cpu: "12", memory: "24Gi" }
+      volumes:
+        - name: docker-config
+          projected:
+            sources:
+              - secret:
+                  name: registry-push
+                  items:
+                    - { key: .dockerconfigjson, path: config.json }
