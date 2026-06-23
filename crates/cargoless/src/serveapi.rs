@@ -685,6 +685,122 @@ fn configured_batch_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Map a coalesced batch member slice to a `ProjectCheckSummary`, applying the
+/// attribution rule: `SoloRed` is genuinely this submitter's code red, but
+/// `InteractionRed` (the combined union failed while every member was solo-green)
+/// is NOT attributable to any one submitter and is routed to a verbose,
+/// retryable `Indeterminate` (→ verdict `unknown`) instead of a `Red`.
+///
+/// Factored out of [`ServeApi::coalesced_project_check`] so the mapping —
+/// especially the InteractionRed branch, which a single-member coalesced call
+/// can never produce — is deterministically unit-testable with synthetic
+/// members (no rust-analyzer, no threads), matching the cargoless-core::batch
+/// attribution-state-machine test philosophy.
+fn member_result_to_summary(
+    wt_key: &str,
+    member: Option<&cargoless_core::batch::BatchMemberResult>,
+) -> crate::servedrv::ProjectCheckSummary {
+    use crate::servedrv::ProjectCheckSummary;
+    let Some(m) = member else {
+        // Coalescer returned a report without our member — treat as
+        // indeterminate (should not happen in practice).
+        return ProjectCheckSummary::Indeterminate {
+            reason: "project_check_batch_missing_member",
+            detail: format!("coalesced report did not include member {wt_key}"),
+        };
+    };
+    match m.verdict {
+        cargoless_core::batch::BatchVerdict::Green => {
+            // CombinedGreen and SoloGreen both map to Green.
+            // Empty is indistinguishable at this layer (documented above).
+            ProjectCheckSummary::Green
+        }
+        cargoless_core::batch::BatchVerdict::Red => {
+            // Provenance decides ATTRIBUTION. A `SoloRed` checked red on its OWN
+            // overlay in the solo-fallback → genuinely this submitter's code red.
+            // An `InteractionRed` means the coalesced UNION of several
+            // concurrently-submitted overlays (same base) failed while EVERY
+            // member checked green alone — so no single submitter introduced the
+            // failure, and we must NOT publish it as this member's red. Route it
+            // to Indeterminate (→ verdict `unknown` → retryable, never a "fix
+            // your code"), carrying a verbose, human- AND agent-readable
+            // explanation. (Mirrors the run_batch InteractionRed arm in
+            // cargoless-core::batch.)
+            if m.provenance == cargoless_core::batch::BatchProvenance::InteractionRed {
+                // First error from the combined run, single-line, so the reader
+                // can see WHAT broke in combination. Kept on one line: the
+                // verdict status-file format is line-based
+                // (`verdict_failure_reason=<value>\n`), so an embedded newline
+                // would corrupt the parse.
+                let combined_error = m
+                    .diagnostics
+                    .iter()
+                    .find(|d| d.severity == cargoless_core::Severity::Error)
+                    .map(|d| {
+                        format!(
+                            "{} [{}:{}]",
+                            d.message.lines().next().unwrap_or("").trim(),
+                            d.file_path.display(),
+                            d.line
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "no error-severity diagnostic on the combined run".to_string()
+                    });
+                ProjectCheckSummary::Indeterminate {
+                    // Stable classifier — the SigNoz/dashboard query key.
+                    reason: "project_check_interaction_red_not_attributable",
+                    // Verbose human+agent tail (single line via `\` continuations).
+                    // compose_hard_mode_payload publishes this as
+                    // `unknown("{reason}: {detail}")`.
+                    detail: format!(
+                        "INTERACTION CONFLICT — not your red, retry. Your overlay was \
+                         coalesced with one or more other agents' concurrently-submitted \
+                         overlays (same base) into one shared compiler check, and that \
+                         COMBINED check failed — but your overlay checks GREEN on its own. \
+                         No single submitter introduced this failure, so the daemon will \
+                         not attribute it to you. What to do: just resubmit — on retry you \
+                         are very likely checked alone or in a different batch and get a \
+                         clean verdict. If the SAME conflict reproduces across retries, the \
+                         concurrent changes are genuinely incompatible and need coordination \
+                         (rebase one onto the other). Underlying combined error: {combined_error}"
+                    ),
+                }
+            } else {
+                let error_count = m
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == cargoless_core::Severity::Error)
+                    .count() as u32;
+                // Defensive: if error_count is 0 despite Red verdict, route to
+                // Indeterminate (mirrors the same guard in
+                // run_project_checks_and_log).
+                if error_count == 0 {
+                    ProjectCheckSummary::Indeterminate {
+                        reason: "project_check_red_without_diagnostics",
+                        detail: format!(
+                            "batch member {wt_key} red but 0 error-severity diagnostics"
+                        ),
+                    }
+                } else {
+                    ProjectCheckSummary::Red { error_count }
+                }
+            }
+        }
+        cargoless_core::batch::BatchVerdict::Indeterminate => {
+            let detail = m
+                .diagnostics
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
+            ProjectCheckSummary::Indeterminate {
+                reason: "project_check_batch_indeterminate",
+                detail,
+            }
+        }
+    }
+}
+
 fn batch_coalesce_key(request: &BatchCheckRequest) -> Option<BatchCoalesceKey> {
     let coalesce_key = request
         .coalesce_key
@@ -1220,56 +1336,14 @@ impl ServeVerdictState {
             .batch_coalescer
             .submit(key, &request, |combined| self.run_batch_check_now(combined));
 
-        // Find this WT's slice in the returned report.
+        // Find this WT's slice in the returned report. The verdict→summary
+        // mapping (incl. the InteractionRed→retryable attribution rule) is
+        // factored into `member_result_to_summary` so it is unit-testable with
+        // synthetic members — a single-member coalesced call can only ever
+        // produce SoloRed, so InteractionRed (which needs ≥2 concurrent
+        // same-base members) is otherwise unreachable from a deterministic test.
         let member_result = report.members.into_iter().find(|m| m.worktree == wt_key);
-
-        Some(match member_result {
-            None => {
-                // Coalescer returned a report without our member — treat as
-                // indeterminate (should not happen in practice).
-                crate::servedrv::ProjectCheckSummary::Indeterminate {
-                    reason: "project_check_batch_missing_member",
-                    detail: format!("coalesced report did not include member {wt_key}"),
-                }
-            }
-            Some(m) => match m.verdict {
-                cargoless_core::batch::BatchVerdict::Green => {
-                    // CombinedGreen and SoloGreen both map to Green.
-                    // Empty is indistinguishable at this layer (documented above).
-                    crate::servedrv::ProjectCheckSummary::Green
-                }
-                cargoless_core::batch::BatchVerdict::Red => {
-                    let error_count = m
-                        .diagnostics
-                        .iter()
-                        .filter(|d| d.severity == cargoless_core::Severity::Error)
-                        .count() as u32;
-                    // Defensive: if error_count is 0 despite Red verdict, route
-                    // to Indeterminate (mirrors the same guard in run_project_checks_and_log).
-                    if error_count == 0 {
-                        crate::servedrv::ProjectCheckSummary::Indeterminate {
-                            reason: "project_check_red_without_diagnostics",
-                            detail: format!(
-                                "batch member {wt_key} red but 0 error-severity diagnostics"
-                            ),
-                        }
-                    } else {
-                        crate::servedrv::ProjectCheckSummary::Red { error_count }
-                    }
-                }
-                cargoless_core::batch::BatchVerdict::Indeterminate => {
-                    let detail = m
-                        .diagnostics
-                        .first()
-                        .map(|d| d.message.clone())
-                        .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
-                    crate::servedrv::ProjectCheckSummary::Indeterminate {
-                        reason: "project_check_batch_indeterminate",
-                        detail,
-                    }
-                }
-            },
-        })
+        Some(member_result_to_summary(&wt_key, member_result.as_ref()))
     }
 
     pub fn quiescing(&self) -> bool {
@@ -3219,6 +3293,130 @@ checks:
             "clean overlay over a clean project should yield ProjectCheckSummary::Green"
         );
         // project drops here → Drop removes root + remote dirs.
+    }
+
+    /// Pure-mapping coverage for `member_result_to_summary`, the attribution
+    /// rule extracted from `coalesced_project_check`. The InteractionRed case is
+    /// the load-bearing one: a single-member coalesced call can only ever
+    /// produce SoloRed, so InteractionRed (≥2 concurrent same-base members whose
+    /// union fails but who are each solo-green) is unreachable from a live
+    /// single-call test — but the mapping MUST route it to a retryable
+    /// `unknown`, never a `Red`, or an innocent agent is told to "fix" code that
+    /// is green on its own.
+    fn batch_member_result(
+        worktree: &str,
+        verdict: BatchVerdict,
+        provenance: cargoless_core::batch::BatchProvenance,
+        diagnostics: Vec<Diagnostic>,
+    ) -> cargoless_core::batch::BatchMemberResult {
+        cargoless_core::batch::BatchMemberResult {
+            worktree: worktree.to_string(),
+            verdict,
+            provenance,
+            diagnostics,
+            duration_ms: 0,
+        }
+    }
+
+    fn error_diag(message: &str, path: &str, line: u32) -> Diagnostic {
+        Diagnostic {
+            file_path: std::path::PathBuf::from(path),
+            line,
+            col: 1,
+            severity: Severity::Error,
+            code: Some("E0599".to_string()),
+            message: message.to_string(),
+            source: Some("rustc".to_string()),
+        }
+    }
+
+    #[test]
+    fn member_result_interaction_red_maps_to_retryable_unknown_not_red() {
+        use crate::servedrv::ProjectCheckSummary;
+        let m = batch_member_result(
+            "/client/wt-a",
+            BatchVerdict::Red,
+            cargoless_core::batch::BatchProvenance::InteractionRed,
+            vec![error_diag(
+                "cannot find function `helper` in this scope",
+                "src/shared.rs",
+                12,
+            )],
+        );
+
+        let summary = member_result_to_summary("/client/wt-a", Some(&m));
+
+        match summary {
+            ProjectCheckSummary::Indeterminate { reason, detail } => {
+                assert_eq!(
+                    reason, "project_check_interaction_red_not_attributable",
+                    "interaction-red must use the stable SigNoz classifier, not a generic unknown"
+                );
+                // Human+agent legibility: the verbose tail must say it is not
+                // the submitter's red, tell them to retry, AND surface the
+                // underlying combined error so it is diagnosable.
+                assert!(
+                    detail.contains("not your red"),
+                    "detail must state it is not the submitter's red: {detail}"
+                );
+                assert!(
+                    detail.to_lowercase().contains("retry") || detail.contains("resubmit"),
+                    "detail must tell the reader to retry: {detail}"
+                );
+                assert!(
+                    detail.contains("src/shared.rs"),
+                    "detail must surface the underlying combined error location: {detail}"
+                );
+                // Status-file format is line-based; the message MUST be single-line.
+                assert!(
+                    !detail.contains('\n'),
+                    "detail must be single-line (status-file is line-based): {detail:?}"
+                );
+            }
+            other => panic!("InteractionRed must map to Indeterminate/unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_result_solo_red_stays_a_real_code_red() {
+        use crate::servedrv::ProjectCheckSummary;
+        let m = batch_member_result(
+            "/client/wt-b",
+            BatchVerdict::Red,
+            cargoless_core::batch::BatchProvenance::SoloRed,
+            vec![error_diag("mismatched types", "src/mine.rs", 7)],
+        );
+
+        let summary = member_result_to_summary("/client/wt-b", Some(&m));
+
+        assert_eq!(
+            summary,
+            ProjectCheckSummary::Red { error_count: 1 },
+            "a SoloRed checked red on its own overlay — genuinely the submitter's red"
+        );
+    }
+
+    #[test]
+    fn member_result_green_and_missing_member_map_as_expected() {
+        use crate::servedrv::ProjectCheckSummary;
+        let green = batch_member_result(
+            "/client/wt-c",
+            BatchVerdict::Green,
+            cargoless_core::batch::BatchProvenance::CombinedGreen,
+            Vec::new(),
+        );
+        assert_eq!(
+            member_result_to_summary("/client/wt-c", Some(&green)),
+            ProjectCheckSummary::Green
+        );
+
+        // A report slice that omitted our member → indeterminate, never green.
+        match member_result_to_summary("/client/wt-missing", None) {
+            ProjectCheckSummary::Indeterminate { reason, .. } => {
+                assert_eq!(reason, "project_check_batch_missing_member");
+            }
+            other => panic!("missing member must be Indeterminate, got {other:?}"),
+        }
     }
 
     #[test]
