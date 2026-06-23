@@ -74,6 +74,18 @@ spec:
         storage.triform.dev/pool: fsn
         longhorn-storage: "true"
       terminationGracePeriodSeconds: 90
+      # Run serve (and repo-sync) as uid 1000 with a shared fsGroup so the two
+      # writers of /workspace/tf-multiverse/.git/objects do not split UID
+      # ownership (serve-as-root + repo-sync-as-1000 with no fsGroup caused
+      # intermittent "insufficient permission for adding an object to
+      # .git/objects" → incremental witness timeouts). Mirrors the live
+      # tf-multiverse cargoless-serve Deployment (the Flux source of truth).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       imagePullSecrets:
         - name: registry-pull
       initContainers:
@@ -84,9 +96,13 @@ spec:
             - |
               set -eu
               mkdir -p /workspace
-              chown 1000:1000 /workspace || true
+              chown -R 1000:1000 /workspace || true
           securityContext:
             runAsUser: 0
+            # Override the pod-level runAsNonRoot:true so this chown init is
+            # still admitted as root (it re-owns any legacy split objects to
+            # 1000 before serve starts as 1000).
+            runAsNonRoot: false
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
         - name: repo-bootstrap
@@ -100,6 +116,9 @@ spec:
             - name: FORGEJO_TOKEN
               valueFrom:
                 secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+            # uid 1000 has no real home; point git/HOME at the writable PVC so
+            # `git config --global` works as non-root.
+            - { name: HOME, value: "/workspace" }
           args:
             - |
               set -eu
@@ -150,6 +169,9 @@ spec:
             - name: CARGOLESS_AUTH_TOKEN
               valueFrom:
                 secretKeyRef: { name: cargoless-serve-auth, key: token }
+            # uid 1000 needs a writable HOME for `git config --global
+            # safe.directory`, cargo, and rust-analyzer.
+            - { name: HOME, value: "/workspace" }
             - { name: PATH, value: "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: CARGO_HOME, value: "/workspace/.cargo" }
             - { name: RUSTUP_HOME, value: "/usr/local/rustup" }
@@ -203,6 +225,9 @@ spec:
             - name: FORGEJO_TOKEN
               valueFrom:
                 secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+            # uid 1000 has no real home; point git/HOME at the writable PVC so
+            # `git config --global` works as non-root.
+            - { name: HOME, value: "/workspace" }
           args:
             - |
               set -u
