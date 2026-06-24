@@ -781,6 +781,7 @@ mod tests {
                 generation: g2,
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
+                    enospc: false,
                 },
             },
         );
