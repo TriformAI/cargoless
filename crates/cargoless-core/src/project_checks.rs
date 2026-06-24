@@ -1078,6 +1078,18 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             0,
         );
     }
+    // Pin CARGO_TARGET_DIR to a path inside this run's scratch worktree so
+    // concurrent witness builds cannot clobber each other's
+    // `incremental/`, `.fingerprint/`, or encoded-metadata files (CGLS-24:
+    // `failed to create encoded metadata from file: os error 2`). The
+    // scratch is per-run by construction (`run-<pid>-<seq>/`) and is
+    // `git worktree remove --force`'d at cleanup, so the target subtree is
+    // auto-collected with it. Setting it via env wins over any ambient
+    // `CARGO_TARGET_DIR` on the daemon pod (e.g. the `/workspace/target`
+    // default in `cargoless-serve.k8s.yaml`) and over any workspace-level
+    // `.cargo/config.toml` `[build] target-dir` in the project under
+    // check — cargo's resolution order is env > config > default.
+    let cargo_target_dir = ctx.root.join(".cargoless-target");
     let mut cmd = Command::new(&check.command[0]);
     cmd.args(&check.command[1..])
         .current_dir(&ctx.root)
@@ -1085,6 +1097,7 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         .env("CARGOLESS_CHECK_ID", &check.id)
         .env("CARGOLESS_PROFILE", &ctx.profile_name)
         .env("CARGOLESS_WORKTREE", &ctx.root)
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
         .env(
             "CARGOLESS_CHANGED_FILES",
             ctx.changed_files
@@ -2395,6 +2408,76 @@ checks:
             "portal/src/lib.rs"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// CGLS-24: `check_command` must set `CARGO_TARGET_DIR` to a path inside
+    /// its scratch root so concurrent witness builds cannot collide on a
+    /// shared `incremental/`. A regression that drops the env line would
+    /// leave the spawned process inheriting the daemon-pod default and
+    /// reintroduce the `os error 2` race.
+    #[test]
+    fn command_check_isolates_cargo_target_dir_per_scratch_root() {
+        let root = scratch("target-dir-isolate");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: target-dir-isolate
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf '%s' \"$CARGO_TARGET_DIR\" > target-dir.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+        let report = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        let expected = root.join(".cargoless-target");
+        assert_eq!(
+            fs::read_to_string(root.join("target-dir.out")).unwrap(),
+            expected.to_string_lossy(),
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// CGLS-24: two concurrent `check_command` invocations against distinct
+    /// scratch roots must see distinct `CARGO_TARGET_DIR`s in their child
+    /// processes — the per-scratch isolation must hold under the actual
+    /// witness lane's thread-fanout shape (`servedrv.rs:1832-1834` spawns
+    /// one detached thread per gate push, deliberately un-slotted).
+    #[test]
+    fn concurrent_command_checks_get_distinct_cargo_target_dirs() {
+        let root_a = scratch("target-dir-conc-a");
+        let root_b = scratch("target-dir-conc-b");
+        let manifest = r#"
+version: 1
+checks:
+  - id: target-dir-conc
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf '%s' \"$CARGO_TARGET_DIR\" > td.out"]
+    cache: none
+"#;
+        fs::write(root_a.join(MANIFEST_NAME), manifest).unwrap();
+        fs::write(root_b.join(MANIFEST_NAME), manifest).unwrap();
+        let (a, b) = std::thread::scope(|s| {
+            let h_a = s.spawn(|| run_profile(&root_a, "dev", None).unwrap());
+            let h_b = s.spawn(|| run_profile(&root_b, "dev", None).unwrap());
+            (h_a.join().unwrap(), h_b.join().unwrap())
+        });
+        assert_eq!(a.tree, TreeState::Green);
+        assert_eq!(b.tree, TreeState::Green);
+        assert_eq!(
+            fs::read_to_string(root_a.join("td.out")).unwrap(),
+            root_a.join(".cargoless-target").to_string_lossy(),
+        );
+        assert_eq!(
+            fs::read_to_string(root_b.join("td.out")).unwrap(),
+            root_b.join(".cargoless-target").to_string_lossy(),
+        );
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
     }
 
     #[test]
