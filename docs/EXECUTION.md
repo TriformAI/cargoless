@@ -27,6 +27,13 @@ Forgejo CI (`.forgejo/workflows/ci.yml`) on `triform/cargoless`. Workflow:
    (`/api/v1/repos/triform/cargoless/actions/tasks`) — this build does not
    expose logs over REST, so CI is **one job per check** (build / test / fmt /
    clippy) and the failing job name *is* the diagnosis.
+   When the job-name heuristic isn't enough (e.g. a `test` failure where you
+   need the exact panic line), the log file is reachable directly off the
+   server pod's PVC at `/data/actions_log/triform/cargoless/<task_id mod 256,
+   %02x>/<task_id>.log.zst` (zstd-compressed). The tf-multiverse script
+   `scripts/ci/ci-log` (added 2026-06-24) wraps that dance — invoke with
+   `REPO=triform/cargoless <repo-root>/../tf-multiverse/scripts/ci/ci-log
+   <SHA> [job-name-glob]` and it extracts the panic/rustc block in one shot.
 5. Report branch + commit to the lead. The lead keeps `main` always-green and
    merges CI-green branches. Agents do **not** push to `main`, do not
    pull/merge/rebase (the lead integrates).
