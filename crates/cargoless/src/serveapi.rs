@@ -748,7 +748,7 @@ fn member_result_to_summary(
         // Coalescer returned a report without our member — treat as
         // indeterminate (should not happen in practice).
         return ProjectCheckSummary::Indeterminate {
-            class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+            class: cargoless_core::VerdictFailureClass::DaemonDegraded,
             reason: "project_check_batch_missing_member",
             detail: format!("coalesced report did not include member {wt_key}"),
         };
@@ -792,7 +792,7 @@ fn member_result_to_summary(
                         "no error-severity diagnostic on the combined run".to_string()
                     });
                 ProjectCheckSummary::Indeterminate {
-                    class: cargoless_proto::VerdictFailureClass::NonAttributable,
+                    class: cargoless_core::VerdictFailureClass::NonAttributable,
                     // Stable classifier — the SigNoz/dashboard query key.
                     reason: "project_check_interaction_red_not_attributable",
                     // Verbose human+agent tail (single line via `\` continuations).
@@ -822,7 +822,7 @@ fn member_result_to_summary(
                 // run_project_checks_and_log).
                 if error_count == 0 {
                     ProjectCheckSummary::Indeterminate {
-                        class: cargoless_proto::VerdictFailureClass::NonAttributable,
+                        class: cargoless_core::VerdictFailureClass::NonAttributable,
                         reason: "project_check_red_without_diagnostics",
                         detail: format!(
                             "batch member {wt_key} red but 0 error-severity diagnostics"
@@ -840,7 +840,7 @@ fn member_result_to_summary(
                 .map(|d| d.message.clone())
                 .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_batch_indeterminate",
                 detail,
             }
@@ -3407,7 +3407,7 @@ checks:
             } => {
                 assert_eq!(
                     class,
-                    cargoless_proto::VerdictFailureClass::NonAttributable,
+                    cargoless_core::VerdictFailureClass::NonAttributable,
                     "interaction-red is the canonical NonAttributable: a result exists \
                      but the daemon cannot pin it to this submitter"
                 );

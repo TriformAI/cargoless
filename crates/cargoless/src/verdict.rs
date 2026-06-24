@@ -732,7 +732,7 @@ fn exit_byte_for_status(advisory: bool, status: &WorktreeStatus) -> u8 {
 /// every degraded path the hook silently let through.
 fn log_advisory_skip(
     verdict: &str,
-    class: Option<cargoless_proto::VerdictFailureClass>,
+    class: Option<cargoless_core::VerdictFailureClass>,
     reason: Option<&str>,
     detail: &str,
 ) {
@@ -876,7 +876,7 @@ mod tests {
         verdict: &str,
         red_diagnostics: u32,
         crates_attributed: bool,
-        class: Option<cargoless_proto::VerdictFailureClass>,
+        class: Option<cargoless_core::VerdictFailureClass>,
     ) -> WorktreeStatus {
         WorktreeStatus {
             worktree: "/wt".into(),
@@ -952,7 +952,7 @@ mod tests {
             "red",
             0,
             true,
-            Some(cargoless_proto::VerdictFailureClass::NonAttributable),
+            Some(cargoless_core::VerdictFailureClass::NonAttributable),
         );
         assert_eq!(exit_byte_for_status(true, &s), 0);
     }
@@ -975,10 +975,10 @@ mod tests {
     fn advisory_unknown_never_blocks_regardless_of_class() {
         for class in [
             None,
-            Some(cargoless_proto::VerdictFailureClass::DaemonDegraded),
-            Some(cargoless_proto::VerdictFailureClass::Unwitnessable),
-            Some(cargoless_proto::VerdictFailureClass::NonAttributable),
-            Some(cargoless_proto::VerdictFailureClass::TimeBudget),
+            Some(cargoless_core::VerdictFailureClass::DaemonDegraded),
+            Some(cargoless_core::VerdictFailureClass::Unwitnessable),
+            Some(cargoless_core::VerdictFailureClass::NonAttributable),
+            Some(cargoless_core::VerdictFailureClass::TimeBudget),
         ] {
             let s = advisory_status("unknown", 0, false, class);
             assert_eq!(

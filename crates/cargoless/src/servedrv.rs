@@ -1691,7 +1691,7 @@ fn compose_hard_mode_payload(
     authoritative_error: bool,
     summary: ProjectCheckSummary,
 ) -> statusfile::VerdictPayload {
-    use cargoless_proto::VerdictFailureClass;
+    use cargoless_core::VerdictFailureClass;
     use statusfile::VerdictPayload;
     match (authoritative_error, summary) {
         (_, ProjectCheckSummary::Red { error_count }) => VerdictPayload::red(error_count),
@@ -1795,7 +1795,7 @@ fn gate_require_checks() -> bool {
 fn apply_require_checks(summary: ProjectCheckSummary, require: bool) -> ProjectCheckSummary {
     match summary {
         ProjectCheckSummary::Empty if require => ProjectCheckSummary::Indeterminate {
-            class: cargoless_proto::VerdictFailureClass::Unwitnessable,
+            class: cargoless_core::VerdictFailureClass::Unwitnessable,
             reason: "witness",
             detail: "vacuous (0 checks evaluated)".to_string(),
         },
@@ -1894,7 +1894,7 @@ fn spawn_project_checks_hard_with_timeout(
                             timeout.as_millis()
                         );
                         ProjectCheckSummary::Indeterminate {
-                            class: cargoless_proto::VerdictFailureClass::TimeBudget,
+                            class: cargoless_core::VerdictFailureClass::TimeBudget,
                             reason: "witness",
                             detail: format!("timeout after {}ms", timeout.as_millis()),
                         }
@@ -1905,14 +1905,14 @@ fn spawn_project_checks_hard_with_timeout(
                             wt.display()
                         );
                         ProjectCheckSummary::Indeterminate {
-                            class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                            class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                             reason: "witness",
                             detail: "worker exited without a result".to_string(),
                         }
                     }
                 },
                 Err(e) => ProjectCheckSummary::Indeterminate {
-                    class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                    class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                     reason: "witness",
                     detail: format!("spawn failed: {e}"),
                 },
@@ -1951,7 +1951,7 @@ fn spawn_project_checks_hard_with_timeout(
         let payload = compose_hard_mode_payload(
             authoritative_error,
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                 reason: "witness",
                 detail: format!("spawn failed: {e}"),
             },
@@ -2039,7 +2039,7 @@ pub(crate) enum ProjectCheckSummary {
     /// `Verdict::Unknown`, NOT `Red` — the gate did not evaluate, so it
     /// cannot vote.
     Indeterminate {
-        class: cargoless_proto::VerdictFailureClass,
+        class: cargoless_core::VerdictFailureClass,
         reason: &'static str,
         detail: String,
     },
@@ -2199,7 +2199,7 @@ fn run_project_checks_and_log(
                 // project-check layer.
                 if error_count == 0 {
                     ProjectCheckSummary::Indeterminate {
-                        class: cargoless_proto::VerdictFailureClass::NonAttributable,
+                        class: cargoless_core::VerdictFailureClass::NonAttributable,
                         reason: "project_check_red_without_diagnostics",
                         detail: format!(
                             "tree=red but error_count=0 across {} results",
@@ -2230,7 +2230,7 @@ fn run_project_checks_and_log(
                 e
             );
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_setup_error",
                 detail: e.to_string(),
             }
@@ -2249,7 +2249,7 @@ fn run_project_checks_and_log(
                 e
             );
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_overlay_error",
                 detail: e.to_string(),
             }
@@ -2660,7 +2660,7 @@ mod tests {
         let p = compose_hard_mode_payload(
             false,
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_setup_error",
                 detail: "manifest not found".to_string(),
             },
@@ -2680,7 +2680,7 @@ mod tests {
         assert!(reason.contains("manifest not found"));
         assert_eq!(
             p.analysis_failure_class,
-            Some(cargoless_proto::VerdictFailureClass::DaemonDegraded),
+            Some(cargoless_core::VerdictFailureClass::DaemonDegraded),
             "compose MUST preserve the class stamped at the construction \
              site — the additive guarantee the wire/statusfile mirrors"
         );
@@ -2693,10 +2693,10 @@ mod tests {
         // collapses class to a constant before the publish edge would
         // silently regress consumer-side gating; this catches it.
         for class in [
-            cargoless_proto::VerdictFailureClass::DaemonDegraded,
-            cargoless_proto::VerdictFailureClass::Unwitnessable,
-            cargoless_proto::VerdictFailureClass::NonAttributable,
-            cargoless_proto::VerdictFailureClass::TimeBudget,
+            cargoless_core::VerdictFailureClass::DaemonDegraded,
+            cargoless_core::VerdictFailureClass::Unwitnessable,
+            cargoless_core::VerdictFailureClass::NonAttributable,
+            cargoless_core::VerdictFailureClass::TimeBudget,
         ] {
             let p = compose_hard_mode_payload(
                 false,
@@ -2744,7 +2744,7 @@ mod tests {
             );
             assert_eq!(
                 p.analysis_failure_class,
-                Some(cargoless_proto::VerdictFailureClass::Unwitnessable),
+                Some(cargoless_core::VerdictFailureClass::Unwitnessable),
                 "the RA-native unattributed bool path is Unwitnessable \
                  by class — cargoless ran but cannot say which file/line"
             );
@@ -2758,7 +2758,7 @@ mod tests {
         let p = compose_hard_mode_payload(
             true,
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
+                class: cargoless_core::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_overlay_error",
                 detail: "PVC ENOSPC".to_string(),
             },
@@ -2778,7 +2778,7 @@ mod tests {
         assert_eq!(
             converted,
             ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::Unwitnessable,
+                class: cargoless_core::VerdictFailureClass::Unwitnessable,
                 reason: "witness",
                 detail: "vacuous (0 checks evaluated)".to_string(),
             }
@@ -2797,7 +2797,7 @@ mod tests {
                 ProjectCheckSummary::Red { error_count: 3 }
             );
             let indeterminate = ProjectCheckSummary::Indeterminate {
-                class: cargoless_proto::VerdictFailureClass::TimeBudget,
+                class: cargoless_core::VerdictFailureClass::TimeBudget,
                 reason: "witness",
                 detail: "timeout after 5ms".to_string(),
             };
