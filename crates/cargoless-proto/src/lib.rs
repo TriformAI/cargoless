@@ -518,19 +518,45 @@ pub fn classify_reason(reason: &str) -> Option<VerdictFailureClass> {
     if reason.starts_with("witness: spawn failed") {
         return Some(DaemonDegraded);
     }
-    match reason {
-        "project_check_setup_error"
-        | "project_check_overlay_error"
-        | "project_check_batch_missing_member"
-        | "project_check_batch_indeterminate" => Some(DaemonDegraded),
-        "project_check_red_without_diagnostics"
-        | "project_check_interaction_red_not_attributable"
-        | "red_claimed_without_evidence" => Some(NonAttributable),
-        "ra_native_unattributed_error"
-        | "ra_native_timer_settled_no_flycheck_activity"
-        | "ra_blind_path_green_unwitnessed" => Some(Unwitnessable),
-        _ => None,
+    // Prefix-match on the locked reasons — production formats them as
+    // `format!("{reason}: {detail}")` at the publish edge
+    // (`servedrv::compose_hard_mode_payload`), so the strings that reach
+    // `classify_reason` may carry trailing detail. Exact-match would
+    // mis-class every formatted reason; we therefore follow the same
+    // `starts_with` discipline as the `witness:` arms above.
+    //
+    // `project_check_red_without_diagnostics` is checked BEFORE
+    // `project_check_red_*` (the bare `red_without_diagnostics` reason)
+    // because there is no other `project_check_red_*` literal; explicit
+    // order would matter only if a new sibling appeared, in which case
+    // the longer prefix should win and this comment would prompt the
+    // ordering fix. Same for `project_check_interaction_red_not_attributable`.
+    let daemon_degraded = [
+        "project_check_setup_error",
+        "project_check_overlay_error",
+        "project_check_batch_missing_member",
+        "project_check_batch_indeterminate",
+    ];
+    let non_attributable = [
+        "project_check_red_without_diagnostics",
+        "project_check_interaction_red_not_attributable",
+        "red_claimed_without_evidence",
+    ];
+    let unwitnessable = [
+        "ra_native_unattributed_error",
+        "ra_native_timer_settled_no_flycheck_activity",
+        "ra_blind_path_green_unwitnessed",
+    ];
+    if daemon_degraded.iter().any(|p| reason.starts_with(p)) {
+        return Some(DaemonDegraded);
     }
+    if non_attributable.iter().any(|p| reason.starts_with(p)) {
+        return Some(NonAttributable);
+    }
+    if unwitnessable.iter().any(|p| reason.starts_with(p)) {
+        return Some(Unwitnessable);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -990,5 +1016,38 @@ mod tests {
             Some(TimeBudget),
             "bare prefix must classify — daemon may log without a tail"
         );
+        // The publish-edge format is `format!("{reason}: {detail}")`
+        // (see `servedrv::compose_hard_mode_payload`), so every locked
+        // reason MUST classify with a trailing `: <detail>` too. This is
+        // the regression guard against the exact-match bug that shipped
+        // initially and failed on `"project_check_setup_error: foo"`.
+        let detail_pairs: &[(&str, VerdictFailureClass)] = &[
+            ("project_check_setup_error: oops", DaemonDegraded),
+            ("project_check_overlay_error: bad json", DaemonDegraded),
+            ("project_check_batch_missing_member: wt5", DaemonDegraded),
+            ("project_check_batch_indeterminate: timer", DaemonDegraded),
+            (
+                "project_check_red_without_diagnostics: bug",
+                NonAttributable,
+            ),
+            (
+                "project_check_interaction_red_not_attributable: race",
+                NonAttributable,
+            ),
+            ("red_claimed_without_evidence: foo", NonAttributable),
+            ("ra_native_unattributed_error: bool", Unwitnessable),
+            (
+                "ra_native_timer_settled_no_flycheck_activity: 5s",
+                Unwitnessable,
+            ),
+            ("ra_blind_path_green_unwitnessed: src/gen", Unwitnessable),
+        ];
+        for (reason, expected) in detail_pairs {
+            assert_eq!(
+                classify_reason(reason),
+                Some(*expected),
+                "detail-bearing reason {reason:?} must classify like its prefix"
+            );
+        }
     }
 }
