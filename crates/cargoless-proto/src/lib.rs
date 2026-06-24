@@ -394,6 +394,146 @@ pub struct CheckResult {
 }
 
 // ---------------------------------------------------------------------------
+// Verdict-failure class — coarse axis for INDETERMINATE reasons
+//
+// The serve/CLI surface emits one of ~14 free-text `reason` strings whenever
+// a verdict cannot be issued (witness timeout, RA-blind path, attribution
+// gap, daemon spawn-failure, …). Free text is the right grain for SigNoz
+// dashboards (grouped by substring) but the wrong grain for *policy* — a
+// consumer pre-commit hook should treat "daemon could not run the check"
+// completely differently from "the code is RED with diagnostics", yet the
+// existing wire collapses both into the same `verdict=unknown` byte.
+//
+// This enum is the structural seam that lets a consumer make that decision
+// without re-parsing the free-text reason. It is deliberately COARSE — four
+// classes only — so the wire stays stable across new fine-grained reasons:
+// adding a new reason string requires adding it to [`classify_reason`] but
+// does NOT break a downstream that pattern-matches on the class.
+//
+// Adjacent to the byte-frozen `TreeState`/`FileState`/`CheckResult`. The
+// proto stays serde-free; the wire tag is a single lowercase string via
+// [`as_str`](VerdictFailureClass::as_str) / [`from_tag`](VerdictFailureClass::from_tag).
+// ---------------------------------------------------------------------------
+
+/// The coarse class of a non-determinate verdict (`verdict=unknown` on the
+/// wire). Four mutually exclusive buckets, chosen so a consumer can decide
+/// policy from the class alone:
+///
+/// * [`DaemonDegraded`](Self::DaemonDegraded) — the daemon could not finish
+///   the check at all (setup error, overlay-apply error, spawn failure,
+///   worker death, batch-coalesce missing-member). **Not the submitter's
+///   fault.** A blocking pre-commit hook should treat this as "skip and
+///   continue" (with a logged warning); the authoritative downstream
+///   compile-witness will catch a real regression.
+/// * [`Unwitnessable`](Self::Unwitnessable) — the daemon ran fine but the
+///   change is not covered by the configured witnesses (RA-blind glob,
+///   vacuous witness with zero checks evaluated, RA-native timer-settled
+///   with no flycheck activity, RA-native diagnostics without crate
+///   attribution). **Not provably RED, not provably GREEN.** Same policy
+///   as `DaemonDegraded` for a pre-commit hook.
+/// * [`NonAttributable`](Self::NonAttributable) — a result exists, but the
+///   daemon cannot attribute it to *this* submitter (interaction-red from
+///   a concurrent push, red-claimed-without-evidence, red-without-
+///   diagnostics). The submitter may be green; treat as "skip" and retry,
+///   or rely on the downstream witness.
+/// * [`TimeBudget`](Self::TimeBudget) — the witness ran out of wall-clock.
+///   No information about the underlying code state. Skip + retry.
+///
+/// New construction sites must pick a class; new free-text reasons must be
+/// added to [`classify_reason`]. The [`from_tag`](Self::from_tag) parser
+/// drops unknown tag strings to `None` for forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VerdictFailureClass {
+    /// Infrastructure failure — the daemon could not run the check.
+    DaemonDegraded,
+    /// The change is outside the witnesses' coverage envelope.
+    Unwitnessable,
+    /// A result exists but cannot be attributed to this submitter.
+    NonAttributable,
+    /// The witness ran out of wall-clock.
+    TimeBudget,
+}
+
+impl VerdictFailureClass {
+    /// Stable lowercase wire tag. Used as the JSON value for
+    /// `verdict_failure_class` on `WorktreeStatus`/`TransitionEvent` and as
+    /// the stable identifier in SigNoz dashboards. Adding a variant requires
+    /// adding a tag; removing or renaming a tag is a wire break.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerdictFailureClass::DaemonDegraded => "daemon_degraded",
+            VerdictFailureClass::Unwitnessable => "unwitnessable",
+            VerdictFailureClass::NonAttributable => "non_attributable",
+            VerdictFailureClass::TimeBudget => "time_budget",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str). Unknown strings → `None` so a
+    /// daemon that emits a class string the consumer doesn't yet recognise
+    /// falls back to "no class known" rather than breaking the parser. This
+    /// is the forward-compat half of the additive-wire discipline.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "daemon_degraded" => Some(VerdictFailureClass::DaemonDegraded),
+            "unwitnessable" => Some(VerdictFailureClass::Unwitnessable),
+            "non_attributable" => Some(VerdictFailureClass::NonAttributable),
+            "time_budget" => Some(VerdictFailureClass::TimeBudget),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for VerdictFailureClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Map a free-text INDETERMINATE `reason` to its coarse class.
+///
+/// The reason strings are the SigNoz grouping keys and are deliberately
+/// stable; this function is the locked translation from "fine SigNoz axis"
+/// to "coarse policy axis". A new reason added to the daemon MUST be added
+/// here too (the unit test `classify_reason_covers_every_known_reason` will
+/// fail otherwise, refusing CI), so the policy half can never silently drift
+/// past the observability half.
+///
+/// Prefix matching is used for the interpolated forms
+/// (`witness: timeout after 30000ms`, `witness: spawn failed: ENOENT`). Anything
+/// not on the locked list returns `None` — a new daemon emitting a new reason
+/// is parsed as "class unknown" by an older consumer, which is the safe
+/// forward-compat fallback (treat as `DaemonDegraded`-like in policy).
+pub fn classify_reason(reason: &str) -> Option<VerdictFailureClass> {
+    use VerdictFailureClass::*;
+    // Most specific witness:* prefixes first.
+    if reason.starts_with("witness: vacuous") {
+        return Some(Unwitnessable);
+    }
+    if reason.starts_with("witness: timeout") {
+        return Some(TimeBudget);
+    }
+    if reason.starts_with("witness: worker exited") {
+        return Some(DaemonDegraded);
+    }
+    if reason.starts_with("witness: spawn failed") {
+        return Some(DaemonDegraded);
+    }
+    match reason {
+        "project_check_setup_error"
+        | "project_check_overlay_error"
+        | "project_check_batch_missing_member"
+        | "project_check_batch_indeterminate" => Some(DaemonDegraded),
+        "project_check_red_without_diagnostics"
+        | "project_check_interaction_red_not_attributable"
+        | "red_claimed_without_evidence" => Some(NonAttributable),
+        "ra_native_unattributed_error"
+        | "ra_native_timer_settled_no_flycheck_activity"
+        | "ra_blind_path_green_unwitnessed" => Some(Unwitnessable),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Latest-green publisher seam (the ONLY additive v0 surface — D-A1 / AC#4)
 // ---------------------------------------------------------------------------
 
@@ -770,5 +910,85 @@ mod tests {
             .strip_prefix("/repo")
             .expect("strips the root cleanly");
         assert_eq!(rel, std::path::Path::new("src/lib.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // VerdictFailureClass — the structural seam for INDETERMINATE policy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verdict_failure_class_tags_round_trip() {
+        // Every variant has a unique lowercase tag, and `from_tag` is the
+        // inverse of `as_str`. This is the contract a wire consumer binds to.
+        for v in [
+            VerdictFailureClass::DaemonDegraded,
+            VerdictFailureClass::Unwitnessable,
+            VerdictFailureClass::NonAttributable,
+            VerdictFailureClass::TimeBudget,
+        ] {
+            assert_eq!(VerdictFailureClass::from_tag(v.as_str()), Some(v));
+            // Display matches as_str — the SigNoz dashboards bind to this.
+            assert_eq!(v.to_string(), v.as_str());
+        }
+        // Unknown tags drop to None (forward-compat fallback).
+        assert_eq!(VerdictFailureClass::from_tag(""), None);
+        assert_eq!(VerdictFailureClass::from_tag("DAEMON_DEGRADED"), None);
+        assert_eq!(VerdictFailureClass::from_tag("future_class_v2"), None);
+    }
+
+    #[test]
+    fn classify_reason_covers_every_known_reason() {
+        // The locked translation from SigNoz axis (fine) to policy axis
+        // (coarse). Adding a new INDETERMINATE reason to the daemon WITHOUT
+        // updating `classify_reason` is a CI break — that's the audit-
+        // completeness guarantee. The exact prefixes for the interpolated
+        // forms (`witness: timeout/spawn failed/worker exited/vacuous`) are
+        // load-bearing: a refactor that drops the prefix silently downgrades
+        // a class to None on every consumer.
+        use VerdictFailureClass::*;
+        let cases: &[(&str, VerdictFailureClass)] = &[
+            // Witness — interpolated prefixes
+            ("witness: vacuous (0 checks evaluated)", Unwitnessable),
+            ("witness: timeout after 30000ms", TimeBudget),
+            ("witness: worker exited without a result", DaemonDegraded),
+            ("witness: spawn failed: ENOENT", DaemonDegraded),
+            // Daemon-infra failures
+            ("project_check_setup_error", DaemonDegraded),
+            ("project_check_overlay_error", DaemonDegraded),
+            ("project_check_batch_missing_member", DaemonDegraded),
+            ("project_check_batch_indeterminate", DaemonDegraded),
+            // Attribution gaps
+            ("project_check_red_without_diagnostics", NonAttributable),
+            (
+                "project_check_interaction_red_not_attributable",
+                NonAttributable,
+            ),
+            ("red_claimed_without_evidence", NonAttributable),
+            // Witness-coverage gaps
+            ("ra_native_unattributed_error", Unwitnessable),
+            (
+                "ra_native_timer_settled_no_flycheck_activity",
+                Unwitnessable,
+            ),
+            ("ra_blind_path_green_unwitnessed", Unwitnessable),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                classify_reason(reason),
+                Some(*expected),
+                "classify_reason({reason:?}) drifted off the locked class"
+            );
+        }
+        // Unknown reasons return None (the safe forward-compat fallback).
+        assert_eq!(classify_reason(""), None);
+        assert_eq!(classify_reason("some_future_failure_mode"), None);
+        // Prefix discipline: the interpolated forms tolerate the tail but the
+        // empty-tail bare prefixes are still valid (a daemon-side log without
+        // a colon-suffix still classifies).
+        assert_eq!(
+            classify_reason("witness: timeout"),
+            Some(TimeBudget),
+            "bare prefix must classify — daemon may log without a tail"
+        );
     }
 }

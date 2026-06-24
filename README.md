@@ -352,6 +352,29 @@ introducing a syntax error; observe that `.cargoless/latest-green`
 
 For the full v0 surface, see [`ROADMAP.md`](ROADMAP.md#v0-capabilities-available-today-on-main).
 
+### Local hooks: use `cargoless verdict --advisory`
+
+The local cargoless verdict is **advisory**. A local pre-commit hook should
+pass `--advisory` so only a real RED with diagnostic evidence and per-crate
+attribution hard-blocks the commit (exit 1) — every other shape (`unknown`,
+red-without-evidence, ladder-exhausted client-side `unknown`) exits 0 and
+emits one structured `[cargoless:advisory] verdict=… class=… reason=…`
+stderr line so the operator still sees the degraded path without being
+hard-blocked. The downstream compile-witness (CI gate) is the authoritative
+gate, by design. JSON wire shape is unchanged; only the exit-code mapping
+changes.
+
+```bash
+$ cargoless verdict --advisory --output json \
+    --remote http://cargoless-pool.svc:8787 \
+    -- "$repo"
+```
+
+See [`examples/pre-commit-advisory.sh`](examples/pre-commit-advisory.sh)
+for a reference hook and
+[`docs/operator/pre-commit-hook-contract.md`](docs/operator/pre-commit-hook-contract.md)
+for the contract.
+
 ---
 
 ## Performance vs alternatives

@@ -748,6 +748,7 @@ fn member_result_to_summary(
         // Coalescer returned a report without our member — treat as
         // indeterminate (should not happen in practice).
         return ProjectCheckSummary::Indeterminate {
+            class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
             reason: "project_check_batch_missing_member",
             detail: format!("coalesced report did not include member {wt_key}"),
         };
@@ -791,6 +792,7 @@ fn member_result_to_summary(
                         "no error-severity diagnostic on the combined run".to_string()
                     });
                 ProjectCheckSummary::Indeterminate {
+                    class: cargoless_proto::VerdictFailureClass::NonAttributable,
                     // Stable classifier — the SigNoz/dashboard query key.
                     reason: "project_check_interaction_red_not_attributable",
                     // Verbose human+agent tail (single line via `\` continuations).
@@ -820,6 +822,7 @@ fn member_result_to_summary(
                 // run_project_checks_and_log).
                 if error_count == 0 {
                     ProjectCheckSummary::Indeterminate {
+                        class: cargoless_proto::VerdictFailureClass::NonAttributable,
                         reason: "project_check_red_without_diagnostics",
                         detail: format!(
                             "batch member {wt_key} red but 0 error-severity diagnostics"
@@ -837,6 +840,7 @@ fn member_result_to_summary(
                 .map(|d| d.message.clone())
                 .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_batch_indeterminate",
                 detail,
             }
@@ -1055,6 +1059,7 @@ impl ServeVerdictState {
         let verdict_color = payload.verdict.as_str().to_string();
         let red_diagnostics = payload.red_diagnostics;
         let failure_reason = payload.analysis_failure_reason.clone();
+        let failure_class = payload.analysis_failure_class;
         let published_at = crate::statusfile::now_unix();
         let status = WorktreeStatus {
             worktree: worktree.clone(),
@@ -1068,6 +1073,7 @@ impl ServeVerdictState {
             crates: Vec::new(),
             red_diagnostics,
             verdict_failure_reason: failure_reason.clone(),
+            verdict_failure_class: failure_class,
             base_sha: base_sha.clone(),
             ra_blind_paths,
             // Freshly published ⇒ age computed at read time (get_status)
@@ -1081,6 +1087,7 @@ impl ServeVerdictState {
             verdict: verdict_color,
             red_diagnostics,
             verdict_failure_reason: failure_reason,
+            verdict_failure_class: failure_class,
             base_sha,
             ra_blind_paths,
             published_at,
@@ -3393,7 +3400,17 @@ checks:
         let summary = member_result_to_summary("/client/wt-a", Some(&m));
 
         match summary {
-            ProjectCheckSummary::Indeterminate { reason, detail } => {
+            ProjectCheckSummary::Indeterminate {
+                class,
+                reason,
+                detail,
+            } => {
+                assert_eq!(
+                    class,
+                    cargoless_proto::VerdictFailureClass::NonAttributable,
+                    "interaction-red is the canonical NonAttributable: a result exists \
+                     but the daemon cannot pin it to this submitter"
+                );
                 assert_eq!(
                     reason, "project_check_interaction_red_not_attributable",
                     "interaction-red must use the stable SigNoz classifier, not a generic unknown"

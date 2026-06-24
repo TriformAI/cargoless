@@ -200,6 +200,16 @@ struct Opts {
     /// `verdict --check-id <id>` repeatable — B3 witness check-ids,
     /// attached to the push as `PushOverlayOptions::check_ids`.
     verdict_check_ids: Vec<String>,
+    /// `verdict --advisory` — exit-code reification of the
+    /// operator-design contract that cargoless local verdict is
+    /// advisory: a real RED with diagnostic evidence + per-crate
+    /// attribution stays exit 1, every other shape (unknown, red
+    /// without evidence, client-synthesized unknown) exits 0 + a
+    /// structured stderr `[cargoless:advisory]` line naming the class.
+    /// The downstream compile-witness is the authoritative gate.
+    /// `--advisory` only changes the exit-code mapping; JSON wire shape
+    /// is unchanged so programmatic consumers see no diff.
+    verdict_advisory: bool,
     /// `verdict -- <repo>` — positional repo path after the `--`
     /// separator (the thin-wrapper calling convention).
     verdict_repo_positional: Option<PathBuf>,
@@ -544,6 +554,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .clone(),
                 );
             }
+            "--advisory" if cmd == Cmd::Verdict => opts.verdict_advisory = true,
             // `verdict ... -- <repo>`: everything after the separator is
             // positional; exactly one (the repo path) is accepted.
             "--" if cmd == Cmd::Verdict => {
@@ -684,6 +695,14 @@ fn usage() {
     println!("  --output json|text    stdout format (default json: one object with");
     println!("                        verdict/base_sha/remote/source keys)");
     println!("  --check-id <ID>       repeatable: witness check-ids attached to the push");
+    println!("  --advisory            reify the operator-design advisory contract at the exit");
+    println!(
+        "                        seam: only red+diagnostics+per-crate-attribution hard-blocks"
+    );
+    println!("                        (exit 1); every other shape (unknown, red-without-evidence,");
+    println!("                        client-synth unknown) exits 0 + one structured stderr line");
+    println!("                        (`[cargoless:advisory] verdict=... class=... reason=...`).");
+    println!("                        JSON wire shape unchanged; downstream witness is gate.");
     println!("  -- <REPO>             positional repo path (after the -- separator)");
     println!();
     println!(
@@ -1006,6 +1025,7 @@ fn main() -> ExitCode {
                 gate: parsed.opts.push_gate,
                 check_ids: parsed.opts.verdict_check_ids.clone(),
                 await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
+                advisory: parsed.opts.verdict_advisory,
             });
         }
         _ => {}
@@ -1176,9 +1196,39 @@ mod tests {
             p.opts.verdict_repo_positional,
             Some(PathBuf::from("/workspace/repo"))
         );
+        // `--advisory` not in argv → exit-code mapping is legacy 0/1/75.
+        assert!(!p.opts.verdict_advisory);
         // The scalar --remote used by status/push/batch-check stays unset:
         // verdict's repeatable arm captured every occurrence.
         assert_eq!(p.opts.remote, None);
+    }
+
+    #[test]
+    fn verdict_advisory_flag_sets_opt() {
+        let p = parse(&v(&[
+            "verdict",
+            "--remote",
+            "http://pool:8787",
+            "--advisory",
+            "--",
+            "/workspace/repo",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::Verdict);
+        assert!(p.opts.verdict_advisory);
+    }
+
+    #[test]
+    fn verdict_advisory_scoped_to_verdict() {
+        // --advisory is verdict-only; other commands must keep rejecting it.
+        assert_eq!(
+            parse(&v(&["push", "--advisory"])),
+            Err(ParseError::UnknownFlag("--advisory".into()))
+        );
+        assert_eq!(
+            parse(&v(&["status", "--advisory"])),
+            Err(ParseError::UnknownFlag("--advisory".into()))
+        );
     }
 
     #[test]

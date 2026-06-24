@@ -461,6 +461,7 @@ mod tests {
             verdict: "red".into(),
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            verdict_failure_class: None,
             base_sha: None,
             ra_blind_paths: false,
             published_at: 99,

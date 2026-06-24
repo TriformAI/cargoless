@@ -113,6 +113,22 @@ pub struct VerdictOpts {
     /// when per-check gating lands).
     pub check_ids: Vec<String>,
     pub await_timeout_secs: u64,
+    /// **Operator-design contract reification** — when set, the exit
+    /// code maps the verdict through the policy that cargoless's local
+    /// verdict is advisory (see
+    /// `cargoless-gate.yml:295-314` operator note in tf-multiverse): a
+    /// real RED *with* diagnostic evidence and a non-empty per-crate
+    /// roll-up stays exit 1 (the one case where pre-commit blocking is
+    /// justified — RA-native catches syntax/unresolved-name/type errors
+    /// in seconds), every other shape (unknown, red-without-evidence,
+    /// red-without-crate-attribution) returns 0 with a structured
+    /// stderr line naming the class so the operator still sees the
+    /// degraded path without being hard-blocked. The downstream
+    /// compile-witness remains the authoritative gate. The JSON wire
+    /// shape is unchanged — `--advisory` only changes the exit-code
+    /// mapping; programmatic consumers still see the same
+    /// `verdict`/`verdict_failure_class`/`red_diagnostics` keys.
+    pub advisory: bool,
 }
 
 /// `cargoless verdict` entry. Exit codes: 0 green, 1 red, 75 unknown /
@@ -517,7 +533,7 @@ fn emit_daemon_verdict(opts: &VerdictOpts, status: &WorktreeStatus, remote: &str
         OutputMode::Json => println!("{}", daemon_verdict_json(status, remote)),
         OutputMode::Text => println!("{}", status.verdict),
     }
-    ExitCode::from(exit_byte_for_verdict(&status.verdict))
+    ExitCode::from(exit_byte_for_status(opts.advisory, status))
 }
 
 fn daemon_verdict_json(status: &WorktreeStatus, remote: &str) -> String {
@@ -560,7 +576,28 @@ fn emit_client_verdict(
         ),
         OutputMode::Text => println!("{verdict}"),
     }
-    ExitCode::from(exit)
+    // `--advisory` on a synthesized client-side `unknown` (ladder
+    // exhausted, await-timeout) is the same policy as the daemon-side
+    // unknown branch in `exit_byte_for_status`: never hard-block local
+    // pre-commit on infrastructure trouble (a synthesized unknown is
+    // *infrastructure*, not code). The all-unauthorized config-bug exit
+    // (2) stays a hard error even under advisory — a misconfigured
+    // remote is not a degraded daemon, it is a setup error the operator
+    // must fix; otherwise a silent `--advisory` would mask every hook
+    // run after a token rotation. `green`/non-`unknown` exits pass
+    // through unchanged.
+    let effective_exit = if opts.advisory && verdict == "unknown" && exit != 2 {
+        log_advisory_skip(
+            verdict,
+            None,
+            Some(detail),
+            "advisory: client-synthesized unknown (network/timeout) — downstream witness is authoritative",
+        );
+        0
+    } else {
+        exit
+    };
+    ExitCode::from(effective_exit)
 }
 
 fn client_verdict_json(
@@ -604,12 +641,108 @@ fn client_verdict_json(
 
 /// 0 green / 1 red / 75 anything else (EX_TEMPFAIL: `unknown`,
 /// `Indeterminate`-class strings — infra trouble, never a code red).
+///
+/// Plain mode (no `--advisory`): pre-existing semantics — pollers and
+/// CI gates that already key off the legacy 0/1/75 ladder are
+/// byte-identical to today.
 fn exit_byte_for_verdict(verdict: &str) -> u8 {
     match verdict {
         "green" => 0,
         "red" => 1,
         _ => 75,
     }
+}
+
+/// `--advisory` aware exit-byte mapping for a *full* `WorktreeStatus`
+/// (the daemon-published path — the rich info is available).
+///
+/// Plain mode falls through to [`exit_byte_for_verdict`] so the legacy
+/// 0/1/75 ladder is byte-identical for non-advisory consumers.
+///
+/// `--advisory` collapses the policy decision the in-tree operator note
+/// (`cargoless-gate.yml:295-314` in tf-multiverse) already encodes for
+/// the CI gate, applied at the *local pre-commit* hook seam:
+///   * `green` → 0
+///   * `red` with `red_diagnostics > 0` AND `!crates.is_empty()` → 1
+///     (a real RED with diagnostic evidence and per-crate attribution
+///     — the one shape where pre-commit blocking is justified)
+///   * `red` with `red_diagnostics == 0` OR empty `crates` → 0 + class
+///     stderr (the NonAttributable degraded path: a red was claimed
+///     but cannot be pinned on a submitter)
+///   * `unknown` (any class) → 0 + class stderr (daemon couldn't
+///     evaluate — never hard-block, the witness is authoritative)
+///   * any other / future verdict string → 0 (forward-compat: an
+///     unknown verdict must not surprise a hook with a non-zero exit)
+fn exit_byte_for_status(advisory: bool, status: &WorktreeStatus) -> u8 {
+    if !advisory {
+        return exit_byte_for_verdict(&status.verdict);
+    }
+    match status.verdict.as_str() {
+        "green" => 0,
+        "red" if status.red_diagnostics > 0 && !status.crates.is_empty() => {
+            // Real RED with backing evidence and per-crate attribution —
+            // emit one structured line confirming the hard-block is
+            // intentional (so the operator can read the audit trail).
+            log_advisory_skip(
+                "red",
+                status.verdict_failure_class,
+                status.verdict_failure_reason.as_deref(),
+                "blocked: red with diagnostics — pre-commit gate honored",
+            );
+            1
+        }
+        "red" => {
+            // Degraded RED: NonAttributable by class (covered by
+            // `compose_hard_mode_payload` and the `red(0)` constructor
+            // downgrade). Never hard-block; the witness is authoritative.
+            log_advisory_skip(
+                "red",
+                status.verdict_failure_class,
+                status.verdict_failure_reason.as_deref(),
+                "advisory: red without diagnostics or crate attribution — daemon-degraded path, downstream witness is authoritative",
+            );
+            0
+        }
+        "unknown" => {
+            log_advisory_skip(
+                "unknown",
+                status.verdict_failure_class,
+                status.verdict_failure_reason.as_deref(),
+                "advisory: daemon could not evaluate this push — downstream witness is authoritative",
+            );
+            0
+        }
+        _ => {
+            // Forward-compat: a future verdict string we don't yet know
+            // must not surprise a `--advisory` hook with a non-zero exit.
+            log_advisory_skip(
+                status.verdict.as_str(),
+                status.verdict_failure_class,
+                status.verdict_failure_reason.as_deref(),
+                "advisory: unrecognised verdict string — treating as advisory-skip",
+            );
+            0
+        }
+    }
+}
+
+/// Structured stderr line for every `--advisory` skip. Same shape
+/// across all four shapes (`class=<tag>` always present, `-` when
+/// `None`) so an operator can `grep -F '[cargoless:advisory]'` for
+/// every degraded path the hook silently let through.
+fn log_advisory_skip(
+    verdict: &str,
+    class: Option<cargoless_proto::VerdictFailureClass>,
+    reason: Option<&str>,
+    detail: &str,
+) {
+    eprintln!(
+        "[cargoless:advisory] verdict={} class={} reason={} note={}",
+        verdict,
+        class.map(|c| c.as_str()).unwrap_or("-"),
+        reason.unwrap_or("-"),
+        detail
+    );
 }
 
 #[cfg(test)]
@@ -632,6 +765,7 @@ mod tests {
             }],
             red_diagnostics: u32::from(verdict == "red"),
             verdict_failure_reason: None,
+            verdict_failure_class: None,
             base_sha: base_sha.map(str::to_string),
             ra_blind_paths: false,
             heartbeat_age_secs: 1,
@@ -733,6 +867,134 @@ mod tests {
         assert_eq!(exit_byte_for_verdict("unknown"), 75);
         assert_eq!(exit_byte_for_verdict(""), 75);
         assert_eq!(exit_byte_for_verdict("Indeterminate"), 75);
+    }
+
+    /// Mint a `WorktreeStatus` with explicit verdict, diagnostic
+    /// count, crate-attribution toggle, and failure class — the four
+    /// dimensions `--advisory` keys off.
+    fn advisory_status(
+        verdict: &str,
+        red_diagnostics: u32,
+        crates_attributed: bool,
+        class: Option<cargoless_proto::VerdictFailureClass>,
+    ) -> WorktreeStatus {
+        WorktreeStatus {
+            worktree: "/wt".into(),
+            verdict: verdict.into(),
+            daemon_build_id: "test-build".into(),
+            crates: if crates_attributed {
+                vec![CrateVerdict {
+                    name: "core".into(),
+                    verdict: verdict.into(),
+                }]
+            } else {
+                vec![]
+            },
+            red_diagnostics,
+            verdict_failure_reason: None,
+            verdict_failure_class: class,
+            base_sha: None,
+            ra_blind_paths: false,
+            heartbeat_age_secs: 0,
+            published_at: 0,
+        }
+    }
+
+    /// Non-advisory `exit_byte_for_status` MUST be byte-identical to
+    /// the legacy `exit_byte_for_verdict` (no behavior change for hooks
+    /// that haven't opted in).
+    #[test]
+    fn exit_byte_for_status_plain_mode_matches_legacy() {
+        for (verdict, expected) in [
+            ("green", 0u8),
+            ("red", 1u8),
+            ("unknown", 75u8),
+            ("Indeterminate", 75u8),
+        ] {
+            for diags in [0u32, 7u32] {
+                for attributed in [true, false] {
+                    let s = advisory_status(verdict, diags, attributed, None);
+                    assert_eq!(
+                        exit_byte_for_status(false, &s),
+                        expected,
+                        "plain mode must match legacy for verdict={verdict} diags={diags} attributed={attributed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn advisory_green_exits_zero() {
+        let s = advisory_status("green", 0, true, None);
+        assert_eq!(exit_byte_for_status(true, &s), 0);
+    }
+
+    /// The one protective shape: real RED with diagnostic evidence
+    /// AND per-crate attribution. `--advisory` must still hard-block
+    /// these (fast pre-commit feedback for RA-native syntax / type
+    /// errors — the case `cargoless-gate-witness-is-advisory-by-design`
+    /// memory carves out as the justified pre-commit gate).
+    #[test]
+    fn advisory_red_with_evidence_and_attribution_hard_blocks() {
+        let s = advisory_status("red", 1, true, None);
+        assert_eq!(exit_byte_for_status(true, &s), 1);
+        let s = advisory_status("red", 14, true, None);
+        assert_eq!(exit_byte_for_status(true, &s), 1);
+    }
+
+    /// `red` with `red_diagnostics == 0` is the NonAttributable
+    /// degraded path (e.g. `red_claimed_without_evidence`). `--advisory`
+    /// MUST exit 0 — never hard-block on an unattributable RED.
+    #[test]
+    fn advisory_red_without_diagnostics_does_not_block() {
+        let s = advisory_status(
+            "red",
+            0,
+            true,
+            Some(cargoless_proto::VerdictFailureClass::NonAttributable),
+        );
+        assert_eq!(exit_byte_for_status(true, &s), 0);
+    }
+
+    /// `red` with diagnostics but no per-crate attribution (the wire
+    /// "honesty case" preserved at e.g. `inproc.rs:171` — empty crates
+    /// with red_diagnostics=1) cannot be pinned on this submitter, so
+    /// `--advisory` MUST NOT hard-block. The downstream witness is the
+    /// authoritative gate.
+    #[test]
+    fn advisory_red_without_crate_attribution_does_not_block() {
+        let s = advisory_status("red", 3, false, None);
+        assert_eq!(exit_byte_for_status(true, &s), 0);
+    }
+
+    /// `unknown` of any class — `--advisory` MUST exit 0 across every
+    /// `VerdictFailureClass` variant (never hard-block on infra
+    /// trouble or an Unwitnessable path).
+    #[test]
+    fn advisory_unknown_never_blocks_regardless_of_class() {
+        for class in [
+            None,
+            Some(cargoless_proto::VerdictFailureClass::DaemonDegraded),
+            Some(cargoless_proto::VerdictFailureClass::Unwitnessable),
+            Some(cargoless_proto::VerdictFailureClass::NonAttributable),
+            Some(cargoless_proto::VerdictFailureClass::TimeBudget),
+        ] {
+            let s = advisory_status("unknown", 0, false, class);
+            assert_eq!(
+                exit_byte_for_status(true, &s),
+                0,
+                "advisory unknown must exit 0 for class={class:?}"
+            );
+        }
+    }
+
+    /// Forward-compat: an unrecognised verdict string under
+    /// `--advisory` must not surprise a hook with a non-zero exit.
+    #[test]
+    fn advisory_unknown_verdict_string_does_not_block() {
+        let s = advisory_status("future-shape", 0, false, None);
+        assert_eq!(exit_byte_for_status(true, &s), 0);
     }
 
     #[test]
@@ -998,6 +1260,7 @@ mod tests {
                 crates: Vec::new(),
                 red_diagnostics: 0,
                 verdict_failure_reason: None,
+                verdict_failure_class: None,
                 base_sha: Some(self.sha.clone()),
                 ra_blind_paths: false,
                 heartbeat_age_secs: 0,

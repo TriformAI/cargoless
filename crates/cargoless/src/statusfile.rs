@@ -115,6 +115,16 @@ pub struct VerdictPayload {
     /// `"overlay_apply_error: <msg>"`, `"red_claimed_without_evidence"`.
     /// Always populated on `Unknown`; always `None` on `Green` and `Red`.
     pub analysis_failure_reason: Option<String>,
+    /// Coarse policy class for a non-Green `Unknown` (`DaemonDegraded`,
+    /// `Unwitnessable`, `NonAttributable`, `TimeBudget`). The structural
+    /// seam consumers gate on without re-parsing `analysis_failure_reason`.
+    /// `Some` whenever the path that produced this `Unknown` knew which
+    /// class to stamp (every site in [`crate::servedrv`]); `None` for
+    /// `Green`/`Red` and for the small number of legacy `unknown()` call
+    /// sites that have not been migrated to [`unknown_classed`]. A `None`
+    /// is a forward-compat signal, not a guarantee — the consumer should
+    /// treat it the same as `DaemonDegraded` for policy purposes.
+    pub analysis_failure_class: Option<cargoless_proto::VerdictFailureClass>,
 }
 
 impl VerdictPayload {
@@ -125,6 +135,7 @@ impl VerdictPayload {
             verdict: Verdict::Green,
             red_diagnostics: 0,
             analysis_failure_reason: None,
+            analysis_failure_class: None,
         }
     }
 
@@ -136,15 +147,22 @@ impl VerdictPayload {
     /// `"red_claimed_without_evidence"` — the unrepresentable state
     /// from INFRA-36 cannot leave this constructor. This is the
     /// single source of truth that makes "verdict=red, 0 diagnostics"
-    /// structurally impossible across every publish path.
+    /// structurally impossible across every publish path. The downgrade
+    /// stamps `NonAttributable` — a red was claimed but the daemon
+    /// cannot show *which file/line/diagnostic* justifies attributing
+    /// it to this submitter.
     pub fn red(diagnostic_count: u32) -> Self {
         if diagnostic_count == 0 {
-            return Self::unknown("red_claimed_without_evidence");
+            return Self::unknown_classed(
+                cargoless_proto::VerdictFailureClass::NonAttributable,
+                "red_claimed_without_evidence",
+            );
         }
         Self {
             verdict: Verdict::Red,
             red_diagnostics: diagnostic_count,
             analysis_failure_reason: None,
+            analysis_failure_class: None,
         }
     }
 
@@ -155,11 +173,40 @@ impl VerdictPayload {
     /// can drive SigNoz dashboards / alerts. A longer human message
     /// can be appended with `: <detail>`; the leading classifier is
     /// what telemetry queries group on.
+    ///
+    /// **Prefer [`unknown_classed`](Self::unknown_classed)** for new
+    /// call sites — it stamps the coarse [`VerdictFailureClass`] policy
+    /// axis alongside the fine SigNoz axis. This shim stays for
+    /// legacy paths (the proto's
+    /// [`classify_reason`](cargoless_proto::classify_reason)
+    /// post-classifies on read where possible).
     pub fn unknown(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        let class = cargoless_proto::classify_reason(reason.as_str());
+        Self {
+            verdict: Verdict::Unknown,
+            red_diagnostics: 0,
+            analysis_failure_reason: Some(reason),
+            analysis_failure_class: class,
+        }
+    }
+
+    /// Build an `Unknown` payload with the coarse class stamped at the
+    /// construction site. This is the preferred constructor; it makes
+    /// the policy axis (DaemonDegraded/Unwitnessable/NonAttributable/
+    /// TimeBudget) explicit at the call site instead of relying on the
+    /// post-classifier in [`unknown`](Self::unknown). The class survives
+    /// through to `WorktreeStatus` / `TransitionEvent` on the wire and
+    /// through to `cargoless verdict --advisory` on the CLI.
+    pub fn unknown_classed(
+        class: cargoless_proto::VerdictFailureClass,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             verdict: Verdict::Unknown,
             red_diagnostics: 0,
             analysis_failure_reason: Some(reason.into()),
+            analysis_failure_class: Some(class),
         }
     }
 
@@ -171,7 +218,10 @@ impl VerdictPayload {
     /// emitting the liar state.
     pub fn from_bool_unattributed(authoritative_error: bool) -> Self {
         if authoritative_error {
-            Self::unknown("ra_native_unattributed_error")
+            Self::unknown_classed(
+                cargoless_proto::VerdictFailureClass::Unwitnessable,
+                "ra_native_unattributed_error",
+            )
         } else {
             Self::green()
         }
@@ -206,6 +256,18 @@ pub struct Status {
     /// (forward-compatible default; serializer omits the line when
     /// empty so unaware readers see no new key).
     pub verdict_failure_reason: String,
+    /// Coarse policy class for a non-Green `unknown` verdict — the
+    /// structural seam consumers gate on without re-parsing
+    /// `verdict_failure_reason`. Mirrors
+    /// [`VerdictPayload::analysis_failure_class`]. `None` for
+    /// green/red, for legacy `unknown()` paths the post-classifier
+    /// could not place, and for old statusfile readers that have not
+    /// learned the `verdict_failure_class=` key yet (omit-when-None
+    /// serialize discipline, same as `ra_blind_paths`). Tag strings:
+    /// `daemon_degraded`, `unwitnessable`, `non_attributable`,
+    /// `time_budget` — see
+    /// [`cargoless_proto::VerdictFailureClass`].
+    pub verdict_failure_class: Option<cargoless_proto::VerdictFailureClass>,
     /// #247 in-scope obs fold: unix-seconds timestamp of the
     /// AUTHORITATIVE analysis that produced this verdict (= the
     /// barrier-settle instant observed at `publish_verdict`). Distinct
@@ -297,6 +359,13 @@ impl Status {
                 self.verdict_failure_reason
             ));
         }
+        // Adjacent to `verdict_failure_reason`: the coarse class is
+        // emitted only on Unknown verdicts where the construction site
+        // stamped one. Same omit-when-None discipline as `ra_blind_paths`
+        // so pre-aware readers see no new key.
+        if let Some(class) = self.verdict_failure_class {
+            out.push_str(&format!("verdict_failure_class={}\n", class.as_str()));
+        }
         // #247: analysed_at emitted unconditionally (zero on green/never-
         // checked is meaningful — distinguishes "no authoritative check
         // yet" from a stale "recently re-heartbeated" state). Forward-
@@ -332,6 +401,10 @@ impl Status {
                 "crates" => s.crates = parse_crates(v.trim()),
                 "red_diagnostics" => s.red_diagnostics = v.trim().parse().unwrap_or(0),
                 "verdict_failure_reason" => s.verdict_failure_reason = v.trim().to_string(),
+                "verdict_failure_class" => {
+                    s.verdict_failure_class =
+                        cargoless_proto::VerdictFailureClass::from_tag(v.trim())
+                }
                 "analysed_at" => s.analysed_at = v.trim().parse().unwrap_or(0),
                 "build_id" => s.build_id = v.trim().to_string(),
                 "ra_blind_paths" => s.ra_blind_paths = v.trim() == "1",
@@ -1494,6 +1567,13 @@ mod tests {
              on the violation rather than hiding it inside a silent \
              color flip"
         );
+        assert_eq!(
+            p.analysis_failure_class,
+            Some(cargoless_proto::VerdictFailureClass::NonAttributable),
+            "the red(0) downgrade is the canonical NonAttributable case \
+             — a red was claimed but no diagnostic exists to pin it on \
+             a submitter"
+        );
     }
 
     #[test]
@@ -1504,6 +1584,40 @@ mod tests {
         assert_eq!(
             p.analysis_failure_reason.as_deref(),
             Some("project_check_setup_error: foo")
+        );
+    }
+
+    #[test]
+    fn verdict_payload_unknown_post_classifies_known_reasons() {
+        // The legacy `unknown(reason)` shim runs the reason through
+        // `cargoless_proto::classify_reason` so existing call sites
+        // get the class even before they migrate to `unknown_classed`.
+        let p = VerdictPayload::unknown("project_check_setup_error: foo");
+        assert_eq!(
+            p.analysis_failure_class,
+            Some(cargoless_proto::VerdictFailureClass::DaemonDegraded)
+        );
+        // Free-text reasons (no `classify_reason` arm) stay class-less
+        // and the consumer treats `None` as DaemonDegraded by contract.
+        let p = VerdictPayload::unknown("a totally unstructured legacy string");
+        assert!(p.analysis_failure_class.is_none());
+    }
+
+    #[test]
+    fn verdict_payload_unknown_classed_stamps_class() {
+        let p = VerdictPayload::unknown_classed(
+            cargoless_proto::VerdictFailureClass::TimeBudget,
+            "witness: timeout after 60000ms",
+        );
+        assert_eq!(p.verdict, Verdict::Unknown);
+        assert_eq!(p.red_diagnostics, 0);
+        assert_eq!(
+            p.analysis_failure_class,
+            Some(cargoless_proto::VerdictFailureClass::TimeBudget)
+        );
+        assert_eq!(
+            p.analysis_failure_reason.as_deref(),
+            Some("witness: timeout after 60000ms")
         );
     }
 
@@ -1525,8 +1639,67 @@ mod tests {
             p.analysis_failure_reason.as_deref(),
             Some("ra_native_unattributed_error")
         );
+        assert_eq!(
+            p.analysis_failure_class,
+            Some(cargoless_proto::VerdictFailureClass::Unwitnessable),
+            "the legacy bool shim now stamps Unwitnessable so consumers \
+             gating on class get a uniform answer across all sites"
+        );
 
         let g = VerdictPayload::from_bool_unattributed(false);
         assert_eq!(g.verdict, Verdict::Green);
+    }
+
+    #[test]
+    fn status_round_trips_verdict_failure_class() {
+        // Omit-when-None: a status without a class produces a file
+        // missing the `verdict_failure_class=` key entirely, the same
+        // discipline `ra_blind_paths` uses for its boolean.
+        let s = Status {
+            verdict_str: "green".to_string(),
+            ..Default::default()
+        };
+        let text = s.serialize();
+        assert!(
+            !text.contains("verdict_failure_class="),
+            "green/None must NOT emit the key: pre-aware readers see no \
+             new key, the same forward-compat invariant ra_blind_paths \
+             promises"
+        );
+        let back = Status::parse(&text);
+        assert_eq!(back.verdict_failure_class, None);
+
+        // Some(class): emit the tag, round-trip back to the same variant.
+        for class in [
+            cargoless_proto::VerdictFailureClass::DaemonDegraded,
+            cargoless_proto::VerdictFailureClass::Unwitnessable,
+            cargoless_proto::VerdictFailureClass::NonAttributable,
+            cargoless_proto::VerdictFailureClass::TimeBudget,
+        ] {
+            let s = Status {
+                verdict_str: "unknown".to_string(),
+                verdict_failure_reason: "witness: vacuous (0 checks evaluated)".to_string(),
+                verdict_failure_class: Some(class),
+                ..Default::default()
+            };
+            let text = s.serialize();
+            assert!(
+                text.contains(&format!("verdict_failure_class={}", class.as_str())),
+                "class {class:?} must round-trip via its stable tag"
+            );
+            let back = Status::parse(&text);
+            assert_eq!(back.verdict_failure_class, Some(class));
+        }
+
+        // Unknown tag string → None (forward-compat parse: a daemon
+        // version older than us must not error on a new tag a newer
+        // daemon emitted).
+        let text = "schema=2\nverdict=unknown\nverdict_failure_class=quantum_uncertainty\n";
+        let back = Status::parse(text);
+        assert_eq!(
+            back.verdict_failure_class, None,
+            "unknown class tags must drop to None, not panic — the \
+             same forward-compat discipline as `crates=` parsing"
+        );
     }
 }

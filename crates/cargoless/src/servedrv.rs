@@ -1413,6 +1413,7 @@ fn publish_verdict(
     let verdict = payload.verdict;
     let red_diagnostics = payload.red_diagnostics;
     let failure_reason = payload.analysis_failure_reason.clone();
+    let failure_class = payload.analysis_failure_class;
     // #A2/#A7 — the attribution was popped by the EmitVerdict arm at
     // dispatch time (loop thread) and handed in as a parameter. `None` ⇒
     // FS-watch verdict: no base_sha echo, no latency line (there was no
@@ -1461,6 +1462,11 @@ fn publish_verdict(
         verdict_color = verdict.as_str(),
         red_diagnostics = red_diagnostics,
         verdict_failure_reason = failure_reason.as_deref().unwrap_or(""),
+        // Adjacent to verdict_failure_reason: the coarse policy class
+        // SigNoz dashboards/alerts split on without re-parsing the
+        // free-text reason. Empty string when None so the span field
+        // shape stays stable across versions.
+        verdict_failure_class = failure_class.map(|c| c.as_str()).unwrap_or(""),
         // #A7 — push-receipt → publish latency; 0 = FS-watch verdict
         // (no push to measure from; the SigNoz SLO query filters those
         // out via `base_sha != ''`).
@@ -1492,6 +1498,9 @@ fn publish_verdict(
         // `verdict=unknown (reason: ...)` summary instead of a
         // bare `unknown` that asks the operator to go fishing.
         verdict_failure_reason: failure_reason.clone().unwrap_or_default(),
+        // Coarse policy class — the structural seam for
+        // `cargoless verdict --advisory` and SigNoz dashboards.
+        verdict_failure_class: failure_class,
         // #247 obs: analysed_at = settle-observed instant (Judgment B sole
         // attribution site = the moment the wire reached this arm). For
         // the current single-write path, analysed_at == updated; the
@@ -1506,10 +1515,11 @@ fn publish_verdict(
     };
     statusfile::write(wt, &st);
     eprintln!(
-        "[cargoless:obs] verdict-emit wt={} verdict={} red_diagnostics={} reason={} analysed_at={} (#247,INFRA-36)",
+        "[cargoless:obs] verdict-emit wt={} verdict={} red_diagnostics={} class={} reason={} analysed_at={} (#247,INFRA-36)",
         wt.display(),
         verdict.as_str(),
         red_diagnostics,
+        failure_class.map(|c| c.as_str()).unwrap_or("-"),
         failure_reason.as_deref().unwrap_or("-"),
         now
     );
@@ -1681,13 +1691,27 @@ fn compose_hard_mode_payload(
     authoritative_error: bool,
     summary: ProjectCheckSummary,
 ) -> statusfile::VerdictPayload {
+    use cargoless_proto::VerdictFailureClass;
     use statusfile::VerdictPayload;
     match (authoritative_error, summary) {
         (_, ProjectCheckSummary::Red { error_count }) => VerdictPayload::red(error_count),
-        (_, ProjectCheckSummary::Indeterminate { reason, detail }) => {
-            VerdictPayload::unknown(format!("{reason}: {detail}"))
-        }
-        (true, _) => VerdictPayload::unknown("ra_native_unattributed_error"),
+        (
+            _,
+            ProjectCheckSummary::Indeterminate {
+                class,
+                reason,
+                detail,
+            },
+        ) => VerdictPayload::unknown_classed(class, format!("{reason}: {detail}")),
+        // RA-native bool error with no project-check evidence. The fabricated
+        // reason `ra_native_unattributed_error` does not pass through a
+        // typed `ProjectCheckSummary::Indeterminate` site, but it IS one of
+        // the locked 14 reasons; classify it via the proto's `classify_reason`
+        // so the class stays in lockstep with the SigNoz axis.
+        (true, _) => VerdictPayload::unknown_classed(
+            VerdictFailureClass::Unwitnessable,
+            "ra_native_unattributed_error",
+        ),
         (false, ProjectCheckSummary::Green) | (false, ProjectCheckSummary::Empty) => {
             VerdictPayload::green()
         }
@@ -1771,6 +1795,7 @@ fn gate_require_checks() -> bool {
 fn apply_require_checks(summary: ProjectCheckSummary, require: bool) -> ProjectCheckSummary {
     match summary {
         ProjectCheckSummary::Empty if require => ProjectCheckSummary::Indeterminate {
+            class: cargoless_proto::VerdictFailureClass::Unwitnessable,
             reason: "witness",
             detail: "vacuous (0 checks evaluated)".to_string(),
         },
@@ -1869,6 +1894,7 @@ fn spawn_project_checks_hard_with_timeout(
                             timeout.as_millis()
                         );
                         ProjectCheckSummary::Indeterminate {
+                            class: cargoless_proto::VerdictFailureClass::TimeBudget,
                             reason: "witness",
                             detail: format!("timeout after {}ms", timeout.as_millis()),
                         }
@@ -1879,12 +1905,14 @@ fn spawn_project_checks_hard_with_timeout(
                             wt.display()
                         );
                         ProjectCheckSummary::Indeterminate {
+                            class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                             reason: "witness",
                             detail: "worker exited without a result".to_string(),
                         }
                     }
                 },
                 Err(e) => ProjectCheckSummary::Indeterminate {
+                    class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                     reason: "witness",
                     detail: format!("spawn failed: {e}"),
                 },
@@ -1923,6 +1951,7 @@ fn spawn_project_checks_hard_with_timeout(
         let payload = compose_hard_mode_payload(
             authoritative_error,
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                 reason: "witness",
                 detail: format!("spawn failed: {e}"),
             },
@@ -1999,10 +2028,18 @@ pub(crate) enum ProjectCheckSummary {
     /// is the count of error-severity diagnostics.
     Red { error_count: u32 },
     /// Checks could not run (manifest load error, overlay-apply error,
-    /// etc.). `reason` is the stable classifier; `detail` is the
-    /// human-readable tail for diagnosis. Maps to `Verdict::Unknown`,
-    /// NOT `Red` — the gate did not evaluate, so it cannot vote.
+    /// etc.). `reason` is the stable classifier (the SigNoz fine axis);
+    /// `class` is the coarse policy axis from `cargoless-proto`
+    /// (`DaemonDegraded`/`Unwitnessable`/`NonAttributable`/`TimeBudget`)
+    /// that the CLI's `--advisory` mode and downstream consumers gate on
+    /// without re-parsing the free-text reason. Rust's exhaustive-pattern
+    /// check refuses to compile any new construction site that does not
+    /// stamp a class — that is the audit-completeness guarantee.
+    /// `detail` is the human-readable tail for diagnosis. Maps to
+    /// `Verdict::Unknown`, NOT `Red` — the gate did not evaluate, so it
+    /// cannot vote.
     Indeterminate {
+        class: cargoless_proto::VerdictFailureClass,
         reason: &'static str,
         detail: String,
     },
@@ -2162,6 +2199,7 @@ fn run_project_checks_and_log(
                 // project-check layer.
                 if error_count == 0 {
                     ProjectCheckSummary::Indeterminate {
+                        class: cargoless_proto::VerdictFailureClass::NonAttributable,
                         reason: "project_check_red_without_diagnostics",
                         detail: format!(
                             "tree=red but error_count=0 across {} results",
@@ -2192,6 +2230,7 @@ fn run_project_checks_and_log(
                 e
             );
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_setup_error",
                 detail: e.to_string(),
             }
@@ -2210,6 +2249,7 @@ fn run_project_checks_and_log(
                 e
             );
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_overlay_error",
                 detail: e.to_string(),
             }
@@ -2620,6 +2660,7 @@ mod tests {
         let p = compose_hard_mode_payload(
             false,
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_setup_error",
                 detail: "manifest not found".to_string(),
             },
@@ -2628,6 +2669,7 @@ mod tests {
         assert_eq!(p.red_diagnostics, 0);
         let reason = p
             .analysis_failure_reason
+            .clone()
             .expect("indeterminate carries reason");
         assert!(
             reason.starts_with("project_check_setup_error"),
@@ -2636,6 +2678,36 @@ mod tests {
              whole reason string. Got: {reason}"
         );
         assert!(reason.contains("manifest not found"));
+        assert_eq!(
+            p.analysis_failure_class,
+            Some(cargoless_proto::VerdictFailureClass::DaemonDegraded),
+            "compose MUST preserve the class stamped at the construction \
+             site — the additive guarantee the wire/statusfile mirrors"
+        );
+    }
+
+    #[test]
+    fn compose_preserves_every_class_variant() {
+        // Truth-table proof that compose_hard_mode_payload routes EVERY
+        // class through, not just DaemonDegraded. A future arm that
+        // collapses class to a constant before the publish edge would
+        // silently regress consumer-side gating; this catches it.
+        for class in [
+            cargoless_proto::VerdictFailureClass::DaemonDegraded,
+            cargoless_proto::VerdictFailureClass::Unwitnessable,
+            cargoless_proto::VerdictFailureClass::NonAttributable,
+            cargoless_proto::VerdictFailureClass::TimeBudget,
+        ] {
+            let p = compose_hard_mode_payload(
+                false,
+                ProjectCheckSummary::Indeterminate {
+                    class,
+                    reason: "compose_truth_table_probe",
+                    detail: format!("class={}", class.as_str()),
+                },
+            );
+            assert_eq!(p.analysis_failure_class, Some(class));
+        }
     }
 
     #[test]
@@ -2670,6 +2742,12 @@ mod tests {
                  SigNoz query key for the historical liar-state path \
                  — it must remain stable across releases"
             );
+            assert_eq!(
+                p.analysis_failure_class,
+                Some(cargoless_proto::VerdictFailureClass::Unwitnessable),
+                "the RA-native unattributed bool path is Unwitnessable \
+                 by class — cargoless ran but cannot say which file/line"
+            );
         }
     }
 
@@ -2680,6 +2758,7 @@ mod tests {
         let p = compose_hard_mode_payload(
             true,
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::DaemonDegraded,
                 reason: "project_check_overlay_error",
                 detail: "PVC ENOSPC".to_string(),
             },
@@ -2699,6 +2778,7 @@ mod tests {
         assert_eq!(
             converted,
             ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::Unwitnessable,
                 reason: "witness",
                 detail: "vacuous (0 checks evaluated)".to_string(),
             }
@@ -2717,6 +2797,7 @@ mod tests {
                 ProjectCheckSummary::Red { error_count: 3 }
             );
             let indeterminate = ProjectCheckSummary::Indeterminate {
+                class: cargoless_proto::VerdictFailureClass::TimeBudget,
                 reason: "witness",
                 detail: "timeout after 5ms".to_string(),
             };

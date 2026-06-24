@@ -1651,6 +1651,7 @@ mod tests {
             verdict: "red".into(),
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            verdict_failure_class: None,
             // SSE attribution case: the echo must survive the SSE frame
             // (the subscribe-driven poller path A2 exists for).
             base_sha: Some("feedfeedfeedfeedfeedfeedfeedfeedfeedfeed".into()),
@@ -2629,6 +2630,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 0,
             verdict_failure_reason: None,
+            verdict_failure_class: None,
             base_sha: None,
             ra_blind_paths: false,
             heartbeat_age_secs: 0,

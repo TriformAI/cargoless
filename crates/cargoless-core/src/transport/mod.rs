@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
-use cargoless_proto::{Diagnostic, Severity};
+use cargoless_proto::{Diagnostic, Severity, VerdictFailureClass};
 
 use crate::batch::{BatchMember, BatchMemberResult, BatchProvenance, BatchReport, BatchVerdict};
 use crate::config::{FleetConfig, FleetConfigError};
@@ -242,6 +242,18 @@ pub struct WorktreeStatus {
     /// dashboards group on the leading classifier (the substring before
     /// `: `) to separate "gate doing its job" from "gate didn't run".
     pub verdict_failure_reason: Option<String>,
+    /// Coarse policy class for a non-Green `unknown` verdict — the
+    /// machine-discriminable structural seam that consumers gate on
+    /// without re-parsing `verdict_failure_reason`. `None` for
+    /// `green`/`red`, for legacy `unknown` paths the daemon could not
+    /// place into one of the four classes, and for pre-aware servers
+    /// (omit-when-None on the wire, same discipline as `base_sha` /
+    /// `ra_blind_paths`). A `None` is a forward-compat signal; the
+    /// consumer should treat it the same as `DaemonDegraded` for
+    /// policy purposes. Tag strings:
+    /// `daemon_degraded`, `unwitnessable`, `non_attributable`,
+    /// `time_budget` — see [`cargoless_proto::VerdictFailureClass`].
+    pub verdict_failure_class: Option<VerdictFailureClass>,
     /// Verdict attribution — the client-resolved base SHA carried on the
     /// overlay push this verdict was computed against (`PushOverlayOptions::
     /// base_sha`), echoed back so a poller sharing a status key with other
@@ -293,6 +305,11 @@ pub struct TransitionEvent {
     /// Unknown-the-daemon-couldn't-evaluate without round-tripping a
     /// `get_status` call.
     pub verdict_failure_reason: Option<String>,
+    /// See [`WorktreeStatus::verdict_failure_class`] — mirrored on the
+    /// transition event so a subscribe-driven consumer can apply the
+    /// structural policy gate directly off the SSE frame without a
+    /// status round-trip.
+    pub verdict_failure_class: Option<VerdictFailureClass>,
     /// See [`WorktreeStatus::base_sha`] — mirrored here for the same
     /// reason as `verdict_failure_reason`: a subscribe-driven poller must
     /// be able to discard another branch's verdict without a status
@@ -1420,6 +1437,14 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
                 serde_json::Value::String(reason.clone()),
             );
     }
+    if let Some(class) = s.verdict_failure_class {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert(
+                "verdict_failure_class".to_string(),
+                serde_json::Value::String(class.as_str().to_string()),
+            );
+    }
     if let Some(sha) = &s.base_sha {
         obj.as_object_mut()
             .expect("status_to_json constructed an object literal")
@@ -1465,6 +1490,10 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("verdict_failure_reason")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
+        verdict_failure_class: v
+            .get("verdict_failure_class")
+            .and_then(serde_json::Value::as_str)
+            .and_then(VerdictFailureClass::from_tag),
         base_sha: v
             .get("base_sha")
             .and_then(serde_json::Value::as_str)
@@ -1551,6 +1580,14 @@ pub fn event_to_json(e: &TransitionEvent) -> String {
                 serde_json::Value::String(reason.clone()),
             );
     }
+    if let Some(class) = e.verdict_failure_class {
+        obj.as_object_mut()
+            .expect("event_to_json constructed an object literal")
+            .insert(
+                "verdict_failure_class".to_string(),
+                serde_json::Value::String(class.as_str().to_string()),
+            );
+    }
     if let Some(sha) = &e.base_sha {
         obj.as_object_mut()
             .expect("event_to_json constructed an object literal")
@@ -1591,6 +1628,10 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
             .get("verdict_failure_reason")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
+        verdict_failure_class: v
+            .get("verdict_failure_class")
+            .and_then(serde_json::Value::as_str)
+            .and_then(VerdictFailureClass::from_tag),
         base_sha: v
             .get("base_sha")
             .and_then(serde_json::Value::as_str)
@@ -1873,6 +1914,7 @@ mod tests {
             crates: vec![],
             red_diagnostics: 3,
             verdict_failure_reason: None,
+            verdict_failure_class: None,
             // Attribution case: a gate push carries its commit; the echo
             // must survive the wire byte-for-byte (pollers string-match).
             base_sha: Some("0123abc0123abc0123abc0123abc0123abc01234".into()),
@@ -1905,6 +1947,7 @@ mod tests {
             ],
             red_diagnostics: 1,
             verdict_failure_reason: None,
+            verdict_failure_class: None,
             // Legacy case: no SHA on the push ⇒ key absent on the wire
             // (additive contract — old parsers see exactly the old JSON).
             base_sha: None,
@@ -1921,7 +1964,55 @@ mod tests {
             !wire.contains("ra_blind_paths"),
             "false ra_blind_paths must not appear on the wire (#A8 additive contract): {wire}"
         );
+        assert!(
+            !wire.contains("verdict_failure_class"),
+            "None verdict_failure_class must not appear on the wire (additive contract): {wire}"
+        );
         assert_eq!(status_from_json(&wire), Some(s2));
+    }
+
+    #[test]
+    fn status_round_trips_verdict_failure_class_for_every_variant() {
+        // Mirror of the `ra_blind_paths` round-trip precedent —
+        // additive forward-compat: each class survives wire ser/de,
+        // a `None` class never appears on the wire, an unknown tag
+        // from a newer daemon drops to `None` instead of erroring.
+        for class in [
+            VerdictFailureClass::DaemonDegraded,
+            VerdictFailureClass::Unwitnessable,
+            VerdictFailureClass::NonAttributable,
+            VerdictFailureClass::TimeBudget,
+        ] {
+            let s = WorktreeStatus {
+                worktree: "wt".into(),
+                verdict: "unknown".into(),
+                daemon_build_id: "test".into(),
+                crates: vec![],
+                red_diagnostics: 0,
+                verdict_failure_reason: Some("project_check_setup_error: foo".into()),
+                verdict_failure_class: Some(class),
+                base_sha: None,
+                ra_blind_paths: false,
+                heartbeat_age_secs: 0,
+                published_at: 0,
+            };
+            let wire = status_to_json(&s);
+            assert!(
+                wire.contains(&format!(r#""verdict_failure_class":"{}""#, class.as_str())),
+                "class {class:?} must serialise its stable tag: {wire}"
+            );
+            assert_eq!(status_from_json(&wire), Some(s));
+        }
+        // Unknown tag → None (newer daemon emits a class an older client
+        // hasn't seen yet — must not error).
+        let s = status_from_json(
+            r#"{"worktree":"wt","verdict":"unknown","verdict_failure_class":"quantum_uncertainty"}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            s.verdict_failure_class, None,
+            "unknown class tag must drop to None (forward-compat parse)"
+        );
     }
 
     #[test]
