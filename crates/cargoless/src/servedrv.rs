@@ -1814,18 +1814,55 @@ fn spawn_project_checks_warn(
 }
 
 /// #A4.3 — wall-clock budget for one hard-witness run (the supervisor's
-/// `recv_timeout`). Default 30 min: deliberately ABOVE the 20-min
-/// manifest-level check `timeout_ms` ceiling plus the git fetch/reset/
-/// scratch budget, so per-check timeouts fire first and the watchdog only
-/// catches truly wedged witnesses (unbounded git, stuck IO, lost thread).
+/// `recv_timeout`). Default 25 min: deliberately BELOW the tf-multiverse
+/// `incremental-compile-check.yml` runner-poll budget of 1900s (~31m40s)
+/// so a wedged witness publishes terminal `unknown` while the runner is
+/// still polling, instead of racing the runner's own deadline (CGLS-23,
+/// PR #7039 wedge). The cargoless-side daemon watchdog is the inner of
+/// three nested ceilings: per-check (manifest `timeout_ms`, SIGKILLs the
+/// process group) < daemon watchdog (this default, publishes `unknown`)
+/// < runner poll (1900s, posts `error`). The previous 30-min default
+/// inverted the daemon/runner ordering and let stuck runs reach the
+/// runner deadline before the watchdog ever fired. Override via
+/// `CARGOLESS_WITNESS_TIMEOUT_MS` for deployments that have raised the
+/// runner budget in tandem.
 fn witness_timeout() -> Duration {
-    const DEFAULT_MS: u64 = 1_800_000;
-    Duration::from_millis(
-        std::env::var("CARGOLESS_WITNESS_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .unwrap_or(DEFAULT_MS),
+    let env_ms = std::env::var("CARGOLESS_WITNESS_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0);
+    witness_timeout_from(env_ms)
+}
+
+/// Pure half of [`witness_timeout`] for unit tests: `env_ms = Some(ms)`
+/// is the override, `None` is the production default. Mirrors
+/// [`crate::serveapi::git_timeout_from`] so parallel `cargo test` runs
+/// never need to mutate process env to exercise this knob.
+fn witness_timeout_from(env_ms: Option<u64>) -> Duration {
+    const DEFAULT_MS: u64 = 1_500_000;
+    Duration::from_millis(env_ms.unwrap_or(DEFAULT_MS))
+}
+
+/// CGLS-23 H4 — one-line summary of a witness's input shape for the
+/// watchdog-fire log line. Captured before the `context` is moved into
+/// the supervisor so the timeout/disconnect arm can correlate hung
+/// witnesses with payload size (the PR #7039 wedge was on a 151 kB
+/// single-file `executor.rs` edit; future hangs need this for triage).
+fn summarize_witness_input(context: Option<&crate::serveapi::ProjectCheckRunContext>) -> String {
+    let Some(ctx) = context else {
+        return "changed_files=none overlay_files=0".to_string();
+    };
+    let changed_count = ctx.changed_files.as_ref().map(|v| v.len()).unwrap_or(0);
+    let overlay_count = ctx.overlay_files.len();
+    let total_bytes: usize = ctx.overlay_files.iter().map(|(_, c)| c.len()).sum();
+    let largest = ctx
+        .overlay_files
+        .iter()
+        .max_by_key(|(_, c)| c.len())
+        .map(|(p, c)| format!("{}:{}", p, c.len()))
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "changed_files={changed_count} overlay_files={overlay_count} overlay_bytes={total_bytes} largest={largest}"
     )
 }
 
@@ -1912,12 +1949,17 @@ fn spawn_project_checks_hard_with_timeout(
         .as_ref()
         .and_then(|a| a.base_sha.clone())
         .filter(|s| !s.is_empty());
+    // CGLS-23 H4 — snapshot payload shape before the supervisor takes
+    // ownership of `context`. Captured here so the watchdog-fire arm
+    // can log it even though `context` is moved into the worker below.
+    let input_summary = summarize_witness_input(context.as_ref());
     let generation = api.begin_hard_witness(&wt_key, witness_base_sha.as_deref());
     let attribution_fallback = attribution.clone();
     let supervisor = {
         let wt = wt.clone();
         let wt_key = wt_key.clone();
         let witness_base_sha = witness_base_sha.clone();
+        let input_summary = input_summary.clone();
         let api = Arc::clone(&api);
         move || {
             // The channel carries the verdict AND the ran-check ids (the
@@ -1953,9 +1995,11 @@ fn spawn_project_checks_hard_with_timeout(
                     Ok(result) => result,
                     Err(RecvTimeoutError::Timeout) => {
                         eprintln!(
-                            "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=timeout timeout_ms={} (#A4.3)",
+                            "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=timeout timeout_ms={} base_sha={} {} (#A4.3 CGLS-23)",
                             wt.display(),
-                            timeout.as_millis()
+                            timeout.as_millis(),
+                            witness_base_sha.as_deref().unwrap_or("none"),
+                            input_summary,
                         );
                         (
                             ProjectCheckSummary::Indeterminate {
@@ -1967,8 +2011,10 @@ fn spawn_project_checks_hard_with_timeout(
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         eprintln!(
-                            "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=worker-died (#A4.3)",
-                            wt.display()
+                            "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=worker-died base_sha={} {} (#A4.3 CGLS-23)",
+                            wt.display(),
+                            witness_base_sha.as_deref().unwrap_or("none"),
+                            input_summary,
                         );
                         (
                             ProjectCheckSummary::Indeterminate {
@@ -2902,6 +2948,72 @@ mod tests {
                 indeterminate
             );
         }
+    }
+
+    #[test]
+    fn witness_timeout_default_25m_and_env_override() {
+        // CGLS-23: the daemon watchdog must publish `unknown` while the
+        // tf-multiverse runner's 1900s poll is still alive, so the runner
+        // observes a terminal status instead of timing out itself. Default
+        // is 25 min; env override wins when set.
+        assert_eq!(witness_timeout_from(None), Duration::from_millis(1_500_000));
+        assert_eq!(
+            witness_timeout_from(Some(60_000)),
+            Duration::from_millis(60_000)
+        );
+        // The empty/zero filtering happens in `witness_timeout()`'s env
+        // parsing layer; `witness_timeout_from(Some(0))` is the literal
+        // override path (a test asking for an instant-fire watchdog).
+        assert_eq!(witness_timeout_from(Some(0)), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn summarize_witness_input_reports_payload_shape() {
+        // CGLS-23 H4: the watchdog-fire log line includes a one-line
+        // summary so hung-witness post-mortems can correlate with input
+        // size (PR #7039 was a 151 kB single-file edit). Verify the
+        // string shape: keys are stable so SigNoz log-parse stays robust.
+        let none = summarize_witness_input(None);
+        assert!(none.contains("changed_files=none"));
+        assert!(none.contains("overlay_files=0"));
+
+        let ctx = crate::serveapi::ProjectCheckRunContext {
+            root: PathBuf::from("/tmp/wt"),
+            changed_files: Some(vec![
+                "physics/src/runtime/wire/executor.rs".to_string(),
+                "physics/src/runtime/wire/lib.rs".to_string(),
+            ]),
+            base_ref: "origin/dev".to_string(),
+            overlay_files: vec![
+                (
+                    "physics/src/runtime/wire/executor.rs".to_string(),
+                    "x".repeat(151_807),
+                ),
+                (
+                    "physics/src/runtime/wire/lib.rs".to_string(),
+                    "y".repeat(42),
+                ),
+            ],
+            materialize_overlay: true,
+            gate: true,
+        };
+        let summary = summarize_witness_input(Some(&ctx));
+        assert!(
+            summary.contains("changed_files=2"),
+            "expected changed_files=2 in `{summary}`"
+        );
+        assert!(
+            summary.contains("overlay_files=2"),
+            "expected overlay_files=2 in `{summary}`"
+        );
+        assert!(
+            summary.contains("overlay_bytes=151849"),
+            "expected overlay_bytes=151849 in `{summary}`"
+        );
+        assert!(
+            summary.contains("largest=physics/src/runtime/wire/executor.rs:151807"),
+            "expected largest path:size in `{summary}`"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────
