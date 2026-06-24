@@ -262,6 +262,7 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
                 // `servedrv::publish_verdict` path where Unknown verdicts
                 // do happen.
                 verdict_failure_reason: String::new(),
+                verdict_failure_class: None,
                 // #247: v0 single-WT path — settle ≈ write instant (the
                 // model fires BecameGreen/Red and we write immediately).
                 // `analysed_at == updated` is honest for v0; the

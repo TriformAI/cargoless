@@ -51,7 +51,7 @@ pub use cargoless_cas::{ContentStore, LocalDiskStore};
 pub use cargoless_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
     Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,
-    VerdictFailureClass,
+    VerdictFailureClass, classify_reason,
 };
 pub use config::{
     FleetConfig, FleetConfigError, FleetOverrides, Provenance, Source, TelemetryConfig,

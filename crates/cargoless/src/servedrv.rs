@@ -658,6 +658,7 @@ fn heartbeat_repo_status(repo_root: &Path) {
             crates: Vec::new(),
             red_diagnostics: 0,
             verdict_failure_reason: String::new(),
+            verdict_failure_class: None,
             analysed_at: 0,
             build_id: cargoless_core::build_id().to_string(),
             ra_blind_paths: false,
