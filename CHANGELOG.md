@@ -26,6 +26,18 @@ canonical, in this order):
 
 ### Added
 
+- **Stale-base detection in `--allow-existing-red` classification** —
+  `cargoless checks run --base <ref> --allow-existing-red` now warns when
+  the local tracking ref is behind real origin before re-running checks
+  against the base worktree. Without the warning, a stale `origin/dev`
+  silently resolves to a pre-PYAML merge-base and `classify_required_reds_at_base`
+  reports phantom counts for whole-tree fingerprint checks — the wedge
+  PYAML hit on donut (~5 false-block dev-merge attempts). Uses read-only
+  `git ls-remote origin`; never auto-advances local refs. Tunable via
+  `CARGOLESS_BASE_STALE_THRESHOLD` (default: 5 commits) and disable with
+  `CARGOLESS_BASE_STALE_CHECK=0`. Detect-only: the warning suggests
+  `git fetch origin <ref>`; classification proceeds regardless.
+
 - **Macro-blind annotation + opt-in witness escalation (#A8)** — the daemon
   classifies each consumed push against `CARGOLESS_MACRO_BLIND_PATHS`
   (comma-separated path globs; e.g. Leptos `view!`-heavy trees whose
