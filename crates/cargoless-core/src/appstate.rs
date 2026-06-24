@@ -939,9 +939,11 @@ mod tests {
             },
         );
         let respawn_gen = match actions.as_slice() {
-            [Action::Respawn {
-                sha, generation, ..
-            }] => {
+            [
+                Action::Respawn {
+                    sha, generation, ..
+                },
+            ] => {
                 assert_eq!(sha, "aaa", "respawn boots the last green bundle");
                 *generation
             }
@@ -956,9 +958,11 @@ mod tests {
                 generation: respawn_gen,
             },
         );
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Promote { sha, .. } if sha == "aaa")));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Promote { sha, .. } if sha == "aaa"))
+        );
         let inst = s.instance("dev").unwrap();
         assert_eq!(
             inst.serving.as_ref().unwrap().sha,
