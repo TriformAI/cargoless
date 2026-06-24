@@ -918,6 +918,9 @@ fn serve_loop(
                     }
                 ) {
                     let removed = driver.pressure_prune_bundles();
+                    // Surface the relief on `/app` (climbing count = PVC full +
+                    // self-relieving) so the wedge is observable, not silent.
+                    svc.set_pressure_prune(removed.len());
                     tracing::warn!(
                         "cargoless.app.instance" = instance.as_str(),
                         "app.event" = "disk_pressure_relief",
