@@ -73,8 +73,11 @@ pub type Generation = u64;
 pub enum AppBuildOutcome {
     /// Every step exited 0 and the bundle was harvested.
     Green,
-    /// A step failed (or harvest failed); `reason` names the step.
-    Red { reason: String },
+    /// A step failed (or harvest failed); `reason` names the step. `enospc`
+    /// marks an out-of-disk failure — environmental, not a defect in the sha —
+    /// which is handled non-latching (requeue-once) so a transient full disk
+    /// the daemon then self-relieves does not pin a good commit red forever.
+    Red { reason: String, enospc: bool },
     /// The build cannot be trusted (e.g. the worktree changed underneath
     /// it). Not red — requeued once, then red on a repeat.
     Indeterminate { reason: String },
@@ -129,6 +132,14 @@ pub struct InstanceState {
     /// `InstanceState` literal with `..Default::default()`; not part of the
     /// lifecycle contract — only [`AppState::step`] ever advances it.
     pub indeterminate_streak: u8,
+    /// Consecutive out-of-disk (ENOSPC) build reds for this instance. An
+    /// `enospc` red is environmental, not a defect in the sha, so it is
+    /// requeued (the bin layer pressure-prunes before the retry rebuilds)
+    /// rather than latched. This streak caps the retries so a genuinely
+    /// undersized PVC escalates to a real, surfaced red instead of churning
+    /// cold rebuilds forever. Same `pub`/contract caveat as
+    /// `indeterminate_streak`.
+    pub enospc_streak: u8,
 }
 
 /// Input to [`AppState::step`] — everything the daemon can observe.
@@ -369,6 +380,7 @@ impl AppState {
         match outcome {
             AppBuildOutcome::Green => {
                 inst.indeterminate_streak = 0;
+                inst.enospc_streak = 0;
                 inst.pipeline = Pipeline::Probing {
                     sha: sha.clone(),
                     generation,
@@ -380,8 +392,51 @@ impl AppState {
                     generation,
                 });
             }
-            AppBuildOutcome::Red { reason } => {
+            AppBuildOutcome::Red {
+                reason,
+                enospc: true,
+            } => {
+                // Infra-red: the disk failed transiently, the sha is fine.
+                // Mirror the Indeterminate requeue-once discipline — do NOT
+                // latch `last_red` — so the bin layer's pressure-prune (run on
+                // this same red event, before the requeue rebuilds) can free
+                // space and the retry usually fits. Cap the streak so a PVC
+                // that is genuinely too small escalates to a real, surfaced red
+                // instead of churning cold rebuilds forever.
+                const ENOSPC_RETRY_CAP: u8 = 2;
                 inst.indeterminate_streak = 0;
+                inst.pipeline = Pipeline::Idle;
+                if inst.enospc_streak >= ENOSPC_RETRY_CAP {
+                    inst.enospc_streak = 0;
+                    self.record_red(
+                        instance,
+                        sha,
+                        format!(
+                            "disk full, self-relief exhausted (PVC likely too small): {reason}"
+                        ),
+                        actions,
+                    );
+                    self.settle_idle(instance, actions);
+                } else {
+                    inst.enospc_streak += 1;
+                    // Prefer the newest pending sha if a commit arrived while we
+                    // were building (newest-sha-wins for the retry target);
+                    // otherwise rebuild the same sha after relief. The shared
+                    // `self.dispatch(actions)` at the end of this match hands
+                    // out the build slot (mirrors the Indeterminate arm — no
+                    // dispatch here, or the slot would be handed out twice).
+                    let retry = inst.pending.take().unwrap_or(sha);
+                    self.request_build(instance, retry);
+                }
+            }
+            AppBuildOutcome::Red {
+                reason,
+                enospc: false,
+            } => {
+                // Code-red: a real defect in this sha. Latch it (unchanged) so
+                // the bad commit is not auto-retried until a new one arrives.
+                inst.indeterminate_streak = 0;
+                inst.enospc_streak = 0;
                 inst.pipeline = Pipeline::Idle;
                 self.record_red(instance, sha, reason, actions);
                 self.settle_idle(instance, actions);
@@ -704,6 +759,21 @@ mod tests {
         )
     }
 
+    /// Finish a build as an out-of-disk (ENOSPC) red — the non-latching,
+    /// requeue-once infra-red path.
+    fn enospc_red(s: &mut AppState, inst: &str, generation: Generation) -> Vec<Action> {
+        s.step(
+            inst,
+            Event::BuildFinished {
+                generation,
+                outcome: AppBuildOutcome::Red {
+                    reason: "bundle harvest failed: No space left on device (os error 28)".into(),
+                    enospc: true,
+                },
+            },
+        )
+    }
+
     /// Drive `inst` from HeadAdvanced(sha) all the way to Serving(sha).
     fn drive_to_serving(s: &mut AppState, inst: &str, sha: &str) -> Generation {
         let a = head(s, inst, sha);
@@ -808,6 +878,7 @@ mod tests {
                 generation: g,
                 outcome: AppBuildOutcome::Red {
                     reason: "step `server` exited 101".into(),
+                    enospc: false,
                 },
             },
         );
@@ -835,6 +906,100 @@ mod tests {
         let a = head(&mut s, "dev", "fixed");
         assert_eq!(a.len(), 1);
         assert!(matches!(&a[0], Action::StartBuild { sha, .. } if sha == "fixed"));
+    }
+
+    #[test]
+    fn enospc_red_requeues_the_same_sha_without_latching() {
+        // An out-of-disk red is environmental: the sha must be REBUILT (so the
+        // daemon's pressure-prune-then-retry can succeed), and it must NOT be
+        // latched in `last_red` (else even after space frees the sha would
+        // never retry until a new commit — the self-starvation wedge).
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "aaa");
+        let g = build_gen(&a);
+
+        let actions = enospc_red(&mut s, "dev", g);
+        // The same sha is re-queued and immediately re-dispatched (StartBuild),
+        // NOT recorded red.
+        assert!(
+            actions
+                .iter()
+                .any(|x| matches!(x, Action::StartBuild { sha, .. } if sha == "aaa")),
+            "enospc red rebuilds the same sha: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|x| matches!(x, Action::RecordRed { .. })),
+            "enospc red must not RecordRed on the first attempt: {actions:?}"
+        );
+        let inst = s.instance("dev").unwrap();
+        assert!(
+            inst.last_red.is_none(),
+            "enospc red does not latch last_red"
+        );
+        assert_eq!(inst.enospc_streak, 1, "one enospc attempt counted");
+    }
+
+    #[test]
+    fn enospc_red_converges_to_a_real_red_when_relief_is_exhausted() {
+        // A genuinely undersized PVC: every retry re-ENOSPCs. After the cap
+        // (2 retries) the daemon stops churning cold rebuilds and records a
+        // real, surfaced red so the operator sees the disk is too small.
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "aaa");
+        let mut g = build_gen(&a);
+
+        // Attempt 1 + 2: requeue (streak 1, then 2), no latch.
+        for expect_streak in [1u8, 2u8] {
+            let actions = enospc_red(&mut s, "dev", g);
+            assert_eq!(
+                s.instance("dev").unwrap().enospc_streak,
+                expect_streak,
+                "streak after attempt"
+            );
+            assert!(
+                s.instance("dev").unwrap().last_red.is_none(),
+                "still not latched at streak {expect_streak}"
+            );
+            g = build_gen(&actions); // the requeued StartBuild's generation
+        }
+
+        // Attempt 3: streak was at the cap (2) → record a real red and reset.
+        let actions = enospc_red(&mut s, "dev", g);
+        let recorded = actions.iter().find_map(|x| match x {
+            Action::RecordRed { sha, reason, .. } => Some((sha.clone(), reason.clone())),
+            _ => None,
+        });
+        let (sha, reason) = recorded.expect("a RecordRed once relief is exhausted");
+        assert_eq!(sha, "aaa");
+        assert!(
+            reason.contains("self-relief exhausted"),
+            "names the exhaustion: {reason}"
+        );
+        let inst = s.instance("dev").unwrap();
+        assert_eq!(inst.last_red.as_ref().unwrap().0, "aaa", "now latched");
+        assert_eq!(inst.enospc_streak, 0, "streak reset after the red-out");
+    }
+
+    #[test]
+    fn enospc_red_prefers_a_newer_pending_sha_on_retry() {
+        // If a newer commit arrived while the disk-starved build ran, the retry
+        // targets the NEWEST sha (newest-sha-wins) — no point rebuilding a sha
+        // we would immediately supersede.
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "aaa");
+        let g = build_gen(&a);
+        // A newer commit lands while "aaa" is building → stashed as pending.
+        head(&mut s, "dev", "bbb");
+
+        let actions = enospc_red(&mut s, "dev", g);
+        assert!(
+            actions
+                .iter()
+                .any(|x| matches!(x, Action::StartBuild { sha, .. } if sha == "bbb")),
+            "retry targets the newer pending sha: {actions:?}"
+        );
     }
 
     #[test]
@@ -1202,6 +1367,7 @@ mod tests {
                 generation: g2,
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
+                    enospc: false,
                 },
             },
         );
@@ -1332,6 +1498,7 @@ mod tests {
                 generation: g_build,
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
+                    enospc: false,
                 },
             },
         );

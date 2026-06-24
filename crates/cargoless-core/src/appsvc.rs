@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::Diagnostic;
@@ -124,6 +124,13 @@ pub struct AppServeState {
     /// Public routing facts per runtime preview, keyed by instance name. Set by
     /// the control loop at proxy-bind, cleared on remove. Merged into `/app`.
     routes: std::sync::Mutex<BTreeMap<String, PreviewRoute>>,
+    /// Disk-pressure self-heal counters, surfaced on `/app` so a wedge that the
+    /// daemon is relieving is VISIBLE instead of silent. `pressure_prunes` is
+    /// the lifetime count of ENOSPC-triggered emergency prunes; `last_removed`
+    /// is how many bundles the most recent one shed. Lock-free (daemon-level,
+    /// set by the single control thread, read by HTTP threads).
+    pressure_prunes: AtomicU64,
+    last_pressure_prune_removed: AtomicU64,
 }
 
 impl Default for AppServeState {
@@ -133,6 +140,8 @@ impl Default for AppServeState {
             ready: AtomicBool::new(false),
             control: std::sync::Mutex::new(None),
             routes: std::sync::Mutex::new(BTreeMap::new()),
+            pressure_prunes: AtomicU64::new(0),
+            last_pressure_prune_removed: AtomicU64::new(0),
         }
     }
 }
@@ -188,6 +197,15 @@ impl AppServeState {
         self.ready.store(ready, Ordering::Release);
     }
 
+    /// Record a disk-pressure relief prune (control loop, on an ENOSPC red):
+    /// bump the lifetime count and store how many bundles it shed. Surfaced on
+    /// `/app` under `disk` so the self-heal is observable. Lock-free.
+    pub fn set_pressure_prune(&self, removed: usize) {
+        self.pressure_prunes.fetch_add(1, Ordering::Relaxed);
+        self.last_pressure_prune_removed
+            .store(removed as u64, Ordering::Relaxed);
+    }
+
     /// Current snapshot (cheap Arc clone).
     pub fn snapshot(&self) -> Arc<Vec<InstanceReport>> {
         self.reports.lock().expect("appsvc reports lock").clone()
@@ -226,6 +244,15 @@ impl AppServeState {
         serde_json::json!({
             "instances": instances,
             "ready": self.ready.load(Ordering::Acquire),
+            // Disk-pressure self-heal observability: how many ENOSPC-triggered
+            // emergency prunes have run, and how many bundles the last one shed.
+            // A climbing `pressure_prunes` is the visible signal that the PVC is
+            // full and the daemon is self-relieving (vs. silently wedged).
+            "disk": {
+                "pressure_prunes": self.pressure_prunes.load(Ordering::Relaxed),
+                "last_pressure_prune_removed":
+                    self.last_pressure_prune_removed.load(Ordering::Relaxed),
+            },
         })
         .to_string()
     }
@@ -358,6 +385,27 @@ mod tests {
         assert_eq!(instances[1]["name"], "feature-x");
         assert_eq!(instances[1]["last_red_sha"], "bad");
         assert_eq!(v["ready"], true, "dev serving ⇒ ready");
+    }
+
+    #[test]
+    fn app_report_includes_the_disk_pressure_block() {
+        let svc = AppServeState::new();
+        svc.publish(vec![report("dev", Some("g1"), Some("g1"))]);
+
+        // Fresh daemon: zero prunes.
+        let v: serde_json::Value = serde_json::from_str(&svc.app_report().unwrap()).unwrap();
+        assert_eq!(v["disk"]["pressure_prunes"], 0);
+        assert_eq!(v["disk"]["last_pressure_prune_removed"], 0);
+
+        // Two relief prunes; the block reflects the count + the last shed total.
+        svc.set_pressure_prune(3);
+        svc.set_pressure_prune(1);
+        let v: serde_json::Value = serde_json::from_str(&svc.app_report().unwrap()).unwrap();
+        assert_eq!(v["disk"]["pressure_prunes"], 2, "lifetime count");
+        assert_eq!(
+            v["disk"]["last_pressure_prune_removed"], 1,
+            "most recent prune shed 1 bundle"
+        );
     }
 
     #[test]

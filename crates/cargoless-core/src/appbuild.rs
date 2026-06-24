@@ -51,8 +51,17 @@ pub enum BuildReport {
         bundle_dir: PathBuf,
     },
     /// A step failed (or checkout / harvest failed). `reason` is operator-
-    /// facing and names the failing step + a short output tail.
-    Red { sha: String, reason: String },
+    /// facing and names the failing step + a short output tail. `enospc` is
+    /// `true` when the failure was an out-of-disk (ENOSPC) condition — an
+    /// *environmental* fault, not a defect in `sha`. The state machine treats
+    /// an `enospc` red as non-latching (requeue-once, like Indeterminate) so a
+    /// transient full disk the daemon then self-relieves does not pin a good
+    /// commit red forever (the disk self-starvation latch).
+    Red {
+        sha: String,
+        reason: String,
+        enospc: bool,
+    },
     /// The build cannot be trusted: the worktree sha moved mid-build, or HEAD
     /// could not be re-resolved. Not a defect in `sha` — requeued once.
     Indeterminate { sha: String, reason: String },
@@ -73,6 +82,30 @@ impl InstancePaths {
     pub fn bundle_dir(&self, sha: &str) -> PathBuf {
         self.bundles.join(sha)
     }
+}
+
+/// True if this io error is ENOSPC (disk full). `harvest`'s `fs::copy` /
+/// `fs::rename` / `create_dir_all` surface a full disk as a real `io::Error`
+/// whose `raw_os_error()` is 28 on every unix — the robust signal (a string
+/// match is the fallback only where we have lost the typed error, see
+/// [`reason_looks_like_enospc`]).
+fn io_is_enospc(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(28)
+}
+
+/// True if a build/checkout error *string* looks like a disk-full failure.
+/// Used where the typed `io::Error` is gone — `checkout` returns git's stderr
+/// as a `String`, and git surfaces ENOSPC as "No space left on device" /
+/// "index.lock: ... Out of disk space" / "os error 28". Lowercased to be
+/// phrasing-robust. Conservative: a non-match just means "treat as a normal
+/// (latching) red", which is the safe default.
+fn reason_looks_like_enospc(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("no space left")
+        || s.contains("os error 28")
+        || s.contains("enospc")
+        || s.contains("out of disk")
+        || s.contains("disk quota exceeded")
 }
 
 /// Injection seam for the effectful operations, so inc-5's daemon tests can
@@ -173,11 +206,16 @@ pub fn build(
     sha: &str,
     env: &[(String, String)],
 ) -> BuildReport {
-    // 1. Checkout — a failure here is a real, reportable Red (bad sha).
+    // 1. Checkout — a failure here is a real, reportable Red (bad sha)…
+    //    unless it is the *disk* that failed (git can't write its index/lock
+    //    on a full PVC), which is environmental — classify it `enospc` so the
+    //    state machine retries the sha once after the daemon self-relieves.
     if let Err(e) = hooks.checkout(&paths.worktree, sha) {
+        let enospc = reason_looks_like_enospc(&e);
         return BuildReport::Red {
             sha: sha.to_string(),
             reason: e,
+            enospc,
         };
     }
 
@@ -189,12 +227,14 @@ pub fn build(
                 sha: sha.to_string(),
                 reason: "no cargoless.app.yaml at this sha (app-serve not configured for this ref)"
                     .to_string(),
+                enospc: false,
             };
         }
         Err(e) => {
             return BuildReport::Red {
                 sha: sha.to_string(),
                 reason: format!("invalid cargoless.app.yaml: {e}"),
+                enospc: false,
             };
         }
     };
@@ -209,6 +249,10 @@ pub fn build(
                     .unwrap_or_else(|| "signal".into());
                 return BuildReport::Red {
                     sha: sha.to_string(),
+                    // A build step that ran out of disk reports it in its tail
+                    // (linker / cargo "No space left"): treat that as ENOSPC so
+                    // the sha is retried after relief rather than latched.
+                    enospc: reason_looks_like_enospc(&tail),
                     reason: format!("build step `{}` exited {code}:\n{tail}", step.id),
                 };
             }
@@ -219,12 +263,14 @@ pub fn build(
                         "build step `{}` timed out after {}ms",
                         step.id, step.timeout_ms
                     ),
+                    enospc: false,
                 };
             }
             StepOutcome::SpawnError { message } => {
                 return BuildReport::Red {
                     sha: sha.to_string(),
                     reason: format!("build step `{}` could not start: {message}", step.id),
+                    enospc: false,
                 };
             }
         }
@@ -255,10 +301,18 @@ pub fn build(
             manifest: Box::new(manifest),
             bundle_dir,
         },
-        Err(e) => BuildReport::Red {
-            sha: sha.to_string(),
-            reason: format!("bundle harvest failed: {e}"),
-        },
+        // Harvest is the primary ENOSPC site: a full PVC fails the artifact
+        // copy / atomic rename with a typed `os error 28`. Classify off the
+        // typed error (robust) so the state machine retries the sha once after
+        // the daemon self-relieves, rather than latching a good commit red.
+        Err(e) => {
+            let enospc = io_is_enospc(&e);
+            BuildReport::Red {
+                sha: sha.to_string(),
+                reason: format!("bundle harvest failed: {e}"),
+                enospc,
+            }
+        }
     }
 }
 
@@ -749,10 +803,17 @@ mod tests {
 
         let report = build(&hooks, &p, "sha1", &[]);
         match report {
-            BuildReport::Red { reason, sha } => {
+            BuildReport::Red {
+                reason,
+                sha,
+                enospc,
+            } => {
                 assert_eq!(sha, "sha1");
                 assert!(reason.contains("`portal` exited 101"), "{reason}");
                 assert!(reason.contains("E0432"), "tail surfaced: {reason}");
+                // A genuine compile error is a code-red, NOT environmental:
+                // it must latch (enospc=false) so the bad sha is not retried.
+                assert!(!enospc, "compile-error red must not be classified ENOSPC");
             }
             other => panic!("expected Red, got {other:?}"),
         }
@@ -849,12 +910,16 @@ mod tests {
         write_manifest(&p.worktree, &m);
         let hooks = FakeHooks::new("sha1");
         match build(&hooks, &p, "sha1", &[]) {
-            BuildReport::Red { reason, .. } => {
+            BuildReport::Red { reason, enospc, .. } => {
                 assert!(reason.contains("harvest failed"), "{reason}");
                 assert!(
                     reason.contains("missing-bin"),
                     "names the artifact: {reason}"
                 );
+                // A missing artifact is ENOENT, not ENOSPC — must NOT be
+                // classified as a disk-full red (else a real harvest bug would
+                // be retried forever instead of latching).
+                assert!(!enospc, "missing-artifact harvest red is not ENOSPC");
             }
             other => panic!("expected Red, got {other:?}"),
         }
@@ -870,6 +935,37 @@ mod tests {
             .unwrap_or_default();
         assert!(litter.is_empty(), "no tmp litter: {litter:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn io_is_enospc_matches_only_os_error_28() {
+        // The typed signal harvest relies on: raw os error 28 == ENOSPC.
+        let enospc = std::io::Error::from_raw_os_error(28);
+        assert!(io_is_enospc(&enospc));
+        // ENOENT (2) and a kind-only error are NOT disk-full.
+        assert!(!io_is_enospc(&std::io::Error::from_raw_os_error(2)));
+        assert!(!io_is_enospc(&std::io::Error::other("no os errno")));
+    }
+
+    #[test]
+    fn reason_looks_like_enospc_matches_disk_full_phrasings() {
+        // git / cargo / linker phrasings the string-fallback must catch.
+        assert!(reason_looks_like_enospc(
+            "fatal: ... index.lock: No space left on device"
+        ));
+        assert!(reason_looks_like_enospc(
+            "error: failed to write (os error 28)"
+        ));
+        assert!(reason_looks_like_enospc("ENOSPC: disk full"));
+        assert!(reason_looks_like_enospc("linker: Disk quota exceeded"));
+        // Case-insensitive.
+        assert!(reason_looks_like_enospc("NO SPACE LEFT"));
+        // A real compile / checkout error is NOT disk-full.
+        assert!(!reason_looks_like_enospc("error[E0308]: mismatched types"));
+        assert!(!reason_looks_like_enospc(
+            "fatal: reference is not a tree: abc123"
+        ));
+        assert!(!reason_looks_like_enospc(""));
     }
 
     #[test]

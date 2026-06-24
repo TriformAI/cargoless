@@ -177,13 +177,27 @@ impl PortAllocator {
     }
 }
 
+/// A tracked child plus the sha it runs from. The launcher's [`ChildHandle`]
+/// is intentionally sha-blind (it is just port+token); the driver pairs it with
+/// the sha so the bundle-prune protected set can cover *every* live child —
+/// including a draining one, whose sha is no longer in `serving`/`last_green`.
+/// Without this, an aggressive (disk-pressure) prune could delete the bundle a
+/// draining or probing child is still serving from (the FS analogue of serving
+/// a red).
+#[derive(Debug, Clone)]
+struct TrackedChild {
+    handle: ChildHandle,
+    sha: String,
+}
+
 /// One instance's driver-side resources (the pure phase lives in `AppState`).
 struct Runtime {
     slot: Arc<UpstreamSlot>,
     paths: InstancePaths,
     env: Vec<(String, String)>,
-    /// Children by generation (promoted, probing, or draining).
-    children: BTreeMap<Generation, ChildHandle>,
+    /// Children by generation (promoted, probing, or draining), each paired
+    /// with the sha it runs from (see [`TrackedChild`]).
+    children: BTreeMap<Generation, TrackedChild>,
 }
 
 /// The control-loop driver. Generic over both effectful seams.
@@ -339,7 +353,13 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         match self.launcher.spawn(instance, &bundle_dir, port, &env) {
             Ok(handle) => {
                 if let Some(rt) = self.runtimes.get_mut(instance) {
-                    rt.children.insert(generation, handle);
+                    rt.children.insert(
+                        generation,
+                        TrackedChild {
+                            handle,
+                            sha: sha.to_string(),
+                        },
+                    );
                 }
                 self.launcher.start_probe(instance, generation, port);
             }
@@ -362,7 +382,7 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
             return;
         };
         if let Some(child) = rt.children.get(&generation) {
-            rt.slot.set(child.port, generation);
+            rt.slot.set(child.handle.port, generation);
         }
         // inc-6: bound disk after a promote landed a new bundle. Protect the
         // live set — the new serving sha + last_green (both set by the state
@@ -372,26 +392,88 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         self.prune_instance_bundles(instance);
     }
 
+    /// The set of shas whose bundles must NEVER be pruned for `instance`: the
+    /// currently-serving sha, the recovery pointer (`last_green`), the in-flight
+    /// build/probe/queue sha, and every sha a tracked child (promoted, probing,
+    /// or draining) still runs from. Threaded into both the steady promote-time
+    /// prune and the aggressive disk-pressure prune so neither can delete a
+    /// live or recoverable bundle (the never-serve-red invariant, at the FS
+    /// level). De-duplicated.
+    fn protected_shas(&self, instance: &str) -> Vec<String> {
+        let mut protected: Vec<String> = Vec::new();
+        if let Some(st) = self.state.instance(instance) {
+            if let Some(s) = &st.serving {
+                protected.push(s.sha.clone());
+            }
+            if let Some(g) = &st.last_green {
+                protected.push(g.clone());
+            }
+            // The in-flight pipeline sha: a bundle being built does not exist
+            // yet, but a Probing child's bundle does and must survive a prune
+            // that races the probe.
+            match &st.pipeline {
+                crate::appstate::Pipeline::Building { sha, .. }
+                | crate::appstate::Pipeline::Probing { sha, .. }
+                | crate::appstate::Pipeline::Queued { sha } => protected.push(sha.clone()),
+                crate::appstate::Pipeline::Idle => {}
+            }
+        }
+        // Every tracked child's sha — load-bearing for a *draining* child, whose
+        // sha is no longer in serving/last_green but whose bundle it still runs.
+        if let Some(rt) = self.runtimes.get(instance) {
+            for child in rt.children.values() {
+                protected.push(child.sha.clone());
+            }
+        }
+        protected.sort();
+        protected.dedup();
+        protected
+    }
+
     /// Prune this instance's bundle dir, never deleting a live/recovery
-    /// bundle. Protected = currently-serving sha + last_green sha + every sha a
-    /// tracked child (promoted or draining) still runs from.
+    /// bundle (see [`Self::protected_shas`]). keep_extra = 1: a warm previous
+    /// bundle for instant rollback.
     fn prune_instance_bundles(&self, instance: &str) {
         let Some(rt) = self.runtimes.get(instance) else {
             return;
         };
-        let Some(st) = self.state.instance(instance) else {
-            return;
-        };
-        let mut protected: Vec<String> = Vec::new();
-        if let Some(s) = &st.serving {
-            protected.push(s.sha.clone());
-        }
-        if let Some(g) = &st.last_green {
-            protected.push(g.clone());
-        }
+        let protected = self.protected_shas(instance);
         let refs: Vec<&str> = protected.iter().map(String::as_str).collect();
-        // keep_extra = 1: a warm previous bundle for instant rollback.
         let _ = crate::appbuild::prune_bundles(&rt.paths.bundles, &refs, 1);
+    }
+
+    /// Disk-pressure relief: aggressively prune EVERY instance's bundle dir to
+    /// keep_extra = 0 — keep only its protected shas, shedding even the warm
+    /// rollback bundle — and sweep `*.tmp.*` litter. Skips any instance with a
+    /// build IN FLIGHT: its harvest may be writing a `<sha>.tmp.<pid>` dir that
+    /// [`crate::appbuild::prune_bundles`] would otherwise sweep, turning that
+    /// build into a spurious (and now non-latching, so endlessly retried) red.
+    /// Returns `"instance/sha"` for every bundle removed (for the caller's log).
+    ///
+    /// Pure on-disk housekeeping: it never touches `serving`, never flips a
+    /// proxy slot, never emits an action — so the never-serve / never-publish-
+    /// red invariant is untouched. The protected set keeps every live, probing,
+    /// draining, and recovery bundle, so no in-use bundle is ever deleted.
+    pub fn pressure_prune_bundles(&self) -> Vec<String> {
+        let mut removed = Vec::new();
+        let names: Vec<String> = self.runtimes.keys().cloned().collect();
+        for instance in &names {
+            if matches!(
+                self.state.instance(instance).map(|s| &s.pipeline),
+                Some(crate::appstate::Pipeline::Building { .. })
+            ) {
+                continue; // a live harvest owns a tmp dir we must not sweep
+            }
+            let Some(rt) = self.runtimes.get(instance) else {
+                continue;
+            };
+            let protected = self.protected_shas(instance);
+            let refs: Vec<&str> = protected.iter().map(String::as_str).collect();
+            if let Ok(r) = crate::appbuild::prune_bundles(&rt.paths.bundles, &refs, 0) {
+                removed.extend(r.into_iter().map(|name| format!("{instance}/{name}")));
+            }
+        }
+        removed
     }
 
     fn stop_child(&mut self, instance: &str, generation: Generation, drain: bool) {
@@ -400,17 +482,18 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         // across those reborrows of `self`.
         let child = match self.runtimes.get_mut(instance) {
             Some(rt) if !drain => rt.children.remove(&generation),
-            Some(rt) => rt.children.get(&generation).copied(),
+            Some(rt) => rt.children.get(&generation).cloned(),
             None => return,
         };
         let Some(child) = child else {
             return;
         };
-        self.launcher.stop(instance, generation, child.token, drain);
+        self.launcher
+            .stop(instance, generation, child.handle.token, drain);
         if !drain {
             // A killed standby never served: reclaim its port now. A
             // *draining* child keeps its port until DrainComplete.
-            self.ports.release(child.port);
+            self.ports.release(child.handle.port);
         }
     }
 
@@ -442,7 +525,7 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         let handles: Vec<(Generation, ChildHandle)> = self
             .runtimes
             .get(instance)
-            .map(|rt| rt.children.iter().map(|(&g, &h)| (g, h)).collect())
+            .map(|rt| rt.children.iter().map(|(&g, c)| (g, c.handle)).collect())
             .unwrap_or_default();
         for (generation, child) in handles {
             self.launcher.stop(instance, generation, child.token, false);
@@ -454,6 +537,16 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
         }
         self.runtimes.remove(instance);
         self.state.remove_instance(instance);
+        // Reclaim this dead lane's on-disk footprint — the per-lane cargo
+        // target dir (the dominant ~40 GB PVC consumer when run with a per-lane
+        // CARGO_TARGET_DIR) and its retained bundles. Race-free: the instance is
+        // gone from both runtime and state, so no build can be writing here (a
+        // late build result is discarded by `AppState::step`'s unknown-instance
+        // guard). Best-effort — a missing dir or a busy file is a non-fatal
+        // `remove_dir_all` error we ignore (the next teardown / boot retries).
+        let app = self.state_dir.join("app").join(instance);
+        let _ = std::fs::remove_dir_all(app.join("target"));
+        let _ = std::fs::remove_dir_all(app.join("bundles"));
         self.publish();
     }
 
@@ -472,7 +565,7 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
             None => return,
         };
         if let Some(child) = child {
-            self.ports.release(child.port);
+            self.ports.release(child.handle.port);
         }
     }
 
@@ -620,6 +713,30 @@ mod tests {
         d.runtimes.get(instance).unwrap().slot.clone()
     }
 
+    /// Plant a non-empty bundle dir `<bundles>/<sha>/` so the prune logic has
+    /// something real to keep or sweep.
+    fn plant_bundle(d: &Driver<Recorder, Recorder, Recorder>, instance: &str, sha: &str) {
+        let bundles = d.runtimes.get(instance).unwrap().paths.bundles.clone();
+        let dir = bundles.join(sha);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta"), b"x").unwrap();
+    }
+
+    /// The sorted set of bundle `<sha>` dir names on disk for an instance.
+    fn bundle_shas(d: &Driver<Recorder, Recorder, Recorder>, instance: &str) -> Vec<String> {
+        let bundles = d.runtimes.get(instance).unwrap().paths.bundles.clone();
+        let mut shas: Vec<String> = match std::fs::read_dir(&bundles) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        shas.sort();
+        shas
+    }
+
     #[test]
     fn happy_path_build_spawn_probe_promote_flips_the_slot() {
         let rec = Arc::new(Recorder {
@@ -741,6 +858,118 @@ mod tests {
         );
     }
 
+    /// The aggressive disk-pressure prune keeps every PROTECTED bundle —
+    /// serving, last_green, AND a still-DRAINING child's bundle (whose sha is no
+    /// longer in serving/last_green) — while shedding the warm rollback + stale
+    /// junk. This is the hardened-protected-set guarantee: even at keep_extra=0
+    /// no in-use bundle is deleted (the FS never-serve-red invariant). The prior
+    /// attempt had to skip relief entirely while draining; tracking the child
+    /// sha lets us prune safely instead.
+    #[test]
+    fn pressure_prune_protects_serving_and_draining_bundles() {
+        let rec = Arc::new(Recorder {
+            spawn_ok: true,
+            ..Default::default()
+        });
+        let ports = Arc::new(PortAllocator::new(9000, 9009));
+        let mut d = driver(&["dev"], rec.clone(), ports);
+
+        // Drive two greens: g1("aaa") promoted then drained-but-NOT-complete by
+        // g2("bbb"). Now serving=last_green="bbb", and g1 still runs "aaa".
+        d.drive("dev", Event::HeadAdvanced { sha: "aaa".into() });
+        let g1 = rec.builds.lock().unwrap()[0].2;
+        d.drive(
+            "dev",
+            Event::BuildFinished {
+                generation: g1,
+                outcome: AppBuildOutcome::Green,
+            },
+        );
+        d.drive("dev", Event::ProbeSucceeded { generation: g1 });
+        d.drive("dev", Event::HeadAdvanced { sha: "bbb".into() });
+        let g2 = rec
+            .builds
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| b.2)
+            .max()
+            .unwrap();
+        d.drive(
+            "dev",
+            Event::BuildFinished {
+                generation: g2,
+                outcome: AppBuildOutcome::Green,
+            },
+        );
+        d.drive("dev", Event::ProbeSucceeded { generation: g2 });
+        // Do NOT DrainComplete g1 → "aaa" is a live draining bundle.
+        assert!(
+            !d.state.instance("dev").unwrap().draining.is_empty(),
+            "precondition: g1 is still draining"
+        );
+
+        plant_bundle(&d, "dev", "bbb"); // serving + last_green
+        plant_bundle(&d, "dev", "aaa"); // the draining child's live bundle
+        plant_bundle(&d, "dev", "old"); // warm rollback (sheddable @ keep=0)
+        plant_bundle(&d, "dev", "junk"); // stale (always sheddable)
+        assert_eq!(bundle_shas(&d, "dev"), vec!["aaa", "bbb", "junk", "old"]);
+
+        let removed = d.pressure_prune_bundles();
+
+        // serving/last_green ("bbb") AND the draining ("aaa") bundle survive;
+        // the warm-rollback + junk are shed.
+        assert_eq!(
+            bundle_shas(&d, "dev"),
+            vec!["aaa", "bbb"],
+            "protected = serving + last_green + draining child sha"
+        );
+        assert!(
+            removed.contains(&"dev/old".to_string()) && removed.contains(&"dev/junk".to_string()),
+            "removed names the shed bundles as instance/sha: {removed:?}"
+        );
+    }
+
+    /// The pressure prune SKIPS an instance whose build is in flight: its
+    /// harvest may be writing a `<sha>.tmp.<pid>` dir that `prune_bundles` would
+    /// sweep, corrupting the build into a spurious red. The whole bundle dir is
+    /// left untouched while Building.
+    #[test]
+    fn pressure_prune_skips_an_instance_mid_build() {
+        let rec = Arc::new(Recorder {
+            spawn_ok: true,
+            ..Default::default()
+        });
+        let ports = Arc::new(PortAllocator::new(9030, 9039));
+        let mut d = driver(&["dev"], rec.clone(), ports);
+
+        // Put "dev" into Building (HeadAdvanced dispatches a StartBuild, no
+        // BuildFinished yet).
+        d.drive("dev", Event::HeadAdvanced { sha: "aaa".into() });
+        assert!(
+            matches!(
+                d.state.instance("dev").unwrap().pipeline,
+                crate::appstate::Pipeline::Building { .. }
+            ),
+            "precondition: dev is Building"
+        );
+
+        plant_bundle(&d, "dev", "stale1");
+        plant_bundle(&d, "dev", "stale2");
+
+        let removed = d.pressure_prune_bundles();
+
+        assert!(
+            removed.is_empty(),
+            "mid-build instance is skipped: {removed:?}"
+        );
+        assert_eq!(
+            bundle_shas(&d, "dev"),
+            vec!["stale1", "stale2"],
+            "a live harvest's bundle dir is left wholly untouched"
+        );
+    }
+
     #[test]
     fn red_build_keeps_serving_and_never_spawns() {
         let rec = Arc::new(Recorder {
@@ -781,6 +1010,7 @@ mod tests {
                 generation: g2,
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
+                    enospc: false,
                 },
             },
         );
