@@ -494,7 +494,7 @@ impl BuildBackend for ThreadBuildBackend {
             // `sha` on an Indeterminate where they legitimately differ.
             let (verdict, built_sha, reason): (&str, &str, &str) = match &report {
                 BuildReport::Green { sha, .. } => ("green", sha.as_str(), ""),
-                BuildReport::Red { sha, reason } => ("red", sha.as_str(), reason.as_str()),
+                BuildReport::Red { sha, reason, .. } => ("red", sha.as_str(), reason.as_str()),
                 BuildReport::Indeterminate { sha, reason } => {
                     ("indeterminate", sha.as_str(), reason.as_str())
                 }
@@ -510,8 +510,12 @@ impl BuildBackend for ThreadBuildBackend {
             );
             let outcome = match report {
                 BuildReport::Green { .. } => cargoless_core::appstate::AppBuildOutcome::Green,
-                BuildReport::Red { reason, .. } => {
-                    cargoless_core::appstate::AppBuildOutcome::Red { reason }
+                // Carry the ENOSPC classification into the state machine: an
+                // out-of-disk red is non-latching (requeue-once) so the
+                // control loop's pressure-prune can free space and the sha
+                // retries, instead of pinning a good commit red forever.
+                BuildReport::Red { reason, enospc, .. } => {
+                    cargoless_core::appstate::AppBuildOutcome::Red { reason, enospc }
                 }
                 BuildReport::Indeterminate { reason, .. } => {
                     cargoless_core::appstate::AppBuildOutcome::Indeterminate { reason }
@@ -701,12 +705,25 @@ fn serve_loop(
     }
 
     // Boot recovery: respawn each instance's durable last-green before any
-    // build, so a restart restores service in seconds, not a cold build.
+    // build, so a restart restores service in seconds, not a cold build — but
+    // ONLY if the bundle still exists; a vanished bundle (PVC churn / prune)
+    // falls through to a cold HEAD build instead of latching a false red on the
+    // green sha. Read the durable pointer once and branch on whether its bundle
+    // survives (a match guard, so no nested `if let` / no MSRV-1.85 let-chain).
     for spec in &specs {
-        let recovered = cargoless_core::appstatefile::read(state_dir, &spec.name)
+        let durable_green = cargoless_core::appstatefile::read(state_dir, &spec.name)
             .and_then(|snap| snap.last_green);
-        if let Some(green) = recovered {
-            driver.drive(&spec.name, Event::RecoverFromPointer { sha: green });
+        match durable_green {
+            Some(green) if instance_bundle_present(state_dir, &spec.name, &green) => {
+                driver.drive(&spec.name, Event::RecoverFromPointer { sha: green });
+            }
+            Some(lost) => {
+                ui::warn(format!(
+                    "instance {}: last_green bundle {lost} vanished — booting cold, building HEAD fresh",
+                    spec.name
+                ));
+            }
+            None => {}
         }
     }
 
@@ -881,6 +898,38 @@ fn serve_loop(
                 ) {
                     let wt = instance_worktree(state_dir, &instance);
                     launcher_ref.refresh_plan(&instance, &wt, repo);
+                }
+                // Disk-pressure self-heal: a build that died out-of-disk
+                // (ENOSPC) means the PVC is full. Aggressively prune every
+                // instance's stale bundles HERE — before `drive` lets the
+                // state machine (part 2) requeue the sha — so the imminent
+                // rebuild's harvest has room. This breaks the self-starvation
+                // latch: the only other prune is promote, which a disk-starved
+                // build never reaches. Safe: the prune keeps every live bundle
+                // and skips a mid-build instance (see `pressure_prune_bundles`).
+                if matches!(
+                    &event,
+                    Event::BuildFinished {
+                        outcome: cargoless_core::appstate::AppBuildOutcome::Red {
+                            enospc: true,
+                            ..
+                        },
+                        ..
+                    }
+                ) {
+                    let removed = driver.pressure_prune_bundles();
+                    // Surface the relief on `/app` (climbing count = PVC full +
+                    // self-relieving) so the wedge is observable, not silent.
+                    svc.set_pressure_prune(removed.len());
+                    tracing::warn!(
+                        "cargoless.app.instance" = instance.as_str(),
+                        "app.event" = "disk_pressure_relief",
+                        removed = removed.len(),
+                    );
+                    ui::warn(format!(
+                        "disk full during {instance} build — pressure-pruned {} stale bundle(s), retrying",
+                        removed.len()
+                    ));
                 }
                 driver.drive(&instance, event);
             }
@@ -1225,6 +1274,28 @@ fn trace_event(instance: &str, event: &Event) {
 /// instance gets its own worktree under the state dir.
 fn instance_worktree(state_dir: &Path, name: &str) -> PathBuf {
     state_dir.join("app").join(name).join("worktree")
+}
+
+/// Is `<state_dir>/app/<name>/bundles/<sha>/` present on disk? Used to gate
+/// boot recovery so it never trusts a `last_green` pointer whose bundle was
+/// lost to PVC churn or an aggressive prune — a `RecoverFromPointer` on a
+/// vanished bundle would fail to respawn, record a false red on the *green*
+/// sha, and idle the instance until HEAD advances.
+fn instance_bundle_present(state_dir: &Path, name: &str, sha: &str) -> bool {
+    state_dir
+        .join("app")
+        .join(name)
+        .join("bundles")
+        .join(sha)
+        .is_dir()
+}
+
+/// The durable `last_green` for `name`, but only if its bundle is still present
+/// (see [`instance_bundle_present`]); otherwise `None` so the caller falls
+/// through to a cold HEAD build instead of latching a false red.
+fn recoverable_green(state_dir: &Path, name: &str) -> Option<String> {
+    let green = cargoless_core::appstatefile::read(state_dir, name)?.last_green?;
+    instance_bundle_present(state_dir, name, &green).then_some(green)
 }
 
 /// Create the instance's git worktree (a `git worktree add` of the main repo)
@@ -1806,12 +1877,12 @@ fn reregister_persisted_previews(
             },
         );
         expires_at.insert(name.clone(), rec.expires_at);
-        // Recover last-green (via appstatefile) immediately; also kick a build
-        // so a moved ref rebuilds. RecoverFromPointer restores service in
-        // seconds; the HeadAdvanced rebuilds if the durable green is stale.
-        if let Some(green) =
-            cargoless_core::appstatefile::read(state_dir, &name).and_then(|s| s.last_green)
-        {
+        // Recover last-green (only if its bundle survives — see
+        // `recoverable_green`) immediately; also kick a build so a moved ref
+        // rebuilds. RecoverFromPointer restores service in seconds; the
+        // HeadAdvanced rebuilds if the durable green is stale or its bundle is
+        // gone (in which case recovery is skipped and we never false-latch red).
+        if let Some(green) = recoverable_green(state_dir, &name) {
             driver.drive(&name, Event::RecoverFromPointer { sha: green });
         }
         if let Some(sha) = resolve_ref(repo, &rec.git_ref) {
@@ -2473,5 +2544,50 @@ mod tests {
             "an unresolvable ${{VAR}} must be a startup error, not an empty value"
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn recoverable_green_requires_the_bundle_dir_to_exist() {
+        use cargoless_core::appstate::{InstanceState, ServingChild};
+
+        let state_dir =
+            std::env::temp_dir().join(format!("cgls-recover-green-{}", std::process::id()));
+        let name = "dev";
+        let _ = std::fs::remove_dir_all(&state_dir);
+
+        // No state file yet ⇒ nothing to recover.
+        assert_eq!(recoverable_green(&state_dir, name), None);
+
+        // Write a durable state naming last_green="abc123", but DO NOT create
+        // its bundle dir → recovery must refuse it (vanished bundle).
+        let inst = InstanceState {
+            serving: Some(ServingChild {
+                sha: "abc123".into(),
+                generation: 1,
+            }),
+            last_green: Some("abc123".into()),
+            ..Default::default()
+        };
+        cargoless_core::appstatefile::write(&state_dir, name, &inst, 100).unwrap();
+        assert_eq!(
+            recoverable_green(&state_dir, name),
+            None,
+            "last_green with a missing bundle dir must not be recovered"
+        );
+
+        // Now create the bundle dir → recovery honours the pointer.
+        let bundle = state_dir
+            .join("app")
+            .join(name)
+            .join("bundles")
+            .join("abc123");
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(
+            recoverable_green(&state_dir, name),
+            Some("abc123".to_string()),
+            "last_green with a present bundle dir is recovered"
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

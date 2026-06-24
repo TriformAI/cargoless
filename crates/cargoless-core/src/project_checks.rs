@@ -1078,6 +1078,18 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             0,
         );
     }
+    // Pin CARGO_TARGET_DIR to a path inside this run's scratch worktree so
+    // concurrent witness builds cannot clobber each other's
+    // `incremental/`, `.fingerprint/`, or encoded-metadata files (CGLS-24:
+    // `failed to create encoded metadata from file: os error 2`). The
+    // scratch is per-run by construction (`run-<pid>-<seq>/`) and is
+    // `git worktree remove --force`'d at cleanup, so the target subtree is
+    // auto-collected with it. Setting it via env wins over any ambient
+    // `CARGO_TARGET_DIR` on the daemon pod (e.g. the `/workspace/target`
+    // default in `cargoless-serve.k8s.yaml`) and over any workspace-level
+    // `.cargo/config.toml` `[build] target-dir` in the project under
+    // check — cargo's resolution order is env > config > default.
+    let cargo_target_dir = ctx.root.join(".cargoless-target");
     let mut cmd = Command::new(&check.command[0]);
     cmd.args(&check.command[1..])
         .current_dir(&ctx.root)
@@ -1085,6 +1097,7 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         .env("CARGOLESS_CHECK_ID", &check.id)
         .env("CARGOLESS_PROFILE", &ctx.profile_name)
         .env("CARGOLESS_WORKTREE", &ctx.root)
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
         .env(
             "CARGOLESS_CHANGED_FILES",
             ctx.changed_files
@@ -1169,14 +1182,15 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
                 .any(|d| d.severity == Severity::Error)
             {
                 let tail = tail_lines(&combined, 12);
+                let (code, message) = classify_exit(s, &tail);
                 command_diagnostics.push(diag(
                     &ctx.root,
                     check,
                     MANIFEST_NAME,
                     1,
                     1,
-                    "command.failed",
-                    &format!("command exited with {s}; output:\n{tail}"),
+                    code,
+                    &message,
                 ));
             }
             result_from_diags(check, command_diagnostics, 0)
@@ -1194,6 +1208,65 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             )],
             0,
         ),
+    }
+}
+
+/// Translate a wrapped check command's non-zero exit into a structured
+/// diagnostic. Generic across check kinds (rustc, python, bash) — the bash
+/// idiom `exit "$rc"` propagates a signal-coded child as a 128+N exit code,
+/// which lands here as a numeric exit, NOT a unix signal on the bash process.
+///
+/// Calling this out separately matters for verdict trust: a 141 (SIGPIPE) /
+/// 137 (SIGKILL) is the OS killing the wrapped command, not an honest tool-
+/// reported failure. Rendering both as `command.failed` hides that distinction
+/// and forces an operator to grep the source code to know whether a witness
+/// found a real RED or merely got pipe-raced on a deadline. The synthetic
+/// `command.process_killed` code surfaces it as a discrete class.
+fn classify_exit(status: std::process::ExitStatus, tail: &str) -> (&'static str, String) {
+    // Unix-signal-terminated child: ExitStatus::signal() returns Some(N).
+    // (`s.code()` is None in that case; bash also re-encodes as 128+N when it
+    // propagates its child's signal — we cover that case below.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = signal_name(sig);
+            return (
+                "command.process_killed",
+                format!(
+                    "command was killed by SIG{name} (signal {sig}); not an honest tool verdict.\noutput:\n{tail}"
+                ),
+            );
+        }
+    }
+    // Numeric exit codes from `bash -c '... ; exit "$rc"'` carry the wrapped
+    // child's signal as 128+N (SIGPIPE=13 → 141, SIGKILL=9 → 137,
+    // SIGTERM=15 → 143). Treat those exactly like the signal() case.
+    if let Some(code) = status.code().filter(|c| (128..192).contains(c)) {
+        let sig = code - 128;
+        let name = signal_name(sig);
+        return (
+            "command.process_killed",
+            format!(
+                "command exited with status {code} (wrapped child killed by SIG{name}, signal {sig}); not an honest tool verdict.\noutput:\n{tail}"
+            ),
+        );
+    }
+    (
+        "command.failed",
+        format!("command exited with {status}; output:\n{tail}"),
+    )
+}
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "HUP",
+        2 => "INT",
+        3 => "QUIT",
+        9 => "KILL",
+        13 => "PIPE",
+        15 => "TERM",
+        _ => "?",
     }
 }
 
@@ -2337,6 +2410,76 @@ checks:
         let _ = fs::remove_dir_all(root);
     }
 
+    /// CGLS-24: `check_command` must set `CARGO_TARGET_DIR` to a path inside
+    /// its scratch root so concurrent witness builds cannot collide on a
+    /// shared `incremental/`. A regression that drops the env line would
+    /// leave the spawned process inheriting the daemon-pod default and
+    /// reintroduce the `os error 2` race.
+    #[test]
+    fn command_check_isolates_cargo_target_dir_per_scratch_root() {
+        let root = scratch("target-dir-isolate");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: target-dir-isolate
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf '%s' \"$CARGO_TARGET_DIR\" > target-dir.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+        let report = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        let expected = root.join(".cargoless-target");
+        assert_eq!(
+            fs::read_to_string(root.join("target-dir.out")).unwrap(),
+            expected.to_string_lossy(),
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// CGLS-24: two concurrent `check_command` invocations against distinct
+    /// scratch roots must see distinct `CARGO_TARGET_DIR`s in their child
+    /// processes — the per-scratch isolation must hold under the actual
+    /// witness lane's thread-fanout shape (`servedrv.rs:1832-1834` spawns
+    /// one detached thread per gate push, deliberately un-slotted).
+    #[test]
+    fn concurrent_command_checks_get_distinct_cargo_target_dirs() {
+        let root_a = scratch("target-dir-conc-a");
+        let root_b = scratch("target-dir-conc-b");
+        let manifest = r#"
+version: 1
+checks:
+  - id: target-dir-conc
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf '%s' \"$CARGO_TARGET_DIR\" > td.out"]
+    cache: none
+"#;
+        fs::write(root_a.join(MANIFEST_NAME), manifest).unwrap();
+        fs::write(root_b.join(MANIFEST_NAME), manifest).unwrap();
+        let (a, b) = std::thread::scope(|s| {
+            let h_a = s.spawn(|| run_profile(&root_a, "dev", None).unwrap());
+            let h_b = s.spawn(|| run_profile(&root_b, "dev", None).unwrap());
+            (h_a.join().unwrap(), h_b.join().unwrap())
+        });
+        assert_eq!(a.tree, TreeState::Green);
+        assert_eq!(b.tree, TreeState::Green);
+        assert_eq!(
+            fs::read_to_string(root_a.join("td.out")).unwrap(),
+            root_a.join(".cargoless-target").to_string_lossy(),
+        );
+        assert_eq!(
+            fs::read_to_string(root_b.join("td.out")).unwrap(),
+            root_b.join(".cargoless-target").to_string_lossy(),
+        );
+        let _ = fs::remove_dir_all(root_a);
+        let _ = fs::remove_dir_all(root_b);
+    }
+
     #[test]
     fn glob_star_star_matches_nested_paths() {
         assert!(glob_match_path("portal/**/*.rs", "portal/src/lib.rs"));
@@ -2441,5 +2584,58 @@ checks:
             "grandchild kept writing after timeout — process tree NOT killed \
              (orphan leak): {size_after_kill} -> {size_later}"
         );
+    }
+
+    #[cfg(unix)]
+    fn exit_with_code(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
+    fn exit_with_signal(sig: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(sig)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_treats_141_as_process_killed_sigpipe() {
+        let (code, msg) = classify_exit(exit_with_code(141), "tail content");
+        assert_eq!(code, "command.process_killed");
+        assert!(msg.contains("SIGPIPE"), "msg: {msg}");
+        assert!(msg.contains("141"), "msg: {msg}");
+        assert!(msg.contains("not an honest tool verdict"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_treats_137_as_process_killed_sigkill() {
+        let (code, msg) = classify_exit(exit_with_code(137), "");
+        assert_eq!(code, "command.process_killed");
+        assert!(msg.contains("SIGKILL"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_treats_raw_unix_signal_as_process_killed() {
+        let (code, msg) = classify_exit(exit_with_signal(13), "tail");
+        assert_eq!(code, "command.process_killed");
+        assert!(msg.contains("SIGPIPE"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_preserves_command_failed_for_normal_nonzero() {
+        let (code, msg) = classify_exit(exit_with_code(1), "honest red");
+        assert_eq!(code, "command.failed");
+        assert!(msg.contains("honest red"), "msg: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_exit_preserves_command_failed_for_high_nonsignal_code() {
+        let (code, _) = classify_exit(exit_with_code(200), "");
+        assert_eq!(code, "command.failed");
     }
 }
