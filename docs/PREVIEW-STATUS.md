@@ -75,6 +75,13 @@ field only advances on a successful health probe (single Promote site in
 `last_red_reason`; the old image keeps answering on the public app host
 throughout.
 
+`last_red_sha` / `last_red_reason` always reflect *current* brokenness: the
+moment a newer build serves green, the prior red is cleared (it is superseded
+by a known-good, servable sha). So the canary never advertises a stale
+`last_red=<old-sha>` after a newer green is already serving — there is no
+phantom red to age out. (Crash-recovery respawn of an older green bundle keeps
+`last_red`, because in that case the tip genuinely is still red.)
+
 ## Source-of-truth split
 
 | What | Where |

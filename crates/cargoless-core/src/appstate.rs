@@ -49,7 +49,15 @@
 //! ## Red discipline
 //!
 //! A red sha is recorded per instance and **never auto-retried**: only a new
-//! HEAD on that ref queues again. The one exception is
+//! HEAD on that ref queues again. The recorded red is **cleared the moment a
+//! fresh build promotes green** (a successful health probe on a newly compiled
+//! bundle): that newer servable sha supersedes the red, so `last_red` always
+//! reports *current* brokenness rather than a phantom that outlived its fix —
+//! the canary advertising `last_red=<old-sha>` for days after a newer green is
+//! already serving. A *respawn* promote (boot/crash recovery from an existing
+//! green bundle, no fresh compile) deliberately keeps `last_red`: the tip may
+//! still be the red sha while only the older green is restored underneath it.
+//! The one exception is
 //! [`AppBuildOutcome::Indeterminate`] (the tree-mutated-mid-build backstop):
 //! it requeues once (the newest pending sha if a commit arrived meanwhile —
 //! newest-sha-wins for the *retry target*), and a second **consecutive**
@@ -113,7 +121,10 @@ pub struct InstanceState {
     pub pipeline: Pipeline,
     /// Newest sha seen while the pipeline was busy (newest-sha-wins).
     pub pending: Option<String>,
-    /// Last red `(sha, reason)` — that sha is never auto-retried.
+    /// Last red `(sha, reason)` — that sha is never auto-retried, and it is
+    /// **cleared when a fresh build promotes green** (a newer servable sha
+    /// supersedes it), so `last_red` always means *current* brokenness, never a
+    /// stale phantom that outlived its fix. A respawn promote keeps it.
     pub last_red: Option<(String, String)>,
     /// Most recent successfully promoted sha (survives a serving-child
     /// death; names the bundle a recovery respawn boots from).
@@ -431,10 +442,12 @@ impl AppState {
         actions: &mut Vec<Action>,
     ) {
         let inst = self.instances.get_mut(instance).expect("checked");
-        let sha = match &inst.pipeline {
+        let (sha, respawn) = match &inst.pipeline {
             Pipeline::Probing {
-                sha, generation: g, ..
-            } if *g == generation => sha.clone(),
+                sha,
+                generation: g,
+                respawn,
+            } if *g == generation => (sha.clone(), *respawn),
             _ => return,
         };
         actions.push(Action::Promote {
@@ -454,6 +467,19 @@ impl AppState {
         }
         inst.last_green = Some(sha);
         inst.needs_respawn = false;
+        if !respawn {
+            // A *fresh build* compiled green AND passed its health probe: it is
+            // a known-good, servable sha that supersedes any prior red (HEAD is
+            // forward-only, so this green is ≥ the red sha). Clearing the latch
+            // here is what makes `last_red` mean "current brokenness" and never
+            // a stale phantom that outlived its own fix — the canary reporting
+            // `last_red=<old-sha>` for days after a newer green is already
+            // serving. A *respawn* (boot/crash-recovery from an existing green
+            // bundle, no fresh compile) must NOT clear: the tip may still be the
+            // red sha and we are only restoring the older green underneath it,
+            // so that red is a genuine current signal, not a phantom.
+            inst.last_red = None;
+        }
         inst.pipeline = Pipeline::Idle;
         self.settle_idle(instance, actions);
         self.dispatch(actions);
@@ -835,6 +861,115 @@ mod tests {
         let a = head(&mut s, "dev", "fixed");
         assert_eq!(a.len(), 1);
         assert!(matches!(&a[0], Action::StartBuild { sha, .. } if sha == "fixed"));
+    }
+
+    #[test]
+    fn green_promote_clears_a_prior_red() {
+        // The direct phantom-canary repro: an instance goes red on one sha,
+        // then a newer sha builds green and promotes. The stale red MUST be
+        // cleared — the canary must not keep advertising `last_red=<old-sha>`
+        // once a newer green is serving (the ~2.85-day phantom seen in the
+        // field: serving=cd23 while last_red=f488 lingered for days).
+        let mut s = state(&["dev"]);
+        drive_to_serving(&mut s, "dev", "g0");
+
+        // dev goes red on f488; the old green keeps serving (never-serve-red).
+        let a = head(&mut s, "dev", "f488");
+        let g = build_gen(&a);
+        s.step(
+            "dev",
+            Event::BuildFinished {
+                generation: g,
+                outcome: AppBuildOutcome::Red {
+                    reason: "step `server` exited 101".into(),
+                },
+            },
+        );
+        let inst = s.instance("dev").unwrap();
+        assert_eq!(inst.last_red.as_ref().unwrap().0, "f488", "red recorded");
+        assert_eq!(
+            inst.serving.as_ref().unwrap().sha,
+            "g0",
+            "serving untouched by the red"
+        );
+
+        // A newer sha builds green and promotes — the prior red is superseded.
+        drive_to_serving(&mut s, "dev", "cd23");
+        let inst = s.instance("dev").unwrap();
+        assert_eq!(inst.serving.as_ref().unwrap().sha, "cd23");
+        assert_eq!(inst.last_green.as_deref(), Some("cd23"));
+        assert_eq!(
+            inst.last_red, None,
+            "a fresh green promote clears the superseded red — no phantom"
+        );
+    }
+
+    #[test]
+    fn respawn_does_not_clear_last_red() {
+        // The genuine-signal guard: when the tip is red and the serving child
+        // dies, the instance respawns the OLDER green bundle. That respawn
+        // promote must NOT clear `last_red` — the tip really is broken; we are
+        // only restoring the older green underneath it, so the red is a current
+        // signal, not a phantom.
+        let mut s = state(&["dev"]);
+        let g_serve = drive_to_serving(&mut s, "dev", "aaa");
+
+        // The tip goes red; serving stays on aaa.
+        let a = head(&mut s, "dev", "bad");
+        let g_build = build_gen(&a);
+        s.step(
+            "dev",
+            Event::BuildFinished {
+                generation: g_build,
+                outcome: AppBuildOutcome::Red {
+                    reason: "boom".into(),
+                },
+            },
+        );
+        assert_eq!(
+            s.instance("dev").unwrap().last_red.as_ref().unwrap().0,
+            "bad"
+        );
+
+        // The serving child dies → respawn the last green (aaa) from its bundle.
+        let actions = s.step(
+            "dev",
+            Event::ServingExited {
+                generation: g_serve,
+            },
+        );
+        let respawn_gen = match actions.as_slice() {
+            [Action::Respawn {
+                sha, generation, ..
+            }] => {
+                assert_eq!(sha, "aaa", "respawn boots the last green bundle");
+                *generation
+            }
+            other => panic!("expected a single Respawn, got {other:?}"),
+        };
+
+        // The respawn promotes: serving is restored to the old green, but the
+        // red is preserved — the tip is still broken.
+        let actions = s.step(
+            "dev",
+            Event::ProbeSucceeded {
+                generation: respawn_gen,
+            },
+        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Promote { sha, .. } if sha == "aaa")));
+        let inst = s.instance("dev").unwrap();
+        assert_eq!(
+            inst.serving.as_ref().unwrap().sha,
+            "aaa",
+            "old green restored"
+        );
+        assert_eq!(
+            inst.last_red.as_ref().map(|(s, _)| s.as_str()),
+            Some("bad"),
+            "a respawn promote keeps last_red — the tip is genuinely red"
+        );
     }
 
     #[test]
