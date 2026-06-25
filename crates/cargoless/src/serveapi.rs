@@ -5953,13 +5953,16 @@ checks:
         let macro_names = parse_macro_blind_macros("view");
         for name in ["double_capture_move.rs", "early_return_into_any.rs"] {
             let content = read_known_blind(name);
-            // Drift guard: the blind class IS the `view!` — if a future edit
-            // removes it, this fixture no longer documents the class and the
-            // content-narrowed detector would (correctly) stop firing. Fail
-            // here, loudly, rather than let the corpus rot into a false green.
+            // Drift guard: the blind class IS the `view!` INVOCATION — if a
+            // future edit removes it, this fixture no longer documents the
+            // class and the content-narrowed detector would (correctly) stop
+            // firing. Assert with the real detector primitive (not a naive
+            // substring, which a prose mention in backticks would satisfy)
+            // so the guard fails loudly rather than let the corpus rot into a
+            // false green.
             assert!(
-                content.contains("view!"),
-                "{name} must contain a `view!` invocation (the macro-blind class it documents)"
+                content_has_macro_call(&content, &macro_names),
+                "{name} must contain a `view!` macro invocation (the macro-blind class it documents)"
             );
             let changed = vec![format!("portal/src/known_blind/{name}")];
             let overlay = vec![(format!("portal/src/known_blind/{name}"), content)];
@@ -5978,15 +5981,21 @@ checks:
         // the content-exempt glob set must classify it blind regardless.
         let name = "generated_twin_unimported_type.rs";
         let content = read_known_blind(name);
+        let macro_names = parse_macro_blind_macros("view"); // narrowing ON
         // Drift guard the other way: the whole point of this class is that
-        // there is NO macro for a content scan to find.
+        // there is NO macro CALL for a content scan to find. Assert with the
+        // real detector primitive (`content_has_macro_call`), not a naive
+        // substring — the file's prose legitimately mentions `view!` in
+        // backticks while explaining the class, and only an actual
+        // invocation (`view!{`/`(`/`[`) is what the macro-narrowed net keys
+        // on. Using the primitive keeps this guard self-consistent with the
+        // "macro net misses it" assertion below.
         assert!(
-            !content.contains("view!"),
-            "{name} must NOT contain a `view!` — it documents the content-exempt \
-             (non-macro) cross-crate blind class"
+            !content_has_macro_call(&content, &macro_names),
+            "{name} must contain NO `view!`-style macro INVOCATION — it documents \
+             the content-exempt (non-macro) cross-crate blind class"
         );
         let exempt = parse_macro_blind_globs("**/known_blind/**");
-        let macro_names = parse_macro_blind_macros("view"); // narrowing ON
         let changed = vec![format!("chemistry/generated/known_blind/{name}")];
         let overlay = vec![(format!("chemistry/generated/known_blind/{name}"), content)];
         // Pass it through the EXEMPT slot with the macro slot empty: a macro
