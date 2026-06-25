@@ -1953,6 +1953,31 @@ impl VerdictService for ServeVerdictState {
                 }
             }
 
+            // CGLS-26 — central-daemon attribution guard. A push with
+            // `analysis_root` set is the witness path: the runner polls
+            // `/status?worktree=W&base_sha=<COMMIT>` and refuses any green
+            // it can't match commit-for-commit (post-2026-06-17 fail-closed
+            // policy). Without `base_sha` the published verdict is
+            // structurally unattributable (slot stamp is `None`, the
+            // base_sha-addressable ring is gated on `Some(non-empty)` at
+            // `publish_attributed`), so the runner polls until its 1900s
+            // budget expires — observed live on PR #7190 across 2/2
+            // witness attempts. Refusing the push here surfaces the
+            // contract violation in the ack instead of burning 31 minutes
+            // per attempt. Symmetric to the zero-files guard above;
+            // placed before `ensure_analysis_root` so a doomed push never
+            // spends the sync_lock on a fetch.
+            if analysis_root.is_some() && base_sha.is_none() {
+                eprintln!(
+                    "[cargoless:obs] reject-attribution-missing wt={worktree} reason=base_sha_absent_on_central_push (CGLS-26)"
+                );
+                return rejected_push(
+                    worktree,
+                    "central-daemon push (analysis_root set) missing base_sha; \
+                     refusing to publish an unattributable verdict the runner cannot match",
+                );
+            }
+
             if let Some(root) = analysis_root.as_ref() {
                 let base = base_ref.trim();
                 if !base.is_empty() {
@@ -5596,6 +5621,83 @@ checks:
         assert!(
             !ack.accepted,
             "central-daemon zero-file push must be rejected"
+        );
+    }
+
+    #[test]
+    fn central_daemon_push_missing_base_sha_is_rejected() {
+        // CGLS-26 — a push that sets `analysis_root` (witness path) but
+        // omits `base_sha` would publish an unattributable verdict the
+        // runner cannot match commit-for-commit, guaranteeing the 1900s
+        // poll-budget timeout. The guard refuses the push at ingest so
+        // the contract violation surfaces in the ack instead of burning
+        // 31 minutes per attempt.
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "fn main() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: Some("/workspace/tf-multiverse".into()),
+            base_sha: None,
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            gate: false,
+            check_ids: None,
+        };
+        let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
+        assert!(
+            !ack.accepted,
+            "central-daemon push missing base_sha must be rejected"
+        );
+        assert!(
+            api.peek_overlay_for("/wt").is_none(),
+            "rejected push must not be stored"
+        );
+    }
+
+    #[test]
+    fn central_daemon_push_with_empty_base_sha_is_rejected() {
+        // CGLS-26 — the V2 ingest trims `base_sha` and collapses empty/
+        // whitespace strings to `None` (serveapi.rs ~1909), so a literal
+        // `"base_sha": ""` from the runner reaches the guard as
+        // `base_sha=None` and must be rejected the same way an absent
+        // key is.
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "fn main() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: Some("/workspace/tf-multiverse".into()),
+            base_sha: Some("   ".into()),
+            changed_files: None,
+            gate: false,
+            check_ids: None,
+        };
+        let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
+        assert!(
+            !ack.accepted,
+            "central-daemon push with whitespace-only base_sha must be rejected"
+        );
+    }
+
+    #[test]
+    fn local_push_without_analysis_root_and_no_base_sha_stays_accepted() {
+        // CGLS-26 boundary — the guard is scoped to central-daemon
+        // (`analysis_root` set) pushes. A plain local push without
+        // `analysis_root` is the v0.2.x path: `base_sha` is genuinely
+        // optional (FS-watch verdicts carry no SHA anyway), so the
+        // guard must not break it.
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "fn main() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: None,
+            base_sha: None,
+            changed_files: None,
+            gate: false,
+            check_ids: None,
+        };
+        let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
+        assert!(
+            ack.accepted,
+            "local push without analysis_root must remain accepted without base_sha"
         );
     }
 
