@@ -1807,6 +1807,7 @@ mod tests {
                     crates: vec![],
                     red_diagnostics: 0,
                     verdict_failure_reason: None,
+                    verdict_failure_class: None,
                     // Echo the routed param so the test can assert it arrived.
                     base_sha: base_sha.map(str::to_string),
                     ra_blind_paths: false,

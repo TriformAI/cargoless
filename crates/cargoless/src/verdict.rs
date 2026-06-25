@@ -896,6 +896,7 @@ mod tests {
             verdict_failure_class: class,
             base_sha: None,
             ra_blind_paths: false,
+            gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 0,
             published_at: 0,
         }
