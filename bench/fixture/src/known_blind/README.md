@@ -17,6 +17,7 @@ witness-only.
 |---|---|---|
 | `early_return_into_any.rs` | early-return `view!` branch not unified with the tail branch (missing `.into_any()`) | E0308 mismatched types |
 | `double_capture_move.rs` | same variable captured twice inside one `view!` without an intermediate `let` | E0382 use of moved value |
+| `generated_twin_unimported_type.rs` | generated twin references a sibling-crate type the generator forgot to `use` (no `view!` — the **content-exempt** class) | E0412 cannot find type / E0425 cannot find value |
 
 Transcribed from the incident write-up (tf-mv `portal/CLAUDE.md`); the
 portal runs a newer Leptos than this fixture pins (`=0.6.15`), so exact
@@ -33,6 +34,10 @@ referencing an unimported type (`cannot find type DonutSlice`, E0425), which
 RA-native greened and a later rustc/SSR compile caught. It is covered by the
 content-exempt `CARGOLESS_BLIND_PATHS` glob set (always blind, no `view!` for
 a content scan to key on), not `CARGOLESS_MACRO_BLIND_PATHS` — see
-`docs/design/D-PROJECT-CHECKS.md` § Blind-path coverage. A fixture for this
-class is not added here (it would need a sibling crate to import from, unlike
-the self-contained macro-expansion files above).
+`docs/design/D-PROJECT-CHECKS.md` § Blind-path coverage. The corpus file
+`generated_twin_unimported_type.rs` documents this class: it deliberately omits
+the cross-crate `use` and references a sibling-crate type, so a *self-contained*
+`cargo build` of it would need a real sibling crate to import from. That is why
+— like the macro files — it is NOT in the module tree: it is documentation-as-
+code, and the content source the in-tree detector test reads to assert the
+content-exempt path classifies it blind without a `view!` to key on.

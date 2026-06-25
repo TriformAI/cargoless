@@ -188,7 +188,7 @@ fn latency_ms(push_received_unix: u64, consumed_unix: u64, analysis: Duration) -
 /// inert until the deployment opts in). Read per consume, not cached:
 /// pushes are seconds-apart events and a fleet env edit must not require
 /// a daemon restart reasoning step during an incident.
-fn macro_blind_globs() -> Vec<String> {
+pub(crate) fn macro_blind_globs() -> Vec<String> {
     parse_macro_blind_globs(&std::env::var("CARGOLESS_MACRO_BLIND_PATHS").unwrap_or_default())
 }
 
@@ -205,7 +205,7 @@ fn macro_blind_globs() -> Vec<String> {
 /// (a fleet env edit during an incident must not require a daemon restart).
 /// Empty / unset ⇒ the content-exempt class is inert; behavior is
 /// byte-identical to the pre-#DONUT path.
-fn content_exempt_globs() -> Vec<String> {
+pub(crate) fn content_exempt_globs() -> Vec<String> {
     parse_macro_blind_globs(&std::env::var("CARGOLESS_BLIND_PATHS").unwrap_or_default())
 }
 
@@ -5913,6 +5913,95 @@ checks:
         assert_eq!(names, vec!["view", "html", "rsx"]);
         assert!(parse_macro_blind_macros("").is_empty());
         assert_eq!(parse_macro_blind_macros("view"), vec!["view"]);
+    }
+
+    // ──────────── #A8/#DONUT — REAL known-blind corpus proof ────────────
+    //
+    // The unit tests above exercise the detector with SYNTHETIC inputs.
+    // Nothing asserted that the actual `bench/fixture/src/known_blind/*.rs`
+    // corpus — the documentation-as-code of the classes RA-native is blind
+    // to, including the #7067 `view!` double-capture (E0382) — really trips
+    // the detector. Without that link the corpus can silently drift out of
+    // sync with `compute_blind_hit` and nobody would notice. These tests
+    // read the REAL file CONTENTS and assert the detector fires, with a
+    // drift guard so editing the blind pattern out of a fixture fails loudly.
+    //
+    // No live daemon, no cargo: the corpus files are read as DATA at test
+    // time (the `cargoless` crate is published to crates.io, so an
+    // `include_str!` escaping the crate root would break `cargo publish`;
+    // a `cargo test --workspace` run always has `bench/` in the checkout,
+    // so a runtime read off `CARGO_MANIFEST_DIR` is the correct seam).
+
+    /// Read a known-blind corpus file by name, resolved relative to this
+    /// crate's manifest dir (`crates/cargoless` → repo root → `bench/...`).
+    fn read_known_blind(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/fixture/src/known_blind")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read known-blind corpus {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn real_macro_corpus_files_are_classified_blind() {
+        // The #A8 macro-expansion class: both files contain a `view!` and
+        // live under known_blind/, so the macro-glob + content-narrowing net
+        // (`macro_names = ["view"]`) must classify them blind. `double_capture
+        // _move.rs` is the exact #7067 class (E0382 use of moved value inside
+        // one `view!`).
+        let macro_globs = parse_macro_blind_globs("**/known_blind/**");
+        let macro_names = parse_macro_blind_macros("view");
+        for name in ["double_capture_move.rs", "early_return_into_any.rs"] {
+            let content = read_known_blind(name);
+            // Drift guard: the blind class IS the `view!` — if a future edit
+            // removes it, this fixture no longer documents the class and the
+            // content-narrowed detector would (correctly) stop firing. Fail
+            // here, loudly, rather than let the corpus rot into a false green.
+            assert!(
+                content.contains("view!"),
+                "{name} must contain a `view!` invocation (the macro-blind class it documents)"
+            );
+            let changed = vec![format!("portal/src/known_blind/{name}")];
+            let overlay = vec![(format!("portal/src/known_blind/{name}"), content)];
+            assert!(
+                compute_blind_hit(Some(&changed), &macro_globs, &[], &overlay, &macro_names),
+                "{name} (real corpus content) must be classified blind by the macro-narrowed net"
+            );
+        }
+    }
+
+    #[test]
+    fn real_generated_twin_corpus_file_is_content_exempt_blind() {
+        // The #DONUT content-exempt class: a generated twin with NO `view!`
+        // (the cross-crate `cannot find type DonutSlice` E0425 incident). The
+        // macro-narrowed net would WRONGLY clear it (no `view!` to key on);
+        // the content-exempt glob set must classify it blind regardless.
+        let name = "generated_twin_unimported_type.rs";
+        let content = read_known_blind(name);
+        // Drift guard the other way: the whole point of this class is that
+        // there is NO macro for a content scan to find.
+        assert!(
+            !content.contains("view!"),
+            "{name} must NOT contain a `view!` — it documents the content-exempt \
+             (non-macro) cross-crate blind class"
+        );
+        let exempt = parse_macro_blind_globs("**/known_blind/**");
+        let macro_names = parse_macro_blind_macros("view"); // narrowing ON
+        let changed = vec![format!("chemistry/generated/known_blind/{name}")];
+        let overlay = vec![(format!("chemistry/generated/known_blind/{name}"), content)];
+        // Pass it through the EXEMPT slot with the macro slot empty: a macro
+        // narrowing that is active everywhere must not suppress this hit.
+        assert!(
+            compute_blind_hit(Some(&changed), &[], &exempt, &overlay, &macro_names),
+            "{name} (real corpus content, no view!) must be content-exempt blind"
+        );
+        // And it must NOT be caught by the macro-narrowed slot alone (proves
+        // why the content-exempt set is necessary, not redundant).
+        assert!(
+            !compute_blind_hit(Some(&changed), &exempt, &[], &overlay, &macro_names),
+            "{name} must be MISSED by the macro-narrowed net — that gap is exactly \
+             what the content-exempt glob set closes"
+        );
     }
 
     #[test]

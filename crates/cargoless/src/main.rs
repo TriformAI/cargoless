@@ -185,6 +185,14 @@ struct Opts {
     /// `batch-check --request-json <PATH>` — native batch_check transport
     /// request body to send to a remote daemon.
     batch_request_json: Option<PathBuf>,
+    /// `batch-check --advisory` — the same exit-code reification `verdict
+    /// --advisory` applies, for a staged/pre-commit gate wrapping
+    /// `batch-check`: a real RED stays exit 1, but an `Indeterminate`
+    /// report (infra could not produce a verdict) and a transport/IO
+    /// failure exit 0 + a structured `[cargoless:advisory]` stderr line
+    /// instead of 75. The downstream compile-witness is the authoritative
+    /// gate; the report JSON on stdout is unchanged.
+    batch_advisory: bool,
     // ── A1 (0.4) `verdict` flags ────────────────────────────────────
     /// `verdict --remote <url>` repeatable — failover ladder, tried in
     /// order (first = primary). Separate from the scalar `remote` so the
@@ -555,6 +563,7 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 );
             }
             "--advisory" if cmd == Cmd::Verdict => opts.verdict_advisory = true,
+            "--advisory" if cmd == Cmd::BatchCheck => opts.batch_advisory = true,
             // `verdict ... -- <repo>`: everything after the separator is
             // positional; exactly one (the repo path) is accepted.
             "--" if cmd == Cmd::Verdict => {
@@ -615,8 +624,9 @@ fn usage() {
     println!("                        preview on a remote app-serve daemon, follow it");
     println!("                        to green; auto-removes after --ttl (default 24h);");
     println!("                        --remove tears it down now");
-    println!("  batch-check --remote <URL> --request-json <PATH>");
+    println!("  batch-check --remote <URL> --request-json <PATH> [--advisory]");
     println!("                        Native optimistic batch gate; prints report JSON");
+    println!("                        (--advisory: red→1, indeterminate/transport-fail→0)");
     println!("  verdict --remote <URL> [--remote <URL>...] [-- <REPO>]");
     println!("                        One-shot gate verdict: push the diff, await the");
     println!("                        SHA-attributed verdict, print one JSON object;");
@@ -977,6 +987,7 @@ fn main() -> ExitCode {
                 remote,
                 auth_token: auth_token_for_push(parsed.opts.auth_token.clone()),
                 request_json,
+                advisory: parsed.opts.batch_advisory,
             });
         }
         // A1 (0.4) — `verdict` is a server-protocol command like push:
@@ -1220,7 +1231,8 @@ mod tests {
 
     #[test]
     fn verdict_advisory_scoped_to_verdict() {
-        // --advisory is verdict-only; other commands must keep rejecting it.
+        // --advisory is valid ONLY on the two gate-client commands (verdict
+        // and batch-check); every other command must keep rejecting it.
         assert_eq!(
             parse(&v(&["push", "--advisory"])),
             Err(ParseError::UnknownFlag("--advisory".into()))
@@ -1228,6 +1240,39 @@ mod tests {
         assert_eq!(
             parse(&v(&["status", "--advisory"])),
             Err(ParseError::UnknownFlag("--advisory".into()))
+        );
+    }
+
+    #[test]
+    fn batch_check_advisory_flag_sets_opt() {
+        let p = parse(&v(&[
+            "batch-check",
+            "--remote",
+            "http://pool:8787",
+            "--request-json",
+            "/tmp/req.json",
+            "--advisory",
+        ]))
+        .unwrap();
+        assert_eq!(p.cmd, Cmd::BatchCheck);
+        assert!(p.opts.batch_advisory);
+        // The verdict-scoped advisory opt stays untouched (distinct field).
+        assert!(!p.opts.verdict_advisory);
+    }
+
+    #[test]
+    fn batch_check_advisory_defaults_off() {
+        let p = parse(&v(&[
+            "batch-check",
+            "--remote",
+            "http://pool:8787",
+            "--request-json",
+            "/tmp/req.json",
+        ]))
+        .unwrap();
+        assert!(
+            !p.opts.batch_advisory,
+            "--advisory absent → legacy 0/1/75 ladder"
         );
     }
 

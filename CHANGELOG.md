@@ -64,6 +64,28 @@ canonical, in this order):
   additive `ra_blind_paths` wire key and inherit the same
   `CARGOLESS_MACRO_BLIND_ESCALATE=1` witness escalation. Inert until set;
   empty/unset behaves byte-identically to the prior path.
+- **Known-blind corpus proof + generated-twin fixture** — the
+  `bench/fixture/src/known_blind/` corpus is now asserted against the live
+  detector: tests read the real file contents and prove `compute_blind_hit`
+  fires (and `ra_native_payload` downgrades a clean RA green to
+  `unknown(ra_blind_path_green_unwitnessed)`), with drift guards so editing
+  the blind pattern out of a fixture fails loudly. Adds the missing
+  generated-twin file `generated_twin_unimported_type.rs` for the
+  content-exempt (cross-crate `DonutSlice` E0425) class. Closes the gap that
+  let a `view!` double-capture (E0382) reach trunk RA-native-green.
+- **Unprotected-RA-native startup observability** — at serve boot the daemon
+  emits a `[cargoless:obs] ra-native blind-path config: …` line (macro-glob /
+  exempt-glob counts + escalation state), and a distinct `WARN … UNPROTECTED`
+  line when RA-native is active with zero blind globs configured — the exact
+  precondition under which a proc-macro/cross-crate false-GREEN can
+  self-merge unwitnessed. Observability only; no behavior change.
+- **`cargoless batch-check --advisory`** — exit-code parity with `verdict
+  --advisory` for a staged/pre-commit gate wrapping `batch-check`: a real RED
+  still hard-blocks (exit 1), but an `Indeterminate` report and a transport/IO
+  failure exit 0 + a `[cargoless:advisory]` stderr line instead of 75 (infra
+  trouble is not a code red; the downstream compile-witness is authoritative).
+  Plain `batch-check` (no `--advisory`) is byte-identical to the legacy 0/1/75
+  ladder. The report JSON on stdout is unchanged.
 
 ## [0.3.0] - 2026-06-08
 

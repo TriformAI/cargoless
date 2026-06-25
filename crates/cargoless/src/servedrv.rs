@@ -395,6 +395,15 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
              remote push requests drive verdicts.",
         );
     }
+    // #A8/#DONUT observability: the daemon's verdict tier is RA-native
+    // (`ra_native_verdict_mode()` is the product invariant), which is
+    // structurally blind to post-proc-macro and cross-crate-twin errors.
+    // Surface the blind-path config at boot so an UNPROTECTED RA-native
+    // daemon is observable (the #7067 false-GREEN precondition) rather than
+    // silently shipping with zero protection.
+    if ra_native_verdict_mode() {
+        log_blind_config_banner();
+    }
     // #225 0d: the daemon's serve loop is now live → flip the /healthz
     // readiness latch (503 {"status":"starting"} → 200 {"status":"ready"}).
     // A6 split: /healthz is the startup/LIVENESS boundary only — RA is not
@@ -1682,6 +1691,57 @@ fn effective_project_checks_mode(
 /// `CARGOLESS_BLIND_PATHS`); the env name is retained for compatibility.
 fn macro_blind_escalate() -> bool {
     std::env::var("CARGOLESS_MACRO_BLIND_ESCALATE").is_ok_and(|v| v == "1")
+}
+
+/// True when this RA-native daemon has ZERO blind-path protection
+/// configured — neither glob set is set, so `compute_blind_hit` returns
+/// `false` for every push and a proc-macro/cross-crate false-GREEN (the
+/// #7067 `view!` double-capture class) could be published as green and
+/// self-merge unwitnessed. Pure over its inputs so it is unit-testable
+/// without env mutation.
+fn ra_native_unprotected(macro_globs: &[String], exempt_globs: &[String]) -> bool {
+    macro_globs.is_empty() && exempt_globs.is_empty()
+}
+
+/// One-line, operator-facing summary of the blind-path configuration, for
+/// the serve-startup banner. Pure (no env reads) so the formatting is
+/// unit-tested directly; the I/O site sources the slices from the serveapi
+/// accessors. Shape:
+///   `macro_globs=2 exempt_globs=1 escalate=on`
+fn blind_config_summary(macro_globs: &[String], exempt_globs: &[String], escalate: bool) -> String {
+    format!(
+        "macro_globs={} exempt_globs={} escalate={}",
+        macro_globs.len(),
+        exempt_globs.len(),
+        if escalate { "on" } else { "off" }
+    )
+}
+
+/// Emit the blind-path configuration banner at serve startup (RA-native
+/// mode only). A configured daemon gets one `[cargoless:obs]` line; an
+/// UNPROTECTED RA-native daemon gets a distinct WARN line naming the exact
+/// gap (the #7067 precondition: RA-native is blind to post-proc-macro and
+/// cross-crate errors, so with no blind globs a false-GREEN can self-merge).
+/// Reads the env via the serveapi accessors so it reflects the same config
+/// `compute_blind_hit` consumes per push. Side-effecting (stderr only);
+/// the pure parts are [`blind_config_summary`] / [`ra_native_unprotected`].
+fn log_blind_config_banner() {
+    let macro_globs = crate::serveapi::macro_blind_globs();
+    let exempt_globs = crate::serveapi::content_exempt_globs();
+    let escalate = macro_blind_escalate();
+    eprintln!(
+        "[cargoless:obs] ra-native blind-path config: {}",
+        blind_config_summary(&macro_globs, &exempt_globs, escalate)
+    );
+    if ra_native_unprotected(&macro_globs, &exempt_globs) {
+        eprintln!(
+            "[cargoless:obs] WARN ra-native UNPROTECTED — no CARGOLESS_MACRO_BLIND_PATHS / \
+             CARGOLESS_BLIND_PATHS configured; RA-native is blind to post-proc-macro \
+             (e.g. Leptos view!) and cross-crate-twin errors, so a false-GREEN on those \
+             paths can self-merge unwitnessed. Set the blind-path globs (+ \
+             CARGOLESS_MACRO_BLIND_ESCALATE=1 to demand a witness) for any proc-macro UI workspace."
+        );
+    }
 }
 
 /// The RA-native-only verdict payload for the Off / Warn arms (no
@@ -3192,6 +3252,93 @@ mod tests {
                 "timer-settle classifier takes precedence; blind={blind}"
             );
         }
+    }
+
+    #[test]
+    fn real_corpus_blind_hit_downgrades_clean_ra_green_to_unknown() {
+        // The verdict-consequence half of the known-blind corpus proof
+        // (the detector half lives in serveapi.rs). Each `bench/fixture/src/
+        // known_blind/*.rs` file is a class RA-native is BLIND to — a clean
+        // RA window over a push touching one of them is necessary-not-
+        // sufficient. This pins the end of the chain: a blind hit (whatever
+        // mechanism produced it) turns a would-be GREEN into the honest
+        // unknown the downstream witness then resolves. Read the real corpus
+        // so the assertion stays bound to the files, not a synthetic stand-in.
+        let corpus_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bench/fixture/src/known_blind");
+        for name in [
+            "double_capture_move.rs",            // #7067 class (E0382)
+            "early_return_into_any.rs",          // E0308
+            "generated_twin_unimported_type.rs", // #DONUT content-exempt (E0412/E0425)
+        ] {
+            let path = corpus_dir.join(name);
+            assert!(
+                path.is_file(),
+                "known-blind corpus file missing: {} — the verdict-consequence \
+                 proof must stay bound to a real fixture",
+                path.display()
+            );
+            // A blind hit on this corpus file: a clean (non-error, non-timer)
+            // RA window MUST NOT publish green.
+            let p = ra_native_payload(false, false, true);
+            assert_eq!(
+                p.verdict,
+                statusfile::Verdict::Unknown,
+                "a blind hit on corpus {name} must downgrade clean RA green to unknown"
+            );
+            assert_eq!(
+                p.analysis_failure_reason.as_deref(),
+                Some("ra_blind_path_green_unwitnessed"),
+                "corpus {name}: stable classifier so a poller/SigNoz demands a witness"
+            );
+            assert_eq!(
+                p.analysis_failure_class,
+                Some(cargoless_core::VerdictFailureClass::Unwitnessable),
+                "corpus {name}: blind-path green-unwitnessed is Unwitnessable by class"
+            );
+        }
+    }
+
+    // ──────────── B — unprotected-RA-native observability ────────────
+
+    #[test]
+    fn ra_native_unprotected_only_when_both_glob_sets_empty() {
+        let some = vec!["portal/**".to_string()];
+        let none: Vec<String> = vec![];
+        assert!(
+            ra_native_unprotected(&none, &none),
+            "no globs at all ⇒ unprotected (the #7067 false-GREEN precondition)"
+        );
+        assert!(
+            !ra_native_unprotected(&some, &none),
+            "a macro glob alone ⇒ protected"
+        );
+        assert!(
+            !ra_native_unprotected(&none, &some),
+            "a content-exempt glob alone ⇒ protected"
+        );
+        assert!(!ra_native_unprotected(&some, &some), "both ⇒ protected");
+    }
+
+    #[test]
+    fn blind_config_summary_reports_counts_and_escalation() {
+        // Unset / inert.
+        assert_eq!(
+            blind_config_summary(&[], &[], false),
+            "macro_globs=0 exempt_globs=0 escalate=off"
+        );
+        // Configured, escalation on — the protected fleet posture.
+        let macro_globs = vec!["portal/**".to_string(), "chemistry/shell/**".to_string()];
+        let exempt = vec!["chemistry/generated/**".to_string()];
+        assert_eq!(
+            blind_config_summary(&macro_globs, &exempt, true),
+            "macro_globs=2 exempt_globs=1 escalate=on"
+        );
+        // Globs without escalation: annotated-but-not-witnessed.
+        assert_eq!(
+            blind_config_summary(&macro_globs, &[], false),
+            "macro_globs=2 exempt_globs=0 escalate=off"
+        );
     }
 
     #[test]
