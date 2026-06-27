@@ -91,7 +91,32 @@ pub struct InitOpts {
     /// deployments can set `TF_RA_CHECK_DISABLED=1` and let the per-push
     /// direct Cargo check own the fresh green/red boundary.
     pub cargo_check_enabled: bool,
+    /// Whether RA should activate **all** cargo features
+    /// (`cargo.allFeatures` / `--all-features`). Drives the `allFeatures`
+    /// init-option keys. Default `false` (cargo's own default-feature
+    /// behavior). On a mutually-exclusive-feature workspace (a Leptos SSR
+    /// app's `ssr`/`hydrate`/`csr`) this is the WRONG knob — prefer an
+    /// explicit `features` list there; `all_features` suits simple/CSR
+    /// crates whose features compose.
+    pub all_features: bool,
+    /// Extra cfg options for RA to treat as active
+    /// (`rust-analyzer.cargo.cfgs`). Each entry is `"key"`, `"key=value"`,
+    /// or `"!key"` to disable, per RA's schema. These are **appended onto
+    /// RA's own defaults** (`debug_assertions`, `miri`) rather than
+    /// replacing them: `cargo.cfgs` has replace semantics in RA, so emitting
+    /// a bare set would silently drop `debug_assertions` and flip every
+    /// `#[cfg(debug_assertions)]` item in the analyzed tree. Default empty ⇒
+    /// RA's defaults are emitted unchanged. The `erase_components` Leptos
+    /// 0.7+ dev cfg is the motivating case.
+    pub cfgs: Vec<String>,
 }
+
+/// RA's built-in `rust-analyzer.cargo.cfgs` default. `cargo.cfgs` REPLACES
+/// (not merges) RA's defaults, so any operator cfgs must be appended onto
+/// this base or `debug_assertions`/`miri` silently vanish from the analyzed
+/// tree. Verified against `rust-analyzer --print-config-schema` (1.94.1;
+/// same schema family as the deployed 1.93.1).
+const RA_DEFAULT_CFGS: &[&str] = &["debug_assertions", "miri"];
 
 impl Default for InitOpts {
     /// Safe defaults: proc-macros ON (most projects need them — the only
@@ -115,6 +140,8 @@ impl Default for InitOpts {
             no_default_features: false,
             release: false,
             cargo_check_enabled: true,
+            all_features: false,
+            cfgs: Vec::new(),
         }
     }
 }
@@ -152,24 +179,20 @@ impl InitOpts {
                 _ => detect_proc_macro(project_root).unwrap_or(false),
             }
         };
-        let features: Vec<String> = std::env::var("TF_FEATURES")
-            .ok()
-            .map(|s| {
-                s.split([',', ' '])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            // Unset / parse-failure ⇒ empty list (let cargo use its
-            // own defaults). See InitOpts::default() rationale on why
-            // we do NOT default to `["default"]`.
-            .unwrap_or_default();
+        // Unset / parse-failure ⇒ empty list (let cargo use its own
+        // defaults). See InitOpts::default() rationale on why we do NOT
+        // default to `["default"]`.
+        let features = csv_list_env("TF_FEATURES");
         let package = nonempty_env("TF_CHECK_PACKAGE");
         let target = nonempty_env("TF_CHECK_TARGET");
         let no_default_features = truthy_env("TF_CHECK_NO_DEFAULT_FEATURES");
         let release = truthy_env("TF_CHECK_RELEASE");
         let cargo_check_enabled = !truthy_env("TF_RA_CHECK_DISABLED");
+        let all_features = truthy_env("TF_ALL_FEATURES");
+        // Extra RA cfgs (e.g. `erase_components`), comma/space-separated.
+        // Same split as TF_FEATURES; appended onto RA's default cfgs in
+        // `lean_init_options`.
+        let cfgs = csv_list_env("TF_RA_CFGS");
         Self {
             proc_macro_enabled,
             features,
@@ -178,6 +201,8 @@ impl InitOpts {
             no_default_features,
             release,
             cargo_check_enabled,
+            all_features,
+            cfgs,
         }
     }
 
@@ -241,6 +266,23 @@ fn nonempty_env(key: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse a comma/space-separated env var into a list, trimming entries and
+/// dropping empties (order preserved, no dedup). Unset / empty ⇒ `vec![]`.
+/// Shared by `TF_FEATURES` and `TF_RA_CFGS` so both honor the same `"a,b c"`
+/// operator ergonomics.
+fn csv_list_env(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| {
+            s.split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn truthy_env(key: &str) -> bool {
@@ -363,8 +405,9 @@ fn ra_lru_capacity() -> u32 {
 ///   3. cachePriming.enable: false (skip eager startup analysis).
 ///   4. procMacro.enable: from InitOpts.proc_macro_enabled (auto-detected
 ///      from Cargo.toml or explicit per `cargoless.proc-macro` knob).
-///   5. cargo.allTargets/allFeatures: false + features: from InitOpts +
-///      workspace symbol narrowed (only_types, workspace scope).
+///   5. cargo.allTargets: false; allFeatures + features + cfgs: from
+///      InitOpts (operator knobs `--all-features`/`--cfg`, default off/empty)
+///      + workspace symbol narrowed (only_types, workspace scope).
 ///   6. package-scoped profiles set `check.overrideCommand` with the
 ///      normalized Cargo package ID so tf-multiverse shorthands
 ///      (`-p alchemy`) run the same package as `scripts/check-remote`
@@ -393,6 +436,17 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
     // this mode is replacing.
     let cargo_build_scripts_enabled = opts.cargo_check_enabled && opts.package.is_none();
     let proc_macro_enabled = opts.proc_macro_enabled && cargo_build_scripts_enabled;
+    // `rust-analyzer.cargo.cfgs` REPLACES RA's defaults rather than merging,
+    // so append operator cfgs onto RA's base (`debug_assertions`, `miri`)
+    // instead of emitting a bare set — otherwise every `#[cfg(debug_assertions)]`
+    // item in the analyzed tree silently flips. With no operator cfgs this is
+    // exactly RA's default, so the key is a no-op. (Verified against
+    // `rust-analyzer --print-config-schema`.)
+    let cargo_cfgs: Vec<String> = RA_DEFAULT_CFGS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(opts.cfgs.iter().cloned())
+        .collect();
     json!({
         // Current RA's generated schema names are flat
         // `rust-analyzer.<section>.<key>` settings. Keep the historical
@@ -413,10 +467,11 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
         "rust-analyzer.lru.capacity": ra_lru_capacity(),
         "rust-analyzer.procMacro.enable": proc_macro_enabled,
         "rust-analyzer.cargo.allTargets": false,
-        "rust-analyzer.cargo.allFeatures": false,
+        "rust-analyzer.cargo.allFeatures": opts.all_features,
         "rust-analyzer.cargo.buildScripts.enable": cargo_build_scripts_enabled,
         "rust-analyzer.cargo.features": opts.features.clone(),
         "rust-analyzer.cargo.noDefaultFeatures": opts.no_default_features,
+        "rust-analyzer.cargo.cfgs": cargo_cfgs.clone(),
         "rust-analyzer.cargo.target": opts.target.clone(),
         "rust-analyzer.workspace.symbol.search.scope": "workspace",
         "rust-analyzer.workspace.symbol.search.kind": "only_types",
@@ -493,19 +548,22 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
         "procMacro": { "enable": proc_macro_enabled },
 
         // (5) cargo.* + workspace.symbol.* — narrow what RA indexes.
-        // allFeatures=false matches cargo's actual default behavior
-        // (RA's "all features" was always a divergence); the features
-        // list flows from InitOpts (CLI `--features` flag); symbol
-        // search narrowed to workspace + types-only avoids indexing
-        // 3rd-party crate APIs we never query.
+        // allFeatures defaults false (cargo's actual default behavior — RA's
+        // "all features" was always a divergence) but is operator-settable
+        // via `--all-features`/`TF_ALL_FEATURES` for crates whose features
+        // compose; the features list flows from InitOpts (CLI `--features`
+        // flag); cfgs appends operator cfgs (e.g. `erase_components`) onto
+        // RA's defaults; symbol search narrowed to workspace + types-only
+        // avoids indexing 3rd-party crate APIs we never query.
         "cargo": {
             "allTargets": false,
-            "allFeatures": false,
+            "allFeatures": opts.all_features,
             "buildScripts": {
                 "enable": cargo_build_scripts_enabled,
             },
             "features": opts.features.clone(),
             "noDefaultFeatures": opts.no_default_features,
+            "cfgs": cargo_cfgs.clone(),
             "target": opts.target.clone(),
         },
         "workspace": {
@@ -1802,6 +1860,14 @@ mod tests {
         assert_eq!(v["cargo"]["features"], json!([]));
         assert_eq!(v["cargo"]["noDefaultFeatures"], json!(false));
         assert_eq!(v["cargo"]["target"], json!(null));
+        // cargo.cfgs default = RA's OWN defaults (NOT empty) — `cargo.cfgs`
+        // replaces rather than merges, so with no operator cfgs we must
+        // re-emit RA's base or `debug_assertions`/`miri` silently vanish.
+        assert_eq!(
+            v["rust-analyzer.cargo.cfgs"],
+            json!(["debug_assertions", "miri"])
+        );
+        assert_eq!(v["cargo"]["cfgs"], json!(["debug_assertions", "miri"]));
 
         // workspace.symbol narrowed.
         assert_eq!(
@@ -1859,6 +1925,30 @@ mod tests {
         assert_eq!(v["cargo"]["features"], json!(["foo", "bar"]));
         assert_eq!(v["check"]["features"], json!(["foo", "bar"]));
         assert_eq!(v["rust-analyzer.check.features"], json!(["foo", "bar"]));
+    }
+
+    #[test]
+    fn lean_init_options_threads_all_features() {
+        let v = lean_init_options(&InitOpts {
+            all_features: true,
+            ..InitOpts::default()
+        });
+        // Both the flat and nested allFeatures keys flip to true.
+        assert_eq!(v["rust-analyzer.cargo.allFeatures"], json!(true));
+        assert_eq!(v["cargo"]["allFeatures"], json!(true));
+    }
+
+    #[test]
+    fn lean_init_options_appends_cfgs_onto_ra_defaults() {
+        let v = lean_init_options(&InitOpts {
+            cfgs: vec!["erase_components".into(), "foo=bar".into()],
+            ..InitOpts::default()
+        });
+        // Operator cfgs are APPENDED onto RA's defaults (not replacing them),
+        // in both the flat and nested shapes.
+        let expected = json!(["debug_assertions", "miri", "erase_components", "foo=bar"]);
+        assert_eq!(v["rust-analyzer.cargo.cfgs"], expected);
+        assert_eq!(v["cargo"]["cfgs"], expected);
     }
 
     #[test]
@@ -2142,6 +2232,32 @@ mod tests {
         let opts = InitOpts::default();
         assert!(opts.proc_macro_enabled);
         assert_eq!(opts.features, Vec::<String>::new());
+        // New knobs default off/empty — preserves pre-change behavior.
+        assert!(!opts.all_features);
+        assert_eq!(opts.cfgs, Vec::<String>::new());
+    }
+
+    #[test]
+    fn init_opts_all_features_from_env() {
+        // One var per test: EnvGuard takes the (non-reentrant) ENV_LOCK, so a
+        // single test must not hold two guards at once.
+        let _g = EnvGuard::set("TF_ALL_FEATURES", "1");
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert!(opts.all_features);
+    }
+
+    #[test]
+    fn init_opts_cfgs_from_env_csv() {
+        let _g = EnvGuard::set("TF_RA_CFGS", "erase_components, foo=bar otherflag");
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert_eq!(
+            opts.cfgs,
+            vec![
+                "erase_components".to_string(),
+                "foo=bar".to_string(),
+                "otherflag".to_string()
+            ]
+        );
     }
 
     #[test]

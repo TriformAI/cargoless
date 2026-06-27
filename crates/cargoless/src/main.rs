@@ -103,6 +103,14 @@ struct Opts {
     target: Option<String>,
     /// Disable default features for RA analysis.
     no_default_features: bool,
+    /// Enable all cargo features for RA analysis (`cargo.allFeatures`).
+    /// Plumbed via `TF_ALL_FEATURES` env. Suits crates whose features
+    /// compose; an SSR Leptos app (mutually-exclusive ssr/hydrate/csr)
+    /// wants an explicit `--features` instead.
+    all_features: bool,
+    /// Extra RA cfgs (e.g. `erase_components`), comma/space-separated.
+    /// Plumbed via `TF_RA_CFGS` env; appended onto RA's default cfgs.
+    cfgs: Option<String>,
     /// Release-profile hint for RA analysis.
     release: bool,
     /// Compatibility marker accepted from old `check-remote` callers.
@@ -319,6 +327,16 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
             a if a.starts_with("--features=") => {
                 opts.features = Some(a["--features=".len()..].to_string());
             }
+            // RA cfg knob (e.g. `--cfg erase_components`). Must precede the
+            // cargo-extra-arg catch-all below; `--cfg` would otherwise hit
+            // the unknown-flag error path.
+            "--cfg" => {
+                let v = it.next().ok_or(ParseError::MissingValue("--cfg"))?;
+                opts.cfgs = Some(v.clone());
+            }
+            a if a.starts_with("--cfg=") => {
+                opts.cfgs = Some(a["--cfg=".len()..].to_string());
+            }
             "-p" | "--package" => {
                 opts.package = Some(
                     it.next()
@@ -343,6 +361,11 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                 opts.target = Some(a["--target=".len()..].to_string());
             }
             "--no-default-features" => opts.no_default_features = true,
+            // Explicit arm BEFORE the cargo-extra-arg catch-all below
+            // (`cargo_extra_arg_flag` lists `--all-features`); without this
+            // the flag would be swallowed as an ignored compat token and
+            // never reach RA's `cargo.allFeatures`.
+            "--all-features" => opts.all_features = true,
             "--release" => opts.release = true,
             "--cargo-subcommand" => {
                 let v = it
@@ -634,6 +657,10 @@ fn usage() {
     );
     println!("  --features <FEATS>    feature set for RA analysis (comma/space-separated;");
     println!("                        also TF_FEATURES env)");
+    println!("  --all-features        enable all cargo features for RA analysis");
+    println!("                        (TF_ALL_FEATURES=1; not for SSR/exclusive-feature apps)");
+    println!("  --cfg <CFG>           extra RA cfgs, e.g. erase_components (comma/space-");
+    println!("                        separated; appended to RA defaults; also TF_RA_CFGS env)");
     println!("  -p, --package <PKG>   package selector for RA analysis (TF_CHECK_PACKAGE)");
     println!("  --target <TRIPLE>     target triple for RA analysis (TF_CHECK_TARGET)");
     println!("  --release             release-profile hint for RA analysis");
@@ -724,6 +751,11 @@ fn apply_runtime_env(opts: &Opts) {
             std::env::set_var("TF_FEATURES", fs);
         }
     }
+    if let Some(cfgs) = opts.cfgs.as_deref() {
+        unsafe {
+            std::env::set_var("TF_RA_CFGS", cfgs);
+        }
+    }
     if let Some(package) = opts.package.as_deref() {
         unsafe {
             std::env::set_var("TF_CHECK_PACKAGE", package);
@@ -737,6 +769,11 @@ fn apply_runtime_env(opts: &Opts) {
     if opts.no_default_features {
         unsafe {
             std::env::set_var("TF_CHECK_NO_DEFAULT_FEATURES", "1");
+        }
+    }
+    if opts.all_features {
+        unsafe {
+            std::env::set_var("TF_ALL_FEATURES", "1");
         }
     }
     if opts.release {
@@ -1341,6 +1378,42 @@ mod tests {
     }
 
     #[test]
+    fn cfg_flag_parses_space_and_equals_forms() {
+        let p = parse(&v(&["watch", "--cfg", "erase_components"])).unwrap();
+        assert_eq!(p.opts.cfgs.as_deref(), Some("erase_components"));
+        let p = parse(&v(&["check", "--cfg=erase_components,foo=bar"])).unwrap();
+        assert_eq!(p.opts.cfgs.as_deref(), Some("erase_components,foo=bar"));
+    }
+
+    #[test]
+    fn cfg_flag_missing_value_is_actionable() {
+        assert_eq!(
+            parse(&v(&["watch", "--cfg"])),
+            Err(ParseError::MissingValue("--cfg"))
+        );
+    }
+
+    #[test]
+    fn all_features_flag_sets_bool_and_is_not_swallowed_as_cargo_extra() {
+        // The load-bearing assertion: `--all-features` is also in
+        // `cargo_extra_arg_flag`, so without the explicit parse arm it would
+        // be silently collected into cargo_extra_args (ignored) instead of
+        // reaching opts.all_features → RA's cargo.allFeatures.
+        let p = parse(&v(&["watch", "--all-features"])).unwrap();
+        assert!(p.opts.all_features);
+        assert!(
+            !p.opts
+                .cargo_extra_args
+                .iter()
+                .any(|a| a == "--all-features"),
+            "--all-features must be honored, not swallowed as a compat token"
+        );
+        // Default off when unset.
+        let p = parse(&v(&["watch"])).unwrap();
+        assert!(!p.opts.all_features);
+    }
+
+    #[test]
     fn push_gate_flag_parses_and_defaults_off() {
         let p = parse(&v(&["push", "--remote", "http://h:1", "--gate"])).unwrap();
         assert_eq!(p.cmd, Cmd::Push);
@@ -1560,6 +1633,8 @@ mod tests {
         assert_eq!(p.opts.cargo_subcommand, None);
         assert!(p.opts.cargo_extra_args.is_empty());
         assert!(!p.opts.no_default_features);
+        assert!(!p.opts.all_features);
+        assert_eq!(p.opts.cfgs, None);
         assert!(!p.opts.release);
     }
 
