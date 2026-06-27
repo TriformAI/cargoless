@@ -184,6 +184,19 @@ spec:
             # docs/SERVE-IMAGE-BUILD.md § activation ladder.
             - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "off" }
             - { name: CARGOLESS_REMOTE_PROJECT_CHECKS, value: "1" }
+            # RA feature/cfg selection (cargoless serve → rust-analyzer
+            # cargo.features/allFeatures/cfgs). Unset today ⇒ default features.
+            # tf-multiverse is a Leptos 0.8 SSR workspace (triform-portal,
+            # default=["ssr"], mutually-exclusive ssr/hydrate/csr) analyzed
+            # host-native, so `TF_FEATURES=ssr` is the correct selection here —
+            # NOT TF_ALL_FEATURES (all-features would activate hydrate/csr cfgs
+            # at once and red the analysis). To roll it: validate on
+            # deploy/cargoless-serve-test.k8s.yaml first, then set TF_FEATURES
+            # in the LIVE Flux manifest (tf-multiverse
+            # deployment/cargoless-builder/{serve,shards}.yaml) — this
+            # reference copy is not read by Flux. TF_RA_CFGS carries extra cfgs
+            # (e.g. erase_components). See docs/dogfood/TF-MULTIVERSE-CANARY.md.
+            # - { name: TF_FEATURES, value: "ssr" }
           ports:
             - name: http
               containerPort: 8787

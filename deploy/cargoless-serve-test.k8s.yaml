@@ -1,55 +1,70 @@
-# Additional FSN Cargoless serve shards for local-agent fan-out.
+# Parallel TEST instance of the central cargoless daemon — validation surface
+# for RA feature/cfg knob changes BEFORE touching the live (Flux-owned) daemon.
 #
-# ⚠️ REFERENCE COPY — NOT the deployed source of truth. Flux reconciles these
-#   shards from the tf-multiverse repo (deployment/cargoless-builder/shards.yaml).
-#   This file is NOT read by Flux; edit the tf-multiverse manifest to change live.
+# Why this exists:
+#   The live cargoless-serve daemon's RA-native diagnostics ARE the fleet
+#   verdict, so a features/cfgs change could flip verdicts fleet-wide. This
+#   manifest stands up an ISOLATED `cargoless-serve-test` Deployment (its own
+#   PVC, its own Service) in the same namespace so the new
+#   TF_FEATURES / TF_ALL_FEATURES / TF_RA_CFGS knobs can be proven on a real
+#   tf-multiverse checkout first. It does NOT touch the live Deployment.
 #
-# The canonical `cargoless-serve` Deployment remains shard 0 and keeps the
-# stable Service name used by existing clients. These shard pods are addressed
-# directly by local `scripts/cargoless-cluster-bridge` port-forwards:
-#   shard 1 -> pod/cargoless-serve-shard-0
-#   shard 2 -> pod/cargoless-serve-shard-1
-#   shard 3 -> pod/cargoless-serve-shard-2
+# This is a reference/test overlay — apply it directly with kubectl (it is NOT
+# reconciled by Flux). The live daemon is rolled by editing the tf-multiverse
+# Flux manifest (deployment/cargoless-builder/{serve,shards}.yaml); see
+# docs/SERVE-IMAGE-BUILD.md and docs/dogfood/TF-MULTIVERSE-CANARY.md.
 #
-# Each pod owns a disposable FSN builder-cache PVC. The workspace is cloned from
-# Forgejo on boot, so losing a shard cache costs warmup time, not source data.
+# Prerequisites:
+#   1. Build a branch image carrying the new knobs via the in-cluster kaniko
+#      Job (deploy/jobs/build-serve-image.yaml) and substitute its tag for
+#      __TEST_IMAGE_TAG__ below, e.g.
+#        registry.triform.cloud/cargoless/cargoless-serve:0.2.x-<sha>-test
+#      (The stock 0.2.6 image predates the knobs and will ignore TF_ALL_FEATURES
+#      / TF_RA_CFGS — TF_FEATURES alone would still work there.)
+#   2. The namespace-local secrets the live daemon uses already exist in
+#      cargoless-builder (cargoless-serve-auth, forgejo-cargoless-auth,
+#      registry-pull). This manifest reuses them; no new secrets needed.
+#
+# Validate, then tear down:
+#   kubectl apply -f deploy/cargoless-serve-test.k8s.yaml
+#   # drive it: cargoless verdict --remote \
+#   #   http://cargoless-serve-test.cargoless-builder.svc:8787 ...
+#   kubectl -n cargoless-builder delete -f deploy/cargoless-serve-test.k8s.yaml
 ---
 apiVersion: v1
-kind: Service
+kind: PersistentVolumeClaim
 metadata:
-  name: cargoless-serve-sharded
+  name: cargoless-tf-multiverse-workspace-test
   namespace: cargoless-builder
   labels:
-    app.kubernetes.io/name: cargoless-serve-shard
+    app.kubernetes.io/name: cargoless-serve-test
     app.kubernetes.io/part-of: cargoless
 spec:
-  clusterIP: None
-  selector:
-    app.kubernetes.io/name: cargoless-serve-shard
-  ports:
-    - name: http
-      port: 8787
-      targetPort: http
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: triform-replicated-fsn-2x
+  resources:
+    requests:
+      storage: 150Gi
 ---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
-  name: cargoless-serve-shard
+  name: cargoless-serve-test
   namespace: cargoless-builder
   labels:
-    app.kubernetes.io/name: cargoless-serve-shard
+    app.kubernetes.io/name: cargoless-serve-test
     app.kubernetes.io/part-of: cargoless
 spec:
-  serviceName: cargoless-serve-sharded
-  replicas: 3
-  podManagementPolicy: Parallel
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: cargoless-serve-shard
+      app.kubernetes.io/name: cargoless-serve-test
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: cargoless-serve-shard
+        app.kubernetes.io/name: cargoless-serve-test
         app.kubernetes.io/part-of: cargoless
     spec:
       nodeSelector:
@@ -57,12 +72,7 @@ spec:
         storage.triform.dev/pool: fsn
         longhorn-storage: "true"
       terminationGracePeriodSeconds: 90
-      # Run serve (and repo-sync) as uid 1000 with a shared fsGroup so the two
-      # writers of /workspace/tf-multiverse/.git/objects do not split UID
-      # ownership (serve-as-root + repo-sync-as-1000 with no fsGroup caused
-      # intermittent "insufficient permission for adding an object to
-      # .git/objects" → incremental witness timeouts). Mirrors the live
-      # tf-multiverse cargoless-serve-shard StatefulSet (the Flux source of truth).
+      # Same split-UID-safe ownership model as the live serve Deployment.
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -82,9 +92,6 @@ spec:
               chown -R 1000:1000 /workspace || true
           securityContext:
             runAsUser: 0
-            # Override the pod-level runAsNonRoot:true so this chown init is
-            # still admitted as root (it re-owns any legacy split objects to
-            # 1000 before serve starts as 1000).
             runAsNonRoot: false
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
@@ -99,8 +106,6 @@ spec:
             - name: FORGEJO_TOKEN
               valueFrom:
                 secretKeyRef: { name: forgejo-cargoless-auth, key: token }
-            # uid 1000 has no real home; point git/HOME at the writable PVC so
-            # `git config --global` works as non-root.
             - { name: HOME, value: "/workspace" }
           args:
             - |
@@ -108,15 +113,16 @@ spec:
               repo=/workspace/tf-multiverse
               url="https://${FORGEJO_USER}:${FORGEJO_TOKEN}@forgejo.triform.dev/triform/tf-multiverse.git"
               if [ ! -d "$repo/.git" ] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-                echo "[cargoless-serve-shard] initializing repo"
+                echo "[cargoless-serve-test] initializing repo"
                 rm -rf "$repo"
                 mkdir -p "$repo"
                 git -C "$repo" init --quiet
                 git -C "$repo" remote add origin "$url"
+                echo "[cargoless-serve-test] fetching origin/dev"
                 git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet
                 git -C "$repo" checkout -f --quiet origin/dev
               else
-                echo "[cargoless-serve-shard] repo present; attempting origin/dev refresh"
+                echo "[cargoless-serve-test] repo present; attempting origin/dev refresh"
                 if git -C "$repo" remote get-url origin >/dev/null 2>&1; then
                   git -C "$repo" remote set-url origin "$url"
                 else
@@ -125,17 +131,19 @@ spec:
                 if git -C "$repo" fetch --depth 1 origin dev:refs/remotes/origin/dev --quiet; then
                   git -C "$repo" checkout -f --quiet origin/dev
                 else
-                  echo "[cargoless-serve-shard] warning: origin/dev fetch failed; keeping seeded repo at $(git -C "$repo" rev-parse --short HEAD)" >&2
+                  echo "[cargoless-serve-test] warning: origin/dev fetch failed; keeping seeded repo at $(git -C "$repo" rev-parse --short HEAD)" >&2
                 fi
               fi
-              git -C "$repo" config user.email "cargoless-serve@triform.dev"
-              git -C "$repo" config user.name "cargoless-serve"
-              echo "[cargoless-serve-shard] repo ready @ $(git -C "$repo" rev-parse --short HEAD)"
+              git -C "$repo" config user.email "cargoless-serve-test@triform.dev"
+              git -C "$repo" config user.name "cargoless-serve-test"
+              echo "[cargoless-serve-test] repo ready @ $(git -C "$repo" rev-parse --short HEAD)"
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
       containers:
         - name: serve
-          image: registry.triform.cloud/cargoless/cargoless-serve:0.2.6-project-check-tools
+          # Substitute the branch-built test tag (see header). The stock image
+          # predates the knobs.
+          image: registry.triform.cloud/cargoless/cargoless-serve:__TEST_IMAGE_TAG__
           imagePullPolicy: Always
           command: ["/bin/bash", "-c"]
           args:
@@ -151,8 +159,6 @@ spec:
             - name: CARGOLESS_AUTH_TOKEN
               valueFrom:
                 secretKeyRef: { name: cargoless-serve-auth, key: token }
-            # uid 1000 needs a writable HOME for `git config --global
-            # safe.directory`, cargo, and rust-analyzer.
             - { name: HOME, value: "/workspace" }
             - { name: PATH, value: "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: CARGO_HOME, value: "/workspace/.cargo" }
@@ -160,34 +166,47 @@ spec:
             - { name: RUSTUP_TOOLCHAIN, value: "1.93.1-x86_64-unknown-linux-gnu" }
             - { name: CARGO_TARGET_DIR, value: "/workspace/target" }
             - { name: CARGO_INCREMENTAL, value: "0" }
-            # Matches live (Flux-authoritative tf-multiverse manifest); see the
-            # serve manifest + docs/SERVE-IMAGE-BUILD.md § activation ladder.
             - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "off" }
             - { name: CARGOLESS_REMOTE_PROJECT_CHECKS, value: "1" }
-            # RA feature/cfg selection (TF_FEATURES / TF_ALL_FEATURES /
-            # TF_RA_CFGS): unset ⇒ default features. tf-multiverse wants
-            # TF_FEATURES=ssr (host-native Leptos SSR; not all-features).
-            # Validate on deploy/cargoless-serve-test.k8s.yaml, then set it in
-            # the LIVE Flux manifest (tf-multiverse) — this copy is not read by
-            # Flux. See the serve manifest + docs/dogfood/TF-MULTIVERSE-CANARY.md.
+            # ── The knobs under test ──────────────────────────────────────
+            # tf-multiverse is Leptos 0.8 SSR analyzed host-native ⇒ `ssr` is
+            # the correct feature (NOT all-features — ssr/hydrate/csr are
+            # mutually exclusive). This is what we validate before promoting
+            # TF_FEATURES into the live Flux manifest.
+            - { name: TF_FEATURES, value: "ssr" }
+            # Uncomment to exercise the all-features knob (only safe for
+            # compose-able-feature crates; wrong for this SSR workspace):
+            # - { name: TF_ALL_FEATURES, value: "1" }
+            # Extra RA cfgs, comma/space-separated (appended onto RA defaults):
+            # - { name: TF_RA_CFGS, value: "erase_components" }
           ports:
             - name: http
               containerPort: 8787
           startupProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet:
+              path: /healthz
+              port: http
             periodSeconds: 5
             failureThreshold: 60
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet:
+              path: /healthz
+              port: http
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet:
+              path: /healthz
+              port: http
             periodSeconds: 20
             failureThreshold: 3
           resources:
-            requests: { cpu: "4", memory: 16Gi }
-            limits: { cpu: "12", memory: 48Gi }
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              cpu: "12"
+              memory: 48Gi
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
         - name: repo-sync
@@ -201,8 +220,6 @@ spec:
             - name: FORGEJO_TOKEN
               valueFrom:
                 secretKeyRef: { name: forgejo-cargoless-auth, key: token }
-            # uid 1000 has no real home; point git/HOME at the writable PVC so
-            # `git config --global` works as non-root.
             - { name: HOME, value: "/workspace" }
           args:
             - |
@@ -220,7 +237,7 @@ spec:
                     current="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
                     target="$(git -C "$repo" rev-parse origin/dev 2>/dev/null || true)"
                     if [ -n "$target" ] && [ "$current" != "$target" ]; then
-                      echo "[cargoless-serve-shard] advancing base ${current:-unknown} -> $target"
+                      echo "[cargoless-serve-test] advancing base ${current:-unknown} -> $target"
                       git -C "$repo" checkout -f --quiet "$target" || true
                     fi
                   fi
@@ -232,31 +249,40 @@ spec:
             limits: { cpu: "1", memory: "2Gi" }
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
-  volumeClaimTemplates:
-    - metadata:
-        name: workspace
-        labels:
-          app.kubernetes.io/name: cargoless-serve-shard
-          app.kubernetes.io/part-of: cargoless
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        storageClassName: triform-builder-cache-fsn
-        resources:
-          requests:
-            storage: 20Gi
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: cargoless-tf-multiverse-workspace-test
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cargoless-serve-test
+  namespace: cargoless-builder
+  labels:
+    app.kubernetes.io/name: cargoless-serve-test
+    app.kubernetes.io/part-of: cargoless
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cargoless-serve-test
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: cargoless-serve-shard-netpol
+  name: cargoless-serve-test-netpol
   namespace: cargoless-builder
   labels:
-    app.kubernetes.io/name: cargoless-serve-shard
+    app.kubernetes.io/name: cargoless-serve-test
     app.kubernetes.io/part-of: cargoless
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: cargoless-serve-shard
+      app.kubernetes.io/name: cargoless-serve-test
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
