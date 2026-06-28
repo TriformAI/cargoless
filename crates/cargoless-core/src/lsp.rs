@@ -1961,6 +1961,8 @@ mod tests {
             no_default_features: true,
             release: true,
             cargo_check_enabled: true,
+            all_features: false,
+            cfgs: vec![],
         });
 
         // Mirrors the tf-multiverse remote-check matrix:
