@@ -1,0 +1,66 @@
+# Example cargoless.checks.yaml — the SSR cargo-check witness.
+#
+# This is a REFERENCE example, not a live file. The daemon loads
+# `cargoless.checks.yaml` from the SERVED repo's root (e.g. the
+# tf-multiverse worktree at /workspace/tf-multiverse), so the real manifest
+# lives in that repo, not in cargoless. Copy/adapt this there.
+#
+# Purpose: make a served GREEN mean "compiles" for Leptos SSR code. `cargo
+# check` expands proc-macros itself and type-checks — the complete authority
+# rust-analyzer's native pass cannot be (it's blind to view!/#[component]
+# expansion and to E0599/E0382). Escalated to only on macro-touching pushes
+# via CARGOLESS_MACRO_BLIND_PATHS + CARGOLESS_MACRO_BLIND_ESCALATE=1 (see
+# docs/operator/WITNESS-FOR-SWARM.md), so non-macro pushes keep the fast
+# ~2s RA-native path.
+version: 1
+checks:
+  - id: "ssr-compiler-witness"
+    title: "Rust compiler witness (SSR: server + portal)"
+    tier: "dev"
+    # A failing required check turns the tree RED → served RED with the real
+    # compiler diagnostics. (A non-required check only warns.)
+    required: true
+    kind: "command"
+    # Mandatory for kind: command in the dev profile — the witness must not
+    # mutate the worktree.
+    read_only: true
+    # Host-native cargo check that EXPANDS macros + type-checks the SSR path.
+    #  --release is load-bearing: the dev profile resolves the dep graph
+    #   differently and false-REDs (BUGS-2428).
+    #  triform-portal's default feature is "ssr", so its SSR render path
+    #   compiles under the same invocation (no extra --features needed).
+    #  No --target ⇒ host-native (x86_64-unknown-linux-gnu), correct for SSR.
+    #   The daemon pins CARGO_TARGET_DIR to a per-run scratch automatically.
+    command:
+      - "cargo"
+      - "check"
+      - "--release"
+      - "-p"
+      - "triform-server"
+      - "-p"
+      - "triform-portal"
+      - "--features"
+      - "ssr-frontend,telephony,webrtc"
+      - "--message-format=json"
+    # Run only when the macro/compile surface changed. Keep in sync with
+    # CARGOLESS_MACRO_BLIND_PATHS so the blind classification and the witness
+    # agree on what "macro-touching" means.
+    triggers:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "server/src/**/*.rs"
+      - "portal/src/**/*.rs"
+      - "chemistry/generated/**/*.rs"
+      - "physics/src/**/*.rs"
+      - "runtime-types/**/*.rs"
+    # Cache key inputs — the cached result is reused until one of these
+    # changes (or the manifest / check config / profile changes).
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "server/src/**/*.rs"
+      - "portal/src/**/*.rs"
+    # 20-minute per-check ceiling. The daemon watchdog (25m default) and a
+    # script-internal `timeout` cap below this; observed SSR witness ~139s.
+    timeout_ms: 1200000
+    cache: "inputs"
