@@ -632,9 +632,205 @@ fn rustup_which_rust_analyzer() -> Option<OsString> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A3 — RA ⇄ toolchain ABI-skew guard.
+//
+// rust-analyzer spawns the proc-macro-server from the WORKSPACE sysroot
+// (`RUSTUP_TOOLCHAIN`); if RA's own ABI version differs from that srv's, RA
+// refuses ALL macro expansion ⇒ zero diagnostics ⇒ every push timer-settles
+// empty ⇒ verdict=unknown fleet-wide (the historical 1.85-RA ⇄ 1.93-srv
+// stall). The Dockerfile pins both equal at build time, but nothing asserts
+// it at runtime — a base-image bump that moves the toolchain without
+// rebuilding RA silently re-introduces the skew. This guard makes that
+// fail-LOUD instead of fail-silent-to-all-unknown. Only meaningful when
+// proc-macros are enabled; the caller decides strictness.
+// ---------------------------------------------------------------------------
+
+/// Extract the semver release (e.g. `1.93.1`) from a `rust-analyzer --version`
+/// line like `rust-analyzer 1.93.1 (01f6ddf 2026-02-11)`. `None` if no
+/// dotted-numeric token is present (a dev build like `rust-analyzer 0.0.0-...`
+/// or an unrecognized format — the caller treats that as "can't verify").
+pub fn parse_ra_release(version_line: &str) -> Option<String> {
+    version_line.split_whitespace().find_map(|tok| {
+        let core = tok.trim_start_matches('v');
+        let mut parts = core.split('.');
+        let (a, b, c) = (parts.next()?, parts.next()?, parts.next()?);
+        // major.minor.patch where the patch may carry a -suffix; require the
+        // first three dot-fields to start numeric so we don't match a date.
+        let numeric = |s: &str| s.chars().next().is_some_and(|ch| ch.is_ascii_digit());
+        if numeric(a) && numeric(b) && numeric(c) {
+            let patch: String = c.chars().take_while(char::is_ascii_digit).collect();
+            Some(format!("{a}.{b}.{patch}"))
+        } else {
+            None
+        }
+    })
+}
+
+/// Extract the channel/release prefix from a `RUSTUP_TOOLCHAIN` value like
+/// `1.93.1-x86_64-unknown-linux-gnu` → `1.93.1`. Non-numeric channels
+/// (`stable`, `nightly-2026-…`) return the leading token as-is; the comparator
+/// treats a non-numeric channel as "can't verify" rather than a mismatch.
+pub fn parse_toolchain_release(toolchain: &str) -> Option<String> {
+    let head = toolchain.split('-').next()?.trim();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head.to_string())
+    }
+}
+
+/// The outcome of the ABI-alignment check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbiAlignment {
+    /// RA release == toolchain release. Safe to expand proc-macros.
+    Aligned { version: String },
+    /// RA release != toolchain release — the skew that silently disables
+    /// macro expansion. Carries both for the operator message.
+    Skewed { ra: String, toolchain: String },
+    /// Could not parse one/both versions (dev build, non-numeric channel,
+    /// missing env). Not an assertion either way — proceed but note it.
+    Unverifiable,
+}
+
+/// Pure comparator: is the RA binary ABI-aligned with the workspace toolchain?
+/// Inputs are the raw `rust-analyzer --version` line and the `RUSTUP_TOOLCHAIN`
+/// value (`None` if unset). Pure ⇒ unit-tested without spawning RA.
+pub fn check_abi_alignment(ra_version_line: &str, rustup_toolchain: Option<&str>) -> AbiAlignment {
+    let (Some(ra), Some(tc)) = (
+        parse_ra_release(ra_version_line),
+        rustup_toolchain.and_then(parse_toolchain_release),
+    ) else {
+        return AbiAlignment::Unverifiable;
+    };
+    // Compare on major.minor — a patch bump (1.93.1 vs 1.93.0) does not move
+    // the proc-macro bridge ABI; the field failure is a generation gap
+    // (1.85 vs 1.93). A token that has no numeric major.minor (`stable`,
+    // `nightly-…`) is NOT a mismatch — it is unverifiable (don't false-skew).
+    let mm = |v: &str| -> Option<String> {
+        let mut it = v.split('.');
+        let (a, b) = (it.next()?, it.next()?);
+        let numeric = |s: &str| s.chars().next().is_some_and(|c| c.is_ascii_digit());
+        (numeric(a) && numeric(b)).then(|| format!("{a}.{b}"))
+    };
+    match (mm(&ra), mm(&tc)) {
+        (Some(ra_mm), Some(tc_mm)) if ra_mm == tc_mm => AbiAlignment::Aligned { version: ra },
+        (Some(_), Some(_)) => AbiAlignment::Skewed { ra, toolchain: tc },
+        // One side has no comparable numeric version (a `stable`/`nightly`
+        // channel) ⇒ can't assert either way.
+        _ => AbiAlignment::Unverifiable,
+    }
+}
+
+/// Convenience: probe the ABI alignment of the RA binary cargoless would
+/// actually spawn (same resolution as [`rust_analyzer_command`]). Called once
+/// at serve startup so the `ra.abi.*` log lands before the first verdict.
+pub fn probe_abi_alignment_default() -> AbiAlignment {
+    match resolve_rust_analyzer() {
+        Ok(ra) => probe_abi_alignment(&ra),
+        Err(_) => AbiAlignment::Unverifiable,
+    }
+}
+
+/// Runtime guard: run `rust-analyzer --version` and compare against
+/// `RUSTUP_TOOLCHAIN`. Returns the [`AbiAlignment`]; the CALLER logs/acts
+/// (`cargoless-core` has no logging dep — the serve crate owns `tracing`).
+/// Best-effort: a failed `--version` spawn is `Unverifiable`, never fatal.
+pub fn probe_abi_alignment(ra: &OsString) -> AbiAlignment {
+    let line = Command::new(ra)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
+    match &line {
+        Some(l) => check_abi_alignment(l, toolchain.as_deref()),
+        None => AbiAlignment::Unverifiable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ra_release_extracts_semver() {
+        assert_eq!(
+            parse_ra_release("rust-analyzer 1.93.1 (01f6ddf 2026-02-11)").as_deref(),
+            Some("1.93.1")
+        );
+        assert_eq!(
+            parse_ra_release("rust-analyzer 1.85.0 (abc 2025-02-17)").as_deref(),
+            Some("1.85.0")
+        );
+        // No dotted-numeric token ⇒ None (unverifiable).
+        assert_eq!(parse_ra_release("rust-analyzer dev-build"), None);
+    }
+
+    #[test]
+    fn parse_toolchain_release_strips_host_triple() {
+        assert_eq!(
+            parse_toolchain_release("1.93.1-x86_64-unknown-linux-gnu").as_deref(),
+            Some("1.93.1")
+        );
+        assert_eq!(parse_toolchain_release("stable").as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn abi_alignment_aligned_when_major_minor_match() {
+        // The live prod case: RA 1.93.1 ⇄ toolchain 1.93.1.
+        assert_eq!(
+            check_abi_alignment(
+                "rust-analyzer 1.93.1 (01f6ddf 2026-02-11)",
+                Some("1.93.1-x86_64-unknown-linux-gnu")
+            ),
+            AbiAlignment::Aligned {
+                version: "1.93.1".into()
+            }
+        );
+        // Patch-only diff is still aligned (ABI bridge is per major.minor).
+        assert!(matches!(
+            check_abi_alignment(
+                "rust-analyzer 1.93.0 (x 2026-01-01)",
+                Some("1.93.1-x86_64-unknown-linux-gnu")
+            ),
+            AbiAlignment::Aligned { .. }
+        ));
+    }
+
+    #[test]
+    fn abi_alignment_detects_the_historical_skew() {
+        // The field failure: 1.85 RA against a 1.93 workspace toolchain.
+        assert_eq!(
+            check_abi_alignment(
+                "rust-analyzer 1.85.0 (4d91de4 2025-02-17)",
+                Some("1.93.1-x86_64-unknown-linux-gnu")
+            ),
+            AbiAlignment::Skewed {
+                ra: "1.85.0".into(),
+                toolchain: "1.93.1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn abi_alignment_unverifiable_on_missing_or_nonnumeric() {
+        assert_eq!(
+            check_abi_alignment("rust-analyzer 1.93.1 (x y)", None),
+            AbiAlignment::Unverifiable
+        );
+        assert_eq!(
+            check_abi_alignment("garbage", Some("1.93.1-x86_64")),
+            AbiAlignment::Unverifiable
+        );
+        // A non-numeric toolchain channel (`stable`) must NOT be reported as a
+        // skew — it is simply unverifiable.
+        assert_eq!(
+            check_abi_alignment("rust-analyzer 1.93.1 (x y)", Some("stable")),
+            AbiAlignment::Unverifiable
+        );
+    }
 
     // -----------------------------------------------------------------------
     // FIELD FINDING #3b — ReapOnDrop kills + reaps on scope exit

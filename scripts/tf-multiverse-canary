@@ -40,6 +40,11 @@ Commands:
   check-remote-all
                  Run tf-multiverse/scripts/check-remote in every canary worktree.
   status-remote  Query cargoless status --remote.
+  diff-remotes <A> <B>
+                 Differential validation: diff every canary worktree's verdict
+                 between two daemons (A=baseline/live, B=candidate/test).
+                 Exit non-zero iff B introduces a NET-NEW RED. (Also reads
+                 CARGOLESS_DIFF_A / CARGOLESS_DIFF_B.)
   paths          Print resolved canary paths and environment defaults.
   clean          Remove the temp canary root, if it was created by this script.
 
@@ -340,6 +345,60 @@ status_remote() {
   "$BIN" status --remote "$REMOTE"
 }
 
+# E1 — differential validation. Push every canary worktree to TWO daemons
+# (A = baseline/live, B = candidate/test) and diff their verdicts. The
+# safety net for a config change (e.g. TF_FEATURES=ssr, proc-macros on):
+# a worktree that is green/unknown on A but RED on B is a NET-NEW RED the
+# change would introduce fleet-wide — surfaced here BEFORE any Flux promote.
+# Usage: diff-remotes <URL_A> <URL_B>
+#   URL_A defaults to $CARGOLESS_DIFF_A, URL_B to $CARGOLESS_DIFF_B.
+diff_remotes() {
+  ensure_bin
+  local url_a="${1:-${CARGOLESS_DIFF_A:-}}"
+  local url_b="${2:-${CARGOLESS_DIFF_B:-}}"
+  [ -n "$url_a" ] && [ -n "$url_b" ] \
+    || die "diff-remotes needs two daemon URLs (args or CARGOLESS_DIFF_A/B)"
+  [ -d "$WTROOT" ] || die "no canary worktrees under $WTROOT (run: prepare)"
+  local base timeout token_args=()
+  base="${CARGOLESS_TFM_PUSH_BASE:-$(cat "$ROOT/base-sha" 2>/dev/null || echo HEAD)}"
+  timeout="${CARGOLESS_TFM_CHECK_TIMEOUT:-240}"
+  [ -n "${CARGOLESS_AUTH_TOKEN:-}" ] && token_args=(--auth-token "$CARGOLESS_AUTH_TOKEN")
+
+  # `cargoless verdict --output json` prints one JSON object per worktree;
+  # pull `.verdict` from each remote. A non-zero exit just means red/unknown
+  # (0 green / 1 red / 75 unknown) — we read the JSON, never the exit code.
+  verdict_for() {
+    local url="$1" wt="$2"
+    "$BIN" verdict --remote "$url" --base "$base" \
+      --await-timeout-secs "$timeout" --output json "${token_args[@]}" -- "$wt" 2>/dev/null \
+      | sed -n 's/.*"verdict"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -1
+  }
+
+  local total=0 newred=0 changed=0
+  echo "[tf-multiverse-canary] diff-remotes A=$url_a B=$url_b base=$base"
+  for wt in "$WTROOT"/wt-*; do
+    [ -d "$wt" ] || continue
+    total=$((total + 1))
+    local label va vb
+    label="$(basename "$wt")"
+    va="$(verdict_for "$url_a" "$wt")"; va="${va:-error}"
+    vb="$(verdict_for "$url_b" "$wt")"; vb="${vb:-error}"
+    if [ "$va" != "$vb" ]; then
+      changed=$((changed + 1))
+      # Net-new red: B is red while A was not. The blocker condition.
+      if [ "$vb" = "red" ] && [ "$va" != "red" ]; then
+        newred=$((newred + 1))
+        echo "  NET-NEW-RED  $label  A=$va  B=$vb"
+      else
+        echo "  changed      $label  A=$va  B=$vb"
+      fi
+    fi
+  done
+  echo "[tf-multiverse-canary] diff-remotes total=$total changed=$changed net_new_red=$newred"
+  # Non-zero exit iff the candidate introduces a net-new red — the gate signal.
+  [ "$newred" -eq 0 ]
+}
+
 clean() {
   safe_canary_root
   if [ -e "$ROOT" ]; then
@@ -361,6 +420,7 @@ case "$cmd" in
   push-all) push_all "$@" ;;
   check-remote-all) check_remote_all "$@" ;;
   status-remote) status_remote "$@" ;;
+  diff-remotes) diff_remotes "$@" ;;
   paths) print_paths ;;
   clean) clean ;;
   help|-h|--help) usage ;;

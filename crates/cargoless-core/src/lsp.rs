@@ -109,6 +109,19 @@ pub struct InitOpts {
     /// RA's defaults are emitted unchanged. The `erase_components` Leptos
     /// 0.7+ dev cfg is the motivating case.
     pub cfgs: Vec<String>,
+    /// A2 — decouple RA proc-macro expansion from the cargo-check coupling.
+    /// `None` (default) = legacy behavior: `proc_macro_resolved` is gated by
+    /// `cargo_build_scripts_enabled` (so `TF_RA_CHECK_DISABLED=1` forces
+    /// proc-macros OFF — the live serve mode that makes Leptos `view!`/
+    /// `#[component]` invisible). `Some(true)` = force RA proc-macro
+    /// expansion ON regardless of cargo-check (RA expands macros from the
+    /// already-built proc-macro-srv; faster than a full cargo check but
+    /// type-INCOMPLETE — RA-native still can't see E0599/E0382). `Some(false)`
+    /// = force OFF. Resolved from `TF_RA_PROCMACRO_ON` (on/off/unset). NOTE:
+    /// this is a RAM/latency/coverage lever, NOT the trust fix — GREEN means
+    /// "compiles" only via the cargo-check witness, which expands macros
+    /// itself independent of this flag.
+    pub ra_proc_macro_override: Option<bool>,
 }
 
 /// RA's built-in `rust-analyzer.cargo.cfgs` default. `cargo.cfgs` REPLACES
@@ -142,6 +155,7 @@ impl Default for InitOpts {
             cargo_check_enabled: true,
             all_features: false,
             cfgs: Vec::new(),
+            ra_proc_macro_override: None,
         }
     }
 }
@@ -193,6 +207,11 @@ impl InitOpts {
         // Same split as TF_FEATURES; appended onto RA's default cfgs in
         // `lean_init_options`.
         let cfgs = csv_list_env("TF_RA_CFGS");
+        // A2 — `TF_RA_PROCMACRO_ON` tri-state: on/true/1 ⇒ Some(true) (force
+        // RA proc-macro expansion, decoupled from cargo-check); off/false/0 ⇒
+        // Some(false) (force off); unset/other ⇒ None (legacy cargo-check
+        // gating). Mirrors the `TF_PROC_MACRO` idiom but as an override.
+        let ra_proc_macro_override = tristate_env("TF_RA_PROCMACRO_ON");
         Self {
             proc_macro_enabled,
             features,
@@ -203,6 +222,7 @@ impl InitOpts {
             cargo_check_enabled,
             all_features,
             cfgs,
+            ra_proc_macro_override,
         }
     }
 
@@ -238,6 +258,46 @@ impl InitOpts {
             cmd.push("--release".to_string());
         }
         Some(cmd)
+    }
+
+    /// Operator-facing summary of the RESOLVED RA configuration — the
+    /// effective knobs this daemon hands rust-analyzer, after env/auto
+    /// resolution. C1 observability: surfaced on `GET /daemon` and the
+    /// `ra.spawn` log so an operator/agent can see what a running pod is
+    /// actually doing (two pods off one image with different `TF_*` env are
+    /// otherwise indistinguishable over the wire). `proc_macro_resolved`
+    /// reflects the post-gating value `lean_init_options` actually emits
+    /// (it can be forced off by the cargo-check coupling even when
+    /// `proc_macro_enabled` is true), so this never overclaims.
+    pub fn resolved_summary(&self) -> Value {
+        json!({
+            "features": self.features,
+            "all_features": self.all_features,
+            "cfgs": self.cfgs,
+            "no_default_features": self.no_default_features,
+            "package": self.package,
+            "target": self.target,
+            "release": self.release,
+            "cargo_check_enabled": self.cargo_check_enabled,
+            "proc_macro_requested": self.proc_macro_enabled,
+            "proc_macro_override": self.ra_proc_macro_override,
+            "proc_macro_resolved": self.proc_macro_resolved(),
+        })
+    }
+
+    /// The proc-macro enable value `lean_init_options` actually emits, after
+    /// the build-scripts/cargo-check gating (`lsp.rs` `proc_macro_enabled`
+    /// derivation). Kept in one place so `resolved_summary` and the emitter
+    /// cannot drift.
+    pub fn proc_macro_resolved(&self) -> bool {
+        // A2 override wins: it decouples proc-macro expansion from the
+        // cargo-check coupling entirely (Some(true) = on even with flycheck
+        // off; Some(false) = hard off). Unset (None) keeps the legacy gating.
+        if let Some(forced) = self.ra_proc_macro_override {
+            return forced;
+        }
+        let cargo_build_scripts_enabled = self.cargo_check_enabled && self.package.is_none();
+        self.proc_macro_enabled && cargo_build_scripts_enabled
     }
 }
 
@@ -295,6 +355,23 @@ fn truthy_env(key: &str) -> bool {
             .as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+/// Tri-state env: `Some(true)` for on/true/1/yes, `Some(false)` for
+/// off/false/0/no, `None` for unset / unrecognized. Used by `TF_RA_PROCMACRO_ON`
+/// (A2) where "unset" must mean "legacy behavior", distinct from an explicit off.
+fn tristate_env(key: &str) -> Option<bool> {
+    match std::env::var(key)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("yes") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("no") | Some("off") => Some(false),
+        _ => None,
+    }
 }
 
 /// FIELD FINDING #74: "auto" proc-macro detector — scan `<root>/Cargo.toml`
@@ -435,7 +512,9 @@ pub fn lean_init_options(opts: &InitOpts) -> Value {
     // --workspace ...`, which is exactly the tf-multiverse fan-out path
     // this mode is replacing.
     let cargo_build_scripts_enabled = opts.cargo_check_enabled && opts.package.is_none();
-    let proc_macro_enabled = opts.proc_macro_enabled && cargo_build_scripts_enabled;
+    // Single source of truth shared with `InitOpts::resolved_summary` (C1)
+    // so the observability surface can never drift from what is emitted.
+    let proc_macro_enabled = opts.proc_macro_resolved();
     // `rust-analyzer.cargo.cfgs` REPLACES RA's defaults rather than merging,
     // so append operator cfgs onto RA's base (`debug_assertions`, `miri`)
     // instead of emitting a bare set — otherwise every `#[cfg(debug_assertions)]`
@@ -1952,6 +2031,112 @@ mod tests {
     }
 
     #[test]
+    fn proc_macro_resolved_matches_emitted_value() {
+        // The C1 summary's proc_macro_resolved MUST equal what
+        // lean_init_options actually emits — they share one derivation so the
+        // observability surface can never overclaim.
+        for opts in [
+            InitOpts::default(),
+            InitOpts {
+                cargo_check_enabled: false,
+                ..InitOpts::default()
+            },
+            InitOpts {
+                proc_macro_enabled: false,
+                ..InitOpts::default()
+            },
+            InitOpts {
+                package: Some("triform-server".into()),
+                ..InitOpts::default()
+            },
+        ] {
+            let emitted = lean_init_options(&opts);
+            assert_eq!(
+                emitted["procMacro"]["enable"],
+                json!(opts.proc_macro_resolved()),
+                "resolved_summary's proc_macro_resolved drifted from emission: {opts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proc_macro_override_decouples_from_cargo_check() {
+        // A2: the live serve mode has cargo-check OFF, which legacy-gates
+        // proc-macros OFF (Leptos view!/#[component] invisible). The override
+        // Some(true) forces RA proc-macro expansion ON regardless — the whole
+        // point of the knob — and it must reach the emitted procMacro.enable.
+        let v = lean_init_options(&InitOpts {
+            cargo_check_enabled: false,
+            ra_proc_macro_override: Some(true),
+            ..InitOpts::default()
+        });
+        assert_eq!(
+            v["procMacro"]["enable"],
+            json!(true),
+            "override Some(true) must turn proc-macros ON even with cargo-check off"
+        );
+        assert_eq!(v["rust-analyzer.procMacro.enable"], json!(true));
+
+        // Some(false) forces OFF even when the legacy path would enable it.
+        let v = lean_init_options(&InitOpts {
+            cargo_check_enabled: true,
+            proc_macro_enabled: true,
+            ra_proc_macro_override: Some(false),
+            ..InitOpts::default()
+        });
+        assert_eq!(v["procMacro"]["enable"], json!(false));
+
+        // None ⇒ legacy gating unchanged (cargo-check off ⇒ off).
+        let v = lean_init_options(&InitOpts {
+            cargo_check_enabled: false,
+            ra_proc_macro_override: None,
+            ..InitOpts::default()
+        });
+        assert_eq!(v["procMacro"]["enable"], json!(false));
+    }
+
+    #[test]
+    fn init_opts_proc_macro_override_from_env() {
+        // Serialized behind ENV_LOCK like the other env-reading tests.
+        let _g = EnvGuard::set("TF_RA_PROCMACRO_ON", "on");
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert_eq!(opts.ra_proc_macro_override, Some(true));
+    }
+
+    #[test]
+    fn init_opts_proc_macro_override_off_from_env() {
+        let _g = EnvGuard::set("TF_RA_PROCMACRO_ON", "off");
+        let opts = InitOpts::from_env_and_project(std::path::Path::new("/nonexistent"));
+        assert_eq!(opts.ra_proc_macro_override, Some(false));
+    }
+
+    #[test]
+    fn resolved_summary_reports_the_operator_facing_config() {
+        // C1: GET /daemon + ra.spawn surface this. Cargo-check OFF (the live
+        // serve mode) forces proc_macro_resolved false even though requested
+        // true — the summary reflects the resolved value, not the request.
+        let opts = InitOpts {
+            features: vec!["ssr".into()],
+            all_features: false,
+            cfgs: vec!["erase_components".into()],
+            cargo_check_enabled: false,
+            proc_macro_enabled: true,
+            ..InitOpts::default()
+        };
+        let s = opts.resolved_summary();
+        assert_eq!(s["features"], json!(["ssr"]));
+        assert_eq!(s["all_features"], json!(false));
+        assert_eq!(s["cfgs"], json!(["erase_components"]));
+        assert_eq!(s["cargo_check_enabled"], json!(false));
+        assert_eq!(s["proc_macro_requested"], json!(true));
+        assert_eq!(
+            s["proc_macro_resolved"],
+            json!(false),
+            "cargo-check off must force proc-macro resolved-off in the summary"
+        );
+    }
+
+    #[test]
     fn lean_init_options_threads_tf_multiverse_check_profile() {
         let v = lean_init_options(&InitOpts {
             proc_macro_enabled: true,
@@ -1963,6 +2148,7 @@ mod tests {
             cargo_check_enabled: true,
             all_features: false,
             cfgs: vec![],
+            ra_proc_macro_override: None,
         });
 
         // Mirrors the tf-multiverse remote-check matrix:
@@ -2237,6 +2423,8 @@ mod tests {
         // New knobs default off/empty — preserves pre-change behavior.
         assert!(!opts.all_features);
         assert_eq!(opts.cfgs, Vec::<String>::new());
+        // A2: override defaults to None (legacy cargo-check gating).
+        assert_eq!(opts.ra_proc_macro_override, None);
     }
 
     #[test]

@@ -869,13 +869,17 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         }
     }
     match req.path.as_str() {
-        "/daemon" => (
-            200,
-            serde_json::json!({
-                "build_id": crate::build_id(),
-            })
-            .to_string(),
-        ),
+        "/daemon" => {
+            // build_id identifies the IMAGE; ra_config (C1) identifies the
+            // RUNTIME — what RA features/proc-macro/check mode this specific
+            // pod resolved from its env. Additive: omitted for services that
+            // run no RA (resolved_config() == None).
+            let mut body = serde_json::json!({ "build_id": crate::build_id() });
+            if let Some(cfg) = svc.resolved_config() {
+                body["ra_config"] = cfg;
+            }
+            (200, body.to_string())
+        }
         "/admin/active" => (200, daemon_activity_to_json(&svc.daemon_activity())),
         "/worktrees" => (200, summaries_to_json(&svc.list_worktrees())),
         "/status" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
@@ -1853,6 +1857,79 @@ mod tests {
         assert!(
             !body.contains("base_sha"),
             "absent base_sha omits the wire key (None): {body}"
+        );
+    }
+
+    #[test]
+    fn daemon_route_includes_resolved_config_when_present() {
+        // C1: GET /daemon always carries build_id; it ALSO carries ra_config
+        // iff the service resolves one (the serve daemon does; mock/read
+        // services return None → field omitted, no wire change for them).
+        struct WithConfig;
+        impl VerdictService for WithConfig {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+            fn resolved_config(&self) -> Option<serde_json::Value> {
+                Some(serde_json::json!({ "features": ["ssr"], "proc_macro_resolved": false }))
+            }
+        }
+        let daemon_req = || HttpReq {
+            method: "GET".into(),
+            path: "/daemon".into(),
+            query: String::new(),
+            bearer: None,
+            content_length: None,
+            content_encoding: None,
+        };
+        let (code, body) = route_oneshot(&WithConfig, &daemon_req());
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["build_id"].is_string(), "build_id always present: {body}");
+        assert_eq!(
+            v["ra_config"]["features"],
+            serde_json::json!(["ssr"]),
+            "ra_config surfaces the resolved RA config: {body}"
+        );
+
+        // A service that resolves no config (the trait default) omits
+        // ra_config — build_id-only, byte-compatible with pre-C1.
+        struct NoConfig;
+        impl VerdictService for NoConfig {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+        }
+        let (_c, body) = route_oneshot(&NoConfig, &daemon_req());
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["build_id"].is_string());
+        assert!(
+            v.get("ra_config").is_none(),
+            "no resolved config ⇒ ra_config omitted: {body}"
         );
     }
 

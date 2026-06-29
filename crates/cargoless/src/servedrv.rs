@@ -337,6 +337,59 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     let (push_tx, push_rx) = channel::<String>();
     api.attach_push_signal(push_tx);
 
+    // C1 observability — record the resolved RA config for `GET /daemon`.
+    // Resolved from the SAME env + repo root the per-cluster RA spawn uses
+    // (`InitOpts::from_env_and_project`, servedrv RA-spawn closure), so the
+    // endpoint reflects exactly what rust-analyzer is handed. Done once at
+    // startup; the config is env-derived and identical across this daemon's
+    // clusters.
+    let startup_opts = cargoless_core::lsp::InitOpts::from_env_and_project(&scope.repo_root);
+    api.set_resolved_config(startup_opts.resolved_summary());
+
+    // A3 — RA ⇄ toolchain ABI-skew guard. Always log the alignment; if
+    // proc-macros are force-enabled (`TF_RA_PROCMACRO_ON`) AND the versions
+    // are skewed, that combination silently disables macro expansion
+    // fleet-wide, so ALSO surface it as a loud error (still non-fatal — the
+    // daemon runs, just degraded; failing the boot would take the whole fleet
+    // down on a version drift, worse than degraded verdicts).
+    use cargoless_core::analyzer::AbiAlignment;
+    let abi = cargoless_core::analyzer::probe_abi_alignment_default();
+    match &abi {
+        AbiAlignment::Aligned { version } => {
+            tracing::info!(ra_version = %version, "ra.abi.aligned");
+        }
+        AbiAlignment::Skewed { ra, toolchain } => {
+            tracing::warn!(
+                ra_version = %ra,
+                toolchain = %toolchain,
+                "ra.abi.SKEW — rust-analyzer ABI differs from the workspace \
+                 toolchain; RA will DISABLE proc-macro expansion ⇒ empty \
+                 diagnostics / verdict=unknown. Rebuild with RA_TOOLCHAIN == \
+                 RUSTUP_TOOLCHAIN."
+            );
+        }
+        AbiAlignment::Unverifiable => {
+            tracing::warn!("ra.abi.unverifiable — could not compare RA vs toolchain version");
+        }
+    }
+    // The dangerous combo: proc-macros force-enabled AND skewed ⇒ macro
+    // expansion silently dies fleet-wide. Surface it loudly. (Single `match`
+    // with a guard — MSRV 1.85 has no let-chains, and a nested `if`/`if let`
+    // would trip clippy::collapsible_if.)
+    match &abi {
+        AbiAlignment::Skewed { ra, toolchain }
+            if startup_opts.ra_proc_macro_override == Some(true) =>
+        {
+            crate::ui::error(format!(
+                "RA proc-macros force-enabled (TF_RA_PROCMACRO_ON) but RA {ra} \
+                 is ABI-skewed from toolchain {toolchain}; macro expansion will \
+                 be DISABLED and verdicts degraded. Rebuild the image with \
+                 RA_TOOLCHAIN == RUSTUP_TOOLCHAIN."
+            ));
+        }
+        _ => {}
+    }
+
     // /healthz readiness latch (#225 0d). `false` until the serve loop is
     // live ⇒ unauthenticated `GET /healthz` answers `503
     // {"status":"starting"}`; flipped `true` at loop-entry below ⇒ `200
@@ -843,6 +896,11 @@ fn spawn_cluster(
         tracing::info!(
             cluster_id = %hook_h.as_str(),
             ra_pid = ?child.id(),
+            // C1 observability: the RESOLVED RA config this spawn runs under,
+            // so an operator/agent can see what a live pod is actually doing
+            // (features / proc-macro / cargo-check differ by env, otherwise
+            // invisible). Compact single-line JSON.
+            ra_config = %opts.resolved_summary(),
             "ra.spawn",
         );
         let _ = ctrl_tx.send(Ctrl::Spawned(hook_h.clone(), Arc::clone(&client)));
