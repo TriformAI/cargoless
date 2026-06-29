@@ -1,3 +1,9 @@
+// `lsp::lean_init_options` builds RA's initializationOptions as one large
+// `serde_json::json!` literal; `json!` expands recursively per key, and the
+// object is big enough that the default limit (128) is exceeded. Lift it so
+// the macro expands. Compile-time only — no runtime cost.
+#![recursion_limit = "256"]
+
 //! The daemon. Owners fill these modules in against the Plane CWDL epics:
 //!
 //! - watcher  — `notify` filesystem watcher (Epic 2)

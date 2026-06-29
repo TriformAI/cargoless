@@ -94,6 +94,52 @@ That prevents rust-analyzer from launching a workspace-wide Cargo
 flycheck; explicit direct Cargo profiles are reserved for compile-gate
 or rollback checks, not default `check-remote`.
 
+## RA feature / cfg selection (TF_FEATURES / TF_ALL_FEATURES / TF_RA_CFGS)
+
+The features and cfgs rust-analyzer treats as active are operator-set on
+the **`serve` process** (not per-push — the daemon ignores a pushed
+`CheckProfile.features`). Three knobs, each with an env form for the k8s
+container `env:` block and a CLI flag for `check`/`watch`/`serve`/`push`:
+
+| Knob | Env | CLI | RA setting |
+|---|---|---|---|
+| Feature list | `TF_FEATURES=ssr` | `--features ssr` | `cargo.features` |
+| All features | `TF_ALL_FEATURES=1` | `--all-features` | `cargo.allFeatures` |
+| Extra cfgs | `TF_RA_CFGS=erase_components` | `--cfg erase_components` | `cargo.cfgs` (appended onto RA's defaults) |
+
+**For tf-multiverse, use `TF_FEATURES=ssr` — not `--all-features`.**
+`triform-portal` is a Leptos 0.8 SSR app (`default=["ssr"]`) whose
+`ssr`/`hydrate`/`csr` features are mutually exclusive, and the serve
+daemon analyzes it host-native. `--all-features` would activate the
+hydrate/csr cfg paths simultaneously and red the analysis. `--all-features`
+is for crates whose features compose (e.g. a simple CSR app). `TF_RA_CFGS`
+entries are appended onto RA's own default cfgs (`debug_assertions`,
+`miri`), never replacing them. `erase_components` is a Leptos 0.7+ dev cfg;
+tf-multiverse does not use it today, so the cfg knob is general-purpose
+here.
+
+**Validation-first rollout (never edit the live Flux manifest first):**
+the live serve daemon's RA-native diagnostics *are* the fleet verdict, so
+prove any feature/cfg change on an isolated instance before promoting it.
+
+1. **Local loopback** — `scripts/tf-multiverse-canary serve-local` forwards
+   extra args to `serve`, so
+   `… serve-local --features ssr -p server` (with
+   `CARGOLESS_RA_LOG_FILE=/tmp/ra.log` to watch the cargo invocation RA
+   spawns). Assert behavior with a feature-gated oracle (a
+   `#[cfg(feature = "ssr")]` item referenced unconditionally: red without
+   the feature, green with it).
+2. **k8s test instance** — `deploy/cargoless-serve-test.k8s.yaml` is a
+   parallel `cargoless-serve-test` Deployment (its own PVC + Service) for
+   exactly this. Build a branch image (the in-cluster kaniko Job,
+   `deploy/jobs/build-serve-image.yaml`), point the manifest's image tag at
+   it, `kubectl apply`, then drive it with `cargoless verdict --remote
+   http://cargoless-serve-test.cargoless-builder.svc:8787 …`.
+3. **Promote** — only after the test instance is green, set `TF_FEATURES`
+   (and bump the image tag) in the **tf-multiverse** Flux manifest
+   (`deployment/cargoless-builder/{serve,shards}.yaml`). The cargoless-repo
+   `deploy/*.k8s.yaml` are reference copies Flux never reads.
+
 ## Local canary flow
 
 Build the current branch binary:
