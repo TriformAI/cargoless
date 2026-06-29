@@ -679,8 +679,16 @@ mod tests {
         ports: Arc<PortAllocator>,
     ) -> Driver<Recorder, Recorder, Recorder> {
         let svc = Arc::new(AppServeState::new());
+        // Unique per `driver()` call, not just per process: cargo runs the
+        // test module multi-threaded in ONE process, and several tests use
+        // the same instance name ("dev"). Keying the bundle root on pid alone
+        // let one test's planted bundles (e.g. "stale1") leak into another's
+        // on-disk view and fail its precondition assert. A monotonic counter
+        // gives every driver its own root so the tests are isolated.
+        static DRIVER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = DRIVER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut dir = std::env::temp_dir();
-        dir.push(format!("cargoless-appdrv-{}", std::process::id()));
+        dir.push(format!("cargoless-appdrv-{}-{}", std::process::id(), seq));
         let instances = names
             .iter()
             .map(|n| InstanceConfig {
