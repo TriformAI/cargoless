@@ -179,6 +179,19 @@ spec:
             # - { name: TF_ALL_FEATURES, value: "1" }
             # Extra RA cfgs, comma/space-separated (appended onto RA defaults):
             # - { name: TF_RA_CFGS, value: "erase_components" }
+            # ── Phase 2: cargo-check witness (macro-AWARE verdicts) ──────────
+            # Makes a GREEN mean "compiles" for Leptos macro code by escalating
+            # macro-touching pushes to a real `cargo check` (the SSR witness in
+            # the served repo's cargoless.checks.yaml). Uncomment ALL FOUR to
+            # validate on this test instance, then diff vs the live (un-armed)
+            # daemon with `tf-multiverse-canary diff-remotes`. Base mode MUST be
+            # warn (escalation only promotes Warn→Hard). Cost: each macro push
+            # runs a full cold `cargo check --release` — measure under load
+            # before scaling. See docs/operator/WITNESS-FOR-SWARM.md.
+            # - { name: CARGOLESS_PROJECT_CHECKS_MODE, value: "warn" }   # overrides the "off" above
+            # - { name: CARGOLESS_MACRO_BLIND_PATHS, value: "portal/**,server/src/**,chemistry/generated/**,physics/src/**,runtime-types/**" }
+            # - { name: CARGOLESS_MACRO_BLIND_ESCALATE, value: "1" }
+            # - { name: CARGOLESS_MACRO_BLIND_MACROS, value: "view" }   # optional: narrow to files invoking view!
           ports:
             - name: http
               containerPort: 8787

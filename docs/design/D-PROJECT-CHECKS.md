@@ -281,6 +281,20 @@ worktrees, but it must be explicit for product safety:
   `CARGOLESS_CHANGED_FILES`. The current implementation inherits the operator
   environment; a minimal-env daemon mode is a follow-up hardening step.
 
+## Macro-aware verdicts for a swarm (the cargo-check witness)
+
+A `kind: command` check that shells `cargo check` is the **complete** compiler
+authority — it expands proc-macros and type-checks, which rust-analyzer's
+native pass cannot. For a swarm editing Leptos `view!`/`#[component]` code, this
+is what makes a served GREEN mean "compiles" rather than "RA-native saw no parse
+error". It is escalated to **only on macro-touching pushes**
+(`CARGOLESS_MACRO_BLIND_PATHS` + `CARGOLESS_MACRO_BLIND_ESCALATE=1`, base mode
+`warn`), so non-macro pushes keep the fast RA-native path, and it composes
+fail-closed (an unwitnessed macro-touching green is downgraded to `unknown`,
+never served as a false green). Operator recipe, the SSR example manifest, and
+the swarm cost caveats: **`docs/operator/WITNESS-FOR-SWARM.md`** (+ the example
+at `docs/operator/examples/cargoless.checks.ssr-witness.yaml`).
+
 ## tf-multiverse Mapping
 
 tf-multiverse should consume this as data, not as Cargoless code:
