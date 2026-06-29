@@ -2167,6 +2167,14 @@ checks:
     #[test]
     fn timeout_results_are_not_cached() {
         let root = scratch("timeout-cache");
+        // The command appends its marker FIRST, then blocks far past the
+        // timeout. Earlier this used `timeout_ms: 1` with `sleep 0.05`, which
+        // raced process startup: under CI load the SIGKILL could land during
+        // bash's startup before `printf` ran, leaving `counter` short of "xx"
+        // (the load-flake that reddened the `test` job + main). A timeout
+        // comfortably above startup jitter (but far below the 30s block)
+        // guarantees the marker is written every run AND that the check still
+        // times out, so the result is not cached and the command re-runs.
         fs::write(
             root.join(MANIFEST_NAME),
             r#"
@@ -2175,8 +2183,8 @@ checks:
   - id: slow
     kind: command
     read_only: true
-    command: ["bash", "-lc", "printf x >> counter; sleep 0.05"]
-    timeout_ms: 1
+    command: ["bash", "-c", "printf x >> counter; sleep 30"]
+    timeout_ms: 200
     cache: inputs
 "#,
         )
