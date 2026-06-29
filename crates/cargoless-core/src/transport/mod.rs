@@ -472,6 +472,17 @@ pub trait VerdictService: Send + Sync {
         unsupported_batch_report(request, "batch_check unsupported by this service")
     }
 
+    /// C1 observability: the resolved RA configuration this daemon hands
+    /// rust-analyzer (features / all_features / cfgs / proc-macro / cargo-
+    /// check / project-checks mode), as a JSON object. `None` ⇒ the service
+    /// does not run an RA (mock/in-proc read paths) — `GET /daemon` then
+    /// omits the field. ADDITIVE with a default body so no existing impl is
+    /// forced to change; the serve loop's `VerdictService` overrides it with
+    /// the env-resolved `InitOpts::resolved_summary()`.
+    fn resolved_config(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Admin read: current drain/quiesce state. Default keeps older/mock
     /// services source-compatible and reports "idle, not quiescing".
     fn daemon_activity(&self) -> DaemonActivity {

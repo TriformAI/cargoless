@@ -448,6 +448,13 @@ pub struct ServeVerdictState {
     /// `statuses` slot afterward. Unattributed (FS-watch) verdicts never enter
     /// the ring — they have no SHA to address.
     verdict_history: Mutex<BTreeMap<String, VecDeque<WorktreeStatus>>>,
+    /// C1 observability — the resolved RA config JSON
+    /// ([`cargoless_core::lsp::InitOpts::resolved_summary`]) this daemon
+    /// runs under, surfaced on `GET /daemon`. `None` until the serve loop
+    /// wires it via [`Self::set_resolved_config`] at startup (same
+    /// attach-at-startup pattern as `push_signal`); a daemon that never
+    /// sets it simply omits `ra_config` from `/daemon`.
+    resolved_config: Mutex<Option<serde_json::Value>>,
 }
 
 #[derive(Default)]
@@ -1264,6 +1271,15 @@ impl ServeVerdictState {
         *poisoned(&self.push_signal) = Some(tx);
     }
 
+    /// C1 observability — record the resolved RA config JSON
+    /// (`InitOpts::resolved_summary()`) for `GET /daemon`. Called by the
+    /// serve loop at startup, same attach-at-startup pattern as
+    /// `attach_push_signal`. Idempotent; last writer wins (the config is
+    /// env-derived and identical across clusters in a single daemon).
+    pub fn set_resolved_config(&self, config: serde_json::Value) {
+        *poisoned(&self.resolved_config) = Some(config);
+    }
+
     /// #240/2b — consume-semantic reader for the SwitchOverlay arm.
     /// Returns the pushed overlay for `wt_key` (matching
     /// `wt.to_string_lossy()` from servedrv) AND removes it from the
@@ -2002,6 +2018,10 @@ impl VerdictService for ServeVerdictState {
 
     fn daemon_activity(&self) -> DaemonActivity {
         self.activity_snapshot()
+    }
+
+    fn resolved_config(&self) -> Option<serde_json::Value> {
+        poisoned(&self.resolved_config).clone()
     }
 
     fn request_quiesce(&self) -> DaemonActivity {
