@@ -275,6 +275,22 @@ mod tests {
             // listener dropped at end of scope — inode remains, no owner
         }
         assert!(sock.exists(), "stale inode persists after listener drop");
+        // Dropping a UnixListener does NOT synchronously refuse new connects:
+        // the kernel keeps the endpoint connectable for a brief teardown
+        // window, and under CI load that window stretches enough that an
+        // immediate `discover()` probe can still see the socket as LIVE
+        // (the observed flake: resolved UnixSocket instead of FileRead). Wait
+        // for the OS to actually reach the intended stale state — connect
+        // refused — before asserting, bounded so a genuine never-refusing
+        // socket still fails fast rather than hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while socket_is_live(&sock) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stale socket never stopped accepting connects within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let sf = repo.join(".cargoless").join("cli-status");
         std::fs::create_dir_all(sf.parent().unwrap()).unwrap();
         std::fs::write(&sf, "schema=2\nverdict=green\n").unwrap();
