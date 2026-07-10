@@ -1116,6 +1116,7 @@ fn exec(
                         overlay_files: pushed.files.clone(),
                         materialize_overlay,
                         gate: pushed.gate,
+                        check_ids: pushed.check_ids.clone(),
                     },
                 );
                 is_from_pushed_overlay = true;
@@ -2213,11 +2214,26 @@ fn run_project_checks_and_log(
     let changed_files = context
         .as_ref()
         .and_then(|ctx| ctx.changed_files.as_deref());
-    let report = match context.as_ref() {
-        Some(ctx) => api.with_project_check_overlay(ctx, |root| {
+    // Direct-lane witness filter — MUST mirror the coalesced lane
+    // (`ServeBatchChecker::run_overlay`). A gated push only reaches this lane
+    // when its overlay touches the project-check manifest (plan
+    // non-coalesceable ⇒ `coalesced_project_check` returns None and the caller
+    // falls through here). Without this branch such a push would run the full
+    // ~97-check `dev` profile and publish its environmental governance reds as
+    // a gating RED. When the filter yields ids we run EXACTLY those witnesses
+    // (change-filtering disabled, matching the coalesced lane); otherwise the
+    // advisory/full-profile behavior is unchanged.
+    let gated_ids = context
+        .as_ref()
+        .and_then(|ctx| crate::serveapi::gated_witness_ids(ctx.gate, ctx.check_ids.as_ref()));
+    let report = match (context.as_ref(), gated_ids.as_deref()) {
+        (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root| {
+            cargoless_core::project_checks::run_profile_with_ids(root, "dev", ids, None)
+        }),
+        (Some(ctx), None) => api.with_project_check_overlay(ctx, |root| {
             cargoless_core::project_checks::run_dev_with_changes(root, changed_files)
         }),
-        None => Ok(cargoless_core::project_checks::run_dev_with_changes(
+        (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
             root,
             changed_files,
         )),
@@ -2999,6 +3015,7 @@ mod tests {
             ],
             materialize_overlay: true,
             gate: true,
+            check_ids: None,
         };
         let summary = summarize_witness_input(Some(&ctx));
         assert!(
@@ -3449,6 +3466,7 @@ checks:
             )],
             materialize_overlay: true,
             gate: false,
+            check_ids: None,
         };
 
         spawn_project_checks_hard_with_timeout(

@@ -112,6 +112,14 @@ pub struct PushedOverlay {
     /// Merge-gate push: promote THIS push's project-check mode from Warn
     /// to Hard (witness-gated verdict). Wire default `false`.
     pub gate: bool,
+    /// Requested witness check-ids for a gate push. When `gate` is set and
+    /// this is a non-empty set, the Hard lane runs ONLY these checks (the
+    /// compile witnesses — ssr/wasm/isolator-vsock) instead of the whole
+    /// `dev` profile, so the merge gate proves the requested witnesses ran
+    /// without dragging the ~97-check governance profile (and its
+    /// environmental reds) through a gating verdict. `None`/empty ⇒ the
+    /// gated lane runs the full profile (prior behavior).
+    pub check_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +132,9 @@ pub(crate) struct ProjectCheckRunContext {
     /// Carried from [`PushedOverlay::gate`]: the EmitVerdict arm promotes
     /// Warn → Hard for this push when set.
     pub gate: bool,
+    /// Carried from [`PushedOverlay::check_ids`]: the witness-only run filter
+    /// for the gated lane. Only consulted when `gate` is true.
+    pub check_ids: Option<Vec<String>>,
 }
 
 /// Verdict-attribution record for one consumed push (#A2/#A7). Captured by
@@ -464,6 +475,14 @@ struct BatchCoalesceKey {
     repo_relative: bool,
     check_profile: String,
     corun: bool,
+    /// Gate + witness-only filter partition the coalesce space. Without these
+    /// a gated witness-only push (runs only ssr/wasm/isolator-vsock) and a
+    /// concurrent advisory full-profile push to the same root+base — which
+    /// compute an IDENTICAL plan coalesce token (planned with `only_id=None`)
+    /// — would share ONE physical run, and a waiter would receive the wrong
+    /// scope's verdict. Keying on them keeps the two runs distinct.
+    gate: bool,
+    check_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -958,6 +977,8 @@ fn batch_coalesce_key(request: &BatchCheckRequest) -> Option<BatchCoalesceKey> {
         repo_relative: request.options.repo_relative,
         check_profile: format!("{:?}", request.check_profile),
         corun: request.corun,
+        gate: request.options.gate,
+        check_ids: request.options.check_ids.clone(),
     })
 }
 
@@ -1537,8 +1558,16 @@ impl ServeVerdictState {
             analysis_root: Some(root_str.into_owned()),
             base_sha: None,
             changed_files: None, // changed_files live on the member, not the options
-            gate: false,
-            check_ids: None,
+            // Carry the push's gate + witness-only filter through the coalesced
+            // lane. `run_batch_check_now` reads these off `request.options` to
+            // build the `ServeBatchChecker`, so a gated witness push runs ONLY
+            // its requested check_ids instead of the full dev profile. These
+            // are ALSO part of `BatchCoalesceKey` (see `batch_coalesce_key`),
+            // so a gated witness-only run never coalesces into — and returns a
+            // waiter the verdict of — a concurrent advisory full-profile run
+            // on the same root+base.
+            gate: context.gate,
+            check_ids: context.check_ids.clone(),
         };
         request.members = vec![member];
         request.corun = true;
@@ -1747,6 +1776,8 @@ impl ServeVerdictState {
                 api: self,
                 root,
                 base_ref: base_ref.to_string(),
+                gate: request.options.gate,
+                check_ids: request.options.check_ids.clone(),
             };
             run_batch(
                 request.batch_id.clone(),
@@ -1917,9 +1948,11 @@ impl VerdictService for ServeVerdictState {
         let mut base_sha = None;
         let mut changed_files = None;
         let mut gate = false;
+        let mut check_ids = None;
         if let Some(options) = options {
             changed_files = options.changed_files.clone();
             gate = options.gate;
+            check_ids = options.check_ids.clone();
             analysis_root = options
                 .analysis_root
                 .as_deref()
@@ -2001,6 +2034,7 @@ impl VerdictService for ServeVerdictState {
             changed_files,
             check_profile: check_profile.cloned(),
             gate,
+            check_ids,
         };
         poisoned(&self.pushed).insert(worktree.to_string(), pushed);
         // Wake the serve loop (best-effort — see attach_push_signal doc).
@@ -2041,6 +2075,11 @@ struct ServeBatchChecker<'a> {
     api: &'a ServeVerdictState,
     root: PathBuf,
     base_ref: String,
+    /// Carried from `request.options.gate`: true ⇒ this is a merge-gate run.
+    gate: bool,
+    /// Carried from `request.options.check_ids`: the witness-only filter for
+    /// a gated run. Only consulted when `gate` is true.
+    check_ids: Option<Vec<String>>,
 }
 
 impl BatchChecker for ServeBatchChecker<'_> {
@@ -2059,39 +2098,95 @@ impl BatchChecker for ServeBatchChecker<'_> {
     }
 }
 
+/// The witness-only run filter shared by BOTH project-check run lanes.
+/// `Some(ids)` iff `gate` is set AND `check_ids` is a non-empty set after
+/// dropping blank entries; else `None` (advisory lane, or a gated push that
+/// requested no specific ids ⇒ full profile).
+///
+/// Load-bearing that this is ONE function used by both lanes: a gated push
+/// normally runs witness-only through the COALESCED lane
+/// (`ServeBatchChecker::run_overlay`), but when its overlay touches the
+/// project-check manifest the plan is non-coalesceable, so
+/// `coalesced_project_check` returns `None` and the push falls through to the
+/// DIRECT lane (`run_project_checks_and_log`). Both lanes MUST filter by the
+/// same witness ids, or a manifest-touching gated PR would silently run the
+/// full ~97-check profile on the direct lane and publish its environmental
+/// governance reds as a gating RED.
+pub(crate) fn gated_witness_ids(
+    gate: bool,
+    check_ids: Option<&Vec<String>>,
+) -> Option<Vec<String>> {
+    if !gate {
+        return None;
+    }
+    let filtered: Vec<String> = check_ids?
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
+        .collect();
+    (!filtered.is_empty()).then_some(filtered)
+}
+
 impl ServeBatchChecker<'_> {
+    /// The witness-only filter for this gated run — see [`gated_witness_ids`].
+    /// `None` when not a gated witness run (advisory lane, or a gated push
+    /// that requested no specific ids) — the caller then runs the full profile.
+    fn gated_run_ids(&self) -> Option<Vec<String>> {
+        gated_witness_ids(self.gate, self.check_ids.as_ref())
+    }
+
     fn run_overlay(
         &self,
         overlay_files: Vec<(String, String)>,
         changed_files: Vec<String>,
     ) -> Result<ProjectCheckReport, String> {
         let changed_files = (!changed_files.is_empty()).then_some(changed_files);
+        let gated_ids = self.gated_run_ids();
         let context = ProjectCheckRunContext {
             root: self.root.clone(),
             changed_files: changed_files.clone(),
             base_ref: self.base_ref.clone(),
             overlay_files,
             materialize_overlay: true,
-            gate: false,
+            gate: self.gate,
+            check_ids: self.check_ids.clone(),
         };
         self.api
             .with_project_check_overlay(&context, |root| {
-                // CHANGE 1: run the FULL `dev` profile with NO trigger-filtering
-                // (`only_id=None`, `changed_files=None`). The compiler witness
-                // (`ssr-compiler-witness`, tier:dev) is in the dev profile, so
-                // this guarantees it runs on the batch lane — AND so do every
-                // other dev-profile check the dev-merge gate depends on
-                // (element-agnostic, hydration-gate, the audits, …). Passing
-                // `changed_files=None` is the key: `run_dev_with_changes` would
-                // pass the real changed-file list, letting `select_for_changes`
-                // SKIP the witness (and others) whose trigger globs the changes
-                // don't match — exactly the gap we are closing. `None` means
-                // "no change-filter → run the whole profile". (An earlier
-                // attempt forced `only_id=Some("ssr-compiler-witness")`, but
-                // that runs ONLY the witness and drops every other check — wrong
-                // for a gate, and on a manifest without that id it selects
-                // nothing → vacuous green.)
-                cargoless_core::project_checks::run_profile_with_changes(root, "dev", None, None)
+                match gated_ids.as_deref() {
+                    // GATED, witness-only. Run EXACTLY the requested witness
+                    // ids (their intersection with the dev profile). This is
+                    // the merge-gate lane: it proves the compile witnesses
+                    // (ssr/wasm/isolator-vsock) ran, WITHOUT dragging the ~97
+                    // governance/coverage checks (and their environmental
+                    // reds inside the scratch overlay) into a gating verdict.
+                    // `only_ids` restricts the profile to these ids; the
+                    // no-vacuous-green invariant holds because every witness
+                    // id is `tier:dev` and so is a member of the dev profile
+                    // (verified against tf-multiverse cargoless.checks.yaml —
+                    // the AND of id-match ∧ profile-match selects exactly the
+                    // witnesses). `changed_files=None` so trigger-globbing
+                    // never additionally skips a requested witness.
+                    Some(ids) => {
+                        cargoless_core::project_checks::run_profile_with_ids(root, "dev", ids, None)
+                    }
+                    // ADVISORY lane (or a gated push with no id filter): run
+                    // the FULL `dev` profile with NO trigger-filtering
+                    // (`only_ids=None`, `changed_files=None`). The compiler
+                    // witnesses are in the dev profile, so this guarantees
+                    // they run on the batch lane — AND so do every other
+                    // dev-profile check the dev-merge gate depends on
+                    // (element-agnostic, hydration-gate, the audits, …).
+                    // Passing `changed_files=None` is the key:
+                    // `run_dev_with_changes` would pass the real changed-file
+                    // list, letting `select_for_changes` SKIP the witness (and
+                    // others) whose trigger globs the changes don't match —
+                    // exactly the gap this path closes. `None` means "no
+                    // change-filter → run the whole profile".
+                    None => {
+                        cargoless_core::project_checks::run_profile_with_ids(root, "dev", &[], None)
+                    }
+                }
             })
             .and_then(|report| report.map_err(|e| format!("project checks failed: {e}")))
     }
@@ -3180,6 +3275,8 @@ checks:
             repo_relative: true,
             check_profile: "None".into(),
             corun: true,
+            gate: false,
+            check_ids: None,
         }
     }
 
@@ -4284,6 +4381,7 @@ checks:
             )],
             materialize_overlay: true,
             gate: false,
+            check_ids: None,
         };
 
         let result = api.coalesced_project_check(wt, &context);
@@ -4991,6 +5089,7 @@ checks:
             ],
             materialize_overlay: true,
             gate: false,
+            check_ids: None,
         };
 
         let seen = api
@@ -5041,6 +5140,7 @@ checks:
             ],
             materialize_overlay: true,
             gate: false,
+            check_ids: None,
         };
 
         let seen = api
@@ -5359,6 +5459,7 @@ checks:
             changed_files: None,
             check_profile: None,
             gate: false,
+            check_ids: None,
         };
         api.record_push_attribution("/wt", &pushed("first"));
         api.record_push_attribution("/wt", &pushed("second"));
@@ -5432,6 +5533,7 @@ checks:
             changed_files: changed,
             check_profile: None,
             gate: false,
+            check_ids: None,
         };
         // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
         api.record_push_attribution_with_globs(
@@ -5987,6 +6089,7 @@ checks:
                 overlay_files: Vec::new(),
                 materialize_overlay: false,
                 gate: true,
+                check_ids: None,
             },
         );
         let ctx = api.take_project_check_context("/wt").expect("recorded");

@@ -866,7 +866,17 @@ impl Request {
                     .to_string();
                 let files = overlay_files_from_json(v.get("files"));
                 let check_profile = check_profile_from_json(v.get("check_profile"));
-                let options = push_overlay_options_from_json(&v);
+                // Nesting-tolerant: a hand-rolled central-mode push (the CI
+                // witness) nests its option fields under `options{}`, whereas
+                // the flat `verdict`/CLI path emits them top-level. Mirror the
+                // batch path (`batch_check_request_from_value`, ~line 1016):
+                // read from `options{}` when present, else fall back to the
+                // top-level body. Before this fix a nested `gate`/`check_ids`/
+                // `analysis_root` silently deserialized to defaults — the
+                // Hard witness gate never promoted (see the CI witness's
+                // never-fires bug). The flat CLI has no `options{}` key, so it
+                // hits `unwrap_or(&v)` and stays byte-identical.
+                let options = push_overlay_options_from_json(v.get("options").unwrap_or(&v));
                 if options.is_empty() {
                     Some(Request::PushOverlay {
                         worktree,
