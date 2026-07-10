@@ -1513,7 +1513,7 @@ impl ServeVerdictState {
         &self,
         wt: &Path,
         context: &ProjectCheckRunContext,
-    ) -> Option<crate::servedrv::ProjectCheckSummary> {
+    ) -> Option<(crate::servedrv::ProjectCheckSummary, Vec<String>)> {
         let base_ref = context.base_ref.trim();
         let root_str = context.root.to_string_lossy();
         if base_ref.is_empty() || root_str.trim().is_empty() {
@@ -1558,49 +1558,72 @@ impl ServeVerdictState {
         Some(match member_result {
             None => {
                 // Coalescer returned a report without our member — treat as
-                // indeterminate (should not happen in practice).
-                crate::servedrv::ProjectCheckSummary::Indeterminate {
-                    reason: "project_check_batch_missing_member",
-                    detail: format!("coalesced report did not include member {wt_key}"),
+                // indeterminate (should not happen in practice). No member ⇒
+                // no ran ids to report.
+                (
+                    crate::servedrv::ProjectCheckSummary::Indeterminate {
+                        reason: "project_check_batch_missing_member",
+                        detail: format!("coalesced report did not include member {wt_key}"),
+                    },
+                    Vec::new(),
+                )
+            }
+            Some(m) => {
+                // The witness's gate proof, carried through the coalesced path
+                // exactly as the direct path carries it (servedrv
+                // run_project_checks_and_log): the ids of the checks that ran
+                // in the shared physical run. Green and Red both keep it (a red
+                // still proves the cone compiled); only a true batch-level
+                // Indeterminate or the red-without-diagnostics downgrade drops
+                // it, matching the direct path's Empty/Indeterminate arms.
+                let ran_check_ids = m.ran_check_ids;
+                match m.verdict {
+                    cargoless_core::batch::BatchVerdict::Green => {
+                        // CombinedGreen and SoloGreen both map to Green.
+                        // Empty is indistinguishable at this layer (documented above).
+                        (crate::servedrv::ProjectCheckSummary::Green, ran_check_ids)
+                    }
+                    cargoless_core::batch::BatchVerdict::Red => {
+                        let error_count = m
+                            .diagnostics
+                            .iter()
+                            .filter(|d| d.severity == cargoless_core::Severity::Error)
+                            .count() as u32;
+                        // Defensive: if error_count is 0 despite Red verdict, route
+                        // to Indeterminate (mirrors the same guard in run_project_checks_and_log).
+                        if error_count == 0 {
+                            (
+                                crate::servedrv::ProjectCheckSummary::Indeterminate {
+                                    reason: "project_check_red_without_diagnostics",
+                                    detail: format!(
+                                        "batch member {wt_key} red but 0 error-severity diagnostics"
+                                    ),
+                                },
+                                ran_check_ids,
+                            )
+                        } else {
+                            (
+                                crate::servedrv::ProjectCheckSummary::Red { error_count },
+                                ran_check_ids,
+                            )
+                        }
+                    }
+                    cargoless_core::batch::BatchVerdict::Indeterminate => {
+                        let detail = m
+                            .diagnostics
+                            .first()
+                            .map(|d| d.message.clone())
+                            .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
+                        (
+                            crate::servedrv::ProjectCheckSummary::Indeterminate {
+                                reason: "project_check_batch_indeterminate",
+                                detail,
+                            },
+                            ran_check_ids,
+                        )
+                    }
                 }
             }
-            Some(m) => match m.verdict {
-                cargoless_core::batch::BatchVerdict::Green => {
-                    // CombinedGreen and SoloGreen both map to Green.
-                    // Empty is indistinguishable at this layer (documented above).
-                    crate::servedrv::ProjectCheckSummary::Green
-                }
-                cargoless_core::batch::BatchVerdict::Red => {
-                    let error_count = m
-                        .diagnostics
-                        .iter()
-                        .filter(|d| d.severity == cargoless_core::Severity::Error)
-                        .count() as u32;
-                    // Defensive: if error_count is 0 despite Red verdict, route
-                    // to Indeterminate (mirrors the same guard in run_project_checks_and_log).
-                    if error_count == 0 {
-                        crate::servedrv::ProjectCheckSummary::Indeterminate {
-                            reason: "project_check_red_without_diagnostics",
-                            detail: format!(
-                                "batch member {wt_key} red but 0 error-severity diagnostics"
-                            ),
-                        }
-                    } else {
-                        crate::servedrv::ProjectCheckSummary::Red { error_count }
-                    }
-                }
-                cargoless_core::batch::BatchVerdict::Indeterminate => {
-                    let detail = m
-                        .diagnostics
-                        .first()
-                        .map(|d| d.message.clone())
-                        .unwrap_or_else(|| "batch indeterminate (no detail)".to_string());
-                    crate::servedrv::ProjectCheckSummary::Indeterminate {
-                        reason: "project_check_batch_indeterminate",
-                        detail,
-                    }
-                }
-            },
         })
     }
 
@@ -2163,6 +2186,8 @@ fn stitch_suspect_members(
                 provenance: cargoless_core::batch::BatchProvenance::Indeterminate,
                 diagnostics: vec![batch_diagnostic(why)],
                 duration_ms: 0,
+                // Suspect placeholder — never executed, so no ran ids.
+                ran_check_ids: Vec::new(),
             }
         })
         .collect();
@@ -2232,6 +2257,8 @@ fn batch_indeterminate(request: &BatchCheckRequest, why: impl Into<String>) -> B
                 provenance: cargoless_core::batch::BatchProvenance::Indeterminate,
                 diagnostics: vec![batch_diagnostic(&why)],
                 duration_ms: 0,
+                // Batch-level indeterminate — nothing ran.
+                ran_check_ids: Vec::new(),
             })
             .collect(),
         combined_checks: 0,
@@ -3183,6 +3210,7 @@ checks:
                     provenance: BatchProvenance::CombinedGreen,
                     diagnostics: Vec::new(),
                     duration_ms: 1,
+                    ran_check_ids: Vec::new(),
                 })
                 .collect(),
             combined_checks: 1,
@@ -3474,6 +3502,7 @@ checks:
                     provenance: BatchProvenance::SoloRed,
                     diagnostics: Vec::new(),
                     duration_ms: 1,
+                    ran_check_ids: Vec::new(),
                 })
                 .collect(),
             combined_checks: 0,
@@ -4127,6 +4156,7 @@ checks:
                             provenance: BatchProvenance::CombinedGreen,
                             diagnostics: Vec::new(),
                             duration_ms: 1,
+                            ran_check_ids: Vec::new(),
                         })
                         .collect();
                     let executed_members = members.len() as u32;
@@ -4256,16 +4286,28 @@ checks:
             gate: false,
         };
 
-        let summary = api.coalesced_project_check(wt, &context);
+        let result = api.coalesced_project_check(wt, &context);
 
         assert!(
-            summary.is_some(),
+            result.is_some(),
             "non-empty base_ref + materialize_overlay=true should engage the coalesced path"
         );
+        let (summary, ran_check_ids) = result.unwrap();
         assert_eq!(
-            summary.unwrap(),
+            summary,
             ProjectCheckSummary::Green,
             "clean overlay over a clean project should yield ProjectCheckSummary::Green"
+        );
+        // Commit-D core proof: the coalesced path now returns the REAL ids of
+        // the checks that ran in the shared physical run (setup_batch_project
+        // configures exactly one — `no-fail-token`), instead of the historical
+        // empty "cannot enumerate" list. This is the witness's `gated_checks_ran`
+        // proof at the method boundary, over a genuine `report.results[].id`
+        // (not a mock). The empty return was the root cause: a requested witness
+        // id could ride a coalesced green without ever being proven-ran.
+        assert!(
+            ran_check_ids.iter().any(|id| id == "no-fail-token"),
+            "coalesced green must enumerate the check that actually ran, not return empty: {ran_check_ids:?}"
         );
         // project drops here → Drop removes root + remote dirs.
     }

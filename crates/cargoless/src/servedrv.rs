@@ -2183,25 +2183,28 @@ fn run_project_checks_and_log(
     // Warn or Hard mode — consistent with the Off-does-nothing invariant.
     if let Some(ctx) = context.as_ref() {
         if ctx.materialize_overlay && !ctx.base_ref.trim().is_empty() {
-            if let Some(summary) = api.coalesced_project_check(wt, ctx) {
+            if let Some((summary, ran_check_ids)) = api.coalesced_project_check(wt, ctx) {
                 // Log the coalesced outcome in the same obs format the direct
                 // path uses so SigNoz dashboards stay comparable.
                 eprintln!(
-                    "[cargoless:obs] project-checks wt={} root={} verdict={} source=coalesced",
+                    "[cargoless:obs] project-checks wt={} root={} verdict={} source=coalesced checks_ran={}",
                     wt.display(),
                     ctx.root.display(),
                     match &summary {
                         ProjectCheckSummary::Green | ProjectCheckSummary::Empty => "green",
                         ProjectCheckSummary::Red { .. } => "red",
                         ProjectCheckSummary::Indeterminate { .. } => "unknown",
-                    }
+                    },
+                    ran_check_ids.len(),
                 );
                 // The coalesced batch path shares ONE physical run across N
-                // pushers and returns a verdict slice, not the enumerated
-                // per-check report — it "cannot enumerate" the ran ids, so
-                // `gated_checks_ran` stays empty (the witness's documented
-                // fallback to plain base_sha attribution).
-                return (summary, Vec::new());
+                // pushers. Each member now carries the run's enumerated
+                // check ids (`BatchMemberResult::ran_check_ids`) — sound to
+                // share because members coalesce only under an identical plan
+                // fingerprint — so `gated_checks_ran` is populated here exactly
+                // as the direct path populates it, instead of falling back to
+                // plain base_sha attribution.
+                return (summary, ran_check_ids);
             }
         }
     }
@@ -3354,5 +3357,135 @@ checks:
             by_sha.gated_checks_ran
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Minimal git-backed project with one committed project-check
+    /// (`no-fail-token`) and a resolvable `origin/main` — the smallest setup
+    /// that makes `project_check_plan_coalesce_token` return `Some` so a push
+    /// routes through the BatchCoalescer instead of the direct path. Modeled on
+    /// `serveapi::tests::setup_batch_project` (a sibling `mod tests`, so it is
+    /// not importable here). Returns `(root, remote)`; the caller removes both.
+    fn setup_coalesce_git_project(label: &str) -> (PathBuf, PathBuf) {
+        fn git(root: &Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let root = temp_root(label);
+        let remote = temp_root(&format!("{label}-remote"));
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+        std::fs::write(
+            root.join("cargoless.checks.yaml"),
+            r#"
+version: 1
+checks:
+  - id: no-fail-token
+    kind: forbidden_patterns
+    inputs: ["src/*.rs"]
+    patterns:
+      - code: batch.fail_token
+        literal: FAIL_BATCH
+        message: failing batch token present
+"#,
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&root, &["push", "-u", "origin", "HEAD:main"]);
+        (root, remote)
+    }
+
+    #[test]
+    fn coalesced_witness_green_stamps_gated_checks_ran_end_to_end() {
+        // Commit-D end-to-end sibling of
+        // `hard_witness_green_stamps_gated_checks_ran_end_to_end`: that test
+        // drives the DIRECT path (context: None); this one forces the COALESCED
+        // path (materialize_overlay=true + non-empty base_ref) and proves the
+        // ran-check id still reaches the published `gated_checks_ran`.
+        //
+        // This is the regression the two half-tests miss: if the coalesced arm
+        // in `run_project_checks_and_log` were reverted to `(summary,
+        // Vec::new())`, the method-level and direct-path proofs would BOTH stay
+        // green while the real coalesced gate silently emitted no proof — the
+        // exact bug Option D closes. Only an end-to-end test that selects the
+        // coalesced arm through real routing guards it.
+        let (root, remote) = setup_coalesce_git_project("coalesced-gated-green");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+
+        // A clean overlay over the clean base → the coalesced run executes the
+        // committed `no-fail-token` check and stays green (non-vacuous: REQUIRE
+        // on below would flag an empty run). `wt` is just the submitter/status
+        // key (decoupled from the analysis root, as in the real-project method
+        // test); the physical run happens on `context.root` via the overlay.
+        let wt = PathBuf::from(format!("{}-wt", root.display()));
+        let context = crate::serveapi::ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec!["src/added.rs".into()]),
+            base_ref: "origin/main".to_string(),
+            overlay_files: vec![(
+                root.join("src/added.rs").to_string_lossy().into_owned(),
+                "pub fn added() {}\n".to_string(),
+            )],
+            materialize_overlay: true,
+            gate: false,
+        };
+
+        spawn_project_checks_hard_with_timeout(
+            wt.clone(),
+            false,
+            Some(context),
+            Some(test_attribution("c0ffee")),
+            Arc::clone(&api),
+            Duration::from_secs(30),
+            true, // REQUIRE on: a real check ran, so green here is non-vacuous.
+        );
+
+        let st = await_verdict(&api, &wt.to_string_lossy(), Duration::from_secs(30));
+        assert_eq!(
+            st.verdict, "green",
+            "clean overlay over a clean coalesced project is green"
+        );
+        assert!(
+            st.gated_checks_ran.iter().any(|id| id == "no-fail-token"),
+            "the coalesced path must carry the ran check id into gated_checks_ran \
+             (was empty before Commit D): {:?}",
+            st.gated_checks_ran
+        );
+        // And it must survive base_sha-addressed retrieval, exactly as the
+        // witness polls it.
+        let by_sha = api
+            .get_status_attributed(&wt.to_string_lossy(), Some("c0ffee"))
+            .expect("verdict retrievable by base_sha");
+        assert!(
+            by_sha
+                .gated_checks_ran
+                .iter()
+                .any(|id| id == "no-fail-token"),
+            "coalesced ran ids survive base_sha-addressed retrieval: {:?}",
+            by_sha.gated_checks_ran
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote);
     }
 }
