@@ -439,6 +439,11 @@ pub struct ServeVerdictState {
     /// Optional server-side coalescing for explicit `coalesce_key`
     /// batch-check requests. Absent key keeps historical immediate behavior.
     batch_coalescer: BatchCoalescer,
+    /// CGLS-25 — global concurrency gate for the Hard-witness compile.
+    /// Default off (`CARGOLESS_WITNESS_MAX_INFLIGHT=0`, unbounded); set to N
+    /// to cap concurrent witness compiles once the overlay-queue fix lets
+    /// N distinct-SHA survivors through. Acquired in the witness worker only.
+    witness_gate: WitnessInflightGate,
     /// Server-local state directory used for transient project-check
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
@@ -574,6 +579,114 @@ impl Drop for InflightGuard<'_> {
         s.inflight_runs = s.inflight_runs.saturating_sub(1);
         drop(s);
         self.coalescer.cv.notify_all();
+    }
+}
+
+/// CGLS-25 — standalone global concurrency gate for the Hard-witness
+/// compile. A DEDICATED instance of the same discipline the
+/// [`BatchCoalescer`] uses for its cross-key inflight gate (Mutex counter +
+/// Condvar + RAII decrement/notify), kept separate so the witness lane can
+/// be soaked with its own env knob independently of the batch lane.
+///
+/// `limit == 0` = OFF = unbounded (today's behavior: every distinct-SHA
+/// witness runs its own detached compile thread). `limit == N` caps the
+/// number of witness compiles running at once across the daemon — the
+/// survivors that CGLS-25's overlay-queue fix now lets through no longer
+/// thrash a single 240Gi pod. Acquired ONLY inside the witness worker
+/// thread; never the serve loop or the supervisor (both must stay
+/// non-blocking so verdict latency is never gated by the compile queue).
+struct WitnessInflightGate {
+    state: Mutex<u32>,
+    cv: Condvar,
+    limit: u32,
+    /// Budget a queued witness waits for a slot before running UNGATED
+    /// (fail-OPEN: losing serialization is a resource regression, never a
+    /// correctness one — the pre-existing behavior was unbounded concurrency
+    /// and it never produced a false verdict). Well under the supervisor's
+    /// witness watchdog so a wedged holder can never deadlock the lane.
+    queue_budget: Duration,
+}
+
+impl Default for WitnessInflightGate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+            limit: configured_batch_u32("CARGOLESS_WITNESS_MAX_INFLIGHT", 0),
+            queue_budget: Duration::from_millis(configured_batch_u64(
+                "CARGOLESS_WITNESS_QUEUE_WAIT_MS",
+                600_000,
+            )),
+        }
+    }
+}
+
+/// RAII slot: decrements the inflight counter + notifies the next waiter on
+/// Drop, on BOTH normal return and worker panic (thread unwind drops the
+/// stack guard). `counted == false` (the gate-disabled no-op grant) skips
+/// the decrement so the counter never underflows below a slot it never took.
+pub(crate) struct WitnessInflightGuard<'a> {
+    gate: &'a WitnessInflightGate,
+    counted: bool,
+}
+
+impl Drop for WitnessInflightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let mut s = poisoned(&self.gate.state);
+        *s = s.saturating_sub(1);
+        drop(s);
+        self.gate.cv.notify_all();
+    }
+}
+
+impl WitnessInflightGate {
+    /// Acquire a compile slot, waiting up to `queue_budget`. `limit == 0`
+    /// grants immediately (uncounted no-op). On budget exhaustion returns a
+    /// no-op grant too (fail-OPEN → run ungated) rather than blocking the
+    /// witness forever. Claim-under-lock: the counter is incremented in the
+    /// SAME lock hold that observed it free, so two waiters cannot both pass
+    /// (mirrors the BatchCoalescer inflight gate).
+    fn acquire(&self) -> WitnessInflightGuard<'_> {
+        if self.limit == 0 {
+            return WitnessInflightGuard {
+                gate: self,
+                counted: false,
+            };
+        }
+        let deadline = Instant::now() + self.queue_budget;
+        let mut s = poisoned(&self.state);
+        loop {
+            if *s < self.limit {
+                *s = s.saturating_add(1);
+                return WitnessInflightGuard {
+                    gate: self,
+                    counted: true,
+                };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Fail-open: run ungated rather than starve the witness. The
+                // supervisor watchdog still bounds the verdict independently.
+                return WitnessInflightGuard {
+                    gate: self,
+                    counted: false,
+                };
+            }
+            let (guard, timed_out) = self
+                .cv
+                .wait_timeout(s, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s = guard;
+            if timed_out.timed_out() && *s >= self.limit {
+                return WitnessInflightGuard {
+                    gate: self,
+                    counted: false,
+                };
+            }
+        }
     }
 }
 
@@ -1142,6 +1255,16 @@ impl ServeVerdictState {
     pub fn with_project_check_state_dir(mut self, state_dir: PathBuf) -> Self {
         self.project_check_state_dir = Some(state_dir);
         self
+    }
+
+    /// CGLS-25 — acquire a Hard-witness compile slot from the global gate.
+    /// Called at the top of the witness WORKER thread (never the serve loop
+    /// or supervisor). The returned RAII guard releases the slot on drop —
+    /// on normal return or panic — waking the next queued witness. With the
+    /// gate off (default) this is an uncounted no-op grant, so the worker
+    /// runs immediately exactly as today.
+    pub(crate) fn acquire_witness_slot(&self) -> WitnessInflightGuard<'_> {
+        self.witness_gate.acquire()
     }
 
     /// A6 — flip the RA-warm readiness latch. Called by servedrv once the
@@ -3878,6 +4001,149 @@ checks:
             "global_inflight_limit=1: runs must be disjoint; \
              run0={e0:?}..{x0:?} run1={e1:?}..{x1:?}"
         );
+    }
+
+    // ── CGLS-25: WitnessInflightGate tests ────────────────────────────────
+
+    fn test_witness_gate(limit: u32, budget_ms: u64) -> WitnessInflightGate {
+        WitnessInflightGate {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+            limit,
+            queue_budget: Duration::from_millis(budget_ms),
+        }
+    }
+
+    #[test]
+    fn witness_gate_limit_1_serializes_two_compiles() {
+        // Two workers acquire the gate (limit=1) and hold it for a
+        // measurable window; their intervals must be disjoint — one runs
+        // only after the other releases. Mirrors
+        // global_inflight_gate_serializes_across_keys.
+        let gate = Arc::new(test_witness_gate(1, 60_000));
+        let start = Arc::new(Barrier::new(2));
+        let timeline = Arc::new(Mutex::new(Vec::<(Instant, Instant)>::new()));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::clone(&gate);
+            let start = Arc::clone(&start);
+            let timeline = Arc::clone(&timeline);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                let _slot = gate.acquire();
+                let enter = Instant::now();
+                thread::sleep(Duration::from_millis(30));
+                let exit = Instant::now();
+                poisoned(&timeline).push((enter, exit));
+            }));
+        }
+        for h in handles {
+            h.join().expect("witness gate thread");
+        }
+        let tl = poisoned(&timeline).clone();
+        assert_eq!(tl.len(), 2, "both compiles must complete");
+        let (e0, x0) = tl[0];
+        let (e1, x1) = tl[1];
+        assert!(
+            x0 <= e1 || x1 <= e0,
+            "limit=1: compiles must be disjoint; run0={e0:?}..{x0:?} run1={e1:?}..{x1:?}"
+        );
+        // Counter fully released.
+        assert_eq!(*poisoned(&gate.state), 0, "all slots released");
+    }
+
+    #[test]
+    fn witness_gate_disabled_is_unbounded_concurrency() {
+        // limit=0 = OFF = today's behavior: N workers run concurrently, no
+        // serialization. Grants are uncounted so the counter never moves.
+        // `overlap`/`max_overlap` are Mutex<usize> (no new atomic import).
+        let gate = Arc::new(test_witness_gate(0, 60_000));
+        let start = Arc::new(Barrier::new(3));
+        let overlap = Arc::new(Mutex::new(0usize));
+        let max_overlap = Arc::new(Mutex::new(0usize));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let gate = Arc::clone(&gate);
+            let start = Arc::clone(&start);
+            let overlap = Arc::clone(&overlap);
+            let max_overlap = Arc::clone(&max_overlap);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                let _slot = gate.acquire();
+                {
+                    let mut cur = poisoned(&overlap);
+                    *cur += 1;
+                    let mut mx = poisoned(&max_overlap);
+                    *mx = (*mx).max(*cur);
+                }
+                thread::sleep(Duration::from_millis(25));
+                *poisoned(&overlap) -= 1;
+            }));
+        }
+        for h in handles {
+            h.join().expect("witness gate thread");
+        }
+        assert!(
+            *poisoned(&max_overlap) >= 2,
+            "gate off ⇒ concurrent compiles allowed (unbounded, today's behavior)"
+        );
+        assert_eq!(
+            *poisoned(&gate.state),
+            0,
+            "no-op grants never touch counter"
+        );
+    }
+
+    #[test]
+    fn witness_gate_budget_exhaustion_fails_open() {
+        // A holder keeps the only slot past the queue budget; the waiter must
+        // FAIL OPEN (run ungated) rather than block forever — losing
+        // serialization is a resource regression, never a correctness one.
+        let gate = Arc::new(test_witness_gate(1, 50)); // 50ms budget
+        let hold_start = Arc::new(Barrier::new(2));
+        let gate_h = Arc::clone(&gate);
+        let hs = Arc::clone(&hold_start);
+        let holder = thread::spawn(move || {
+            let _slot = gate_h.acquire();
+            hs.wait(); // signal the slot is taken
+            thread::sleep(Duration::from_millis(300)); // hold well past budget
+        });
+        hold_start.wait();
+        // Waiter: acquire must return within ~budget, not block 300ms.
+        let t0 = Instant::now();
+        {
+            let _slot = gate.acquire(); // fails open after ~50ms
+        }
+        let waited = t0.elapsed();
+        holder.join().expect("holder");
+        assert!(
+            waited < Duration::from_millis(250),
+            "waiter must fail open near the 50ms budget, not block for the 300ms hold (waited {waited:?})"
+        );
+    }
+
+    #[test]
+    fn witness_gate_panicking_holder_releases_slot() {
+        // A panicking guarded section must still release the slot (RAII drop
+        // on unwind), so the next witness is not permanently blocked.
+        // Mirrors batch_coalescer_panic_cross_key_proceeds_after_inflight_guard.
+        let gate = Arc::new(test_witness_gate(1, 60_000));
+        let gate_p = Arc::clone(&gate);
+        let panicked = thread::spawn(move || {
+            let _slot = gate_p.acquire();
+            assert_eq!(*poisoned(&gate_p.state), 1, "slot claimed");
+            panic!("witness worker panicked mid-compile");
+        })
+        .join();
+        assert!(panicked.is_err(), "the worker did panic");
+        assert_eq!(
+            *poisoned(&gate.state),
+            0,
+            "panic must release the slot (RAII drop on unwind)"
+        );
+        // A fresh acquire still works (not permanently blocked).
+        let _slot = gate.acquire();
+        assert_eq!(*poisoned(&gate.state), 1, "next witness acquires cleanly");
     }
 
     // ── Change 2: cross-run culprit ejection tests ────────────────────────

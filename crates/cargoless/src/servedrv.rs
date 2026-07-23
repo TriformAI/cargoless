@@ -2032,6 +2032,17 @@ fn spawn_project_checks_hard_with_timeout(
                     let wt = wt.clone();
                     let api = Arc::clone(&api);
                     move || {
+                        // CGLS-25 — acquire the global witness-compile slot
+                        // HERE, in the detached worker, so N distinct-SHA
+                        // survivors (which the overlay-queue fix now lets
+                        // through) don't all compile at once on the one pod.
+                        // Held for the compile, released on drop (return OR
+                        // panic). Gate off (default) = uncounted no-op → runs
+                        // immediately. NEVER acquired in the supervisor or
+                        // serve loop: the supervisor's recv_timeout watchdog
+                        // must stay free to publish `unknown`, so a queued or
+                        // wedged compile never gates verdict latency.
+                        let _witness_slot = api.acquire_witness_slot();
                         let result = run_project_checks_and_log(&wt, context, &api);
                         if tx.send(result).is_err() {
                             // rx dropped ⇒ the watchdog already published
