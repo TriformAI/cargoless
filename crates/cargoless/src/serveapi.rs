@@ -379,16 +379,30 @@ pub struct ServeVerdictState {
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
     subs: Mutex<Vec<Sender<TransitionEvent>>>,
-    /// #240/2b — pushed-overlay store. worktree-key →
+    /// #240/2b — pushed-overlay store. worktree-key → FIFO queue of
     /// [`PushedOverlay`]. Populated by `push_overlay` (the
-    /// [`VerdictService`] write-plane ingest), consumed once by
-    /// `take_overlay_for` (the serve loop's SwitchOverlay arm). The
-    /// `take` is **pop-on-consume semantic** (spike open-question #3
-    /// default): once consumed, the WT falls back to the FS path until
-    /// a fresh push arrives. Per-WT serialization (a new push for the
-    /// same WT REPLACES the prior overlay before consumption) is the
-    /// natural BTreeMap semantic.
-    pushed: Mutex<BTreeMap<String, PushedOverlay>>,
+    /// [`VerdictService`] write-plane ingest, `push_back`), consumed one
+    /// at a time by `take_overlay_for` (the serve loop's SwitchOverlay
+    /// arm, `pop_front`). The `take` is **pop-on-consume semantic** (spike
+    /// open-question #3 default): once the queue empties the WT falls back
+    /// to the FS path until a fresh push arrives.
+    ///
+    /// **CGLS-25 — the value is a QUEUE, not a single slot.** The witness
+    /// hardcodes ONE worktree key for every PR, so two concurrent PR
+    /// pushes land on the same key. The historical single-slot `insert`
+    /// let PR-B's push OVERWRITE PR-A's pending overlay before the serve
+    /// loop consumed it — PR-A's witness never ran, its poller starved to
+    /// the CI timeout (the "attributed to X, want Y" clobber class). A
+    /// per-WT FIFO queue makes distinct pushes independent at the map
+    /// level: each survives to its own SwitchOverlay→witness cycle. The
+    /// clobber window is ONLY here — `project_check_context` /
+    /// `push_attribution` are recorded-then-consumed strictly on the
+    /// single serve-loop thread (SwitchOverlay records, EmitVerdict pops,
+    /// alternating per WT), so they never cross-clobber. `take_overlay_for`
+    /// re-signals the serve loop when the queue is still non-empty so a
+    /// second queued push is not starved by the wake-dedup in
+    /// `drain_unique_push_keys`.
+    pushed: Mutex<BTreeMap<String, VecDeque<PushedOverlay>>>,
     /// Serializes central-daemon mirror fetch/reset operations. The HTTP
     /// adapter can accept several requests concurrently; the checked-out
     /// mirror is one mutable filesystem and must move one base at a time.
@@ -425,6 +439,11 @@ pub struct ServeVerdictState {
     /// Optional server-side coalescing for explicit `coalesce_key`
     /// batch-check requests. Absent key keeps historical immediate behavior.
     batch_coalescer: BatchCoalescer,
+    /// CGLS-25 — global concurrency gate for the Hard-witness compile.
+    /// Default off (`CARGOLESS_WITNESS_MAX_INFLIGHT=0`, unbounded); set to N
+    /// to cap concurrent witness compiles once the overlay-queue fix lets
+    /// N distinct-SHA survivors through. Acquired in the witness worker only.
+    witness_gate: WitnessInflightGate,
     /// Server-local state directory used for transient project-check
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
@@ -560,6 +579,114 @@ impl Drop for InflightGuard<'_> {
         s.inflight_runs = s.inflight_runs.saturating_sub(1);
         drop(s);
         self.coalescer.cv.notify_all();
+    }
+}
+
+/// CGLS-25 — standalone global concurrency gate for the Hard-witness
+/// compile. A DEDICATED instance of the same discipline the
+/// [`BatchCoalescer`] uses for its cross-key inflight gate (Mutex counter +
+/// Condvar + RAII decrement/notify), kept separate so the witness lane can
+/// be soaked with its own env knob independently of the batch lane.
+///
+/// `limit == 0` = OFF = unbounded (today's behavior: every distinct-SHA
+/// witness runs its own detached compile thread). `limit == N` caps the
+/// number of witness compiles running at once across the daemon — the
+/// survivors that CGLS-25's overlay-queue fix now lets through no longer
+/// thrash a single 240Gi pod. Acquired ONLY inside the witness worker
+/// thread; never the serve loop or the supervisor (both must stay
+/// non-blocking so verdict latency is never gated by the compile queue).
+struct WitnessInflightGate {
+    state: Mutex<u32>,
+    cv: Condvar,
+    limit: u32,
+    /// Budget a queued witness waits for a slot before running UNGATED
+    /// (fail-OPEN: losing serialization is a resource regression, never a
+    /// correctness one — the pre-existing behavior was unbounded concurrency
+    /// and it never produced a false verdict). Well under the supervisor's
+    /// witness watchdog so a wedged holder can never deadlock the lane.
+    queue_budget: Duration,
+}
+
+impl Default for WitnessInflightGate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+            limit: configured_batch_u32("CARGOLESS_WITNESS_MAX_INFLIGHT", 0),
+            queue_budget: Duration::from_millis(configured_batch_u64(
+                "CARGOLESS_WITNESS_QUEUE_WAIT_MS",
+                600_000,
+            )),
+        }
+    }
+}
+
+/// RAII slot: decrements the inflight counter + notifies the next waiter on
+/// Drop, on BOTH normal return and worker panic (thread unwind drops the
+/// stack guard). `counted == false` (the gate-disabled no-op grant) skips
+/// the decrement so the counter never underflows below a slot it never took.
+pub(crate) struct WitnessInflightGuard<'a> {
+    gate: &'a WitnessInflightGate,
+    counted: bool,
+}
+
+impl Drop for WitnessInflightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
+        let mut s = poisoned(&self.gate.state);
+        *s = s.saturating_sub(1);
+        drop(s);
+        self.gate.cv.notify_all();
+    }
+}
+
+impl WitnessInflightGate {
+    /// Acquire a compile slot, waiting up to `queue_budget`. `limit == 0`
+    /// grants immediately (uncounted no-op). On budget exhaustion returns a
+    /// no-op grant too (fail-OPEN → run ungated) rather than blocking the
+    /// witness forever. Claim-under-lock: the counter is incremented in the
+    /// SAME lock hold that observed it free, so two waiters cannot both pass
+    /// (mirrors the BatchCoalescer inflight gate).
+    fn acquire(&self) -> WitnessInflightGuard<'_> {
+        if self.limit == 0 {
+            return WitnessInflightGuard {
+                gate: self,
+                counted: false,
+            };
+        }
+        let deadline = Instant::now() + self.queue_budget;
+        let mut s = poisoned(&self.state);
+        loop {
+            if *s < self.limit {
+                *s = s.saturating_add(1);
+                return WitnessInflightGuard {
+                    gate: self,
+                    counted: true,
+                };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Fail-open: run ungated rather than starve the witness. The
+                // supervisor watchdog still bounds the verdict independently.
+                return WitnessInflightGuard {
+                    gate: self,
+                    counted: false,
+                };
+            }
+            let (guard, timed_out) = self
+                .cv
+                .wait_timeout(s, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s = guard;
+            if timed_out.timed_out() && *s >= self.limit {
+                return WitnessInflightGuard {
+                    gate: self,
+                    counted: false,
+                };
+            }
+        }
     }
 }
 
@@ -1130,6 +1257,16 @@ impl ServeVerdictState {
         self
     }
 
+    /// CGLS-25 — acquire a Hard-witness compile slot from the global gate.
+    /// Called at the top of the witness WORKER thread (never the serve loop
+    /// or supervisor). The returned RAII guard releases the slot on drop —
+    /// on normal return or panic — waking the next queued witness. With the
+    /// gate off (default) this is an uncounted no-op grant, so the worker
+    /// runs immediately exactly as today.
+    pub(crate) fn acquire_witness_slot(&self) -> WitnessInflightGuard<'_> {
+        self.witness_gate.acquire()
+    }
+
     /// A6 — flip the RA-warm readiness latch. Called by servedrv once the
     /// daemon is first able to produce a meaningful verdict (the first
     /// cluster's RA handshake completed). One-way: never un-set; a
@@ -1310,7 +1447,33 @@ impl ServeVerdictState {
     /// services exactly one SwitchOverlay cycle; FS path resumes if no
     /// fresh push arrives.
     pub fn take_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
-        poisoned(&self.pushed).remove(wt_key)
+        let popped = {
+            let mut store = poisoned(&self.pushed);
+            let queue = store.get_mut(wt_key)?;
+            let front = queue.pop_front();
+            // Drop the now-empty queue so `is_empty`/`len`/peek see no
+            // phantom key, and so the FS-fallback discriminant
+            // (take → None) holds once drained.
+            let still_pending = if queue.is_empty() {
+                store.remove(wt_key);
+                false
+            } else {
+                true
+            };
+            (front, still_pending)
+        };
+        // CGLS-25 — the serve loop's `drain_unique_push_keys` dedups wake
+        // signals per WT key, so a single wake services exactly one
+        // SwitchOverlay cycle (one `pop_front`). If more pushes are queued
+        // for this WT, re-signal so the next loop iteration routes the next
+        // one; without this the tail of a same-WT burst would starve until
+        // an unrelated push happened to wake the loop.
+        if popped.1 {
+            if let Some(tx) = poisoned(&self.push_signal).as_ref() {
+                let _ = tx.send(wt_key.to_string());
+            }
+        }
+        popped.0
     }
 
     /// #240/2b — non-consuming peek. Used by the serve loop's first-push
@@ -1319,7 +1482,13 @@ impl ServeVerdictState {
     /// overlay (the consume happens later in the SwitchOverlay arm via
     /// `take_overlay_for`). Returns a clone; the store is unchanged.
     pub fn peek_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
-        poisoned(&self.pushed).get(wt_key).cloned()
+        // Front of the queue = the next overlay `take_overlay_for` will
+        // consume. Cluster-hash derivation reads workspace-config files,
+        // which are stable across a worktree's pushes, so peeking the front
+        // (vs any other queued push) is correct.
+        poisoned(&self.pushed)
+            .get(wt_key)
+            .and_then(|q| q.front().cloned())
     }
 
     /// Server-side analysis root for a pending pushed overlay, if the client
@@ -1327,8 +1496,11 @@ impl ServeVerdictState {
     /// first-push cluster spawn uses the daemon's mirror path, not the
     /// client's pod-local worktree key.
     pub fn analysis_root_for(&self, wt_key: &str) -> Option<PathBuf> {
+        // Front of the queue = the next overlay to be consumed; its
+        // analysis_root drives the cluster-spawn mirror path.
         poisoned(&self.pushed)
             .get(wt_key)
+            .and_then(|q| q.front())
             .and_then(|p| p.analysis_root.clone())
     }
 
@@ -1705,7 +1877,12 @@ impl ServeVerdictState {
         DaemonActivity {
             quiescing: drain.quiescing,
             active_worktrees: drain.active_worktrees.len() as u32,
-            pending_pushes: poisoned(&self.pushed).len() as u32,
+            // Sum queue depths, not key count: the witness shares one WT
+            // key, so a same-WT burst lives as N entries under one key.
+            pending_pushes: poisoned(&self.pushed)
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>() as u32,
             pending_batch_waiters: batch_counts.waiters,
             pending_batch_members: batch_counts.members,
             inflight_batch_runs: batch_counts.inflight_runs,
@@ -2052,7 +2229,26 @@ impl VerdictService for ServeVerdictState {
             gate,
             check_ids,
         };
-        poisoned(&self.pushed).insert(worktree.to_string(), pushed);
+        // CGLS-25 — base_sha-keyed enqueue: a concurrent PR pushing on the
+        // same hardcoded worktree key must not destroy this one's pending
+        // overlay before the serve loop consumes it. But a rapid re-push of
+        // the SAME commit (same base_sha — an FS save-storm or a retried
+        // push) SHOULD still coalesce to latest-wins, exactly as the
+        // `hard_witness_generation` latch supersedes only same-(wt,base_sha).
+        // So: replace an already-queued entry with a matching base_sha in
+        // place (latest content wins for that commit); otherwise append, so
+        // a DISTINCT commit gets its own SwitchOverlay→witness cycle (drained
+        // one-per-wake, with `take_overlay_for` re-signalling the tail).
+        // base_sha == None (FS-watch / unattributed) keeps the historical
+        // single-slot coalesce: all None-keyed pushes collapse to the last.
+        {
+            let mut store = poisoned(&self.pushed);
+            let queue = store.entry(worktree.to_string()).or_default();
+            match queue.iter_mut().find(|q| q.base_sha == pushed.base_sha) {
+                Some(existing) => *existing = pushed,
+                None => queue.push_back(pushed),
+            }
+        }
         // Wake the serve loop (best-effort — see attach_push_signal doc).
         if let Some(tx) = poisoned(&self.push_signal).as_ref() {
             let _ = tx.send(worktree.to_string());
@@ -3807,6 +4003,149 @@ checks:
         );
     }
 
+    // ── CGLS-25: WitnessInflightGate tests ────────────────────────────────
+
+    fn test_witness_gate(limit: u32, budget_ms: u64) -> WitnessInflightGate {
+        WitnessInflightGate {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+            limit,
+            queue_budget: Duration::from_millis(budget_ms),
+        }
+    }
+
+    #[test]
+    fn witness_gate_limit_1_serializes_two_compiles() {
+        // Two workers acquire the gate (limit=1) and hold it for a
+        // measurable window; their intervals must be disjoint — one runs
+        // only after the other releases. Mirrors
+        // global_inflight_gate_serializes_across_keys.
+        let gate = Arc::new(test_witness_gate(1, 60_000));
+        let start = Arc::new(Barrier::new(2));
+        let timeline = Arc::new(Mutex::new(Vec::<(Instant, Instant)>::new()));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::clone(&gate);
+            let start = Arc::clone(&start);
+            let timeline = Arc::clone(&timeline);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                let _slot = gate.acquire();
+                let enter = Instant::now();
+                thread::sleep(Duration::from_millis(30));
+                let exit = Instant::now();
+                poisoned(&timeline).push((enter, exit));
+            }));
+        }
+        for h in handles {
+            h.join().expect("witness gate thread");
+        }
+        let tl = poisoned(&timeline).clone();
+        assert_eq!(tl.len(), 2, "both compiles must complete");
+        let (e0, x0) = tl[0];
+        let (e1, x1) = tl[1];
+        assert!(
+            x0 <= e1 || x1 <= e0,
+            "limit=1: compiles must be disjoint; run0={e0:?}..{x0:?} run1={e1:?}..{x1:?}"
+        );
+        // Counter fully released.
+        assert_eq!(*poisoned(&gate.state), 0, "all slots released");
+    }
+
+    #[test]
+    fn witness_gate_disabled_is_unbounded_concurrency() {
+        // limit=0 = OFF = today's behavior: N workers run concurrently, no
+        // serialization. Grants are uncounted so the counter never moves.
+        // `overlap`/`max_overlap` are Mutex<usize> (no new atomic import).
+        let gate = Arc::new(test_witness_gate(0, 60_000));
+        let start = Arc::new(Barrier::new(3));
+        let overlap = Arc::new(Mutex::new(0usize));
+        let max_overlap = Arc::new(Mutex::new(0usize));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let gate = Arc::clone(&gate);
+            let start = Arc::clone(&start);
+            let overlap = Arc::clone(&overlap);
+            let max_overlap = Arc::clone(&max_overlap);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                let _slot = gate.acquire();
+                {
+                    let mut cur = poisoned(&overlap);
+                    *cur += 1;
+                    let mut mx = poisoned(&max_overlap);
+                    *mx = (*mx).max(*cur);
+                }
+                thread::sleep(Duration::from_millis(25));
+                *poisoned(&overlap) -= 1;
+            }));
+        }
+        for h in handles {
+            h.join().expect("witness gate thread");
+        }
+        assert!(
+            *poisoned(&max_overlap) >= 2,
+            "gate off ⇒ concurrent compiles allowed (unbounded, today's behavior)"
+        );
+        assert_eq!(
+            *poisoned(&gate.state),
+            0,
+            "no-op grants never touch counter"
+        );
+    }
+
+    #[test]
+    fn witness_gate_budget_exhaustion_fails_open() {
+        // A holder keeps the only slot past the queue budget; the waiter must
+        // FAIL OPEN (run ungated) rather than block forever — losing
+        // serialization is a resource regression, never a correctness one.
+        let gate = Arc::new(test_witness_gate(1, 50)); // 50ms budget
+        let hold_start = Arc::new(Barrier::new(2));
+        let gate_h = Arc::clone(&gate);
+        let hs = Arc::clone(&hold_start);
+        let holder = thread::spawn(move || {
+            let _slot = gate_h.acquire();
+            hs.wait(); // signal the slot is taken
+            thread::sleep(Duration::from_millis(300)); // hold well past budget
+        });
+        hold_start.wait();
+        // Waiter: acquire must return within ~budget, not block 300ms.
+        let t0 = Instant::now();
+        {
+            let _slot = gate.acquire(); // fails open after ~50ms
+        }
+        let waited = t0.elapsed();
+        holder.join().expect("holder");
+        assert!(
+            waited < Duration::from_millis(250),
+            "waiter must fail open near the 50ms budget, not block for the 300ms hold (waited {waited:?})"
+        );
+    }
+
+    #[test]
+    fn witness_gate_panicking_holder_releases_slot() {
+        // A panicking guarded section must still release the slot (RAII drop
+        // on unwind), so the next witness is not permanently blocked.
+        // Mirrors batch_coalescer_panic_cross_key_proceeds_after_inflight_guard.
+        let gate = Arc::new(test_witness_gate(1, 60_000));
+        let gate_p = Arc::clone(&gate);
+        let panicked = thread::spawn(move || {
+            let _slot = gate_p.acquire();
+            assert_eq!(*poisoned(&gate_p.state), 1, "slot claimed");
+            panic!("witness worker panicked mid-compile");
+        })
+        .join();
+        assert!(panicked.is_err(), "the worker did panic");
+        assert_eq!(
+            *poisoned(&gate.state),
+            0,
+            "panic must release the slot (RAII drop on unwind)"
+        );
+        // A fresh acquire still works (not permanently blocked).
+        let _slot = gate.acquire();
+        assert_eq!(*poisoned(&gate.state), 1, "next witness acquires cleanly");
+    }
+
     // ── Change 2: cross-run culprit ejection tests ────────────────────────
 
     /// A member that returned SoloRed must be held out of the immediately-next
@@ -5324,13 +5663,12 @@ checks:
     }
 
     #[test]
-    fn multiple_pushes_same_wt_latest_wins() {
-        // Per-WT serialization: a fresh push for the same WT REPLACES the
-        // prior stored overlay (BTreeMap::insert semantic). N rapid
-        // pushes coalesce — the SwitchOverlay arm services exactly the
-        // latest state. The push_signal still fires per push (each wakeup
-        // services whatever the CURRENT stored state is — natural coalesce
-        // on the consume side via pop-on-consume).
+    fn multiple_pushes_same_commit_coalesce_latest_wins() {
+        // CGLS-25 — SAME commit (same base_sha, here None for the bare
+        // push_overlay path) rapid-pushed N times still coalesces to
+        // latest-wins: an FS save-storm or a retried push must NOT queue N
+        // witnesses for one commit. This preserves the historical
+        // single-slot behavior for the same-commit case.
         let api = ServeVerdictState::new();
         let (tx, rx) = channel::<String>();
         api.attach_push_signal(tx);
@@ -5342,26 +5680,75 @@ checks:
         api.push_overlay("/wt", "main", &v2);
         api.push_overlay("/wt", "main", &v3);
 
-        // Store has the LATEST content (v3), not v1/v2.
+        // One consume yields the LATEST content (v3); v1/v2 coalesced away
+        // because all three share base_sha == None.
         let consumed = api.take_overlay_for("/wt").expect("stored");
         assert_eq!(
             consumed.files, v3,
-            "latest push wins (BTreeMap::insert replace semantic)"
+            "latest push wins for the same commit (base_sha-keyed coalesce)"
         );
-        // Subsequent take: None (consumed once; v1/v2/v3 collapsed).
+        // Nothing else queued — one commit ⇒ one overlay.
         assert!(api.take_overlay_for("/wt").is_none());
 
-        // All 3 signals fired (the wakeup channel is per-push, not
-        // coalesced). The serve loop's drain sees 3 wakeups, but each
-        // take_overlay_for after the first returns None — natural
-        // idempotency.
+        // All 3 accept-side signals fired (per-push wakeup); the consume
+        // side coalesces. The re-signal on drain does NOT fire because the
+        // queue emptied on the single take.
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 3, "3 accept signals; 0 re-signal (queue emptied)");
+    }
+
+    #[test]
+    fn distinct_commits_same_wt_both_survive_no_clobber() {
+        // CGLS-25 — the clobber fix. The witness hardcodes ONE worktree key
+        // for every PR, so two concurrent PR pushes (DISTINCT base_sha) land
+        // on the same key. Historically PR-B's push OVERWROTE PR-A's pending
+        // overlay before the serve loop consumed it → PR-A's witness never
+        // ran, its poller starved. The FIFO-by-base_sha queue makes both
+        // survive: each is consumable in arrival order, each carrying its
+        // OWN base_sha for correct downstream attribution.
+        let api = ServeVerdictState::new();
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+
+        let files_a = vec![("src/lib.rs".to_string(), "// PR-A".to_string())];
+        let files_b = vec![("src/lib.rs".to_string(), "// PR-B".to_string())];
+        let opts = |sha: &str| PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: None,
+            base_sha: Some(sha.to_string()),
+            changed_files: None,
+            gate: true,
+            check_ids: None,
+        };
+        // PR-A pushes, then PR-B pushes on the SAME worktree key before the
+        // serve loop has consumed A.
+        api.push_overlay_with_options("/wt", "main", &files_a, None, Some(&opts("sha-A")));
+        api.push_overlay_with_options("/wt", "main", &files_b, None, Some(&opts("sha-B")));
+
+        // Both survive, FIFO: A consumed first, carrying sha-A.
+        let first = api.take_overlay_for("/wt").expect("PR-A survived");
+        assert_eq!(first.base_sha.as_deref(), Some("sha-A"), "FIFO: A first");
+        assert_eq!(first.files, files_a, "PR-A overlay content intact");
+        // B still queued, carrying sha-B — NOT clobbered by A's consume.
+        let second = api.take_overlay_for("/wt").expect("PR-B survived");
+        assert_eq!(second.base_sha.as_deref(), Some("sha-B"), "then B");
+        assert_eq!(second.files, files_b, "PR-B overlay content intact");
+        // Queue now empty ⇒ FS-fallback discriminant holds.
+        assert!(api.take_overlay_for("/wt").is_none());
+
+        // Signals: 2 accept + 1 re-signal (fired when A's consume left B
+        // queued, so the wake-dedup in drain_unique_push_keys cannot starve
+        // B). = 3 total.
         let mut count = 0;
         while rx.try_recv().is_ok() {
             count += 1;
         }
         assert_eq!(
             count, 3,
-            "3 signals (one per push) — consume-side coalesces"
+            "2 accept signals + 1 re-signal on non-empty drain"
         );
     }
 
