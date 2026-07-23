@@ -379,16 +379,30 @@ pub struct ServeVerdictState {
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
     subs: Mutex<Vec<Sender<TransitionEvent>>>,
-    /// #240/2b — pushed-overlay store. worktree-key →
+    /// #240/2b — pushed-overlay store. worktree-key → FIFO queue of
     /// [`PushedOverlay`]. Populated by `push_overlay` (the
-    /// [`VerdictService`] write-plane ingest), consumed once by
-    /// `take_overlay_for` (the serve loop's SwitchOverlay arm). The
-    /// `take` is **pop-on-consume semantic** (spike open-question #3
-    /// default): once consumed, the WT falls back to the FS path until
-    /// a fresh push arrives. Per-WT serialization (a new push for the
-    /// same WT REPLACES the prior overlay before consumption) is the
-    /// natural BTreeMap semantic.
-    pushed: Mutex<BTreeMap<String, PushedOverlay>>,
+    /// [`VerdictService`] write-plane ingest, `push_back`), consumed one
+    /// at a time by `take_overlay_for` (the serve loop's SwitchOverlay
+    /// arm, `pop_front`). The `take` is **pop-on-consume semantic** (spike
+    /// open-question #3 default): once the queue empties the WT falls back
+    /// to the FS path until a fresh push arrives.
+    ///
+    /// **CGLS-25 — the value is a QUEUE, not a single slot.** The witness
+    /// hardcodes ONE worktree key for every PR, so two concurrent PR
+    /// pushes land on the same key. The historical single-slot `insert`
+    /// let PR-B's push OVERWRITE PR-A's pending overlay before the serve
+    /// loop consumed it — PR-A's witness never ran, its poller starved to
+    /// the CI timeout (the "attributed to X, want Y" clobber class). A
+    /// per-WT FIFO queue makes distinct pushes independent at the map
+    /// level: each survives to its own SwitchOverlay→witness cycle. The
+    /// clobber window is ONLY here — `project_check_context` /
+    /// `push_attribution` are recorded-then-consumed strictly on the
+    /// single serve-loop thread (SwitchOverlay records, EmitVerdict pops,
+    /// alternating per WT), so they never cross-clobber. `take_overlay_for`
+    /// re-signals the serve loop when the queue is still non-empty so a
+    /// second queued push is not starved by the wake-dedup in
+    /// `drain_unique_push_keys`.
+    pushed: Mutex<BTreeMap<String, VecDeque<PushedOverlay>>>,
     /// Serializes central-daemon mirror fetch/reset operations. The HTTP
     /// adapter can accept several requests concurrently; the checked-out
     /// mirror is one mutable filesystem and must move one base at a time.
@@ -1310,7 +1324,33 @@ impl ServeVerdictState {
     /// services exactly one SwitchOverlay cycle; FS path resumes if no
     /// fresh push arrives.
     pub fn take_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
-        poisoned(&self.pushed).remove(wt_key)
+        let popped = {
+            let mut store = poisoned(&self.pushed);
+            let queue = store.get_mut(wt_key)?;
+            let front = queue.pop_front();
+            // Drop the now-empty queue so `is_empty`/`len`/peek see no
+            // phantom key, and so the FS-fallback discriminant
+            // (take → None) holds once drained.
+            let still_pending = if queue.is_empty() {
+                store.remove(wt_key);
+                false
+            } else {
+                true
+            };
+            (front, still_pending)
+        };
+        // CGLS-25 — the serve loop's `drain_unique_push_keys` dedups wake
+        // signals per WT key, so a single wake services exactly one
+        // SwitchOverlay cycle (one `pop_front`). If more pushes are queued
+        // for this WT, re-signal so the next loop iteration routes the next
+        // one; without this the tail of a same-WT burst would starve until
+        // an unrelated push happened to wake the loop.
+        if popped.1 {
+            if let Some(tx) = poisoned(&self.push_signal).as_ref() {
+                let _ = tx.send(wt_key.to_string());
+            }
+        }
+        popped.0
     }
 
     /// #240/2b — non-consuming peek. Used by the serve loop's first-push
@@ -1319,7 +1359,13 @@ impl ServeVerdictState {
     /// overlay (the consume happens later in the SwitchOverlay arm via
     /// `take_overlay_for`). Returns a clone; the store is unchanged.
     pub fn peek_overlay_for(&self, wt_key: &str) -> Option<PushedOverlay> {
-        poisoned(&self.pushed).get(wt_key).cloned()
+        // Front of the queue = the next overlay `take_overlay_for` will
+        // consume. Cluster-hash derivation reads workspace-config files,
+        // which are stable across a worktree's pushes, so peeking the front
+        // (vs any other queued push) is correct.
+        poisoned(&self.pushed)
+            .get(wt_key)
+            .and_then(|q| q.front().cloned())
     }
 
     /// Server-side analysis root for a pending pushed overlay, if the client
@@ -1327,8 +1373,11 @@ impl ServeVerdictState {
     /// first-push cluster spawn uses the daemon's mirror path, not the
     /// client's pod-local worktree key.
     pub fn analysis_root_for(&self, wt_key: &str) -> Option<PathBuf> {
+        // Front of the queue = the next overlay to be consumed; its
+        // analysis_root drives the cluster-spawn mirror path.
         poisoned(&self.pushed)
             .get(wt_key)
+            .and_then(|q| q.front())
             .and_then(|p| p.analysis_root.clone())
     }
 
@@ -1705,7 +1754,12 @@ impl ServeVerdictState {
         DaemonActivity {
             quiescing: drain.quiescing,
             active_worktrees: drain.active_worktrees.len() as u32,
-            pending_pushes: poisoned(&self.pushed).len() as u32,
+            // Sum queue depths, not key count: the witness shares one WT
+            // key, so a same-WT burst lives as N entries under one key.
+            pending_pushes: poisoned(&self.pushed)
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>() as u32,
             pending_batch_waiters: batch_counts.waiters,
             pending_batch_members: batch_counts.members,
             inflight_batch_runs: batch_counts.inflight_runs,
@@ -2052,7 +2106,26 @@ impl VerdictService for ServeVerdictState {
             gate,
             check_ids,
         };
-        poisoned(&self.pushed).insert(worktree.to_string(), pushed);
+        // CGLS-25 — base_sha-keyed enqueue: a concurrent PR pushing on the
+        // same hardcoded worktree key must not destroy this one's pending
+        // overlay before the serve loop consumes it. But a rapid re-push of
+        // the SAME commit (same base_sha — an FS save-storm or a retried
+        // push) SHOULD still coalesce to latest-wins, exactly as the
+        // `hard_witness_generation` latch supersedes only same-(wt,base_sha).
+        // So: replace an already-queued entry with a matching base_sha in
+        // place (latest content wins for that commit); otherwise append, so
+        // a DISTINCT commit gets its own SwitchOverlay→witness cycle (drained
+        // one-per-wake, with `take_overlay_for` re-signalling the tail).
+        // base_sha == None (FS-watch / unattributed) keeps the historical
+        // single-slot coalesce: all None-keyed pushes collapse to the last.
+        {
+            let mut store = poisoned(&self.pushed);
+            let queue = store.entry(worktree.to_string()).or_default();
+            match queue.iter_mut().find(|q| q.base_sha == pushed.base_sha) {
+                Some(existing) => *existing = pushed,
+                None => queue.push_back(pushed),
+            }
+        }
         // Wake the serve loop (best-effort — see attach_push_signal doc).
         if let Some(tx) = poisoned(&self.push_signal).as_ref() {
             let _ = tx.send(worktree.to_string());
@@ -5324,13 +5397,12 @@ checks:
     }
 
     #[test]
-    fn multiple_pushes_same_wt_latest_wins() {
-        // Per-WT serialization: a fresh push for the same WT REPLACES the
-        // prior stored overlay (BTreeMap::insert semantic). N rapid
-        // pushes coalesce — the SwitchOverlay arm services exactly the
-        // latest state. The push_signal still fires per push (each wakeup
-        // services whatever the CURRENT stored state is — natural coalesce
-        // on the consume side via pop-on-consume).
+    fn multiple_pushes_same_commit_coalesce_latest_wins() {
+        // CGLS-25 — SAME commit (same base_sha, here None for the bare
+        // push_overlay path) rapid-pushed N times still coalesces to
+        // latest-wins: an FS save-storm or a retried push must NOT queue N
+        // witnesses for one commit. This preserves the historical
+        // single-slot behavior for the same-commit case.
         let api = ServeVerdictState::new();
         let (tx, rx) = channel::<String>();
         api.attach_push_signal(tx);
@@ -5342,26 +5414,75 @@ checks:
         api.push_overlay("/wt", "main", &v2);
         api.push_overlay("/wt", "main", &v3);
 
-        // Store has the LATEST content (v3), not v1/v2.
+        // One consume yields the LATEST content (v3); v1/v2 coalesced away
+        // because all three share base_sha == None.
         let consumed = api.take_overlay_for("/wt").expect("stored");
         assert_eq!(
             consumed.files, v3,
-            "latest push wins (BTreeMap::insert replace semantic)"
+            "latest push wins for the same commit (base_sha-keyed coalesce)"
         );
-        // Subsequent take: None (consumed once; v1/v2/v3 collapsed).
+        // Nothing else queued — one commit ⇒ one overlay.
         assert!(api.take_overlay_for("/wt").is_none());
 
-        // All 3 signals fired (the wakeup channel is per-push, not
-        // coalesced). The serve loop's drain sees 3 wakeups, but each
-        // take_overlay_for after the first returns None — natural
-        // idempotency.
+        // All 3 accept-side signals fired (per-push wakeup); the consume
+        // side coalesces. The re-signal on drain does NOT fire because the
+        // queue emptied on the single take.
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 3, "3 accept signals; 0 re-signal (queue emptied)");
+    }
+
+    #[test]
+    fn distinct_commits_same_wt_both_survive_no_clobber() {
+        // CGLS-25 — the clobber fix. The witness hardcodes ONE worktree key
+        // for every PR, so two concurrent PR pushes (DISTINCT base_sha) land
+        // on the same key. Historically PR-B's push OVERWROTE PR-A's pending
+        // overlay before the serve loop consumed it → PR-A's witness never
+        // ran, its poller starved. The FIFO-by-base_sha queue makes both
+        // survive: each is consumable in arrival order, each carrying its
+        // OWN base_sha for correct downstream attribution.
+        let api = ServeVerdictState::new();
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+
+        let files_a = vec![("src/lib.rs".to_string(), "// PR-A".to_string())];
+        let files_b = vec![("src/lib.rs".to_string(), "// PR-B".to_string())];
+        let opts = |sha: &str| PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: None,
+            base_sha: Some(sha.to_string()),
+            changed_files: None,
+            gate: true,
+            check_ids: None,
+        };
+        // PR-A pushes, then PR-B pushes on the SAME worktree key before the
+        // serve loop has consumed A.
+        api.push_overlay_with_options("/wt", "main", &files_a, None, Some(&opts("sha-A")));
+        api.push_overlay_with_options("/wt", "main", &files_b, None, Some(&opts("sha-B")));
+
+        // Both survive, FIFO: A consumed first, carrying sha-A.
+        let first = api.take_overlay_for("/wt").expect("PR-A survived");
+        assert_eq!(first.base_sha.as_deref(), Some("sha-A"), "FIFO: A first");
+        assert_eq!(first.files, files_a, "PR-A overlay content intact");
+        // B still queued, carrying sha-B — NOT clobbered by A's consume.
+        let second = api.take_overlay_for("/wt").expect("PR-B survived");
+        assert_eq!(second.base_sha.as_deref(), Some("sha-B"), "then B");
+        assert_eq!(second.files, files_b, "PR-B overlay content intact");
+        // Queue now empty ⇒ FS-fallback discriminant holds.
+        assert!(api.take_overlay_for("/wt").is_none());
+
+        // Signals: 2 accept + 1 re-signal (fired when A's consume left B
+        // queued, so the wake-dedup in drain_unique_push_keys cannot starve
+        // B). = 3 total.
         let mut count = 0;
         while rx.try_recv().is_ok() {
             count += 1;
         }
         assert_eq!(
             count, 3,
-            "3 signals (one per push) — consume-side coalesces"
+            "2 accept signals + 1 re-signal on non-empty drain"
         );
     }
 
