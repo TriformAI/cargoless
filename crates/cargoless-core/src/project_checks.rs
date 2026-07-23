@@ -382,15 +382,21 @@ pub fn plan_profile_with_changes(
             non_coalesce_reason: None,
         });
     };
+    let ids_filter: Vec<String> = only_id.into_iter().map(str::to_string).collect();
     let profile = profile_for(&manifest, profile_name);
-    let profile_selected = checks_for_profile(&manifest, &profile, profile_name, only_id);
+    let profile_selected = checks_for_profile(&manifest, &profile, profile_name, &ids_filter);
     let manifest_changed = changed_files
         .map(|files| normalize_changed_files(&root, files))
         .is_some_and(|changed| changed.iter().any(|p| p == MANIFEST_NAME));
-    let (selected, skipped) = select_for_changes(&root, profile_selected, only_id, changed_files);
+    let (selected, skipped) =
+        select_for_changes(&root, profile_selected, &ids_filter, changed_files);
     let selected_summaries = selected.iter().map(check_summary).collect::<Vec<_>>();
-    let fingerprint =
-        project_check_plan_fingerprint(&manifest.manifest_hash, profile_name, only_id, &selected);
+    let fingerprint = project_check_plan_fingerprint(
+        &manifest.manifest_hash,
+        profile_name,
+        &ids_filter,
+        &selected,
+    );
     Ok(ProjectCheckPlan {
         fingerprint,
         manifest_hash: manifest.manifest_hash,
@@ -407,6 +413,40 @@ pub fn run_profile_with_changes(
     root: &Path,
     profile_name: &str,
     only_id: Option<&str>,
+    changed_files: Option<&[String]>,
+) -> io::Result<ProjectCheckReport> {
+    let ids: Vec<String> = only_id.into_iter().map(str::to_string).collect();
+    run_profile_inner(root, profile_name, &ids, changed_files)
+}
+
+/// Run a profile restricted to an explicit SET of check ids (the merge-gate
+/// witness-only lane). `ids` empty ⇒ whole profile (identical to
+/// `run_profile_with_changes(.., None, ..)`); non-empty ⇒ exactly those ids
+/// (their intersection with the profile), change-filtering disabled. Added
+/// for the per-check witness gate: a gated push runs only its requested
+/// compile witnesses (ssr/wasm/isolator-vsock) instead of the whole dev
+/// profile, so the gate proves the witnesses ran without dragging the ~97
+/// governance/coverage checks (and their environmental reds) into a gating
+/// verdict. No-vacuous-green holds because each witness id is `tier:dev` and
+/// so is a member of the dev profile — the id∧profile AND selects exactly the
+/// requested witnesses, never nothing.
+pub fn run_profile_with_ids(
+    root: &Path,
+    profile_name: &str,
+    ids: &[String],
+    changed_files: Option<&[String]>,
+) -> io::Result<ProjectCheckReport> {
+    run_profile_inner(root, profile_name, ids, changed_files)
+}
+
+/// Shared inner: `ids_filter` empty ⇒ no id filter (whole profile, change-
+/// filtering active); non-empty ⇒ run EXACTLY those ids with change-filtering
+/// disabled. The two public entry points differ only in how they express the
+/// filter (`Option<&str>` single-id vs `&[String]` multi-id).
+fn run_profile_inner(
+    root: &Path,
+    profile_name: &str,
+    ids_filter: &[String],
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
     let started = Instant::now();
@@ -443,8 +483,8 @@ pub fn run_profile_with_changes(
     };
 
     let profile = profile_for(&manifest, profile_name);
-    let selected = checks_for_profile(&manifest, &profile, profile_name, only_id);
-    let (selected, skipped) = select_for_changes(&root, selected, only_id, changed_files);
+    let selected = checks_for_profile(&manifest, &profile, profile_name, ids_filter);
+    let (selected, skipped) = select_for_changes(&root, selected, ids_filter, changed_files);
     let snapshot = Arc::new(RepoSnapshot::build(&root)?);
     let ctx = Arc::new(RunContext {
         root: root.clone(),
@@ -496,12 +536,14 @@ fn checks_for_profile(
     manifest: &ProjectChecksManifest,
     profile: &ProfileConfig,
     profile_name: &str,
-    only_id: Option<&str>,
+    ids_filter: &[String],
 ) -> Vec<CheckConfig> {
     manifest
         .checks
         .iter()
-        .filter(|c| only_id.is_none_or(|id| c.id == id))
+        // Empty `ids_filter` ⇒ no id restriction (whole profile). Non-empty ⇒
+        // keep only checks whose id is in the set (the witness-only gate lane).
+        .filter(|c| ids_filter.is_empty() || ids_filter.iter().any(|id| id == &c.id))
         .filter(|c| profile_includes(profile, c, profile_name))
         .cloned()
         .collect()
@@ -510,7 +552,7 @@ fn checks_for_profile(
 fn project_check_plan_fingerprint(
     manifest_hash: &str,
     profile_name: &str,
-    only_id: Option<&str>,
+    ids_filter: &[String],
     selected: &[CheckConfig],
 ) -> String {
     let mut preimage = String::new();
@@ -520,7 +562,15 @@ fn project_check_plan_fingerprint(
     preimage.push('\n');
     preimage.push_str(profile_name);
     preimage.push('\n');
-    preimage.push_str(only_id.unwrap_or("*"));
+    // Preserve the prior single-id/no-id serialization exactly (no filter ⇒
+    // "*"), so existing plan-cache tokens don't churn. A multi-id filter
+    // joins the ids with ',' — a shape the single-id path could never emit,
+    // so the two id spaces stay distinct without a version bump.
+    if ids_filter.is_empty() {
+        preimage.push('*');
+    } else {
+        preimage.push_str(&ids_filter.join(","));
+    }
     preimage.push('\n');
     for check in selected {
         preimage.push_str(&check.id);
@@ -538,10 +588,13 @@ fn check_config_hash(check: &CheckConfig) -> String {
 fn select_for_changes(
     root: &Path,
     checks: Vec<CheckConfig>,
-    only_id: Option<&str>,
+    ids_filter: &[String],
     changed_files: Option<&[String]>,
 ) -> (Vec<CheckConfig>, Vec<CheckSummary>) {
-    if only_id.is_some() {
+    // An explicit id filter means "run exactly these" — trigger-glob
+    // change-filtering is intentionally bypassed so a requested witness is
+    // never additionally skipped for not matching the changed-file globs.
+    if !ids_filter.is_empty() {
         return (checks, Vec::new());
     }
     let Some(changed_files) = changed_files else {
@@ -2382,6 +2435,87 @@ checks:
             run_profile_with_changes(&root, "dev", Some("required"), Some(&unrelated)).unwrap();
         assert_eq!(forced.results[0].id, "required");
         assert!(forced.skipped.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_profile_with_ids_selects_exactly_the_requested_witnesses() {
+        // The merge-gate witness-only lane: a gated push requests a SET of ids
+        // (the compile witnesses) and must run EXACTLY that set's intersection
+        // with the profile, with change-filtering disabled — never the full
+        // profile, and never (the no-vacuous-green invariant) nothing.
+        let root = scratch("run-with-ids");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "ok").unwrap();
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: witness-a
+    kind: required_patterns
+    inputs: ["src/*.rs"]
+    patterns:
+      - code: a.ok
+        literal: ok
+        message: missing ok
+  - id: witness-b
+    kind: required_patterns
+    inputs: ["src/*.rs"]
+    patterns:
+      - code: b.ok
+        literal: ok
+        message: missing ok
+  - id: governance
+    kind: required_patterns
+    inputs: ["src/*.rs"]
+    patterns:
+      - code: g.ok
+        literal: ok
+        message: missing ok
+"#,
+        )
+        .unwrap();
+
+        // Two-witness filter selects EXACTLY those two, dropping `governance` —
+        // even though `governance` is in the dev profile and its inputs match.
+        // `changed_files=None` here, but the filter also disables change-
+        // filtering: an unrelated changed-file list must NOT skip a witness.
+        let unrelated = vec!["README.md".to_string()];
+        let ids = vec!["witness-a".to_string(), "witness-b".to_string()];
+        let ran = run_profile_with_ids(&root, "dev", &ids, Some(&unrelated)).unwrap();
+        let mut ran_ids: Vec<&str> = ran.results.iter().map(|r| r.id.as_str()).collect();
+        ran_ids.sort_unstable();
+        assert_eq!(
+            ran_ids,
+            vec!["witness-a", "witness-b"],
+            "gated set must run exactly its intersection with the profile"
+        );
+        assert!(
+            ran.skipped.is_empty(),
+            "id-filter disables change-filtering: nothing is trigger-skipped"
+        );
+
+        // No-vacuous-green: an id absent from the manifest is simply not
+        // selected — the present witness still runs (never selects nothing).
+        let with_ghost = vec!["witness-a".to_string(), "does-not-exist".to_string()];
+        let ran = run_profile_with_ids(&root, "dev", &with_ghost, None).unwrap();
+        assert_eq!(
+            ran.results
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["witness-a"],
+            "a ghost id is dropped; the real witness still runs (no vacuous green)"
+        );
+
+        // Empty filter ⇒ whole profile (identical to the None single-id path).
+        let all = run_profile_with_ids(&root, "dev", &[], None).unwrap();
+        assert_eq!(
+            all.results.len(),
+            3,
+            "empty id set runs the full profile, not a filtered subset"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

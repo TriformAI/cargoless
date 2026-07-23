@@ -2690,6 +2690,11 @@ mod tests {
                         provenance: crate::batch::BatchProvenance::CombinedGreen,
                         diagnostics: Vec::new(),
                         duration_ms: 150,
+                        // A green combined run always ran at least one check;
+                        // a representative id keeps the mock faithful and makes
+                        // this concurrency test also carry the field across a
+                        // real HTTP roundtrip.
+                        ran_check_ids: vec!["incremental compile check".into()],
                     })
                     .collect(),
                 combined_checks: 1,

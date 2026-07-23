@@ -117,6 +117,19 @@ pub struct BatchMemberResult {
     pub provenance: BatchProvenance,
     pub diagnostics: Vec<Diagnostic>,
     pub duration_ms: u128,
+    /// IDs of the project-checks that actually RAN in the physical run that
+    /// produced this member's verdict — the `ProjectCheckReport.results[].id`
+    /// set. This is the witness's gate proof: the coalesced push path threads
+    /// it into `gated_checks_ran` so a gate can assert the requested check
+    /// actually compiled (not merely that it was requested).
+    ///
+    /// Sharing one id-list across every member of a combined run is exact,
+    /// not approximate: members coalesce ONLY under an identical plan
+    /// fingerprint (`project_check_plan_coalesce_token`), so they provably ran
+    /// the same check set. Empty for the infra/setup-failure (`Err`) arm,
+    /// where no report was produced, and for the interaction-red override
+    /// (combined-red + all-solo-green), where the id is the solo run's set.
+    pub ran_check_ids: Vec<String>,
 }
 
 /// Whole-batch result plus the counters needed for throughput reporting.
@@ -196,6 +209,11 @@ pub fn run_batch(
     match checker.check_combined(members) {
         Ok(report) if report.tree == TreeState::Green => {
             let executed_members = members.len() as u32;
+            // The single combined compile ran this exact check set; every
+            // coalesced member shares it (identical plan fingerprint — see
+            // `BatchMemberResult::ran_check_ids`). Compute once, clone per
+            // member rather than clone the whole report.
+            let ran_check_ids: Vec<String> = report.results.iter().map(|r| r.id.clone()).collect();
             BatchReport {
                 batch_id: batch_id.clone(),
                 verdict: BatchVerdict::Green,
@@ -207,6 +225,7 @@ pub fn run_batch(
                         provenance: BatchProvenance::CombinedGreen,
                         diagnostics: Vec::new(),
                         duration_ms: report.duration_ms,
+                        ran_check_ids: ran_check_ids.clone(),
                     })
                     .collect(),
                 combined_checks: 1,
@@ -252,6 +271,8 @@ pub fn run_batch(
                         provenance: BatchProvenance::Indeterminate,
                         diagnostics: vec![indeterminate_diagnostic(&member.worktree, &message)],
                         duration_ms: 0,
+                        // Infra/setup failure — no report, so no ran ids.
+                        ran_check_ids: Vec::new(),
                     })
                     .collect(),
                 combined_checks: 1,
@@ -282,15 +303,18 @@ fn report_from_solos(
                 provenance: BatchProvenance::SoloGreen,
                 diagnostics: Vec::new(),
                 duration_ms: report.duration_ms,
+                ran_check_ids: report.results.iter().map(|r| r.id.clone()).collect(),
             },
             Ok(report) => {
                 any_red = true;
+                let ran_check_ids = report.results.iter().map(|r| r.id.clone()).collect();
                 BatchMemberResult {
                     worktree: outcome.member.worktree,
                     verdict: BatchVerdict::Red,
                     provenance: BatchProvenance::SoloRed,
                     diagnostics: report.diagnostics,
                     duration_ms: report.duration_ms,
+                    ran_check_ids,
                 }
             }
             Err(message) => {
@@ -301,6 +325,8 @@ fn report_from_solos(
                     verdict: BatchVerdict::Indeterminate,
                     provenance: BatchProvenance::Indeterminate,
                     duration_ms: 0,
+                    // Infra/setup failure — no report, so no ran ids.
+                    ran_check_ids: Vec::new(),
                 }
             }
         })

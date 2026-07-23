@@ -360,6 +360,8 @@ fn unsupported_batch_report(
                     source: Some("cargoless".into()),
                 }],
                 duration_ms: 0,
+                // Unsupported request — nothing ran.
+                ran_check_ids: Vec::new(),
             })
             .collect(),
         combined_checks: 0,
@@ -875,7 +877,17 @@ impl Request {
                     .to_string();
                 let files = overlay_files_from_json(v.get("files"));
                 let check_profile = check_profile_from_json(v.get("check_profile"));
-                let options = push_overlay_options_from_json(&v);
+                // Nesting-tolerant: a hand-rolled central-mode push (the CI
+                // witness) nests its option fields under `options{}`, whereas
+                // the flat `verdict`/CLI path emits them top-level. Mirror the
+                // batch path (`batch_check_request_from_value`, ~line 1016):
+                // read from `options{}` when present, else fall back to the
+                // top-level body. Before this fix a nested `gate`/`check_ids`/
+                // `analysis_root` silently deserialized to defaults — the
+                // Hard witness gate never promoted (see the CI witness's
+                // never-fires bug). The flat CLI has no `options{}` key, so it
+                // hits `unwrap_or(&v)` and stays byte-identical.
+                let options = push_overlay_options_from_json(v.get("options").unwrap_or(&v));
                 if options.is_empty() {
                     Some(Request::PushOverlay {
                         worktree,
@@ -1362,6 +1374,10 @@ fn batch_member_result_to_json(result: &BatchMemberResult) -> serde_json::Value 
         "provenance": result.provenance.as_str(),
         "diagnostics": diagnostics_to_json(&result.diagnostics),
         "duration_ms": result.duration_ms.to_string(),
+        // The witness's gate proof over the HTTP batch surface. Absent on the
+        // wire from pre-ran_check_ids peers ⇒ decodes to an empty vec, which
+        // is the same "cannot enumerate" fallback the old code always emitted.
+        "ran_check_ids": result.ran_check_ids,
     })
 }
 
@@ -1386,6 +1402,10 @@ fn batch_member_results_from_json(v: Option<&serde_json::Value>) -> Vec<BatchMem
                     .unwrap_or(BatchProvenance::Indeterminate),
                 diagnostics: diagnostics_from_value(item.get("diagnostics")),
                 duration_ms: json_u128(item.get("duration_ms")),
+                // Backward-compatible: a peer that predates this field omits
+                // the key ⇒ empty vec (the historical base_sha-only fallback).
+                ran_check_ids: string_array_from_json(item.get("ran_check_ids"))
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -1895,6 +1915,14 @@ mod tests {
                     provenance: BatchProvenance::SoloGreen,
                     diagnostics: Vec::new(),
                     duration_ms: 12,
+                    // Non-empty on purpose: proves the wire codec carries the
+                    // real ran-check-id set (the gate proof) through a full
+                    // roundtrip — including the witness id the coalesced-path
+                    // gate now asserts on.
+                    ran_check_ids: vec![
+                        "incremental compile check".into(),
+                        "isolator-vsock-compiler-witness".into(),
+                    ],
                 },
                 BatchMemberResult {
                     worktree: "wt-red".into(),
@@ -1910,6 +1938,10 @@ mod tests {
                         source: Some("rustc".into()),
                     }],
                     duration_ms: 34,
+                    // Empty here proves the codec preserves the empty case too
+                    // (absent key → empty vec) and never cross-contaminates it
+                    // with the sibling member's populated list.
+                    ran_check_ids: Vec::new(),
                 },
             ],
             combined_checks: 1,
