@@ -2291,16 +2291,17 @@ fn run_project_checks_and_log(
     // ~97-check `dev` profile and publish its environmental governance reds as
     // a gating RED. When the filter yields ids we run EXACTLY those witnesses
     // (change-filtering disabled, matching the coalesced lane); otherwise the
-    // advisory/full-profile behavior is unchanged.
+    // advisory/full-profile behavior is unchanged. Both arms thread the
+    // CGLS-26 warm target dir (or None=cold).
     let gated_ids = context
         .as_ref()
         .and_then(|ctx| crate::serveapi::gated_witness_ids(ctx.gate, ctx.check_ids.as_ref()));
     let report = match (context.as_ref(), gated_ids.as_deref()) {
-        (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root| {
-            cargoless_core::project_checks::run_profile_with_ids(root, "dev", ids, None)
+        (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root, warm| {
+            cargoless_core::project_checks::run_profile_with_ids_in(root, "dev", ids, None, warm)
         }),
-        (Some(ctx), None) => api.with_project_check_overlay(ctx, |root| {
-            cargoless_core::project_checks::run_dev_with_changes(root, changed_files)
+        (Some(ctx), None) => api.with_project_check_overlay(ctx, |root, warm| {
+            cargoless_core::project_checks::run_dev_with_changes_in(root, changed_files, warm)
         }),
         (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
             root,

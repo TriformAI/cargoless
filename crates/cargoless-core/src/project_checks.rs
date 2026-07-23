@@ -341,6 +341,19 @@ pub fn run_dev_with_changes(
     run_profile_with_changes(root, "dev", None, changed_files)
 }
 
+/// CGLS-26 — like [`run_dev_with_changes`] but with an optional WARM,
+/// persistent, shared `CARGO_TARGET_DIR` for the compile (`None` = the
+/// historical per-run cold dir). Only the serve daemon's witness path passes
+/// `Some`, and only when its warm-target safety lock is held; every other
+/// caller uses the plain form and is byte-identical to before.
+pub fn run_dev_with_changes_in(
+    root: &Path,
+    changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
+) -> io::Result<ProjectCheckReport> {
+    run_profile_with_changes_in(root, "dev", None, changed_files, witness_target_dir)
+}
+
 pub fn run_profile(
     root: &Path,
     profile_name: &str,
@@ -415,8 +428,21 @@ pub fn run_profile_with_changes(
     only_id: Option<&str>,
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
+    run_profile_with_changes_in(root, profile_name, only_id, changed_files, None)
+}
+
+/// CGLS-26 — [`run_profile_with_changes`] with an optional WARM shared
+/// `CARGO_TARGET_DIR` threaded into the compile. `None` is byte-identical to
+/// the plain form (per-run cold dir).
+pub fn run_profile_with_changes_in(
+    root: &Path,
+    profile_name: &str,
+    only_id: Option<&str>,
+    changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
+) -> io::Result<ProjectCheckReport> {
     let ids: Vec<String> = only_id.into_iter().map(str::to_string).collect();
-    run_profile_inner(root, profile_name, &ids, changed_files)
+    run_profile_inner(root, profile_name, &ids, changed_files, witness_target_dir)
 }
 
 /// Run a profile restricted to an explicit SET of check ids (the merge-gate
@@ -436,18 +462,33 @@ pub fn run_profile_with_ids(
     ids: &[String],
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
-    run_profile_inner(root, profile_name, ids, changed_files)
+    run_profile_inner(root, profile_name, ids, changed_files, None)
+}
+
+/// CGLS-26 — [`run_profile_with_ids`] with an optional WARM shared
+/// `CARGO_TARGET_DIR` (the gated witness-only lane is exactly the compile
+/// path warmth targets). `None` = cold, byte-identical to the plain form.
+pub fn run_profile_with_ids_in(
+    root: &Path,
+    profile_name: &str,
+    ids: &[String],
+    changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
+) -> io::Result<ProjectCheckReport> {
+    run_profile_inner(root, profile_name, ids, changed_files, witness_target_dir)
 }
 
 /// Shared inner: `ids_filter` empty ⇒ no id filter (whole profile, change-
 /// filtering active); non-empty ⇒ run EXACTLY those ids with change-filtering
-/// disabled. The two public entry points differ only in how they express the
-/// filter (`Option<&str>` single-id vs `&[String]` multi-id).
+/// disabled. The public entry points differ only in how they express the
+/// filter (`Option<&str>` single-id vs `&[String]` multi-id) and whether they
+/// thread a CGLS-26 warm target dir.
 fn run_profile_inner(
     root: &Path,
     profile_name: &str,
     ids_filter: &[String],
     changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
 ) -> io::Result<ProjectCheckReport> {
     let started = Instant::now();
     let root = fs::canonicalize(root)?;
@@ -492,6 +533,7 @@ fn run_profile_inner(
         manifest_hash: manifest.manifest_hash.clone(),
         profile_name: profile_name.to_string(),
         changed_files: changed_files.map(|files| normalize_changed_files(&root, files)),
+        witness_target_dir: witness_target_dir.map(Path::to_path_buf),
     });
     let results = run_parallel(
         ctx,
@@ -688,6 +730,16 @@ struct RunContext {
     manifest_hash: String,
     profile_name: String,
     changed_files: Option<Vec<String>>,
+    /// CGLS-26 — optional WARM, persistent, shared `CARGO_TARGET_DIR` for the
+    /// witness compile. `None` (the default and every non-witness caller)
+    /// keeps the historical per-run `ctx.root/.cargoless-target`, byte-for-
+    /// byte. `Some(dir)` redirects the compile at a keyed dir under the
+    /// daemon state dir that survives across runs so a small diff reuses
+    /// cached `deps/` rlibs + `.fingerprint/` instead of a cold rebuild. The
+    /// serve daemon resolves this (with its lock/fallback safety) and only
+    /// passes `Some` when the warm-target flag is on and the dir is safely
+    /// held; see `ServeVerdictState::with_project_check_scratch_overlay`.
+    witness_target_dir: Option<PathBuf>,
 }
 
 fn run_parallel(
@@ -1131,18 +1183,27 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             0,
         );
     }
-    // Pin CARGO_TARGET_DIR to a path inside this run's scratch worktree so
-    // concurrent witness builds cannot clobber each other's
-    // `incremental/`, `.fingerprint/`, or encoded-metadata files (CGLS-24:
-    // `failed to create encoded metadata from file: os error 2`). The
-    // scratch is per-run by construction (`run-<pid>-<seq>/`) and is
-    // `git worktree remove --force`'d at cleanup, so the target subtree is
-    // auto-collected with it. Setting it via env wins over any ambient
-    // `CARGO_TARGET_DIR` on the daemon pod (e.g. the `/workspace/target`
-    // default in `cargoless-serve.k8s.yaml`) and over any workspace-level
-    // `.cargo/config.toml` `[build] target-dir` in the project under
-    // check — cargo's resolution order is env > config > default.
-    let cargo_target_dir = ctx.root.join(".cargoless-target");
+    // Pin CARGO_TARGET_DIR. The DEFAULT (`witness_target_dir == None`) is a
+    // path inside this run's scratch worktree so concurrent witness builds
+    // cannot clobber each other's `incremental/`, `.fingerprint/`, or
+    // encoded-metadata files (CGLS-24: `failed to create encoded metadata
+    // from file: os error 2`). The scratch is per-run by construction
+    // (`run-<pid>-<seq>/`) and is `git worktree remove --force`'d at cleanup,
+    // so the target subtree is auto-collected with it.
+    //
+    // CGLS-26 — when the daemon resolves a WARM, persistent, shared target
+    // dir (witness serialization removed the CGLS-24 concurrency hazard, so a
+    // shared dir is safe; the daemon holds a per-key lock and falls back to
+    // cold on any doubt), it passes it here and the compile reuses cached
+    // artifacts across runs instead of a cold rebuild. Either way this env
+    // set wins over any ambient `CARGO_TARGET_DIR` on the daemon pod (e.g.
+    // the `/workspace/target` default in `cargoless-serve.k8s.yaml`) and over
+    // any workspace `.cargo/config.toml` `[build] target-dir` — cargo's
+    // resolution order is env > config > default.
+    let cargo_target_dir = ctx
+        .witness_target_dir
+        .clone()
+        .unwrap_or_else(|| ctx.root.join(".cargoless-target"));
     let mut cmd = Command::new(&check.command[0]);
     cmd.args(&check.command[1..])
         .current_dir(&ctx.root)
@@ -2575,12 +2636,60 @@ checks:
         .unwrap();
         let report = run_profile(&root, "dev", None).unwrap();
         assert_eq!(report.tree, TreeState::Green);
-        let expected = root.join(".cargoless-target");
+        // Canonicalized: run_profile canonicalizes ctx.root, so on macOS a
+        // /var/... temp dir surfaces to the child as /private/var/... .
+        let expected = fs::canonicalize(&root).unwrap().join(".cargoless-target");
         assert_eq!(
             fs::read_to_string(root.join("target-dir.out")).unwrap(),
             expected.to_string_lossy(),
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// CGLS-26: with a warm dir passed (`run_*_in(Some(dir))`), the child
+    /// process sees CARGO_TARGET_DIR == that warm dir; with `None` it sees the
+    /// historical per-run `<root>/.cargoless-target`. This is the whole
+    /// mechanism — a persistent shared dir survives across runs so a small
+    /// diff reuses cached artifacts.
+    #[test]
+    fn command_check_uses_warm_target_dir_when_some_else_cold() {
+        let manifest = r#"
+version: 1
+checks:
+  - id: warm-target-echo
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf '%s' \"$CARGO_TARGET_DIR\" > target-dir.out"]
+    cache: none
+"#;
+        // Some(warm) ⇒ child sees the warm dir.
+        let root = scratch("warm-target-some");
+        fs::write(root.join(MANIFEST_NAME), manifest).unwrap();
+        let warm = scratch("warm-shared-dir");
+        let report = run_dev_with_changes_in(&root, None, Some(&warm)).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(
+            fs::read_to_string(root.join("target-dir.out")).unwrap(),
+            warm.to_string_lossy(),
+            "warm dir passed ⇒ CARGO_TARGET_DIR is the warm dir"
+        );
+        let _ = fs::remove_dir_all(&warm);
+        let _ = fs::remove_dir_all(&root);
+
+        // None ⇒ byte-identical to today (per-run cold dir). Compare against
+        // the canonicalized root: `run_profile` canonicalizes ctx.root, so on
+        // macOS the child sees `/private/var/...` for a `/var/...` temp dir.
+        let root2 = scratch("warm-target-none");
+        fs::write(root2.join(MANIFEST_NAME), manifest).unwrap();
+        let report2 = run_dev_with_changes_in(&root2, None, None).unwrap();
+        assert_eq!(report2.tree, TreeState::Green);
+        let expected2 = fs::canonicalize(&root2).unwrap().join(".cargoless-target");
+        assert_eq!(
+            fs::read_to_string(root2.join("target-dir.out")).unwrap(),
+            expected2.to_string_lossy(),
+            "None ⇒ cold per-run dir, unchanged from CGLS-24 behavior"
+        );
+        let _ = fs::remove_dir_all(&root2);
     }
 
     /// CGLS-24: two concurrent `check_command` invocations against distinct
@@ -2610,13 +2719,21 @@ checks:
         });
         assert_eq!(a.tree, TreeState::Green);
         assert_eq!(b.tree, TreeState::Green);
+        // Canonicalized for the macOS /var → /private/var symlink (see
+        // command_check_isolates_cargo_target_dir_per_scratch_root).
         assert_eq!(
             fs::read_to_string(root_a.join("td.out")).unwrap(),
-            root_a.join(".cargoless-target").to_string_lossy(),
+            fs::canonicalize(&root_a)
+                .unwrap()
+                .join(".cargoless-target")
+                .to_string_lossy(),
         );
         assert_eq!(
             fs::read_to_string(root_b.join("td.out")).unwrap(),
-            root_b.join(".cargoless-target").to_string_lossy(),
+            fs::canonicalize(&root_b)
+                .unwrap()
+                .join(".cargoless-target")
+                .to_string_lossy(),
         );
         let _ = fs::remove_dir_all(root_a);
         let _ = fs::remove_dir_all(root_b);
