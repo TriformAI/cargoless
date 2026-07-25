@@ -53,7 +53,7 @@ pub mod transport;
 pub mod watcher;
 mod yamlscan;
 
-pub use cargoless_cas::{ContentStore, LocalDiskStore};
+pub use cargoless_cas::{ContentStore, LocalDiskStore, sha256_hex};
 pub use cargoless_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
     Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,

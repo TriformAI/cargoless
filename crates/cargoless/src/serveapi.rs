@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
+use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
     BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions,
     TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
@@ -75,6 +76,14 @@ static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
 /// concurrent fan-in and the oldest entry is front-evicted past the cap.
 const HARD_WITNESS_HISTORY_CAP: usize = 16;
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
+/// CGLS-26 — bump when the warm shared-target-dir layout or keying changes,
+/// so a daemon rolling a new image never reuses an incompatible warm tree
+/// (it gets a fresh keyed subdir and one cold rebuild, then warm).
+const WARM_TARGET_SCHEMA_TAG: &str = "warm-v1";
+/// CGLS-26 — number of newest warm-target keyed dirs to retain; older
+/// siblings are pruned (a toolchain/Cargo.lock bump otherwise leaks a
+/// multi-GB target tree per key on the bounded shard PVC).
+const WARM_TARGET_KEEP: usize = 2;
 
 /// A pushed overlay set carried in `ServeVerdictState::pushed`. Stored
 /// pair-shape (`Vec<(String, String)>`) instead of [`OverlaySet`] so the
@@ -485,6 +494,14 @@ pub struct ServeVerdictState {
     /// attach-at-startup pattern as `push_signal`); a daemon that never
     /// sets it simply omits `ra_config` from `/daemon`.
     resolved_config: Mutex<Option<serde_json::Value>>,
+    /// CGLS-26 — per-warm-key in-process busy flag for the shared witness
+    /// target dir. A non-blocking compare-and-swap is the primary interlock:
+    /// if a warm key is already in use (flag true), the caller falls back to
+    /// a cold per-run dir rather than sharing an in-flight target (the
+    /// CGLS-24 corruption hazard). An `AtomicBool` (not a `Mutex<()>`) so the
+    /// RAII release needs no lifetime gymnastics: the guard holds the `Arc`
+    /// and stores `false` on drop. Keyed by the warm-dir key.
+    warm_target_locks: Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 #[derive(Default)]
@@ -1611,10 +1628,12 @@ impl ServeVerdictState {
     pub(crate) fn with_project_check_overlay<T>(
         &self,
         context: &ProjectCheckRunContext,
-        f: impl FnOnce(&Path) -> T,
+        f: impl FnOnce(&Path, Option<&Path>) -> T,
     ) -> Result<T, String> {
         if !context.materialize_overlay {
-            return Ok(f(&context.root));
+            // No overlay to materialize ⇒ no scratch ⇒ no warm dir; run in
+            // place with the historical cold per-run target.
+            return Ok(f(&context.root, None));
         }
 
         if let Some(state_dir) = self.project_check_state_dir.as_deref() {
@@ -1627,12 +1646,14 @@ impl ServeVerdictState {
     fn with_project_check_locked_overlay<T>(
         &self,
         context: &ProjectCheckRunContext,
-        f: impl FnOnce(&Path) -> T,
+        f: impl FnOnce(&Path, Option<&Path>) -> T,
     ) -> Result<T, String> {
         let _guard = poisoned(&self.sync_lock);
         reset_analysis_root(&context.root, &context.base_ref)?;
         materialize_overlay_files(&context.root, &context.overlay_files)?;
-        let result = f(&context.root);
+        // The local (no-state-dir) path always runs cold: warm caching is a
+        // central-daemon-only optimization.
+        let result = f(&context.root, None);
         if let Err(e) = reset_analysis_root(&context.root, &context.base_ref) {
             eprintln!(
                 "[cargoless:obs] project-check-overlay-cleanup root={} error={}",
@@ -1647,7 +1668,7 @@ impl ServeVerdictState {
         &self,
         context: &ProjectCheckRunContext,
         state_dir: &Path,
-        f: impl FnOnce(&Path) -> T,
+        f: impl FnOnce(&Path, Option<&Path>) -> T,
     ) -> Result<T, String> {
         let seq = PROJECT_CHECK_SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
         let scratch_root = state_dir
@@ -1660,14 +1681,24 @@ impl ServeVerdictState {
             prepare_project_check_scratch(&context.root, &scratch_root, &context.base_ref)?;
         }
 
+        // CGLS-26 — resolve a WARM shared target dir (or None = cold per-run).
+        // The returned guard holds the in-process + flock locks for the whole
+        // compile and fails closed to cold on ANY doubt. `warm` is the dir to
+        // hand the compile; the guard's lifetime keeps the locks held.
+        let warm = self.resolve_warm_target(state_dir, &scratch_root);
+        let warm_dir = warm.as_ref().map(|w| w.dir.as_path());
+
         let result = match materialize_overlay_files_from_root(
             &context.root,
             &scratch_root,
             &context.overlay_files,
         ) {
-            Ok(()) => Ok(f(&scratch_root)),
+            Ok(()) => Ok(f(&scratch_root, warm_dir)),
             Err(e) => Err(e),
         };
+        // Warm-lock guard drops here (after the compile), releasing both
+        // layers. Explicit for clarity — the locks must outlive `f`.
+        drop(warm);
 
         let cleanup = {
             let _guard = poisoned(&self.sync_lock);
@@ -1683,6 +1714,91 @@ impl ServeVerdictState {
         }
 
         result
+    }
+
+    /// CGLS-26 — resolve a WARM, persistent, shared `CARGO_TARGET_DIR` for
+    /// this witness compile, or `None` to run cold in the per-run scratch
+    /// (today's behavior). Fails CLOSED to cold on ANY doubt: flag off, key
+    /// unresolvable, in-process lock contended, cross-process flock
+    /// contended, or dir/lock create error. The returned guard holds both
+    /// lock layers for the caller-scoped compile; dropping it releases them.
+    ///
+    /// Warmth is safe only because witness compiles are serialized (CGLS-25):
+    /// a shared target dir can be corrupted by two concurrent `cargo`s
+    /// (CGLS-24), so the locks are a hard interlock — if anything else is in
+    /// the warm dir, this run goes cold rather than share it.
+    fn resolve_warm_target(
+        &self,
+        state_dir: &Path,
+        scratch_root: &Path,
+    ) -> Option<WarmTargetGuard> {
+        // 1. Feature gate — default OFF ⇒ compute nothing, take no lock.
+        if !warm_target_enabled() {
+            return None;
+        }
+        // 2. Key on (schema, toolchain, Cargo.lock). Base_sha is deliberately
+        //    NOT in the key — cargo's own fingerprinting handles the file diff
+        //    between bases; keying per (toolchain, lock) only gives an
+        //    incompatible toolchain/dep-graph a fresh cold subdir. Any input
+        //    unresolvable ⇒ cold.
+        let key = warm_target_key(scratch_root)?;
+        let warm_dir = state_dir.join("witness-target-warm").join(&key);
+        if let Err(e) = std::fs::create_dir_all(&warm_dir) {
+            emit_warm_obs(&warm_dir, "cold-fallback", &format!("mkdir:{e}"));
+            return None;
+        }
+
+        // 3a. In-process per-key busy flag (primary). Non-blocking CAS —
+        //     never wait: a wedged prior witness must not wedge this one;
+        //     already-busy ⇒ cold. The guard stores `false` on drop.
+        let busy = {
+            let mut map = poisoned(&self.warm_target_locks);
+            Arc::clone(map.entry(key.clone()).or_default())
+        };
+        if busy
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            emit_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
+            return None;
+        }
+        let in_proc = InProcWarmGuard { busy };
+
+        // 3b. Cross-process advisory flock (insurance for a future
+        //     multi-daemon topology; today serve is single-replica). LOCK_NB
+        //     ⇒ contended ⇒ cold.
+        let lock_path = warm_dir.join(".witness-lock");
+        let flock = match WarmFlock::acquire_nb(&lock_path) {
+            Ok(Some(fl)) => fl,
+            Ok(None) => {
+                emit_warm_obs(&warm_dir, "cold-fallback", "contended:flock");
+                return None;
+            }
+            Err(e) => {
+                emit_warm_obs(&warm_dir, "cold-fallback", &format!("flock-open:{e}"));
+                return None;
+            }
+        };
+
+        // 4. Stamp LRU recency, then GC older keyed dirs (best-effort; never
+        //    blocks the compile). The stamp makes THIS dir newest so prune's
+        //    ordering can't select it; the explicit `active` skip protects it
+        //    even if the stamp write fails (disk-full) — pruning the dir we
+        //    hold locks on mid-compile would be CGLS-24 by another road.
+        let _ = std::fs::write(warm_dir.join(".last-used"), "");
+        prune_warm_target_dirs(state_dir, &warm_dir);
+
+        emit_warm_obs(&warm_dir, "warm", "hit");
+        Some(WarmTargetGuard {
+            dir: warm_dir,
+            _in_proc: in_proc,
+            _flock: flock,
+        })
     }
 
     /// Route a single-WT push-path project-check through the shared
@@ -2368,7 +2484,8 @@ impl ServeBatchChecker<'_> {
             check_ids: self.check_ids.clone(),
         };
         self.api
-            .with_project_check_overlay(&context, |root| {
+            .with_project_check_overlay(&context, |root, warm| {
+                // Both arms thread the CGLS-26 warm target dir (or None=cold).
                 match gated_ids.as_deref() {
                     // GATED, witness-only. Run EXACTLY the requested witness
                     // ids (their intersection with the dev profile). This is
@@ -2383,9 +2500,9 @@ impl ServeBatchChecker<'_> {
                     // the AND of id-match ∧ profile-match selects exactly the
                     // witnesses). `changed_files=None` so trigger-globbing
                     // never additionally skips a requested witness.
-                    Some(ids) => {
-                        cargoless_core::project_checks::run_profile_with_ids(root, "dev", ids, None)
-                    }
+                    Some(ids) => cargoless_core::project_checks::run_profile_with_ids_in(
+                        root, "dev", ids, None, warm,
+                    ),
                     // ADVISORY lane (or a gated push with no id filter): run
                     // the FULL `dev` profile with NO trigger-filtering
                     // (`only_ids=None`, `changed_files=None`). The compiler
@@ -2399,9 +2516,13 @@ impl ServeBatchChecker<'_> {
                     // others) whose trigger globs the changes don't match —
                     // exactly the gap this path closes. `None` means "no
                     // change-filter → run the whole profile".
-                    None => {
-                        cargoless_core::project_checks::run_profile_with_ids(root, "dev", &[], None)
-                    }
+                    None => cargoless_core::project_checks::run_profile_with_ids_in(
+                        root,
+                        "dev",
+                        &[],
+                        None,
+                        warm,
+                    ),
                 }
             })
             .and_then(|report| report.map_err(|e| format!("project checks failed: {e}")))
@@ -2817,6 +2938,165 @@ fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(),
 
 fn materialize_overlay_files(root: &Path, files: &[(String, String)]) -> Result<(), String> {
     materialize_overlay_files_from_root(root, root, files)
+}
+
+// ── CGLS-26: warm shared witness target dir ──────────────────────────────
+
+/// Feature gate. Default OFF: `CARGOLESS_WITNESS_WARM_TARGET` unset or not
+/// exactly "1" ⇒ cold per-run behavior, byte-identical to before.
+fn warm_target_enabled() -> bool {
+    std::env::var("CARGOLESS_WITNESS_WARM_TARGET").is_ok_and(|v| v == "1")
+}
+
+/// Compute the warm-dir key = short sha256 of (schema, toolchain, lockhash).
+/// Base_sha is intentionally absent (see `resolve_warm_target`). Returns
+/// `None` (⇒ cold) if the toolchain is unresolvable or Cargo.lock is missing
+/// / unreadable — a warm dir keyed on unknown inputs could serve a
+/// schema-incompatible tree, so fail closed.
+fn warm_target_key(scratch_root: &Path) -> Option<String> {
+    let toolchain = warm_toolchain_id()?;
+    // Cargo.lock lives at the scratch (base) root; a missing lock ⇒ cold.
+    let lock_path = scratch_root.join("Cargo.lock");
+    let lock_bytes = std::fs::read(&lock_path).ok()?;
+    let lockhash = sha256_hex(&lock_bytes);
+    let material = format!("{WARM_TARGET_SCHEMA_TAG}\0{toolchain}\0{lockhash}");
+    let full = sha256_hex(material.as_bytes());
+    Some(full[..16].to_string())
+}
+
+/// Resolve a stable toolchain identity. Prefer `RUSTUP_TOOLCHAIN` (set in the
+/// serve deploy env); else a bounded hash of `rustc -vV`. `None` if neither
+/// is obtainable.
+fn warm_toolchain_id() -> Option<String> {
+    if let Ok(tc) = std::env::var("RUSTUP_TOOLCHAIN") {
+        if !tc.trim().is_empty() {
+            return Some(tc);
+        }
+    }
+    let out = Command::new("rustc").arg("-vV").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(sha256_hex(&out.stdout)[..16].to_string())
+}
+
+/// Best-effort GC: keep the newest [`WARM_TARGET_KEEP`] keyed dirs under
+/// `<state_dir>/witness-target-warm/`, remove older ones. Never blocks or
+/// fails the compile — a leaked dir is a disk cost, not a correctness bug.
+///
+/// Two in-use protections (removing a LIVE target dir mid-compile would be
+/// CGLS-24 by another road): `active` (the caller's own dir) is skipped
+/// unconditionally, and every other candidate is removed only after ITS
+/// `.witness-lock` flock is acquired non-blocking — contended = some other
+/// compile owns it = skip this round.
+fn prune_warm_target_dirs(state_dir: &Path, active: &Path) {
+    let root = state_dir.join("witness-target-warm");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let path = e.path();
+            // Recency = the `.last-used` stamp (rewritten every warm hit;
+            // rewriting a file does NOT bump the parent dir's mtime, so the
+            // dir mtime alone would under-count reuse). Dir mtime is the
+            // fallback for dirs predating the stamp.
+            let m = std::fs::metadata(path.join(".last-used"))
+                .and_then(|m| m.modified())
+                .or_else(|_| e.metadata().and_then(|m| m.modified()))
+                .ok()?;
+            Some((m, path))
+        })
+        .collect();
+    if dirs.len() <= WARM_TARGET_KEEP {
+        return;
+    }
+    // Newest first; drop everything past the keep count.
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in dirs.into_iter().skip(WARM_TARGET_KEEP) {
+        if path == active {
+            continue;
+        }
+        match WarmFlock::acquire_nb(&path.join(".witness-lock")) {
+            // Holding the lock: nobody is compiling in there; safe to remove.
+            // The flock dies with the guard whether or not removal succeeds.
+            Ok(Some(_guard)) => {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            // Contended or unreadable: in use / indeterminate — leak it, a
+            // later prune with more evidence gets another chance.
+            Ok(None) | Err(_) => {}
+        }
+    }
+}
+
+fn emit_warm_obs(warm_dir: &Path, mode: &str, reason: &str) {
+    eprintln!(
+        "[cargoless:obs] witness-warm-target dir={} mode={mode} reason={reason}",
+        warm_dir.display()
+    );
+}
+
+/// RAII holder for the resolved warm dir + its two locks. Dropping it
+/// releases the in-process busy flag and the flock (the compile is done).
+struct WarmTargetGuard {
+    dir: PathBuf,
+    _in_proc: InProcWarmGuard,
+    _flock: WarmFlock,
+}
+
+/// Clears the per-key busy flag on drop (normal return OR panic-unwind), so a
+/// finished/aborted witness never leaves the warm key permanently marked
+/// busy. Holds the `Arc` so the flag outlives the daemon map entry if pruned.
+struct InProcWarmGuard {
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for InProcWarmGuard {
+    fn drop(&mut self) {
+        self.busy.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Cross-process advisory lock on `<warm>/.witness-lock` via `flock(2)`,
+/// `LOCK_NB`. Insurance for a future multi-daemon topology; today serve is
+/// single-replica. Holds the open `File` (fd) for the compile; closing it at
+/// Drop releases the lock.
+struct WarmFlock {
+    _file: std::fs::File,
+}
+
+impl WarmFlock {
+    fn acquire_nb(lock_path: &Path) -> std::io::Result<Option<WarmFlock>> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        // LOCK_EX | LOCK_NB = 2 | 4 = 6 on Linux.
+        const LOCK_EX_NB: i32 = 6;
+        // SAFETY: fd is valid for the call; flock is a well-defined syscall.
+        let rc = unsafe {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            flock(file.as_raw_fd(), LOCK_EX_NB)
+        };
+        if rc == 0 {
+            Ok(Some(WarmFlock { _file: file }))
+        } else {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                // EWOULDBLOCK/EAGAIN ⇒ contended, not an error. 11 on Linux
+                // (the deploy target), 35 on macOS (dev/test machines).
+                Some(11) | Some(35) => Ok(None),
+                _ => Err(err),
+            }
+        }
+    }
 }
 
 fn materialize_overlay_files_from_root(
@@ -5452,7 +5732,7 @@ checks:
         };
 
         let seen = api
-            .with_project_check_overlay(&context, |root| {
+            .with_project_check_overlay(&context, |root, _warm| {
                 (
                     std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
                     std::fs::read_to_string(root.join("new.yaml")).unwrap(),
@@ -5503,7 +5783,7 @@ checks:
         };
 
         let seen = api
-            .with_project_check_overlay(&context, |root| {
+            .with_project_check_overlay(&context, |root, _warm| {
                 assert_ne!(
                     root,
                     project.root.as_path(),
@@ -6505,5 +6785,163 @@ checks:
             api.take_project_check_context("/wt").is_none(),
             "take consumes"
         );
+    }
+
+    // ── CGLS-26: warm shared witness target dir ──────────────────────────
+
+    /// Serializes the two tests that flip `CARGOLESS_WITNESS_WARM_TARGET`.
+    /// Env mutation is process-global; without this, one warm test removing
+    /// the var mid-flight fails the other — the exact flake class the
+    /// appserve `CARGOLESS_APP_PARALLEL_BUILDS` tests already exhibit.
+    /// (Other tests are unaffected by a transiently-set flag: their scratch
+    /// roots have no Cargo.lock, so key resolution fails ⇒ cold, as before.)
+    static WARM_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn warm_scratch_with_lockfile(label: &str) -> PathBuf {
+        let root = temp_root(label);
+        std::fs::write(root.join("Cargo.lock"), "# lock v1\n").unwrap();
+        root
+    }
+
+    /// Same (toolchain, Cargo.lock) ⇒ same key; different lock bytes ⇒
+    /// different key; missing lock ⇒ `None` (fail-closed to cold).
+    #[test]
+    fn warm_target_key_is_deterministic_per_lockfile() {
+        let root = warm_scratch_with_lockfile("warm-key-det");
+        let k1 = warm_target_key(&root).expect("toolchain + lock present ⇒ key");
+        let k2 = warm_target_key(&root).expect("second resolve");
+        assert_eq!(
+            k1, k2,
+            "key is a pure function of (schema, toolchain, lock)"
+        );
+
+        std::fs::write(root.join("Cargo.lock"), "# lock v2 — dep graph moved\n").unwrap();
+        let k3 = warm_target_key(&root).expect("changed lock still resolves");
+        assert_ne!(k1, k3, "a Cargo.lock change must land in a FRESH warm dir");
+
+        std::fs::remove_file(root.join("Cargo.lock")).unwrap();
+        assert!(
+            warm_target_key(&root).is_none(),
+            "no Cargo.lock ⇒ no key ⇒ cold fallback"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// flock layer: a held `.witness-lock` makes a second non-blocking
+    /// acquire report contended (`Ok(None)`), and release makes it
+    /// acquirable again. flock(2) locks are per open-file-description, so
+    /// two opens in ONE process genuinely conflict — this exercises the
+    /// real cross-process semantics.
+    #[test]
+    fn warm_flock_second_acquire_contended_until_release() {
+        let root = temp_root("warm-flock");
+        let lock_path = root.join(".witness-lock");
+        let held = WarmFlock::acquire_nb(&lock_path)
+            .expect("io ok")
+            .expect("first acquire wins");
+        assert!(
+            WarmFlock::acquire_nb(&lock_path)
+                .expect("contended is Ok(None), not Err")
+                .is_none(),
+            "second acquire while held ⇒ contended ⇒ caller goes cold"
+        );
+        drop(held);
+        assert!(
+            WarmFlock::acquire_nb(&lock_path).expect("io ok").is_some(),
+            "released lock is acquirable again"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// GC: keeps the newest [`WARM_TARGET_KEEP`] dirs by `.last-used` stamp,
+    /// never removes the active dir or a dir whose `.witness-lock` is held,
+    /// and removes stale unlocked ones.
+    #[test]
+    fn prune_warm_dirs_keeps_active_and_locked_removes_stale() {
+        let state_dir = temp_root("warm-prune-state");
+        let warm_root = state_dir.join("witness-target-warm");
+        // Oldest→newest: stale, locked, mid, active. Distinct stamp mtimes.
+        let mut dirs = Vec::new();
+        for name in ["stale", "locked", "mid", "active"] {
+            let d = warm_root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(".last-used"), "").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            dirs.push(d);
+        }
+        let (stale, locked, mid, active) = (&dirs[0], &dirs[1], &dirs[2], &dirs[3]);
+        let _held = WarmFlock::acquire_nb(&locked.join(".witness-lock"))
+            .expect("io ok")
+            .expect("test holds the busy dir's lock");
+
+        prune_warm_target_dirs(&state_dir, active);
+
+        assert!(active.exists(), "active dir is never pruned");
+        assert!(mid.exists(), "2nd-newest is within WARM_TARGET_KEEP=2");
+        assert!(
+            locked.exists(),
+            "flock-held dir is skipped (in use elsewhere)"
+        );
+        assert!(
+            !stale.exists(),
+            "stale unlocked dir past keep-count is removed"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// Default OFF: with the flag unset, `resolve_warm_target` is `None`
+    /// (cold, byte-identical to today) even when everything else — key,
+    /// locks, dirs — would resolve.
+    #[test]
+    fn resolve_warm_target_flag_off_is_cold() {
+        let _env = WARM_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation is process-global; serialized by
+        // WARM_ENV_LOCK against the other warm-flag test, and behavior-
+        // neutral for non-warm tests (see WARM_ENV_LOCK doc).
+        unsafe { std::env::remove_var("CARGOLESS_WITNESS_WARM_TARGET") };
+        let api = ServeVerdictState::new();
+        let state_dir = temp_root("warm-off-state");
+        let scratch = warm_scratch_with_lockfile("warm-off-scratch");
+        assert!(
+            api.resolve_warm_target(&state_dir, &scratch).is_none(),
+            "flag unset ⇒ cold; the warm path must be opt-in"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// Flag ON: first resolve wins the warm dir; a second resolve for the
+    /// SAME key while the first guard is held goes cold (in-proc busy CAS);
+    /// dropping the guard makes the key warm-resolvable again. This is the
+    /// serialization interlock that keeps CGLS-24 structurally impossible.
+    #[test]
+    fn resolve_warm_target_contended_key_goes_cold_until_release() {
+        let _env = WARM_ENV_LOCK.lock().unwrap();
+        // SAFETY: see `resolve_warm_target_flag_off_is_cold`.
+        unsafe { std::env::set_var("CARGOLESS_WITNESS_WARM_TARGET", "1") };
+        let api = ServeVerdictState::new();
+        let state_dir = temp_root("warm-cas-state");
+        let scratch = warm_scratch_with_lockfile("warm-cas-scratch");
+
+        let first = api
+            .resolve_warm_target(&state_dir, &scratch)
+            .expect("flag on + key resolvable ⇒ warm");
+        assert!(
+            first.dir.starts_with(state_dir.join("witness-target-warm")),
+            "warm dir lives under <state_dir>/witness-target-warm/"
+        );
+        assert!(
+            api.resolve_warm_target(&state_dir, &scratch).is_none(),
+            "same key while held ⇒ contended ⇒ cold (never share a live dir)"
+        );
+        drop(first);
+        assert!(
+            api.resolve_warm_target(&state_dir, &scratch).is_some(),
+            "guard drop releases both lock layers ⇒ key is warm again"
+        );
+
+        unsafe { std::env::remove_var("CARGOLESS_WITNESS_WARM_TARGET") };
+        let _ = std::fs::remove_dir_all(state_dir);
+        let _ = std::fs::remove_dir_all(scratch);
     }
 }
