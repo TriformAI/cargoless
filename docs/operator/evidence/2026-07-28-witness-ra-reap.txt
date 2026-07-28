@@ -1,0 +1,36 @@
+Raw capture — witness-tier RA reap loop, 2026-07-28
+===================================================
+
+Provenance: `kubectl logs` from the witness pod of a downstream operator
+deployment running cargoless image cd4b0a6 (= origin/main tip) with
+CARGOLESS_PROJECT_CHECKS_MODE=warn. Pod logs rotate; this is the durable record
+backing docs/operator/HANDOVER-2026-07-28-RA-REAP-STRANDS-WITNESS.md.
+
+Unmodified except for this header. Contains no secrets: `cluster_id` is a
+content hash of the RA cluster config, and pids are ephemeral. Read alongside
+the handover doc, which explains what each line means.
+
+What to look for:
+  * `ra-reaper: killing` — the external SIGKILL at the 60GiB cap.
+  * `ra.spawn` immediately after — the daemon respawning RA, which then
+    re-indexes from scratch. The pairing is the loop.
+  * Exactly ONE `verdict-emit` in 24h, with `slo_breach=true` on a 10s SLO
+    that was authored for the ~2s RA-native lane (see P3 in the handover).
+
+=== captured 2026-07-28T09:30:46Z ===
+--- reap/respawn 6h ---
+[cargoless-serve-witness] ra-reaper: killing rust-analyzer pid=2288605 rss=62153Mi (>60Gi cap)
+2026-07-28T08:59:09.861283Z  INFO cargoless::servedrv: ra.spawn cluster_id=13b1edd64cdbd0680f70db5c1064ff896fbe2a977f7cd0d1518ef2d5e12cb3f0 ra_pid=2289888 ra_config={"all_features":false,"cargo_check_enabled":false,"cfgs":[],"features":[],"no_default_features":false,"package":null,"proc_macro_override":null,"proc_macro_requested":false,"proc_macro_resolved":false,"release":false,"target":null}
+2026-07-28T09:05:15.123719Z  INFO cargoless::servedrv: ra.spawn cluster_id=13b1edd64cdbd0680f70db5c1064ff896fbe2a977f7cd0d1518ef2d5e12cb3f0 ra_pid=2295977 ra_config={"all_features":false,"cargo_check_enabled":false,"cfgs":[],"features":[],"no_default_features":false,"package":null,"proc_macro_override":null,"proc_macro_requested":false,"proc_macro_resolved":false,"release":false,"target":null}
+[cargoless-serve-witness] ra-reaper: killing rust-analyzer pid=2295977 rss=80823Mi (>60Gi cap)
+2026-07-28T09:07:11.320953Z  INFO cargoless::servedrv: ra.spawn cluster_id=13b1edd64cdbd0680f70db5c1064ff896fbe2a977f7cd0d1518ef2d5e12cb3f0 ra_pid=2299600 ra_config={"all_features":false,"cargo_check_enabled":false,"cfgs":[],"features":[],"no_default_features":false,"package":null,"proc_macro_override":null,"proc_macro_requested":false,"proc_macro_resolved":false,"release":false,"target":null}
+[cargoless-serve-witness] ra-reaper: killing rust-analyzer pid=2299600 rss=82945Mi (>60Gi cap)
+2026-07-28T09:15:57.207974Z  INFO cargoless::servedrv: ra.spawn cluster_id=13b1edd64cdbd0680f70db5c1064ff896fbe2a977f7cd0d1518ef2d5e12cb3f0 ra_pid=2313974 ra_config={"all_features":false,"cargo_check_enabled":false,"cfgs":[],"features":[],"no_default_features":false,"package":null,"proc_macro_override":null,"proc_macro_requested":false,"proc_macro_resolved":false,"release":false,"target":null}
+[cargoless-serve-witness] ra-reaper: killing rust-analyzer pid=2313974 rss=82404Mi (>60Gi cap)
+2026-07-28T09:23:42.862356Z  INFO cargoless::servedrv: ra.spawn cluster_id=13b1edd64cdbd0680f70db5c1064ff896fbe2a977f7cd0d1518ef2d5e12cb3f0 ra_pid=2315455 ra_config={"all_features":false,"cargo_check_enabled":false,"cfgs":[],"features":[],"no_default_features":false,"package":null,"proc_macro_override":null,"proc_macro_requested":false,"proc_macro_resolved":false,"release":false,"target":null}
+[cargoless-serve-witness] ra-reaper: killing rust-analyzer pid=2315455 rss=67117Mi (>60Gi cap)
+2026-07-28T09:30:27.675212Z  INFO cargoless::servedrv: ra.spawn cluster_id=13b1edd64cdbd0680f70db5c1064ff896fbe2a977f7cd0d1518ef2d5e12cb3f0 ra_pid=2317036 ra_config={"all_features":false,"cargo_check_enabled":false,"cfgs":[],"features":[],"no_default_features":false,"package":null,"proc_macro_override":null,"proc_macro_requested":false,"proc_macro_resolved":false,"release":false,"target":null}
+--- verdicts 24h ---
+[cargoless:obs] project-checks wt=/workspace/tf-multiverse root=/workspace/tf-multiverse verdict=red source=coalesced checks_ran=3
+[cargoless:obs] verdict-emit wt=/workspace/tf-multiverse verdict=red red_diagnostics=48 reason=- analysed_at=1785229926 (#247,INFRA-36)
+[cargoless:obs] verdict-latency wt=/workspace/tf-multiverse ms=1340237 slo_ms=10000 slo_breach=true (#A7)
