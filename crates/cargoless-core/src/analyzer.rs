@@ -345,12 +345,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn reap_if_over_cap(shared: &Arc<Shared>, cap_mb: u64) {
     let pid = {
         let mut st = lock(&shared.state);
+        // Re-confirm liveness under the lock: a child that exited between
+        // the caller's check and here must not be signalled (its pid may
+        // already be recycled). Checked in the body rather than a pattern
+        // guard — guard bindings are immutable, and `try_wait` needs
+        // `&mut`.
         match st.child.as_mut() {
-            // Re-confirm liveness under the lock: a child that exited
-            // between the caller's check and here must not be signalled
-            // (its pid may already be recycled).
-            Some(c) if matches!(c.try_wait(), Ok(None)) => c.id(),
-            _ => return,
+            Some(c) => match c.try_wait() {
+                Ok(None) => c.id(),
+                _ => return,
+            },
+            None => return,
         }
     };
     let Some(rss_kb) = current_rss_kb(pid) else {
