@@ -36,11 +36,29 @@
 //!   `ClusterDriver` is mutated only from the single serve loop ⇒ no 2nd
 //!   concurrent per-cluster transaction is representable.
 //! * **(iv) B-as-composed:** a verdict is written at EXACTLY ONE site —
-//!   the `ClusterAction::EmitVerdict` match arm. No wire path reads a
-//!   barrier or attributes a verdict elsewhere (the barrier is private
-//!   to `clusterdrv`; the wire only ever sees `ClusterAction`) ⇒
-//!   pre-settle attribution stays unrepresentable through the
-//!   composition.
+//!   `publish_verdict`. No wire path reads a barrier or attributes a
+//!   verdict elsewhere (the barrier is private to `clusterdrv`; the wire
+//!   only ever sees `ClusterAction`) ⇒ pre-settle attribution stays
+//!   unrepresentable through the composition.
+//!
+//!   **CGLS-27 — two DISPATCH sites, still one WRITE site.** There are
+//!   now two callers that reach `publish_verdict`:
+//!
+//!   1. the `ClusterAction::EmitVerdict` match arm — the only site that
+//!      can express *any* verdict (Green / Red / Unknown), and the only
+//!      one that observes a settled barrier;
+//!   2. `publish_stranded_unknown`, called from the respawn handler for
+//!      a push the respawn stranded — structurally `Unknown`-ONLY.
+//!
+//!   Site 2 is a **safe widening, not a weakening**: it takes no verdict
+//!   parameter and builds `VerdictPayload::unknown` internally, so Green
+//!   and Red are unrepresentable there *by signature*. The property this
+//!   doctrine protects — "no verdict is attributed outside a settled
+//!   barrier" — is preserved, because an `Unknown` attributes no
+//!   analysis result; it reports that no analysis could be completed.
+//!   The `verdict.publish` span's `trigger_source` distinguishes the two
+//!   dispatch sites, so the split stays visible in telemetry rather than
+//!   folded into one label.
 //! * **(v) respawn-staleness closure:** the cluster's
 //!   `OverlayMultiplexer::reset()` is called at EXACTLY ONE site — the
 //!   `Spawned` control-message handler, which is the sole place a
@@ -490,7 +508,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                     lsp_tx.clone(),
                     ctrl_tx.clone(),
                 );
-                drain_spawned(&mut clusters, &ctrl_rx);
+                drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
                 eprintln!(
                     "[cargoless:obs] eager-boot-warm — spawned base cluster RA at {} (push-only; /readyz no longer traffic-dependent)",
                     root.display()
@@ -556,7 +574,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // BEFORE swapping in the new LspClient, so any LspEvents drained
         // next iteration from the new RA cannot interleave with the dead
         // state.
-        drain_spawned(&mut clusters, &ctrl_rx);
+        drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
 
         // #240/2b — overlay-push ingest drain. The PushOverlay write-plane
         // wakeup signal: every `api.push_overlay(...)` call sends the
@@ -603,7 +621,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 // returning. Drain it now so the first pushed batch does
                 // not switch while `cs.lsp` is still None, then get reset
                 // by the next loop's spawn drain.
-                drain_spawned(&mut clusters, &ctrl_rx);
+                drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
             }
             // Feed the SAME DriverEvent::RoutedBatch the watcher path
             // feeds — clusterdrv sees no difference. The SwitchOverlay
@@ -706,7 +724,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                         lsp_tx.clone(),
                         ctrl_tx.clone(),
                     );
-                    drain_spawned(&mut clusters, &ctrl_rx);
+                    drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
                 }
                 route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
             }
@@ -943,13 +961,57 @@ fn spawn_cluster(
     );
 }
 
+/// CGLS-27 — the worktree keys belonging to cluster `h`, in the
+/// client-visible `String` form the attribution map is keyed by.
+///
+/// Pure so the per-cluster scoping property is unit-testable without a
+/// live daemon: the respawn-strand drain must touch ONLY the respawned
+/// cluster's worktrees (see `drain_push_attributions_for`).
+fn worktree_keys_for_cluster(
+    wt_hash: &BTreeMap<WtId, WorkspaceConfigHash>,
+    h: &WorkspaceConfigHash,
+) -> BTreeSet<String> {
+    wt_hash
+        .iter()
+        .filter(|(_, wt_h)| *wt_h == h)
+        .map(|(wt, _)| wt.to_string_lossy().into_owned())
+        .collect()
+}
+
 fn drain_spawned(
     clusters: &mut BTreeMap<WorkspaceConfigHash, ClusterState>,
     ctrl_rx: &Receiver<Ctrl>,
+    wt_hash: &BTreeMap<WtId, WorkspaceConfigHash>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     while let Ok(Ctrl::Spawned(h, client)) = ctrl_rx.try_recv() {
         if let Some(cs) = clusters.get_mut(&h) {
             cs.driver.reset_after_respawn();
+            // CGLS-27 LIVENESS COUNTERPART to the reset above.
+            //
+            // `reset_after_respawn` drops the in-flight txn so the new
+            // RA's events can never settle the dead RA's barrier (#247
+            // no-false-GREEN). That is correct on correctness and silent
+            // on liveness: the stranded push's overlay was ALREADY
+            // consumed, so no fresh `RoutedBatch` re-drives it, and the
+            // pusher's CI polls a frozen mailbox until its budget burns.
+            // Publish an honest `unknown` for exactly those pushes.
+            //
+            // Scoped to THIS cluster's worktrees: the reset stranded only
+            // this driver's txn, and a global drain would resolve other
+            // clusters' healthy in-flight pushes early at exit 75.
+            //
+            // Also runs on the FIRST spawn of a cluster (the Spawned
+            // control message is not restart-only — see the `ra.spawn`
+            // note in `spawn_cluster`). That is a guaranteed no-op:
+            // nothing has been consumed yet, so the map holds no key for
+            // this cluster. No first-spawn guard is needed, and adding
+            // one would be a lie about why it is safe.
+            for (wt_key, attribution) in
+                api.drain_push_attributions_for(&worktree_keys_for_cluster(wt_hash, &h))
+            {
+                publish_stranded_unknown(Path::new(&wt_key), attribution, api);
+            }
             cs.mux.reset();
             cs.lsp = Some(client);
             // In pushed RA-native service mode, a request already carries the
@@ -1432,7 +1494,7 @@ fn exec(
             };
             // Off / Warn / RA-native publish: no Hard witness ran here, so
             // there are no enumerable gated checks to report.
-            publish_verdict(&wt, payload, attribution, Vec::new(), api);
+            publish_verdict(&wt, payload, attribution, Vec::new(), "EmitVerdict", api);
         }
     }
 }
@@ -1543,6 +1605,12 @@ fn publish_verdict(
     // witness's `gated_checks_ran` proof). Empty for FS-watch / RA-native /
     // coalesced / timed-out verdicts — those publish with the key absent.
     gated_checks_ran: Vec<String>,
+    // CGLS-27 — what DISPATCHED this publish, for the `verdict.publish`
+    // span. Was hardcoded `"EmitVerdict"`, which became false the moment a
+    // second dispatch site existed: the respawn-strand drain would have
+    // published under the EmitVerdict label and every dashboard would have
+    // mislabelled it. A parameter keeps the attribute honest per-site.
+    trigger_source: &'static str,
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     let now = statusfile::now_unix();
@@ -1565,13 +1633,20 @@ fn publish_verdict(
     let ra_blind_paths = attribution.as_ref().is_some_and(|a| a.macro_blind_hit);
     // #246 5c KEYSTONE — **Judgment-B sole-attribution at the OTEL surface.**
     // This span MUST be the only emission of `verdict.publish`, mirroring
-    // the structural invariant that publish_verdict fires exactly once per
-    // EmitVerdict — inline from the arm in `exec()` for Off/Warn, deferred
-    // onto the hard-witness supervisor thread for Hard (#A4.3; the
-    // generation guard + watchdog structure enforce the once). A future
-    // emission seam introducing a non-EmitVerdict path would by-pass this
-    // span site → loud telemetry signal at the type-system level (Layer-2
-    // keystone criterion at the OTEL surface).
+    // the structural invariant that every published verdict funnels through
+    // this ONE function — inline from the `EmitVerdict` arm in `exec()` for
+    // Off/Warn, deferred onto the hard-witness supervisor thread for Hard
+    // (#A4.3; the generation guard + watchdog structure enforce the once).
+    // A future emission seam that published WITHOUT calling this function
+    // would by-pass this span site → loud telemetry signal at the
+    // type-system level (Layer-2 keystone criterion at the OTEL surface).
+    //
+    // CGLS-27: `trigger_source` is now a PARAMETER, not the hardcoded
+    // "EmitVerdict" — `publish_stranded_unknown` also dispatches here (an
+    // `Unknown`-only path; see the module doc's two-dispatch-sites note).
+    // Hardcoding the label would have silently mislabelled every stranded
+    // publish as barrier-settled, which is the one thing this span exists
+    // to keep honest.
     //
     // INFRA-36 enrichment (2026-05-25): `red_diagnostics` and
     // `verdict_failure_reason` are now first-class span attributes so a
@@ -1610,7 +1685,7 @@ fn publish_verdict(
         // against the push side.
         ra_blind_paths = ra_blind_paths,
         pid = std::process::id(),
-        trigger_source = "EmitVerdict",
+        trigger_source = trigger_source,
         analysed_at = now,
         otel.status_code = otel_status,
     )
@@ -1671,6 +1746,58 @@ fn publish_verdict(
         attribution.and_then(|a| a.base_sha),
         ra_blind_paths,
         gated_checks_ran,
+    );
+}
+
+/// CGLS-27 — stable classifier for a verdict published because an RA
+/// respawn stranded an already-consumed push.
+///
+/// Deliberately names the RESPAWN, not a cause. This path fires for every
+/// respawn — segfault, kernel OOM-killer, an operator's external reaper,
+/// or (once it lands) cargoless's own memory cap. Only the cap itself can
+/// know the cap fired, so a cap-specific classifier belongs there; naming
+/// a cause here would mislabel every other respawn. Downstream groups on
+/// the `ra_respawn_` prefix.
+const STRANDED_PUSH_REASON: &str = "ra_respawn_stranded_push";
+
+/// CGLS-27 — publish an honest `unknown` for a push stranded by an RA
+/// respawn. The LIVENESS counterpart to `reset_after_respawn`'s
+/// correctness fail-safe.
+///
+/// ## Green and Red are unrepresentable here — by signature
+///
+/// This takes NO verdict parameter: it constructs
+/// [`statusfile::VerdictPayload::unknown`] internally. That is the whole
+/// safety argument. The "exactly one verdict site" doctrine (module doc)
+/// exists to stop a second site from attributing a GREEN or a RED outside
+/// the proven barrier. A site that *cannot express* either is a strictly
+/// safe widening of that doctrine rather than a weakening of it —
+/// enforced by the type of the function, not by the discipline of whoever
+/// edits it next. Do NOT add a payload parameter to this function; add a
+/// new call to `publish_verdict` if a future path genuinely needs one.
+///
+/// The published `unknown` maps to exit 75 (EX_TEMPFAIL) in `cargoless
+/// verdict` — "infra could not decide, escalate", which is exactly the
+/// truth here, and is NOT a code red.
+fn publish_stranded_unknown(
+    wt: &Path,
+    attribution: crate::serveapi::PushAttribution,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
+) {
+    eprintln!(
+        "[cargoless:obs] stranded-push wt={} verdict=unknown reason={} base_sha={} (CGLS-27)",
+        wt.display(),
+        STRANDED_PUSH_REASON,
+        attribution.base_sha.as_deref().unwrap_or("-"),
+    );
+    publish_verdict(
+        wt,
+        statusfile::VerdictPayload::unknown(STRANDED_PUSH_REASON),
+        Some(attribution),
+        // No project checks ran — RA died before a verdict existed.
+        Vec::new(),
+        "RaRespawnStranded",
+        api,
     );
 }
 
@@ -2115,7 +2242,14 @@ fn spawn_project_checks_hard_with_timeout(
             let summary = apply_require_checks(summary, require_checks);
             let payload = compose_hard_mode_payload(authoritative_error, summary);
             if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
-                publish_verdict(&wt, payload, attribution, ran_check_ids, &api);
+                publish_verdict(
+                    &wt,
+                    payload,
+                    attribution,
+                    ran_check_ids,
+                    "EmitVerdict",
+                    &api,
+                );
             } else {
                 eprintln!(
                     "[cargoless:obs] project-checks-hard wt={} verdict=stale-witness-dropped generation={} (#A4.3)",
@@ -2143,7 +2277,14 @@ fn spawn_project_checks_hard_with_timeout(
         );
         if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
             // No supervisor thread spawned ⇒ no witness ran ⇒ no gated checks.
-            publish_verdict(&wt, payload, attribution_fallback, Vec::new(), &api);
+            publish_verdict(
+                &wt,
+                payload,
+                attribution_fallback,
+                Vec::new(),
+                "EmitVerdict",
+                &api,
+            );
         }
     }
 }
@@ -2493,6 +2634,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    // ────────── CGLS-27 — respawn-strand scoping + payload ──────────
+
+    #[test]
+    fn worktree_keys_for_cluster_selects_only_that_clusters_worktrees() {
+        // The scoping input to the respawn-strand drain. If this over-
+        // selects, a respawn on cluster A resolves cluster B's healthy
+        // in-flight pushes at exit 75.
+        let a = WorkspaceConfig::default().hash();
+        let b = WorkspaceConfig {
+            cargo_toml: Some("[workspace]\nmembers=[\"other\"]\n".to_string()),
+            ..WorkspaceConfig::default()
+        }
+        .hash();
+        assert_ne!(a, b, "fixture must model two DISTINCT clusters");
+
+        let mut wt_hash: BTreeMap<WtId, WorkspaceConfigHash> = BTreeMap::new();
+        wt_hash.insert(PathBuf::from("/wt/a1"), a.clone());
+        wt_hash.insert(PathBuf::from("/wt/a2"), a.clone());
+        wt_hash.insert(PathBuf::from("/wt/b1"), b.clone());
+
+        let keys_a = worktree_keys_for_cluster(&wt_hash, &a);
+        assert_eq!(
+            keys_a,
+            BTreeSet::from(["/wt/a1".to_string(), "/wt/a2".to_string()]),
+            "both of cluster A's worktrees, and NOT B's"
+        );
+        assert_eq!(
+            worktree_keys_for_cluster(&wt_hash, &b),
+            BTreeSet::from(["/wt/b1".to_string()])
+        );
+    }
+
+    #[test]
+    fn stranded_push_publishes_unknown_with_the_stable_classifier() {
+        // The P0 contract end-to-end at the API surface: a stranded push
+        // resolves to `unknown` (→ exit 75 EX_TEMPFAIL in `cargoless
+        // verdict`), never green and never red, and carries the stable
+        // classifier downstream dashboards group on.
+        let root = temp_root("stranded-unknown");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        let wt_key = root.to_string_lossy().into_owned();
+
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: None,
+            base_sha: Some("deadbeef".into()),
+            changed_files: None,
+            gate: false,
+            check_ids: None,
+        };
+        assert!(
+            api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options))
+                .accepted
+        );
+        // Consume the overlay exactly as the SwitchOverlay arm does — this
+        // is the instant after which a respawn strands the push.
+        let pushed = api.take_overlay_for(&wt_key).expect("pushed overlay");
+        api.record_push_attribution(&wt_key, &pushed);
+
+        let drained = api.drain_push_attributions_for(&BTreeSet::from([wt_key.clone()]));
+        assert_eq!(drained.len(), 1, "the stranded push");
+        for (key, attribution) in drained {
+            publish_stranded_unknown(Path::new(&key), attribution, &api);
+        }
+
+        let status = api.get_status(&wt_key).expect("a verdict was published");
+        assert_eq!(
+            status.verdict, "unknown",
+            "stranded ⇒ honest unknown (exit 75), never green and never red"
+        );
+        assert_eq!(
+            status.verdict_failure_reason.as_deref(),
+            Some(STRANDED_PUSH_REASON),
+            "stable classifier so downstream CI + dashboards can group on it"
+        );
+        assert_eq!(
+            status.base_sha.as_deref(),
+            Some("deadbeef"),
+            "the stranded push's own SHA — so CI attributes the unknown to ITS push"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
