@@ -2679,18 +2679,20 @@ mod tests {
         let wt_key = root.to_string_lossy().into_owned();
 
         let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        // Absolute-path push: `repo_relative: true` REQUIRES an
+        // analysis_root (the daemon rejects the combination), and this
+        // test is about the strand, not overlay materialization.
         let options = PushOverlayOptions {
-            repo_relative: true,
+            repo_relative: false,
             analysis_root: None,
             base_sha: Some("deadbeef".into()),
             changed_files: None,
             gate: false,
             check_ids: None,
         };
-        assert!(
-            api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options))
-                .accepted
-        );
+        let ack =
+            api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options));
+        assert!(ack.accepted, "push must be accepted to be strandable");
         // Consume the overlay exactly as the SwitchOverlay arm does — this
         // is the instant after which a respawn strands the push.
         let pushed = api.take_overlay_for(&wt_key).expect("pushed overlay");
