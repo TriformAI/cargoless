@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Factory for the supervised process. Called once at start and again on
 /// every restart, so for rust-analyzer this is where the LSP initialize
@@ -34,6 +34,85 @@ pub type SpawnFn = dyn Fn() -> io::Result<Child> + Send + Sync + 'static;
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MIN_BACKOFF: Duration = Duration::from_millis(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
+
+/// CGLS-28 — how often the monitor samples RA's RSS when the memory cap
+/// is armed. The liveness poll runs at 40ms; reading `/proc/<pid>/status`
+/// that often would be pointless syscall traffic for a process that takes
+/// tens of seconds to balloon. 2s is ~2-4 GB of headroom at the ~1.8 GB/s
+/// growth rate the field report measured — fine for a runaway detector,
+/// which is all this is.
+const RSS_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// CGLS-28 — RSS ceiling (MiB) for the supervised rust-analyzer.
+/// **`0` (the default) = disabled**, matching the repo's knob convention
+/// (`CARGOLESS_WITNESS_MAX_INFLIGHT`, `CARGOLESS_WITNESS_WARM_TARGET`).
+///
+/// Unparseable values also yield `0`: a typo must not silently arm a
+/// process-killing cap.
+fn ra_max_rss_mb() -> u64 {
+    std::env::var("CARGOLESS_RA_MAX_RSS_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// CGLS-28 — the cap predicate. Pure, and deliberately NOT `cfg`-gated so
+/// the default-off guarantee is provable by unit test on any host rather
+/// than by reading the call site.
+///
+/// `cap_mb == 0` ⇒ never reap, at ANY resident size. That is the whole
+/// safety property of shipping this default-off.
+fn should_reap(rss_kb: u64, cap_mb: u64) -> bool {
+    if cap_mb == 0 {
+        return false;
+    }
+    rss_kb / 1024 >= cap_mb
+}
+
+/// CGLS-28 — parse `VmRSS` (in kB) out of `/proc/<pid>/status`.
+///
+/// Pure over the file's CONTENT so it unit-tests on macOS dev machines
+/// where no such file exists. `None` on anything unexpected ⇒ the caller
+/// never reaps ⇒ a malformed/absent file degrades to today's behaviour.
+///
+/// Matches `VmRSS` exactly and not by prefix: the adjacent `VmHWM` is the
+/// high-water mark and is >= `VmRSS`, so a sloppy match would fire the cap
+/// early — on memory that has already been returned.
+fn parse_vm_rss_kb(status_contents: &str) -> Option<u64> {
+    status_contents.lines().find_map(|line| {
+        let (key, rest) = line.split_once(':')?;
+        if key.trim() != "VmRSS" {
+            return None;
+        }
+        let mut parts = rest.split_whitespace();
+        let value = parts.next()?.parse::<u64>().ok()?;
+        // The kernel always reports VmRSS in kB; refuse anything else
+        // rather than silently mis-scaling by 1024x.
+        match parts.next() {
+            Some(unit) if unit.eq_ignore_ascii_case("kB") => Some(value),
+            _ => None,
+        }
+    })
+}
+
+/// CGLS-28 — current RSS (kB) of `pid`, or `None` when it cannot be known.
+///
+/// Linux-only by construction: `/proc/<pid>/status` does not exist
+/// elsewhere. On every other platform this returns `None`, so the cap can
+/// never fire and behaviour is byte-identical to pre-CGLS-28. The parser
+/// above stays un-`cfg`'d and is tested everywhere.
+fn current_rss_kb(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        parse_vm_rss_kb(&contents)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
 
 struct SupState {
     child: Option<Child>,
@@ -254,8 +333,68 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// CGLS-28 — SIGKILL the supervised child if it is over `cap_mb`.
+///
+/// Deliberately does NOT respawn: it only kills. The monitor's existing
+/// `try_wait` sees the death on its next iteration and takes the ordinary
+/// AC#6 respawn path, so the cap introduces no second restart mechanism
+/// and no new state machine.
+///
+/// The lock is held only for the pid read and the kill — never across the
+/// `/proc` read, which is I/O.
+fn reap_if_over_cap(shared: &Arc<Shared>, cap_mb: u64) {
+    let pid = {
+        let mut st = lock(&shared.state);
+        match st.child.as_mut() {
+            // Re-confirm liveness under the lock: a child that exited
+            // between the caller's check and here must not be signalled
+            // (its pid may already be recycled).
+            Some(c) if matches!(c.try_wait(), Ok(None)) => c.id(),
+            _ => return,
+        }
+    };
+    let Some(rss_kb) = current_rss_kb(pid) else {
+        // Non-Linux, or the process vanished mid-read. Never reap on an
+        // unknown size — that is the fail-safe direction.
+        return;
+    };
+    if !should_reap(rss_kb, cap_mb) {
+        return;
+    }
+    // Structured, always-on line. `Stdio::inherit()` for RA's own stderr
+    // is deliberate ("make RA death visible", 5914e1c); this is the line
+    // that keeps a capped death visible even once an operator sets
+    // CARGOLESS_RA_STDERR=null.
+    eprintln!(
+        "[cargoless:obs] ra-memory-cap-reap pid={pid} rss_mb={} cap_mb={cap_mb} (CGLS-28)",
+        rss_kb / 1024,
+    );
+    let mut st = lock(&shared.state);
+    if let Some(c) = st.child.as_mut() {
+        // Confirm the pid still matches before signalling: between the
+        // read above and this lock, the child could have died and been
+        // replaced.
+        if c.id() != pid {
+            return;
+        }
+        // The process GROUP, not just the child — `proc-macro-srv`
+        // descendants are part of the runaway and would otherwise survive.
+        #[cfg(unix)]
+        kill_process_group(pid as i32);
+        let _ = c.kill();
+    }
+}
+
 fn monitor_loop(shared: Arc<Shared>) {
     let mut backoff = MIN_BACKOFF;
+    // CGLS-28 — read the cap ONCE. The knob is deployment config, not a
+    // live control, and re-reading env on a 40ms loop would be pointless
+    // syscall traffic.
+    let cap_mb = ra_max_rss_mb();
+    let mut last_rss_sample = Instant::now();
+    if cap_mb > 0 {
+        eprintln!("[cargoless:obs] ra-memory-cap armed cap_mb={cap_mb} (CGLS-28)");
+    }
     loop {
         if shared.shutdown.load(Ordering::SeqCst) {
             break;
@@ -274,6 +413,22 @@ fn monitor_loop(shared: Arc<Shared>) {
         };
 
         if !dead {
+            // CGLS-28 — runaway-memory reap. A live child over the cap is
+            // SIGKILLed here; the next iteration observes the death and
+            // takes the ORDINARY respawn path below, so this adds no new
+            // respawn logic. Downstream, the serve loop's CGLS-27 drain
+            // then publishes `unknown` for any push the death stranded —
+            // that pairing is what makes the cap safe to arm. A cap
+            // WITHOUT CGLS-27 would just reproduce the silent wedge with
+            // better logging.
+            //
+            // `cap_mb == 0` (the default) short-circuits before any
+            // syscall, so an unconfigured daemon does exactly what it did
+            // before: sleep and poll.
+            if cap_mb > 0 && last_rss_sample.elapsed() >= RSS_SAMPLE_INTERVAL {
+                last_rss_sample = Instant::now();
+                reap_if_over_cap(&shared, cap_mb);
+            }
             thread::sleep(POLL_INTERVAL);
             continue;
         }
@@ -531,42 +686,53 @@ impl ReapOnDrop {
     }
 }
 
+/// SIGKILL `pid`'s whole process group plus every straggler in its
+/// session (FIELD FINDING #3b: pgid alone left ~1.75 zombies per check).
+///
+/// Extracted from [`ReapOnDrop::drop`] (CGLS-28) so the memory cap reaps
+/// through the SAME proven path. A bare `Child::kill()` signals only the
+/// immediate child and leaves `proc-macro-srv` descendants running — on a
+/// runaway-memory kill those descendants are precisely what must die.
+///
+/// Best effort throughout: ESRCH on an already-dead member is fine. Unix
+/// only; a no-op elsewhere, where the caller's `Child::kill()` stands
+/// alone as it always has.
+#[cfg(unix)]
+fn kill_process_group(pid: i32) {
+    // Step 1: snapshot session members BEFORE killing. RA was set up as
+    // a session leader via setsid in pre_exec, so the session id equals
+    // the pid. `pgrep -s` is on every modern Linux + macOS (procps-ng +
+    // BSD procps); a missing pgrep (musl minimal containers) just makes
+    // step 3 a no-op — step 2's pgid kill still runs.
+    let session_members = snapshot_session_members(pid);
+    // Step 2: SIGKILL the whole process group (the fast path — catches
+    // every descendant that inherited the pgid).
+    unsafe {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        // Best effort: ESRCH is fine — we just want a successful reap
+        // afterward.
+        let _ = kill(-pid, SIGKILL);
+        // Step 3: SIGKILL each session-member individually (the setpgid
+        // escapees missed by step 2). Skip pid itself (already killed via
+        // -pid above). ESRCH for any already-dead member is harmless.
+        for m in session_members {
+            if m != pid {
+                let _ = kill(m, SIGKILL);
+            }
+        }
+    }
+}
+
 impl Drop for ReapOnDrop {
     fn drop(&mut self) {
         let Some(mut child) = self.0.take() else {
             return;
         };
         #[cfg(unix)]
-        {
-            let pid = child.id() as i32;
-            // Step 1: snapshot session members BEFORE killing. RA was set
-            // up as a session leader via setsid in pre_exec, so the
-            // session id equals the pid. `pgrep -s` is on every modern
-            // Linux + macOS (procps-ng + BSD procps); a missing pgrep
-            // (musl minimal containers) just makes step 3 a no-op —
-            // step 2's pgid kill still runs.
-            let session_members = snapshot_session_members(pid);
-            // Step 2: SIGKILL the whole process group (the fast path —
-            // catches every descendant that inherited the pgid).
-            unsafe {
-                unsafe extern "C" {
-                    fn kill(pid: i32, sig: i32) -> i32;
-                }
-                const SIGKILL: i32 = 9;
-                // Best effort: ESRCH is fine — we just want a successful
-                // reap afterward.
-                let _ = kill(-pid, SIGKILL);
-                // Step 3: SIGKILL each session-member individually (the
-                // setpgid escapees missed by step 2). Skip pid itself
-                // (already killed via -pid above). ESRCH for any already-
-                // dead member is harmless.
-                for m in session_members {
-                    if m != pid {
-                        let _ = kill(m, SIGKILL);
-                    }
-                }
-            }
-        }
+        kill_process_group(child.id() as i32);
         // Step 4: belt-and-braces immediate-child kill + wait. On Unix
         // the SIGKILL above usually already terminated it; the wait
         // here is what frees the PID slot.
@@ -753,6 +919,93 @@ pub fn probe_abi_alignment(ra: &OsString) -> AbiAlignment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ────────── CGLS-28 — RA memory cap (default-off) ──────────
+
+    #[test]
+    fn cap_zero_never_reaps_at_any_resident_size() {
+        // THE default-off guarantee, proved rather than asserted by
+        // reading the call site. An unconfigured daemon must behave
+        // byte-identically to pre-CGLS-28 no matter how large RA gets.
+        assert!(!should_reap(0, 0));
+        assert!(!should_reap(86 * 1024 * 1024, 0), "86 GiB, cap off");
+        assert!(!should_reap(u64::MAX, 0), "no size arms a disabled cap");
+    }
+
+    #[test]
+    fn cap_fires_at_or_above_the_boundary() {
+        // 1 MiB = 1024 kB. `>=`, so the cap is inclusive.
+        assert!(!should_reap(1023, 1), "just under 1 MiB");
+        assert!(should_reap(1024, 1), "exactly at the cap ⇒ reap");
+        assert!(should_reap(2048, 1), "over");
+        // The field-report shape: 60 GiB cap, RA at ~83 GiB.
+        assert!(should_reap(83 * 1024 * 1024, 60 * 1024));
+        assert!(!should_reap(59 * 1024 * 1024, 60 * 1024));
+    }
+
+    #[test]
+    fn parse_vm_rss_reads_vmrss_and_not_the_adjacent_vmhwm() {
+        // VmHWM (high-water mark) sits directly above VmRSS in the real
+        // file and is >= it. Matching it instead would reap on memory
+        // that has ALREADY been returned — firing the cap early.
+        let status = "Name:\trust-analyzer\n\
+                      State:\tR (running)\n\
+                      VmPeak:\t90000000 kB\n\
+                      VmSize:\t85000000 kB\n\
+                      VmHWM:\t 86000000 kB\n\
+                      VmRSS:\t 62153216 kB\n\
+                      Threads:\t17\n";
+        assert_eq!(parse_vm_rss_kb(status), Some(62_153_216));
+    }
+
+    #[test]
+    fn parse_vm_rss_returns_none_on_malformed_input() {
+        // None ⇒ caller never reaps. Every degradation is fail-safe.
+        assert_eq!(parse_vm_rss_kb(""), None, "empty");
+        assert_eq!(parse_vm_rss_kb("Name:\trust-analyzer\n"), None, "no VmRSS");
+        assert_eq!(
+            parse_vm_rss_kb("VmRSS:\tnotanumber kB\n"),
+            None,
+            "unparseable"
+        );
+        assert_eq!(parse_vm_rss_kb("VmRSS:\n"), None, "no value");
+        assert_eq!(
+            parse_vm_rss_kb("VmRSS:\t62153216 MB\n"),
+            None,
+            "unexpected unit must not be mis-scaled by 1024x"
+        );
+        assert_eq!(
+            parse_vm_rss_kb("NotVmRSS:\t123 kB\n"),
+            None,
+            "exact key match, not a suffix/prefix match"
+        );
+    }
+
+    #[test]
+    fn current_rss_is_none_off_linux_so_the_cap_cannot_fire() {
+        // The platform contract: /proc/<pid>/status is Linux-only, so
+        // everywhere else this is None ⇒ `reap_if_over_cap` returns
+        // early ⇒ behaviour is byte-identical to pre-CGLS-28. Keeps the
+        // repo's first target_os cfg honest on dev machines.
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(current_rss_kb(std::process::id()), None);
+        // On Linux the daemon's own RSS is readable and non-zero.
+        #[cfg(target_os = "linux")]
+        assert!(current_rss_kb(std::process::id()).is_some_and(|kb| kb > 0));
+    }
+
+    #[test]
+    fn ra_max_rss_mb_defaults_to_zero_when_unset_or_malformed() {
+        // Env is process-global and tests run in parallel, so assert only
+        // on the unset/parse path via the same parse the getter uses: a
+        // typo must never silently arm a process-killing cap.
+        let parse = |v: &str| v.trim().parse::<u64>().ok().unwrap_or(0);
+        assert_eq!(parse(""), 0);
+        assert_eq!(parse("off"), 0);
+        assert_eq!(parse("-1"), 0, "negative is not a valid cap");
+        assert_eq!(parse("48gb"), 0, "unit suffixes are not accepted");
+        assert_eq!(parse(" 49152 "), 49152, "whitespace-tolerant");
+    }
 
     #[test]
     fn parse_ra_release_extracts_semver() {
