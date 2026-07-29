@@ -1587,6 +1587,59 @@ impl ServeVerdictState {
         poisoned(&self.push_attribution).remove(worktree)
     }
 
+    /// CGLS-27 — drain the attributions of pushes STRANDED by a
+    /// rust-analyzer respawn, restricted to `worktrees` (the caller's
+    /// respawned cluster).
+    ///
+    /// ## Why a lingering entry *is* the stranded set
+    ///
+    /// An attribution is recorded at EXACTLY ONE site (the SwitchOverlay
+    /// exec arm, at overlay-consume) and removed at EXACTLY ONE site
+    /// ([`Self::take_push_attribution`], at EmitVerdict dispatch). So an
+    /// entry that is still present means: this push's overlay was
+    /// consumed, but its verdict never dispatched. When RA dies mid-check,
+    /// `ClusterDriver::reset_after_respawn` drops the in-flight txn to keep
+    /// the #247 no-false-GREEN invariant — correct, but it leaves that
+    /// consumed push with nothing to re-drive it. The entry is the only
+    /// remaining evidence the push ever existed.
+    ///
+    /// A worktree sitting in the driver's deliberately-retained `pending`
+    /// queue has NO attribution (it never reached SwitchOverlay), so this
+    /// drain cannot steal a push that is still legitimately queued. And
+    /// since a driver holds at most ONE in-flight txn, this returns 0 or 1
+    /// entry per respawned cluster in practice — not a crowd.
+    ///
+    /// ## Why `worktrees`-scoped and not a global drain
+    ///
+    /// `reset_after_respawn` strands only the respawned cluster's own
+    /// in-flight txn; other clusters' drivers are untouched and their
+    /// in-flight pushes are still going to publish normally. A global
+    /// drain would publish a spurious `unknown` for those — resolving a
+    /// healthy push's CI early at exit 75 when it was about to go green.
+    /// The caller passes the worktree keys belonging to the respawned
+    /// cluster only.
+    ///
+    /// ## Drain, not peek
+    ///
+    /// Entries are REMOVED. A second respawn (the reap loop this exists
+    /// for is sustained, not one-shot) therefore cannot re-publish a push
+    /// that was already resolved by the first — publish-once survives a
+    /// tight kill/respawn cycle by construction rather than by timing.
+    pub(crate) fn drain_push_attributions_for(
+        &self,
+        worktrees: &BTreeSet<String>,
+    ) -> Vec<(String, PushAttribution)> {
+        let mut map = poisoned(&self.push_attribution);
+        let keys: Vec<String> = map
+            .keys()
+            .filter(|k| worktrees.contains(*k))
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| map.remove(&k).map(|a| (k, a)))
+            .collect()
+    }
+
     /// #A4.3 — claim the hard-witness slot for `(wt_key, base_sha)`. Returns
     /// the new generation; a previously claimed (still-running) witness for
     /// the same key is implicitly invalidated (its `finish_hard_witness` will
@@ -6160,6 +6213,102 @@ checks:
             api.take_push_attribution("/wt").is_none(),
             "pop-on-consume: one publish consumes the attribution"
         );
+    }
+
+    // ────────── CGLS-27 — respawn-stranded push drain ──────────
+
+    /// Minimal pushed overlay for the drain tests.
+    fn stranded_pushed(sha: &str) -> PushedOverlay {
+        PushedOverlay {
+            base_ref: "origin/main".into(),
+            files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
+            analysis_root: None,
+            base_sha: Some(sha.into()),
+            last_push_unix: crate::statusfile::now_unix(),
+            changed_files: None,
+            check_profile: None,
+            gate: false,
+            check_ids: None,
+        }
+    }
+
+    #[test]
+    fn drain_stranded_attributions_is_drain_not_peek() {
+        // The reap loop this exists for is SUSTAINED, not one-shot: a
+        // second respawn must not re-publish a push the first already
+        // resolved. Removal (not a read) is what makes publish-once hold
+        // across a tight kill/respawn cycle by construction.
+        let api = ServeVerdictState::new();
+        api.record_push_attribution("/wt", &stranded_pushed("abc123"));
+
+        let keys = BTreeSet::from(["/wt".to_string()]);
+        let first = api.drain_push_attributions_for(&keys);
+        assert_eq!(first.len(), 1, "the consumed-but-unpublished push");
+        assert_eq!(first[0].0, "/wt");
+        assert_eq!(first[0].1.base_sha.as_deref(), Some("abc123"));
+
+        assert!(
+            api.drain_push_attributions_for(&keys).is_empty(),
+            "second respawn must find nothing — no double-publish"
+        );
+    }
+
+    #[test]
+    fn drain_stranded_attributions_is_scoped_to_the_respawned_cluster() {
+        // THE load-bearing safety property. `reset_after_respawn` strands
+        // only the respawned cluster's in-flight txn; other clusters' RAs
+        // are alive and their pushes are still going to publish normally.
+        // A global drain would resolve those at exit 75 while they were
+        // about to go green — turning a fix into a regression.
+        let api = ServeVerdictState::new();
+        api.record_push_attribution("/cluster-a/wt", &stranded_pushed("aaa"));
+        api.record_push_attribution("/cluster-b/wt", &stranded_pushed("bbb"));
+
+        let only_a = BTreeSet::from(["/cluster-a/wt".to_string()]);
+        let drained = api.drain_push_attributions_for(&only_a);
+
+        assert_eq!(drained.len(), 1, "only the respawned cluster's worktree");
+        assert_eq!(drained[0].0, "/cluster-a/wt");
+        assert_eq!(
+            api.take_push_attribution("/cluster-b/wt")
+                .expect("healthy cluster's push must be UNTOUCHED")
+                .base_sha
+                .as_deref(),
+            Some("bbb"),
+        );
+    }
+
+    #[test]
+    fn drain_stranded_attributions_empty_when_nothing_consumed() {
+        // The first spawn of a cluster also delivers Ctrl::Spawned, so the
+        // drain runs there too. Nothing has been consumed yet ⇒ no keys ⇒
+        // no spurious `unknown` at boot. This is why no first-spawn guard
+        // is needed (and why adding one would misstate the reason).
+        let api = ServeVerdictState::new();
+        assert!(
+            api.drain_push_attributions_for(&BTreeSet::from(["/wt".to_string()]))
+                .is_empty(),
+            "boot spawn must publish nothing"
+        );
+    }
+
+    #[test]
+    fn drain_stranded_attributions_ignores_unrelated_keys() {
+        // A worktree in the driver's deliberately-retained `pending` queue
+        // never reached SwitchOverlay, so it has no attribution and cannot
+        // be stolen by the drain. Modelled here as a key with no entry.
+        let api = ServeVerdictState::new();
+        api.record_push_attribution("/wt-consumed", &stranded_pushed("ccc"));
+
+        let keys = BTreeSet::from(["/wt-consumed".to_string(), "/wt-queued-only".to_string()]);
+        let drained = api.drain_push_attributions_for(&keys);
+
+        assert_eq!(
+            drained.len(),
+            1,
+            "only the CONSUMED push is stranded; a queued-only WT has no attribution"
+        );
+        assert_eq!(drained[0].0, "/wt-consumed");
     }
 
     // ──────────────── #A8 — macro-blind classification ────────────────
