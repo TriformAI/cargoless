@@ -742,6 +742,54 @@ struct RunContext {
     witness_target_dir: Option<PathBuf>,
 }
 
+/// True for checks that will compile into the SHARED warm `CARGO_TARGET_DIR`,
+/// i.e. the ones that must not run concurrently with each other.
+///
+/// Only `command` checks ever inherit `CARGO_TARGET_DIR` (see `check_command`);
+/// every other kind is pure in-process analysis and is unaffected. And only a
+/// `Some` warm dir is shared — with `None` each run compiles into its own
+/// per-run `<root>/.cargoless-target`, so there is nothing to contend on and
+/// this predicate is false for everything.
+fn shares_warm_target(ctx: &RunContext, check: &CheckConfig) -> bool {
+    ctx.witness_target_dir.is_some() && check.kind == CheckKind::Command
+}
+
+/// Run `checks` with at most `max_parallel` in flight — EXCEPT that checks
+/// sharing the warm target dir form a **serial class**: at most one of those
+/// runs at a time, while everything else keeps fanning out normally.
+///
+/// ## Why the serial class exists
+///
+/// It does not buy wall-clock. Those compiles were ALREADY serialized, just
+/// invisibly and wastefully: cargo takes an exclusive `flock` on
+/// `<target>/<layout>/.cargo-lock` for the build, so N concurrent `cargo`s
+/// against one target dir means one builder and N-1 processes parked in
+/// `locks_lock_inode_wait`. Observed live on the witness pod (2026-07-30),
+/// three witnesses on one warm dir:
+///
+/// ```text
+/// FLOCK ADVISORY WRITE 91447 …2767534        <- wasm holds release/
+///    -> FLOCK ADVISORY WRITE 91467 …2767534  <- csr blocked
+///    -> FLOCK ADVISORY WRITE 91489 …2767534  <- ssr blocked
+/// ```
+///
+/// The two waiters had burned 256s of wall for ~0.5s of CPU. Admitting them
+/// only to have the kernel park them costs a thread, a live scratch worktree,
+/// and a process that *looks* like running work in `ps` and in the operator's
+/// mental model. Holding them in `pending` instead is the same execution
+/// order with none of that.
+///
+/// So this is a **clarity and resource fix, not a latency fix** — expect
+/// verdict latency to be unchanged. If it improves, the convoy was costing
+/// more than the lock analysis predicted and that is worth understanding
+/// rather than just banking.
+///
+/// ## Why not `max_parallel: 1` in the manifest
+///
+/// `max_parallel` is per-PROFILE, and the `dev` profile carries 111 checks —
+/// the witnesses are 3 of them. Capping the profile would serialize the whole
+/// advisory governance lane. The constraint is a property of the shared target
+/// dir, not of the profile, so it belongs here where that dir is known.
 fn run_parallel(
     ctx: Arc<RunContext>,
     checks: Vec<CheckConfig>,
@@ -752,6 +800,8 @@ fn run_parallel(
     let mut pending: VecDeque<CheckConfig> = checks.into();
     let (tx, rx) = mpsc::channel();
     let mut in_flight = 0usize;
+    // Count of in-flight members of the warm-target serial class (0 or 1).
+    let mut warm_in_flight = 0usize;
     let mut out = Vec::new();
 
     while !pending.is_empty() || in_flight > 0 {
@@ -759,22 +809,46 @@ fn run_parallel(
             if start.elapsed() >= Duration::from_millis(profile_timeout_ms) {
                 break;
             }
-            let check = pending.pop_front().expect("pending not empty");
+            // Scan for the first admissible check rather than always taking
+            // the head: a blocked warm check must not stall the non-warm
+            // checks queued behind it (that would be the profile-wide
+            // serialization this design exists to avoid). Order within each
+            // class is still FIFO, and `out` is sorted by id at the end, so
+            // the reported result order is unaffected either way.
+            let Some(idx) = pending
+                .iter()
+                .position(|c| warm_in_flight == 0 || !shares_warm_target(&ctx, c))
+            else {
+                // Everything left is warm-class and one is already running:
+                // wait for it to finish rather than spinning.
+                break;
+            };
+            let check = pending.remove(idx).expect("index from position()");
+            let warm = shares_warm_target(&ctx, &check);
+            if warm {
+                warm_in_flight += 1;
+            }
             let tx = tx.clone();
             let ctx = ctx.clone();
             in_flight += 1;
             thread::spawn(move || {
                 let result = run_one(&ctx, check);
-                let _ = tx.send(result);
+                // Report the class back so the scheduler releases the serial
+                // slot on the SAME path it took it — including when `run_one`
+                // returns an error result.
+                let _ = tx.send((warm, result));
             });
         }
         if in_flight == 0 {
             break;
         }
         match rx.recv() {
-            Ok(result) => {
+            Ok((warm, result)) => {
                 out.push(result);
                 in_flight -= 1;
+                if warm {
+                    warm_in_flight -= 1;
+                }
             }
             Err(_) => break,
         }
@@ -1184,16 +1258,23 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         );
     }
     // Pin CARGO_TARGET_DIR. The DEFAULT (`witness_target_dir == None`) is a
-    // path inside this run's scratch worktree so concurrent witness builds
-    // cannot clobber each other's `incremental/`, `.fingerprint/`, or
+    // path inside this run's scratch worktree so witness builds in DIFFERENT
+    // runs cannot clobber each other's `incremental/`, `.fingerprint/`, or
     // encoded-metadata files (CGLS-24: `failed to create encoded metadata
     // from file: os error 2`). The scratch is per-run by construction
     // (`run-<pid>-<seq>/`) and is `git worktree remove --force`'d at cleanup,
     // so the target subtree is auto-collected with it.
     //
+    // NOTE the granularity, because it is easy to over-read: this dir is
+    // per-RUN, not per-CHECK. Every `command` check in one run — the ssr,
+    // wasm and csr witnesses together — shares it. Isolation ACROSS runs is
+    // what this line buys; isolation WITHIN a run has always come from
+    // cargo's own blocking `<target>/<layout>/.cargo-lock`, plus (since the
+    // CGLS-24/26 follow-up) the warm serial class in `run_parallel`.
+    //
     // CGLS-26 — when the daemon resolves a WARM, persistent, shared target
-    // dir (witness serialization removed the CGLS-24 concurrency hazard, so a
-    // shared dir is safe; the daemon holds a per-key lock and falls back to
+    // dir (witness serialization removed the cross-RUN concurrency hazard, so
+    // a shared dir is safe; the daemon holds a per-key lock and falls back to
     // cold on any doubt), it passes it here and the compile reuses cached
     // artifacts across runs instead of a cold rebuild. Either way this env
     // set wins over any ambient `CARGO_TARGET_DIR` on the daemon pod (e.g.
@@ -2737,6 +2818,175 @@ checks:
         );
         let _ = fs::remove_dir_all(root_a);
         let _ = fs::remove_dir_all(root_b);
+    }
+
+    /// Manifest emitting `<id>` enter/exit markers around a sleep, so a test
+    /// can prove NON-OVERLAP from the trace rather than infer it from timing.
+    /// Interleaved (`a+ b+ a- b-`) ⇒ concurrent; nested-free (`a+ a- b+ b-`)
+    /// ⇒ serialized. `>>` on one line per marker keeps appends atomic enough
+    /// for this size under PIPE_BUF.
+    fn overlap_manifest(ids: &[&str]) -> String {
+        let mut m = String::from("version: 1\nchecks:\n");
+        for id in ids {
+            m.push_str(&format!(
+                r#"  - id: {id}
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "echo {id}+ >> trace.out; sleep 0.4; echo {id}- >> trace.out"]
+    cache: none
+"#
+            ));
+        }
+        m
+    }
+
+    fn trace_of(root: &Path) -> Vec<String> {
+        fs::read_to_string(root.join("trace.out"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// True iff no two checks' [enter, exit] windows interleave.
+    fn trace_is_serialized(trace: &[String]) -> bool {
+        let mut open: Option<&str> = None;
+        for ev in trace {
+            let (id, entering) = match ev.strip_suffix('+') {
+                Some(id) => (id, true),
+                None => (ev.trim_end_matches('-'), false),
+            };
+            match (entering, open) {
+                // A second check opened while one was still open ⇒ overlap.
+                (true, Some(_)) => return false,
+                (true, None) => open = Some(id),
+                (false, Some(o)) if o == id => open = None,
+                (false, _) => return false,
+            }
+        }
+        true
+    }
+
+    /// CGLS-24/26 follow-up: with a WARM (shared) target dir, `command` checks
+    /// form a serial class — they never overlap, because they would otherwise
+    /// pile up on cargo's own `<target>/<layout>/.cargo-lock` and sit in
+    /// `locks_lock_inode_wait` burning a thread and a scratch worktree each.
+    #[test]
+    fn warm_target_serializes_command_checks() {
+        let root = scratch("warm-serial");
+        fs::write(root.join(MANIFEST_NAME), overlap_manifest(&["a", "b", "c"])).unwrap();
+        let warm = scratch("warm-serial-target");
+
+        let report = run_dev_with_changes_in(&root, None, Some(&warm)).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(report.results.len(), 3);
+
+        let trace = trace_of(&root);
+        assert_eq!(trace.len(), 6, "3 checks × enter+exit, got {trace:?}");
+        assert!(
+            trace_is_serialized(&trace),
+            "warm dir shared ⇒ command checks must not overlap; trace {trace:?}"
+        );
+
+        let _ = fs::remove_dir_all(&warm);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The cold path stays byte-identical: `witness_target_dir == None` means
+    /// each run owns `<root>/.cargoless-target`, nothing is shared, and the
+    /// profile's `max_parallel` fan-out is preserved. Guards against the
+    /// serial class leaking onto every non-witness caller — the regression
+    /// that would silently serialize the 111-check `dev` governance lane.
+    #[test]
+    fn cold_target_keeps_command_checks_concurrent() {
+        let root = scratch("cold-concurrent");
+        fs::write(root.join(MANIFEST_NAME), overlap_manifest(&["a", "b", "c"])).unwrap();
+
+        let report = run_dev_with_changes_in(&root, None, None).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+
+        let trace = trace_of(&root);
+        assert_eq!(trace.len(), 6, "3 checks × enter+exit, got {trace:?}");
+        assert!(
+            !trace_is_serialized(&trace),
+            "no warm dir ⇒ default max_parallel fan-out must be preserved; \
+             trace {trace:?} shows full serialization"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The class is scoped to what actually shares the target dir. A non-
+    /// `command` check never inherits `CARGO_TARGET_DIR`, so it must keep
+    /// running alongside a warm-class compile instead of queueing behind it.
+    ///
+    /// Asserted structurally, not by wall-clock: the non-command checks write
+    /// their own markers INTO the same trace, so "they ran while the warm
+    /// check was open" is a property of the interleaving. A timing bound would
+    /// be the wrong instrument here — the `test` job is load-flaky, and a
+    /// threshold that passes on an idle laptop turns into a phantom red under
+    /// a loaded CI runner.
+    #[test]
+    fn warm_target_does_not_serialize_non_command_checks() {
+        let root = scratch("warm-mixed");
+        // `slow` is the warm-class compile (sleeps 0.4s). `fast` is a second
+        // command check — also warm class, so it must NOT overlap `slow`.
+        // The `p*` checks are a non-command kind: not warm class, so they are
+        // free to run inside `slow`'s window.
+        let mut manifest = overlap_manifest(&["slow", "fast"]);
+        for i in 0..8 {
+            manifest.push_str(&format!(
+                r#"  - id: p{i}
+    kind: forbidden_patterns
+    inputs:
+      - "*.txt"
+    patterns:
+      - code: never.match
+        word: ZZZ_NO_MATCH_ZZZ
+        message: unreachable
+    cache: none
+"#
+            ));
+        }
+        fs::write(root.join(MANIFEST_NAME), manifest).unwrap();
+        fs::write(root.join("f.txt"), "nothing\n").unwrap();
+        let warm = scratch("warm-mixed-target");
+
+        let report = run_dev_with_changes_in(&root, None, Some(&warm)).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(report.results.len(), 10, "2 command + 8 pattern checks");
+
+        // The two command checks are the only trace writers, and they are both
+        // warm class ⇒ their windows must not interleave.
+        let trace = trace_of(&root);
+        assert_eq!(
+            trace.len(),
+            4,
+            "2 command checks × enter+exit, got {trace:?}"
+        );
+        assert!(
+            trace_is_serialized(&trace),
+            "command checks share the warm dir ⇒ must not overlap; trace {trace:?}"
+        );
+        // And the pattern checks still completed — they were never admitted
+        // into the serial class, so a blocked warm check could not strand them
+        // past the profile timeout.
+        for i in 0..8 {
+            let id = format!("p{i}");
+            let r = report
+                .results
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("missing result for {id}"));
+            assert_eq!(
+                r.tree,
+                TreeState::Green,
+                "{id} must run concurrently with the warm class, not queue behind it"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&warm);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
