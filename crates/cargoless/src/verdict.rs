@@ -483,7 +483,16 @@ fn await_attributed_verdict<C: TransportClient>(
     let timeout = Duration::from_secs(timeout_secs.max(1));
     let started = Instant::now();
     while started.elapsed() < timeout {
-        match client.get_status(worktree) {
+        // Path D (addressing) — when we know the SHA we're asking about,
+        // ask the daemon for THAT SHA's verdict via `verdict_history`
+        // rather than the last-publisher cache. The `status_is_acceptable`
+        // predicate is kept as belt-and-suspenders (harmless when the
+        // server always echoes the requested sha).
+        let poll = match resolved_sha {
+            Some(_) => client.get_status_attributed(worktree, resolved_sha),
+            None => client.get_status(worktree),
+        };
+        match poll {
             Ok(Some(status)) if status_is_acceptable(&status, resolved_sha, freshness) => {
                 return Some(status);
             }
@@ -808,6 +817,7 @@ mod tests {
             worktree: "/wt".into(),
             accepted: true,
             applied_files: 3,
+            ..Default::default()
         }
     }
 
@@ -816,6 +826,7 @@ mod tests {
             worktree: "/wt".into(),
             accepted: false,
             applied_files: 0,
+            ..Default::default()
         }
     }
 
@@ -958,6 +969,102 @@ mod tests {
         assert!(!empty.all_unauthorized());
     }
 
+    /// Path D — a `TransportClient` that records which of `get_status` /
+    /// `get_status_attributed` was called, so the await path's routing
+    /// choice is observable in a unit test rather than only over the
+    /// real wire.
+    struct RoutingRecorder {
+        // (worktree, base_sha) pairs, in call order.
+        attributed_calls: Mutex<Vec<(String, Option<String>)>>,
+        unattributed_calls: Mutex<Vec<String>>,
+        answer: Option<WorktreeStatus>,
+    }
+
+    impl RoutingRecorder {
+        fn new(answer: Option<WorktreeStatus>) -> Self {
+            Self {
+                attributed_calls: Mutex::new(Vec::new()),
+                unattributed_calls: Mutex::new(Vec::new()),
+                answer,
+            }
+        }
+    }
+
+    impl TransportClient for RoutingRecorder {
+        fn get_status(&self, w: &str) -> Result<Option<WorktreeStatus>, TransportError> {
+            self.unattributed_calls.lock().unwrap().push(w.to_string());
+            Ok(self.answer.clone())
+        }
+        fn get_status_attributed(
+            &self,
+            w: &str,
+            base_sha: Option<&str>,
+        ) -> Result<Option<WorktreeStatus>, TransportError> {
+            self.attributed_calls
+                .lock()
+                .unwrap()
+                .push((w.to_string(), base_sha.map(str::to_string)));
+            Ok(self.answer.clone())
+        }
+        fn get_verdict(&self, _w: &str) -> Result<Option<String>, TransportError> {
+            Ok(None)
+        }
+        fn get_diagnostics(
+            &self,
+            _w: &str,
+        ) -> Result<Vec<cargoless_core::Diagnostic>, TransportError> {
+            Ok(Vec::new())
+        }
+        fn list_worktrees(&self) -> Result<Vec<WorktreeSummary>, TransportError> {
+            Ok(Vec::new())
+        }
+        fn subscribe(&self) -> Result<Receiver<TransitionEvent>, TransportError> {
+            Ok(channel().1)
+        }
+    }
+
+    #[test]
+    fn await_routes_through_attributed_when_resolved_sha_is_some() {
+        // Path D wiring — with a resolved base_sha, the await MUST call
+        // `get_status_attributed` (which reaches the verdict_history ring
+        // via `&base_sha=` on the wire) instead of the bare `get_status`
+        // that only sees the last-publisher cache. This is the whole
+        // point of the addressing fix: a poller for a superseded commit
+        // must find its own verdict, not another SHA's.
+        let matching = RoutingRecorder::new(Some(status("green", Some("abc"), 1)));
+        let guard = AwaitFreshness {
+            prior_published_at: Some(1000),
+            not_before_unix: 1000,
+        };
+        let got = await_attributed_verdict(&matching, "/wt", Some("abc"), guard, 5)
+            .expect("attributed path returns the matching status");
+        assert_eq!(got.verdict, "green");
+        assert_eq!(
+            matching.attributed_calls.lock().unwrap().as_slice(),
+            &[("/wt".to_string(), Some("abc".to_string()))],
+            "resolved_sha=Some ⇒ MUST call get_status_attributed with that sha"
+        );
+        assert!(
+            matching.unattributed_calls.lock().unwrap().is_empty(),
+            "resolved_sha=Some ⇒ MUST NOT fall through to get_status"
+        );
+
+        // Symmetric case: no resolved_sha ⇒ historical get_status path.
+        let unattr = RoutingRecorder::new(Some(status("green", None, 5000)));
+        let got = await_attributed_verdict(&unattr, "/wt", None, guard, 5)
+            .expect("unattributed path returns the freshness-passed status");
+        assert_eq!(got.verdict, "green");
+        assert_eq!(
+            unattr.unattributed_calls.lock().unwrap().as_slice(),
+            &["/wt".to_string()],
+            "resolved_sha=None ⇒ MUST call get_status, not the attributed variant"
+        );
+        assert!(
+            unattr.attributed_calls.lock().unwrap().is_empty(),
+            "resolved_sha=None ⇒ MUST NOT call get_status_attributed"
+        );
+    }
+
     #[test]
     fn await_accepts_sha_match_instantly_and_times_out_on_mismatch() {
         // SHA match: instant accept, no freshness needed.
@@ -1028,6 +1135,7 @@ mod tests {
                 worktree: worktree.to_string(),
                 accepted: true,
                 applied_files: files.len() as u32,
+                ..Default::default()
             }
         }
     }

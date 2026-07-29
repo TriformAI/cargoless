@@ -259,9 +259,11 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         return ExitCode::from(1);
     }
     if opts.await_verdict {
+        let base_sha = options.as_ref().and_then(|o| o.base_sha.clone());
         return await_verdict(
             &client,
             &opts.worktree,
+            base_sha.as_deref(),
             await_freshness.expect("await freshness prepared when await_verdict is true"),
             opts.await_timeout_secs,
         );
@@ -272,13 +274,21 @@ pub fn run(opts: &PushOpts) -> ExitCode {
 fn await_verdict(
     client: &HttpClient,
     worktree: &str,
+    base_sha: Option<&str>,
     freshness: AwaitFreshness,
     timeout_secs: u64,
 ) -> ExitCode {
     let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
-        match client.get_status(worktree) {
+        // Path D (addressing) — when the push carried a base_sha, poll
+        // via `verdict_history` for exactly that commit rather than
+        // reading the shared last-publisher slot.
+        let poll = match base_sha {
+            Some(_) => client.get_status_attributed(worktree, base_sha),
+            None => client.get_status(worktree),
+        };
+        match poll {
             Ok(Some(status)) if freshness.is_fresh(status.published_at) => {
                 return exit_for_verdict(
                     "status",

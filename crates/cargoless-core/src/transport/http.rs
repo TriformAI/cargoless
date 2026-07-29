@@ -623,13 +623,16 @@ fn handle(
                     check_profile.as_ref(),
                     Some(&options),
                 );
-                write_response(
-                    &mut writer,
-                    200,
-                    "OK",
-                    "application/json",
-                    &pushoverlayack_to_json(&ack),
-                );
+                // R3 mitigation — the ack can carry an explicit non-200
+                // HTTP status (e.g. 429 for pushed-queue-full) plus a
+                // structured JSON body. `None` ⇒ historical 200 with the
+                // ack JSON, byte-identical to before this shipped.
+                let (code, reason, body) = match (ack.reject_http_status, &ack.reject_body) {
+                    (Some(429), Some(body)) => (429, "Too Many Requests", body.clone()),
+                    (Some(status), Some(body)) => (status, "Rejected", body.clone()),
+                    _ => (200, "OK", pushoverlayack_to_json(&ack)),
+                };
+                write_response(&mut writer, code, reason, "application/json", &body);
             }
             _ => write_response(
                 &mut writer,
@@ -975,6 +978,24 @@ fn parse_preview_add(body: &str) -> Result<PreviewControl, String> {
         own_db,
         ttl_secs,
     })
+}
+
+/// Minimal percent-encoding for a query component. Only escapes bytes
+/// outside an unreserved set (alnum + `-._~`); safe for git commit
+/// hashes (hex passes through unchanged) and for the odd characters
+/// that would otherwise break the request line. Symmetric with
+/// [`pct_decode`] above.
+fn pct_encode_query(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(b.len());
+    for &c in b {
+        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~') {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+        }
+    }
+    out
 }
 
 /// Minimal percent-decoding for `%XX` + `+`→space (worktree ids are
@@ -1460,6 +1481,35 @@ impl TransportClient for HttpClient {
         Ok(status_from_json(&body))
     }
 
+    /// Path D (addressing) — thread `&base_sha=` onto the `/status`
+    /// route so the daemon returns the verdict recorded for exactly
+    /// that commit (via `verdict_history`, cap
+    /// `CARGOLESS_WITNESS_HISTORY_CAP`) instead of the last-publisher
+    /// cache. Percent-encoded to match the server's `pct_decode` at
+    /// `transport::http`'s `/status` handler. Absent `base_sha`
+    /// delegates to [`get_status`] so nothing changes for pollers that
+    /// don't know their commit.
+    fn get_status_attributed(
+        &self,
+        w: &str,
+        base_sha: Option<&str>,
+    ) -> Result<Option<WorktreeStatus>, TransportError> {
+        let Some(sha) = base_sha else {
+            return self.get_status(w);
+        };
+        let (code, body) = self.get(&format!(
+            "/status?worktree={w}&base_sha={}",
+            pct_encode_query(sha)
+        ))?;
+        if code == 404 {
+            return Ok(None);
+        }
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
+        Ok(status_from_json(&body))
+    }
+
     fn get_verdict(&self, w: &str) -> Result<Option<String>, TransportError> {
         let (code, body) = self.get(&format!("/verdict?worktree={w}"))?;
         if code == 404 {
@@ -1586,6 +1636,17 @@ impl TransportClient for HttpClient {
             413 => Err(TransportError::Protocol(
                 "overlay payload too large (413)".into(),
             )),
+            // R3 mitigation — pushed-queue-full backpressure. Surface as a
+            // structured rejection ack (accepted=false + reject metadata)
+            // so callers can back off instead of retrying blindly. Body
+            // is preserved verbatim for the operator's log.
+            429 => Ok(PushOverlayAck {
+                worktree: worktree.to_string(),
+                accepted: false,
+                applied_files: 0,
+                reject_http_status: Some(429),
+                reject_body: Some(resp.trim().to_string()),
+            }),
             c => Err(TransportError::Protocol(format!(
                 "push_overlay HTTP {c}: {}",
                 resp.trim()
@@ -1858,6 +1919,111 @@ mod tests {
             !body.contains("base_sha"),
             "absent base_sha omits the wire key (None): {body}"
         );
+    }
+
+    #[test]
+    fn http_client_get_status_attributed_threads_base_sha() {
+        // Path D (addressing) — the client-side twin of
+        // `status_route_threads_base_sha_into_get_status_attributed`.
+        // `HttpClient::get_status_attributed(w, Some(sha))` must send
+        // `GET /status?worktree=w&base_sha=<pct-encoded sha>`; `None`
+        // must fall back to the bare `/status?worktree=w` route.
+        //
+        // Uses the same EchoBaseSha service from the server-side test:
+        // it round-trips whatever base_sha it was asked for, so the
+        // response body proves what the client actually sent.
+        struct EchoBaseSha;
+        impl VerdictService for EchoBaseSha {
+            fn get_status(&self, w: &str) -> Option<WorktreeStatus> {
+                self.get_status_attributed(w, None)
+            }
+            fn get_status_attributed(
+                &self,
+                w: &str,
+                base_sha: Option<&str>,
+            ) -> Option<WorktreeStatus> {
+                Some(WorktreeStatus {
+                    worktree: w.into(),
+                    verdict: "green".into(),
+                    daemon_build_id: crate::build_id().to_string(),
+                    crates: vec![],
+                    red_diagnostics: 0,
+                    verdict_failure_reason: None,
+                    base_sha: base_sha.map(str::to_string),
+                    ra_blind_paths: false,
+                    gated_checks_ran: Vec::new(),
+                    heartbeat_age_secs: 0,
+                    published_at: 1000,
+                })
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+        }
+        let s = HttpServer::bind("127.0.0.1:0", Arc::new(EchoBaseSha), Arc::new(AllowAll))
+            .expect("bind ephemeral");
+        std::thread::sleep(Duration::from_millis(50));
+        let c = client_for(&s);
+
+        // With a base_sha: the daemon must have seen and echoed it.
+        let got = c
+            .get_status_attributed("/wt", Some("abc123"))
+            .expect("no transport error")
+            .expect("status present");
+        assert_eq!(
+            got.base_sha.as_deref(),
+            Some("abc123"),
+            "client must send &base_sha=… so the daemon can echo it"
+        );
+
+        // Reserved characters must be percent-encoded on the wire and
+        // decoded server-side (round-trip = they arrived intact).
+        let got = c
+            .get_status_attributed("/wt", Some("a/b"))
+            .expect("no transport error")
+            .expect("status present");
+        assert_eq!(
+            got.base_sha.as_deref(),
+            Some("a/b"),
+            "reserved chars must round-trip via pct_encode_query + pct_decode"
+        );
+
+        // No base_sha ⇒ delegates to plain `get_status` ⇒ daemon sees None.
+        let got = c
+            .get_status_attributed("/wt", None)
+            .expect("no transport error")
+            .expect("status present");
+        assert_eq!(
+            got.base_sha, None,
+            "None ⇒ no base_sha param on the wire ⇒ daemon returns None"
+        );
+    }
+
+    #[test]
+    fn pct_encode_query_escapes_reserved_and_passes_alnum() {
+        // Path D — the query-component encoder. Hex-only git SHAs pass
+        // through byte-identical; the reserved characters that would
+        // otherwise break the request line are escaped.
+        assert_eq!(
+            pct_encode_query("abcdef0123456789"),
+            "abcdef0123456789",
+            "hex commit hashes pass through unchanged"
+        );
+        assert_eq!(pct_encode_query("a/b"), "a%2Fb");
+        assert_eq!(pct_encode_query("a b"), "a%20b");
+        assert_eq!(pct_encode_query("a&b"), "a%26b");
+        // Symmetric with pct_decode: encode then decode = original.
+        let original = "weird/&=?value with space";
+        assert_eq!(pct_decode(&pct_encode_query(original)), original);
     }
 
     #[test]

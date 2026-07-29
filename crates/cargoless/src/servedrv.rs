@@ -345,6 +345,18 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         crate::serveapi::ServeVerdictState::new()
             .with_project_check_state_dir(scope.fleet.state_dir_abs(&scope.repo_root)),
     );
+    // Path D + R3 — publish the resolved caps at startup so an operator
+    // can verify what the daemon actually read from env (a knob whose
+    // effect is invisible is dead machinery per the
+    // `tf-mv-optimisations-that-exit-0-while-doing-nothing.md` pattern).
+    eprintln!(
+        "[cargoless:obs] witness-history-cap value={}",
+        api.witness_history_cap()
+    );
+    eprintln!(
+        "[cargoless:obs] pushed-max-per-wt value={}",
+        api.pushed_max_per_wt()
+    );
 
     // #240/2b — overlay-push ingest signal channel. Wired BEFORE
     // `HttpServer::bind` so no `POST /overlay` from a client can race
