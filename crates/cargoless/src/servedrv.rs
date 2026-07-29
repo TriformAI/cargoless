@@ -41,24 +41,31 @@
 //!   only ever sees `ClusterAction`) ⇒ pre-settle attribution stays
 //!   unrepresentable through the composition.
 //!
-//!   **CGLS-27 — two DISPATCH sites, still one WRITE site.** There are
-//!   now two callers that reach `publish_verdict`:
+//!   **CGLS-27/CGLS-11 — three DISPATCH sites, still one WRITE site.**
+//!   Three callers reach `publish_verdict`:
 //!
 //!   1. the `ClusterAction::EmitVerdict` match arm — the only site that
 //!      can express *any* verdict (Green / Red / Unknown), and the only
 //!      one that observes a settled barrier;
 //!   2. `publish_stranded_unknown`, called from the respawn handler for
-//!      a push the respawn stranded — structurally `Unknown`-ONLY.
+//!      a push the respawn stranded — structurally `Unknown`-ONLY;
+//!   3. the CGLS-11 forced-reopen cap arm inside the `SwitchOverlay`
+//!      exec, when the per-(wt, base_sha) nudge budget is exhausted —
+//!      also structurally `Unknown`-ONLY (constructs
+//!      `VerdictPayload::unknown("ra_reopen_cap_exceeded")` inline).
 //!
-//!   Site 2 is a **safe widening, not a weakening**: it takes no verdict
-//!   parameter and builds `VerdictPayload::unknown` internally, so Green
-//!   and Red are unrepresentable there *by signature*. The property this
-//!   doctrine protects — "no verdict is attributed outside a settled
-//!   barrier" — is preserved, because an `Unknown` attributes no
-//!   analysis result; it reports that no analysis could be completed.
-//!   The `verdict.publish` span's `trigger_source` distinguishes the two
-//!   dispatch sites, so the split stays visible in telemetry rather than
-//!   folded into one label.
+//!   Sites 2 and 3 are **safe widenings, not weakenings**: neither takes
+//!   a verdict parameter — both build `VerdictPayload::unknown`
+//!   internally, so Green and Red are unrepresentable there *by
+//!   signature at the call site* (site 2 by function signature; site 3
+//!   by the inline literal). The property this doctrine protects — "no
+//!   verdict is attributed outside a settled barrier" — is preserved,
+//!   because an `Unknown` attributes no analysis result; it reports that
+//!   no analysis could be completed. The `verdict.publish` span's
+//!   `trigger_source` distinguishes the three dispatch sites
+//!   (`EmitVerdict` / `RaRespawnStranded` / `Cgls11ReopenCapExceeded`),
+//!   so the split stays visible in telemetry rather than folded into one
+//!   label.
 //! * **(v) respawn-staleness closure:** the cluster's
 //!   `OverlayMultiplexer::reset()` is called at EXACTLY ONE site — the
 //!   `Spawned` control-message handler, which is the sole place a
@@ -144,6 +151,13 @@ struct ClusterState {
     /// Worktrees with a routed batch that arrived before the current RA
     /// instance reached project-ready.
     deferred: VecDeque<WtId>,
+    /// CGLS-11 — per-(wt_key, base_sha) count of forced close+reopen
+    /// fires. Bounded by CARGOLESS_RA_REOPEN_CAP (default 3). Beyond
+    /// cap → publish unknown(ra_reopen_cap_exceeded) instead of nudging.
+    /// A new base_sha for the same wt_key resets the budget: entries
+    /// whose wt_key matches the current push but whose base_sha differs
+    /// are evicted on entry to the CGLS-11 guard.
+    forced_reopen_count: BTreeMap<(String, Option<String>), u32>,
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -209,6 +223,68 @@ fn ra_native_settle_delay() -> Duration {
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(2_000))
+}
+
+/// CGLS-11 — cap on how many times the forced close+reopen nudge is
+/// allowed to fire for the SAME (wt_key, base_sha) pair. Beyond the cap
+/// the guard publishes `unknown(ra_reopen_cap_exceeded)` instead of
+/// nudging RA again, bounding the balloon-driver storm from repeated
+/// zero-verb re-pushes of the same content. A value of `0` disables the
+/// cap (unlimited nudges — the pre-cap behavior). Default is 3, which
+/// permits the first N nudges (so a genuinely stuck-once re-push still
+/// gets the nudge; only sustained storms hit the cap).
+fn ra_reopen_cap() -> u32 {
+    std::env::var("CARGOLESS_RA_REOPEN_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(3)
+}
+
+/// CGLS-11 — result of consulting the forced-reopen cap for a
+/// (wt_key, base_sha) pair.
+#[derive(Debug, Eq, PartialEq)]
+enum ReopenBudget {
+    /// The nudge fires; `count` is the post-increment fire count for
+    /// this (wt_key, base_sha).
+    Nudge { count: u32, cap: u32 },
+    /// The cap fired; the caller must publish
+    /// `unknown(ra_reopen_cap_exceeded)` instead of nudging.
+    CapExceeded { count: u32, cap: u32 },
+}
+
+/// CGLS-11 — consult and update the per-(wt, base_sha) forced-reopen
+/// budget. Evicts stale entries whose wt matches but whose base_sha
+/// differs (a new push on the same wt resets the budget), then returns
+/// [`ReopenBudget::CapExceeded`] if `cap > 0 && count >= cap`; otherwise
+/// increments the counter and returns [`ReopenBudget::Nudge`]. Pure so
+/// the cap semantics are unit-testable without a live daemon (5 tests).
+///
+/// Load-bearing: `cap > 0 && count >= cap` is structurally unreachable
+/// when `count == 0` (`0 >= cap` requires `cap == 0`, which the guard
+/// excludes). The first N nudges always fire; only sustained storms hit
+/// the cap. `cgls11_forced_reopen_cap_first_push_still_nudges` pins
+/// this — a regression here re-opens the "zero-verb re-push with NO
+/// nudge → unknown forever" failure the original CGLS-11 fix closed
+/// (commit `6fb3aa1`).
+fn consult_reopen_budget(
+    map: &mut BTreeMap<(String, Option<String>), u32>,
+    wt_key: &str,
+    base_sha: &Option<String>,
+    cap: u32,
+) -> ReopenBudget {
+    map.retain(|(k_wt, k_sha), _| k_wt.as_str() != wt_key || k_sha == base_sha);
+    let key = (wt_key.to_string(), base_sha.clone());
+    let count = *map.get(&key).unwrap_or(&0);
+    if cap > 0 && count >= cap {
+        ReopenBudget::CapExceeded { count, cap }
+    } else {
+        let new_count = count + 1;
+        map.insert(key, new_count);
+        ReopenBudget::Nudge {
+            count: new_count,
+            cap,
+        }
+    }
 }
 
 /// Control messages from the per-cluster Supervisor `on_spawn` hook to
@@ -969,6 +1045,7 @@ fn spawn_cluster(
             next_ver: 2,
             ready: false,
             deferred: VecDeque::new(),
+            forced_reopen_count: BTreeMap::new(),
         },
     );
 }
@@ -1230,6 +1307,10 @@ fn exec(
             // from a pushed overlay (true) or the FS-watch path (false).
             // Used below to gate the forced-reopen guard.
             let mut is_from_pushed_overlay = false;
+            // CGLS-11 forced-reopen cap: capture the pushed base_sha so
+            // the guard can key its per-push budget by (wt_key, base_sha)
+            // — a new base_sha for the same wt resets the budget.
+            let mut pushed_base_sha: Option<String> = None;
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
                 // #A2/#A7 — stamp attribution (base_sha + receipt/consume
                 // clocks) the instant the push is consumed, BEFORE the
@@ -1237,6 +1318,7 @@ fn exec(
                 // sole attribution site.
                 api.record_push_attribution(&wt_key, &pushed);
                 pushed_check_profile = pushed.check_profile;
+                pushed_base_sha = pushed.base_sha.clone();
                 let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
                 let materialize_overlay = pushed.analysis_root.is_some();
                 api.record_project_check_context(
@@ -1355,17 +1437,39 @@ fn exec(
             // Determinism: `first_rs_in_overlay` picks the lex-first key from
             // the `OverlaySet`'s internal `BTreeMap`, which is sorted and stable.
             if is_from_pushed_overlay && zero_verbs && !target.is_empty() {
-                if let Some((path, content)) = first_rs_in_overlay(&target) {
-                    eprintln!(
-                        "[cargoless:obs] cgls11-forced-reopen wt={} path={} (zero-verb re-push nudge)",
-                        wt.display(),
-                        path.display(),
-                    );
-                    let v = cs.next_ver;
-                    cs.next_ver += 1;
-                    let p = path.to_string_lossy();
-                    let _ = lsp.did_close(&p);
-                    let _ = lsp.did_open(&p, &content, v);
+                // CGLS-11 forced-reopen cap — bound the per-(wt, base_sha)
+                // nudge count so an unbounded storm of zero-verb re-pushes
+                // stops pinning RA into repeated inference-diagnostic
+                // recomputations (the balloon-driver observed on pod-A).
+                // A new base_sha for the same wt resets the budget
+                // (handled inside `consult_reopen_budget`).
+                match consult_reopen_budget(
+                    &mut cs.forced_reopen_count,
+                    &wt_key,
+                    &pushed_base_sha,
+                    ra_reopen_cap(),
+                ) {
+                    ReopenBudget::CapExceeded { count, cap } => {
+                        let attribution = api.take_push_attribution(&wt_key);
+                        publish_reopen_cap_exceeded(&wt, count, cap, attribution, api);
+                        return;
+                    }
+                    ReopenBudget::Nudge { count, cap } => {
+                        if let Some((path, content)) = first_rs_in_overlay(&target) {
+                            eprintln!(
+                                "[cargoless:obs] cgls11-forced-reopen wt={} path={} count={} cap={} (zero-verb re-push nudge)",
+                                wt.display(),
+                                path.display(),
+                                count,
+                                cap,
+                            );
+                            let v = cs.next_ver;
+                            cs.next_ver += 1;
+                            let p = path.to_string_lossy();
+                            let _ = lsp.did_close(&p);
+                            let _ = lsp.did_open(&p, &content, v);
+                        }
+                    }
                 }
             }
             // Cargoless replaces iterative cargo check/clippy; pushed Cargo
@@ -1771,6 +1875,41 @@ fn publish_verdict(
 /// a cause here would mislabel every other respawn. Downstream groups on
 /// the `ra_respawn_` prefix.
 const STRANDED_PUSH_REASON: &str = "ra_respawn_stranded_push";
+
+/// CGLS-11 — stable classifier for a verdict published when the
+/// forced-reopen cap fires. Downstream dashboards group on this literal;
+/// changing it is a telemetry break.
+const REOPEN_CAP_EXCEEDED_REASON: &str = "ra_reopen_cap_exceeded";
+
+/// CGLS-11 — publish an honest `unknown` when the per-(wt, base_sha)
+/// forced-reopen budget is exhausted. This is the third dispatch site
+/// documented in the module-doc's `publish_verdict` doctrine block;
+/// like [`publish_stranded_unknown`] it takes NO verdict parameter and
+/// constructs [`statusfile::VerdictPayload::unknown`] internally, so
+/// Green and Red are unrepresentable here by signature.
+fn publish_reopen_cap_exceeded(
+    wt: &Path,
+    count: u32,
+    cap: u32,
+    attribution: Option<crate::serveapi::PushAttribution>,
+    api: &Arc<crate::serveapi::ServeVerdictState>,
+) {
+    eprintln!(
+        "[cargoless:obs] cgls11-reopen-cap-exceeded wt={} count={} cap={} verdict=unknown reason={} (CGLS-11)",
+        wt.display(),
+        count,
+        cap,
+        REOPEN_CAP_EXCEEDED_REASON,
+    );
+    publish_verdict(
+        wt,
+        statusfile::VerdictPayload::unknown(REOPEN_CAP_EXCEEDED_REASON),
+        attribution,
+        Vec::new(),
+        "Cgls11ReopenCapExceeded",
+        api,
+    );
+}
 
 /// CGLS-27 — publish an honest `unknown` for a push stranded by an RA
 /// respawn. The LIVENESS counterpart to `reset_after_respawn`'s
@@ -3027,6 +3166,222 @@ mod tests {
             zero_verbs2,
             "re-push of identical content must yield zero verbs — this is the CGLS-11 trigger"
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // CGLS-11 forced-reopen cap
+    //
+    // Bounds the per-(wt_key, base_sha) nudge storm. Six tests:
+    //   1. env default is 3
+    //   2. env=0 disables the cap
+    //   3. counter increments across same-(wt, sha) zero-verb re-pushes
+    //   4. counter resets on a new base_sha for the same wt
+    //   5. LOAD-BEARING anti-regression: first push (count == 0) never
+    //      hits the cap — protects the original CGLS-11 fix (6fb3aa1)
+    //   6. cap-exceeded publishes unknown with the stable reason string
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Serializes tests that flip `CARGOLESS_RA_REOPEN_CAP`. Env mutation
+    /// is process-global; without this, one test removing the var
+    /// mid-flight fails the other. Other tests are unaffected: they never
+    /// call `ra_reopen_cap()` directly — they exercise
+    /// `consult_reopen_budget` with an explicit `cap:` argument.
+    static REOPEN_CAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cgls11_forced_reopen_cap_env_default_is_3() {
+        let _env = REOPEN_CAP_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation is process-global; serialized by
+        // REOPEN_CAP_ENV_LOCK against the other reopen-cap env tests.
+        unsafe { std::env::remove_var("CARGOLESS_RA_REOPEN_CAP") };
+        assert_eq!(
+            ra_reopen_cap(),
+            3,
+            "unset env ⇒ compiled-in default of 3 (operator override is opt-in)"
+        );
+    }
+
+    #[test]
+    fn cgls11_forced_reopen_cap_env_zero_disables() {
+        let _env = REOPEN_CAP_ENV_LOCK.lock().unwrap();
+        // SAFETY: see cgls11_forced_reopen_cap_env_default_is_3.
+        unsafe { std::env::set_var("CARGOLESS_RA_REOPEN_CAP", "0") };
+        assert_eq!(
+            ra_reopen_cap(),
+            0,
+            "env=0 must parse to 0 ⇒ consult_reopen_budget's `cap > 0` guard skips ⇒ unlimited nudges (pre-cap behavior)"
+        );
+        // Prove the semantic: cap=0 lets the counter climb without ever
+        // returning CapExceeded, even far past a plausible finite cap.
+        let mut map = BTreeMap::new();
+        let sha = Some("deadbeef".to_string());
+        for _ in 0..100 {
+            match consult_reopen_budget(&mut map, "/wt", &sha, 0) {
+                ReopenBudget::Nudge { .. } => {}
+                ReopenBudget::CapExceeded { .. } => {
+                    panic!("cap=0 must never publish cap-exceeded — pre-cap behavior");
+                }
+            }
+        }
+        unsafe { std::env::remove_var("CARGOLESS_RA_REOPEN_CAP") };
+    }
+
+    #[test]
+    fn cgls11_forced_reopen_counter_increments_across_same_key_zero_verb_repushes() {
+        // Same (wt, base_sha) hit repeatedly ⇒ counter climbs, cap fires
+        // on the N+1-th call for cap=N.
+        let mut map = BTreeMap::new();
+        let sha = Some("abc123".to_string());
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha, 3),
+            ReopenBudget::Nudge { count: 1, cap: 3 },
+            "first re-push nudges; count post-increments to 1"
+        );
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha, 3),
+            ReopenBudget::Nudge { count: 2, cap: 3 },
+        );
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha, 3),
+            ReopenBudget::Nudge { count: 3, cap: 3 },
+            "third re-push STILL nudges (count == cap ⇒ cap fires on NEXT call, not this one)"
+        );
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha, 3),
+            ReopenBudget::CapExceeded { count: 3, cap: 3 },
+            "fourth re-push exceeds cap ⇒ CapExceeded (no nudge, publish unknown)"
+        );
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha, 3),
+            ReopenBudget::CapExceeded { count: 3, cap: 3 },
+            "counter is not incremented on CapExceeded — stays at 3 for downstream obs"
+        );
+    }
+
+    #[test]
+    fn cgls11_forced_reopen_counter_resets_on_new_base_sha() {
+        // Same wt, new base_sha ⇒ prior entry evicted ⇒ budget resets.
+        // This models the honest case: a NEW commit deserves a fresh
+        // budget because the RA-native re-derivation is genuinely new
+        // work, not a repeat storm on identical content.
+        let mut map = BTreeMap::new();
+        let sha_a = Some("aaaaaaaa".to_string());
+        let sha_b = Some("bbbbbbbb".to_string());
+        // Exhaust the budget under sha_a.
+        for _ in 0..3 {
+            let _ = consult_reopen_budget(&mut map, "/wt", &sha_a, 3);
+        }
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha_a, 3),
+            ReopenBudget::CapExceeded { count: 3, cap: 3 },
+            "sanity: budget under sha_a is exhausted"
+        );
+        // New push on the same wt with a different base_sha ⇒ full budget.
+        assert_eq!(
+            consult_reopen_budget(&mut map, "/wt", &sha_b, 3),
+            ReopenBudget::Nudge { count: 1, cap: 3 },
+            "new base_sha for same wt ⇒ prior entry evicted ⇒ fresh budget",
+        );
+        // The old sha_a entry is gone; a different wt is unaffected.
+        assert!(
+            !map.contains_key(&("/wt".to_string(), sha_a.clone())),
+            "prior (wt, sha_a) entry must be evicted when sha_b arrives"
+        );
+        // Different wt with sha_a should NOT be evicted by sha_b on /wt.
+        let mut map2 = BTreeMap::new();
+        let _ = consult_reopen_budget(&mut map2, "/wt-other", &sha_a, 3);
+        let _ = consult_reopen_budget(&mut map2, "/wt", &sha_a, 3);
+        assert_eq!(
+            consult_reopen_budget(&mut map2, "/wt", &sha_b, 3),
+            ReopenBudget::Nudge { count: 1, cap: 3 },
+        );
+        assert!(
+            map2.contains_key(&("/wt-other".to_string(), sha_a.clone())),
+            "other wt's entry under sha_a must survive a sha_b push on /wt"
+        );
+    }
+
+    #[test]
+    fn cgls11_forced_reopen_cap_first_push_still_nudges() {
+        // LOAD-BEARING ANTI-REGRESSION.
+        //
+        // The original CGLS-11 fix (commit 6fb3aa1) closed the "zero-verb
+        // re-push with NO nudge → unknown forever" failure. Adding a cap
+        // must not reintroduce that failure by capping BEFORE the first
+        // nudge. This test pins: for every cap value from 1 upward (the
+        // only values where the guard is active — cap=0 disables it),
+        // the FIRST call for a fresh (wt, base_sha) returns Nudge, never
+        // CapExceeded. If this ever flips, the balloon-driver fix
+        // (CGLS-11 forced-reopen) is dead machinery at count==0.
+        for cap in 1..=10u32 {
+            let mut map = BTreeMap::new();
+            let sha = Some("fresh".to_string());
+            match consult_reopen_budget(&mut map, "/wt", &sha, cap) {
+                ReopenBudget::Nudge { count: 1, cap: c } => assert_eq!(c, cap),
+                other => panic!(
+                    "cap={cap}: first call MUST nudge (count==0 pre-increment), got {other:?} — this re-opens the CGLS-11 failure the original fix closed (commit 6fb3aa1)"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn cgls11_forced_reopen_cap_publishes_unknown_with_stable_reason_string() {
+        // The publish path: `publish_reopen_cap_exceeded` funnels through
+        // the sole `publish_verdict` seam and stamps the stable
+        // classifier `ra_reopen_cap_exceeded` on the on-disk statusfile
+        // and the in-memory verdict service. Downstream dashboards group
+        // on this literal; changing it is a telemetry break.
+        let root = temp_root("reopen-cap-unknown");
+        let api = Arc::new(crate::serveapi::ServeVerdictState::new());
+        let wt_key = root.to_string_lossy().into_owned();
+
+        // Stage a push + attribution to mirror the live SwitchOverlay
+        // consume path (the cap fires while an attribution is live).
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let options = PushOverlayOptions {
+            repo_relative: false,
+            analysis_root: None,
+            base_sha: Some("beefface".into()),
+            changed_files: None,
+            gate: false,
+            check_ids: None,
+        };
+        let ack =
+            api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options));
+        assert!(ack.accepted, "push must be accepted");
+        let pushed = api
+            .take_overlay_for(&wt_key)
+            .expect("consume the pushed overlay");
+        api.record_push_attribution(&wt_key, &pushed);
+
+        // Simulate the cap firing: the exec arm takes the attribution
+        // and hands it to `publish_reopen_cap_exceeded`.
+        let attribution = api.take_push_attribution(&wt_key);
+        publish_reopen_cap_exceeded(&root, 3, 3, attribution, &api);
+
+        let status = api
+            .get_status(&wt_key)
+            .expect("cap-exceeded must publish a verdict");
+        assert_eq!(
+            status.verdict, "unknown",
+            "cap fired ⇒ honest unknown (exit 75 EX_TEMPFAIL), never green and never red"
+        );
+        assert_eq!(
+            status.verdict_failure_reason.as_deref(),
+            Some("ra_reopen_cap_exceeded"),
+            "stable classifier — downstream dashboards group on this literal"
+        );
+        assert_eq!(
+            REOPEN_CAP_EXCEEDED_REASON, "ra_reopen_cap_exceeded",
+            "constant must not drift from the string tested above (telemetry contract)"
+        );
+        assert_eq!(
+            status.base_sha.as_deref(),
+            Some("beefface"),
+            "the capped push's own SHA — so CI attributes the unknown to THAT push, not a later one"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
