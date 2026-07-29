@@ -1218,7 +1218,13 @@ fn gated_or_plan_coalesce_token(
             );
             return None;
         }
-        return Some(format!("witness-gate:{}", request.base_ref.trim()));
+        let base_ref = request.base_ref.trim();
+        eprintln!(
+            "[cargoless:obs] witness-gate root={} coalesce=true base_ref={}",
+            root.display(),
+            base_ref
+        );
+        return Some(format!("witness-gate:{}", base_ref));
     }
     project_check_plan_coalesce_token(root, request)
 }
@@ -5308,6 +5314,69 @@ checks:
         assert!(
             gated_or_plan_coalesce_token(&project.root, true, &request).is_none(),
             "a gated push editing the check manifest must fall back to a solo run"
+        );
+    }
+
+    /// CGLS-27 × W4 interaction: when N gated pushes coalesce into ONE
+    /// physical run and that run is stranded by an RA respawn, every
+    /// co-run member must independently publish `unknown` — the coarse
+    /// base-keyed coalescing must not swallow per-member attribution.
+    ///
+    /// Attributions are recorded per-WT at overlay-consume (one entry per
+    /// gated pusher, keyed by its own worktree path), and the CGLS-27
+    /// drain scoped to the respawned cluster's worktrees returns ONE
+    /// entry per stranded member. This test pins that shape so the
+    /// coarse-key coalescing cannot regress it silently.
+    #[test]
+    fn stranded_witness_publishes_unknown_to_every_coalesced_member() {
+        let api = ServeVerdictState::new();
+
+        // Three gated pushes on the same base_ref land in the same
+        // coalescer queue (proven by gated_witness_pushes_coalesce_by_base_
+        // across_different_files above); each pusher's SwitchOverlay arm
+        // records its OWN worktree's attribution.
+        let base_sha = "shared-base-sha-abc";
+        let wts = ["/client/gated-a", "/client/gated-b", "/client/gated-c"];
+        for wt in wts {
+            api.record_push_attribution(wt, &stranded_pushed(base_sha));
+        }
+
+        // The physical run this coalesced trio would have shared is
+        // stranded by a respawn (RA reset drops the in-flight txn per
+        // #247). `reset_after_respawn` drains attributions scoped to the
+        // respawned cluster's worktrees — i.e., all three co-run members.
+        let cluster_keys: BTreeSet<String> = wts.iter().map(|s| s.to_string()).collect();
+        let drained = api.drain_push_attributions_for(&cluster_keys);
+
+        // The load-bearing shape: one drained attribution per coalesced
+        // member — not one for the whole batch. `publish_stranded_unknown`
+        // is called once per drained pair, so each member-WT publishes
+        // its own honest `unknown` (ra_respawn_stranded_push, exit 75).
+        assert_eq!(
+            drained.len(),
+            wts.len(),
+            "every coalesced gated member must strand independently — a coarse \
+             base-keyed batch must not swallow per-member attribution"
+        );
+        let mut drained_wts: Vec<String> = drained.iter().map(|(k, _)| k.clone()).collect();
+        drained_wts.sort();
+        let mut expected: Vec<String> = wts.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            drained_wts, expected,
+            "every co-run member must appear in the drain — none lost to the coarse key"
+        );
+        for (_, attribution) in &drained {
+            assert_eq!(
+                attribution.base_sha.as_deref(),
+                Some(base_sha),
+                "the shared base survives per-member attribution"
+            );
+        }
+        // Publish-once: a second respawn cannot re-publish the same batch.
+        assert!(
+            api.drain_push_attributions_for(&cluster_keys).is_empty(),
+            "a second respawn must find nothing to re-publish for the coalesced set"
         );
     }
 
