@@ -69,12 +69,23 @@ static PROJECT_CHECK_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(1);
 /// recycled across worktrees, so `finish_hard_witness`'s equality check
 /// can never be fooled by a reused value.
 static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
-/// Cap on the per-worktree base_sha-addressable verdict ring
-/// ([`ServeVerdictState::verdict_history`]). The witness hardcodes ONE
-/// worktree key for every PR, so a handful of distinct in-flight commits
-/// can share that key during a landing flood; 16 is far past the realistic
-/// concurrent fan-in and the oldest entry is front-evicted past the cap.
-const HARD_WITNESS_HISTORY_CAP: usize = 16;
+/// Fallback cap on the per-worktree base_sha-addressable verdict ring
+/// ([`ServeVerdictState::verdict_history`]) — used only when
+/// `CARGOLESS_WITNESS_HISTORY_CAP` is unset or unparseable. Raised from
+/// 16 to 64 by Path D (addressing): with the wire now actually threading
+/// `&base_sha=`, the ring must survive one CI's poll window (~5100s) of
+/// fan-in, which under a ~20-PR landing flood reliably exceeds 16.
+/// Override via env for post-arming tuning.
+const HARD_WITNESS_HISTORY_CAP_DEFAULT: usize = 64;
+/// Fallback cap on the per-worktree [`ServeVerdictState::pushed`] queue.
+/// The queue is unbounded historically (CGLS-25 introduced the queue for
+/// the clobber fix); this cap is the R3 mitigation for a stuck-consumer
+/// pathology (RA reap loop stranding the queue's head). At the cap,
+/// distinct-base_sha pushes are REJECTED with HTTP 429 so the client
+/// backs off instead of silently accumulating overlay bodies (each up to
+/// 128 MiB per `transport::http`'s cap). Same-base_sha still latest-wins
+/// (replace in place) even at the cap. Override via env.
+const PUSHED_MAX_PER_WT_DEFAULT: usize = 8;
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 /// CGLS-26 — bump when the warm shared-target-dir layout or keying changes,
 /// so a daemon rolling a new image never reuses an incompatible warm tree
@@ -481,7 +492,7 @@ pub struct ServeVerdictState {
     /// `statuses` slot can only hold the *last* publisher's verdict; a poller
     /// for a superseded commit would never see its own verdict echoed even
     /// when that verdict was correctly computed. This ring retains the last
-    /// [`HARD_WITNESS_HISTORY_CAP`] *attributed* (base_sha = `Some`) verdicts
+    /// [`Self::witness_history_cap`] *attributed* (base_sha = `Some`) verdicts
     /// per worktree so `get_status_attributed(wt, Some(sha))` resolves the
     /// exact commit the poller asked about, independent of what landed in the
     /// `statuses` slot afterward. Unattributed (FS-watch) verdicts never enter
@@ -494,6 +505,16 @@ pub struct ServeVerdictState {
     /// attach-at-startup pattern as `push_signal`); a daemon that never
     /// sets it simply omits `ra_config` from `/daemon`.
     resolved_config: Mutex<Option<serde_json::Value>>,
+    /// Path D (addressing) — cap on [`Self::verdict_history`], resolved
+    /// once at construction via [`witness_history_cap_from`]. Stored
+    /// (rather than env-read per publish) so unit tests set an
+    /// explicit cap without env mutation, and env drift mid-daemon-life
+    /// can't confuse the eviction invariant.
+    witness_history_cap: usize,
+    /// R3 mitigation — cap on [`Self::pushed`] queue depth per worktree
+    /// key, resolved once at construction via [`pushed_max_per_wt_from`].
+    /// Same rationale as `witness_history_cap`.
+    pushed_max_per_wt: usize,
     /// CGLS-26 — per-warm-key in-process busy flag for the shared witness
     /// target dir. A non-blocking compare-and-swap is the primary interlock:
     /// if a warm key is already in use (flag true), the caller falls back to
@@ -1114,6 +1135,29 @@ fn configured_batch_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Path D (addressing) — resolve `CARGOLESS_WITNESS_HISTORY_CAP` (default
+/// [`HARD_WITNESS_HISTORY_CAP_DEFAULT`]). Pure over its input so the
+/// default / override / invalid arms are unit-testable without env
+/// mutation. `Some("0")` and unparseable input both fall back to the
+/// default (a zero-cap ring would immediately evict every publish, which
+/// is never the operator intent — matches CGLS-28's "typo doesn't arm a
+/// dangerous knob" pattern).
+pub(crate) fn witness_history_cap_from(env: Option<&str>) -> usize {
+    env.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HARD_WITNESS_HISTORY_CAP_DEFAULT)
+}
+
+/// R3 mitigation — resolve `CARGOLESS_PUSHED_MAX_PER_WT` (default
+/// [`PUSHED_MAX_PER_WT_DEFAULT`]). Same fallback rules as
+/// [`witness_history_cap_from`]. A zero cap would reject every push, so
+/// it degrades to the default.
+pub(crate) fn pushed_max_per_wt_from(env: Option<&str>) -> usize {
+    env.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(PUSHED_MAX_PER_WT_DEFAULT)
+}
+
 fn batch_coalesce_key(request: &BatchCheckRequest) -> Option<BatchCoalesceKey> {
     let coalesce_key = request
         .coalesce_key
@@ -1262,8 +1306,50 @@ impl ServeVerdictState {
     /// `fn new() -> Arc<Self>` trips `clippy::new_ret_no_self` under the
     /// `-D warnings` gate; callers wrap in `Arc` (the house pattern, cf.
     /// `inproc::testmock::MockService`).
+    ///
+    /// Path D + R3 caps are resolved from env HERE, once per state —
+    /// tests that need explicit caps use
+    /// [`Self::with_caps_for_testing`].
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            witness_history_cap: witness_history_cap_from(
+                std::env::var("CARGOLESS_WITNESS_HISTORY_CAP")
+                    .ok()
+                    .as_deref(),
+            ),
+            pushed_max_per_wt: pushed_max_per_wt_from(
+                std::env::var("CARGOLESS_PUSHED_MAX_PER_WT").ok().as_deref(),
+            ),
+            ..Self::default()
+        }
+    }
+
+    /// Test hook: set the addressing + push queue caps explicitly, without
+    /// mutating process env. Used by the cap unit tests so the shipped
+    /// [`Self::new`] env-read path stays untouched. Retains the historical
+    /// stored value for the other cap so a test only overrides what it
+    /// cares about.
+    #[cfg(test)]
+    pub(crate) fn with_caps_for_testing(
+        mut self,
+        witness_history_cap: usize,
+        pushed_max_per_wt: usize,
+    ) -> Self {
+        self.witness_history_cap = witness_history_cap;
+        self.pushed_max_per_wt = pushed_max_per_wt;
+        self
+    }
+
+    /// Path D — the resolved cap this daemon runs under, for the boot
+    /// obs line and any future `/daemon` surface.
+    pub fn witness_history_cap(&self) -> usize {
+        self.witness_history_cap
+    }
+
+    /// R3 — the resolved cap this daemon runs under, for the boot
+    /// obs line and any future `/daemon` surface.
+    pub fn pushed_max_per_wt(&self) -> usize {
+        self.pushed_max_per_wt
     }
 
     /// Use the daemon's resolved state directory for transient
@@ -1398,7 +1484,7 @@ impl ServeVerdictState {
             // verdict for that sha wins) rather than accumulating duplicates.
             ring.retain(|s| s.base_sha.as_deref() != Some(sha));
             ring.push_back(status.clone());
-            while ring.len() > HARD_WITNESS_HISTORY_CAP {
+            while ring.len() > self.witness_history_cap {
                 ring.pop_front();
             }
         }
@@ -2410,12 +2496,27 @@ impl VerdictService for ServeVerdictState {
         // one-per-wake, with `take_overlay_for` re-signalling the tail).
         // base_sha == None (FS-watch / unattributed) keeps the historical
         // single-slot coalesce: all None-keyed pushes collapse to the last.
+        //
+        // R3 mitigation — at `pushed_max_per_wt`, a DISTINCT-base_sha push
+        // is REJECTED with 429 instead of appending. Same-base_sha still
+        // replaces in place regardless of depth — a legitimate retry of an
+        // already-queued commit must not be starved by a stuck consumer.
+        // The reject is loud (obs line at [`rejected_push_queue_full`])
+        // so its hit rate is measurable per the "no dead machinery" rule.
         {
             let mut store = poisoned(&self.pushed);
             let queue = store.entry(worktree.to_string()).or_default();
             match queue.iter_mut().find(|q| q.base_sha == pushed.base_sha) {
                 Some(existing) => *existing = pushed,
-                None => queue.push_back(pushed),
+                None => {
+                    if queue.len() >= self.pushed_max_per_wt {
+                        let depth = queue.len();
+                        let cap = self.pushed_max_per_wt;
+                        drop(store);
+                        return rejected_push_queue_full(worktree, cap, depth);
+                    }
+                    queue.push_back(pushed);
+                }
             }
         }
         // Wake the serve loop (best-effort — see attach_push_signal doc).
@@ -2426,6 +2527,7 @@ impl VerdictService for ServeVerdictState {
             worktree: worktree.to_string(),
             accepted: true,
             applied_files,
+            ..Default::default()
         }
     }
 
@@ -2783,6 +2885,29 @@ fn rejected_push(worktree: &str, why: &str) -> PushOverlayAck {
         worktree: worktree.to_string(),
         accepted: false,
         applied_files: 0,
+        ..Default::default()
+    }
+}
+
+/// R3 mitigation — pushed-queue-full backpressure. Distinct from
+/// [`rejected_push`] in that this carries an explicit HTTP status +
+/// structured body pair that the HTTP handler surfaces as `429 Too Many
+/// Requests` so a client can back off intelligently rather than treating
+/// the queue-full case as an ordinary server-side refusal.
+fn rejected_push_queue_full(worktree: &str, cap: usize, depth: usize) -> PushOverlayAck {
+    eprintln!("[cargoless:obs] pushed-queue-reject wt={worktree} cap={cap} depth={depth}");
+    let body = serde_json::json!({
+        "error": "pushed_queue_full",
+        "cap": cap,
+        "wt": worktree,
+    })
+    .to_string();
+    PushOverlayAck {
+        worktree: worktree.to_string(),
+        accepted: false,
+        applied_files: 0,
+        reject_http_status: Some(429),
+        reject_body: Some(body),
     }
 }
 
@@ -6789,7 +6914,7 @@ checks:
         // of the same commit replaces its prior entry rather than accumulating.
         let api = ServeVerdictState::new();
         let wt = Path::new("/wt");
-        for i in 0..(HARD_WITNESS_HISTORY_CAP + 5) {
+        for i in 0..(HARD_WITNESS_HISTORY_CAP_DEFAULT + 5) {
             api.publish_attributed(
                 wt,
                 crate::statusfile::VerdictPayload::green(),
@@ -6802,7 +6927,7 @@ checks:
             api.get_status_attributed("/wt", Some("sha-0")).is_none(),
             "oldest commit evicted past the cap"
         );
-        let newest = format!("sha-{}", HARD_WITNESS_HISTORY_CAP + 4);
+        let newest = format!("sha-{}", HARD_WITNESS_HISTORY_CAP_DEFAULT + 4);
         assert!(
             api.get_status_attributed("/wt", Some(newest.as_str()))
                 .is_some(),
@@ -6827,9 +6952,158 @@ checks:
             .map(|r| r.len())
             .unwrap_or(0);
         assert!(
-            ring_len <= HARD_WITNESS_HISTORY_CAP,
+            ring_len <= HARD_WITNESS_HISTORY_CAP_DEFAULT,
             "ring stays bounded at the cap (was {ring_len})"
         );
+    }
+
+    #[test]
+    fn witness_history_cap_from_defaults_and_parses_env() {
+        // Path D — pure env-parser. Unset ⇒ default. A parseable positive
+        // integer ⇒ that value. Zero, negative, and unparseable input all
+        // fall back to the default (CGLS-28 convention: a typo must not
+        // silently shrink the addressable ring to a value nobody set).
+        assert_eq!(
+            witness_history_cap_from(None),
+            HARD_WITNESS_HISTORY_CAP_DEFAULT,
+            "unset ⇒ default (64)"
+        );
+        assert_eq!(witness_history_cap_from(Some("64")), 64);
+        assert_eq!(witness_history_cap_from(Some("128")), 128);
+        assert_eq!(
+            witness_history_cap_from(Some("0")),
+            HARD_WITNESS_HISTORY_CAP_DEFAULT,
+            "0 ⇒ default (a zero-cap ring evicts every publish, never operator intent)"
+        );
+        assert_eq!(
+            witness_history_cap_from(Some("bogus")),
+            HARD_WITNESS_HISTORY_CAP_DEFAULT,
+            "unparseable ⇒ default (CGLS-28 pattern)"
+        );
+        assert_eq!(
+            witness_history_cap_from(Some("")),
+            HARD_WITNESS_HISTORY_CAP_DEFAULT,
+            "empty string ⇒ default"
+        );
+    }
+
+    #[test]
+    fn pushed_max_per_wt_from_defaults_and_parses_env() {
+        // R3 — same env-parser shape as `witness_history_cap_from`.
+        assert_eq!(
+            pushed_max_per_wt_from(None),
+            PUSHED_MAX_PER_WT_DEFAULT,
+            "unset ⇒ default (8)"
+        );
+        assert_eq!(pushed_max_per_wt_from(Some("8")), 8);
+        assert_eq!(pushed_max_per_wt_from(Some("2")), 2);
+        assert_eq!(
+            pushed_max_per_wt_from(Some("0")),
+            PUSHED_MAX_PER_WT_DEFAULT,
+            "0 ⇒ default (a zero-cap queue rejects EVERY push, never intended)"
+        );
+        assert_eq!(
+            pushed_max_per_wt_from(Some("bogus")),
+            PUSHED_MAX_PER_WT_DEFAULT,
+            "unparseable ⇒ default"
+        );
+    }
+
+    #[test]
+    fn pushed_queue_rejects_distinct_sha_at_cap_with_429_body() {
+        // R3 mitigation — with `pushed_max_per_wt = 2`, the third
+        // distinct-base_sha push MUST be rejected with `reject_http_status
+        // = 429` and a structured body carrying the cap and the wt id.
+        // The daemon accepts the first two so the queue truly has depth 2
+        // when the third arrives.
+        let api = ServeVerdictState::new().with_caps_for_testing(64, 2);
+        let files = vec![("src/lib.rs".to_string(), "pub fn a() {}".to_string())];
+        let opts = |sha: &str| PushOverlayOptions {
+            base_sha: Some(sha.to_string()),
+            ..PushOverlayOptions::default()
+        };
+
+        let a =
+            api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&opts("aaa")));
+        assert!(a.accepted, "first push accepted");
+        assert_eq!(a.reject_http_status, None);
+        let b =
+            api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&opts("bbb")));
+        assert!(b.accepted, "second push accepted (still under cap=2)");
+        assert_eq!(b.reject_http_status, None);
+
+        let c =
+            api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&opts("ccc")));
+        assert!(!c.accepted, "third distinct-sha push rejected (queue full)");
+        assert_eq!(c.reject_http_status, Some(429), "rejects as HTTP 429");
+        let body = c.reject_body.as_deref().unwrap_or_default();
+        assert!(
+            body.contains("\"error\":\"pushed_queue_full\""),
+            "reject body carries structured error: {body}"
+        );
+        assert!(
+            body.contains("\"cap\":2"),
+            "reject body carries cap: {body}"
+        );
+        assert!(
+            body.contains("\"wt\":\"/wt\""),
+            "reject body carries the wt key: {body}"
+        );
+    }
+
+    #[test]
+    fn pushed_queue_same_sha_replaces_in_place_even_at_cap() {
+        // R3 mitigation — a legitimate retry of an ALREADY-QUEUED commit
+        // (same base_sha) must NOT be starved by the cap; it replaces
+        // the queued entry in place, preserving CGLS-25's latest-wins
+        // per-sha semantics.
+        let api = ServeVerdictState::new().with_caps_for_testing(64, 2);
+        let files_v1 = vec![("src/lib.rs".to_string(), "pub fn v1() {}".to_string())];
+        let files_v2 = vec![("src/lib.rs".to_string(), "pub fn v2() {}".to_string())];
+        let opts = |sha: &str| PushOverlayOptions {
+            base_sha: Some(sha.to_string()),
+            ..PushOverlayOptions::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/wt",
+                "origin/main",
+                &files_v1,
+                None,
+                Some(&opts("aaa"))
+            )
+            .accepted
+        );
+        assert!(
+            api.push_overlay_with_options(
+                "/wt",
+                "origin/main",
+                &files_v1,
+                None,
+                Some(&opts("bbb"))
+            )
+            .accepted
+        );
+        // Queue is now at cap (2). Re-push of an already-queued sha ⇒
+        // replace-in-place, ack must stay accepted, depth unchanged.
+        let retry = api.push_overlay_with_options(
+            "/wt",
+            "origin/main",
+            &files_v2,
+            None,
+            Some(&opts("aaa")),
+        );
+        assert!(
+            retry.accepted,
+            "same-sha retry at cap must replace in place, not reject"
+        );
+        assert_eq!(retry.reject_http_status, None);
+        let depth = poisoned(&api.pushed)
+            .get("/wt")
+            .map(|q| q.len())
+            .unwrap_or(0);
+        assert_eq!(depth, 2, "queue depth stays at cap after same-sha replace");
     }
 
     #[test]

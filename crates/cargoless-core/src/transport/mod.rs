@@ -437,6 +437,7 @@ pub trait VerdictService: Send + Sync {
             worktree: worktree.to_string(),
             accepted: false,
             applied_files: 0,
+            ..Default::default()
         }
     }
 
@@ -578,6 +579,20 @@ pub enum PreviewControl {
 /// HTTP client is a drop-in).
 pub trait TransportClient {
     fn get_status(&self, worktree: &str) -> Result<Option<WorktreeStatus>, TransportError>;
+    /// Path D (addressing) — poll for a verdict attributed to a specific
+    /// `base_sha`. Default delegates to [`get_status`] so older adapters
+    /// keep compiling unchanged; transports that speak the base_sha
+    /// query param (see `HttpClient`) override to reach the daemon's
+    /// `verdict_history` ring instead of the last-publisher cache.
+    /// The server semantics for "no verdict yet for that base_sha" are
+    /// `Ok(None)` — the client keeps polling; no wire-level `pending`.
+    fn get_status_attributed(
+        &self,
+        worktree: &str,
+        _base_sha: Option<&str>,
+    ) -> Result<Option<WorktreeStatus>, TransportError> {
+        self.get_status(worktree)
+    }
     fn get_verdict(&self, worktree: &str) -> Result<Option<String>, TransportError>;
     fn get_diagnostics(&self, worktree: &str) -> Result<Vec<Diagnostic>, TransportError>;
     fn list_worktrees(&self) -> Result<Vec<WorktreeSummary>, TransportError>;
@@ -1278,11 +1293,22 @@ fn overlay_files_from_json(v: Option<&serde_json::Value>) -> Vec<(String, String
 /// the client obtains the verdict via the already-shipped
 /// `subscribe`/`get_status` read plane. `accepted` is the server's
 /// "stored it" signal; `applied_files` is the count it persisted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PushOverlayAck {
     pub worktree: String,
     pub accepted: bool,
     pub applied_files: u32,
+    /// R3 mitigation — when set, the HTTP layer maps this ack to a
+    /// specific non-200 status. `None` ⇒ historical 200 semantics
+    /// (accepted/rejected both). `Some(429)` ⇒ pushed-queue-full
+    /// backpressure; `Some(<other>)` reserved for future use. Absent on
+    /// the JSON wire so pre-existing pollers/tests are byte-identical.
+    pub reject_http_status: Option<u16>,
+    /// R3 mitigation — structured reject payload paired with
+    /// [`Self::reject_http_status`]. When set, the HTTP layer serves it
+    /// as the response body verbatim (application/json). `None` ⇒ fall
+    /// back to `pushoverlayack_to_json(self)`.
+    pub reject_body: Option<String>,
 }
 
 /// Serialise a [`PushOverlayAck`] to wire JSON
@@ -1311,6 +1337,11 @@ pub fn pushoverlayack_from_json(text: &str) -> Option<PushOverlayAck> {
             .get("applied_files")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
+        // Reject metadata is HTTP-side (status + body), never on the wire
+        // ack JSON — mirrors the "absent on the JSON wire" contract at
+        // the struct definition.
+        reject_http_status: None,
+        reject_body: None,
     })
 }
 
@@ -2337,6 +2368,7 @@ mod tests {
             worktree: "wt-y".into(),
             accepted: true,
             applied_files: 7,
+            ..Default::default()
         };
         assert_eq!(
             pushoverlayack_from_json(&pushoverlayack_to_json(&a)),
@@ -2363,6 +2395,7 @@ mod tests {
                 worktree: "w".into(),
                 accepted: false,
                 applied_files: 0,
+                ..Default::default()
             }
         );
     }
