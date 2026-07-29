@@ -333,6 +333,17 @@ pub struct DaemonActivity {
     pub pending_batch_waiters: u32,
     pub pending_batch_members: u32,
     pub inflight_batch_runs: u32,
+    /// Witness compiles currently HOLDING a `WitnessInflightGate` slot.
+    pub inflight_witness_compiles: u32,
+    /// Witness workers currently PARKED waiting for one.
+    ///
+    /// This gate sits UPSTREAM of the batch coalescer: a witness worker takes
+    /// a slot before the call that enters `BatchCoalescer`. So with
+    /// `CARGOLESS_WITNESS_MAX_INFLIGHT=1` the `pending_batch_*` fields above
+    /// can read near-zero while N witnesses are queued here — the batcher only
+    /// ever sees the one member this gate admits. Read these two fields TOGETHER
+    /// with the batch fields; either alone misattributes where the queue is.
+    pub waiting_witness_compiles: u32,
 }
 
 fn unsupported_batch_report(
