@@ -1177,6 +1177,58 @@ fn batch_coalesce_key(request: &BatchCheckRequest) -> Option<BatchCoalesceKey> {
     })
 }
 
+/// Pick the coalesce token for a project-check push. The granularity is
+/// deliberately different for the two modes:
+///
+///   * **Non-gated** (warn/advisory) project-checks use the fine-grained
+///     per-plan fingerprint (`project-check-plan:{fp}`), so pushes that select
+///     DIFFERENT check subsets do not co-run and pollute each other's advisory
+///     diagnostics.
+///
+///   * **Gated** (hard) witness pushes take a COARSE key keyed only on the base
+///     ref (`witness-gate:{base_ref}`). Every gated push on a given base runs
+///     the same physical `cargo check --release` against the base-tip mirror, so
+///     grouping them by exact changed-file set is pure fragmentation: on a hot
+///     trunk each PR's file set differs slightly → a distinct fingerprint → a
+///     distinct coalesce queue → N serialized 15–20 min release compiles while
+///     `GLOBAL_INFLIGHT=1` holds the single mirror. Keying by base instead lets
+///     all pending gated pushes flatten into ONE `run_batch`, which already
+///     returns `CombinedGreen` to every member on a green union and falls back
+///     to per-member solo checks to attribute a red honestly
+///     (`batch.rs::run_batch`). This trades exactness — a member is checked
+///     against base-tip + the batch's union overlay, not its own base — for the
+///     throughput the witness lane needs under a push storm.
+///
+/// **Manifest safety (both modes):** a push whose overlay edits
+/// `cargoless.checks.yaml` changes the plan itself, so it must NOT share a
+/// physical run with pushes computed against the un-edited manifest. The gated
+/// branch preserves the same guard the fine token applies (return `None` ⇒ the
+/// caller falls back to a solo run) before keying by base.
+fn gated_or_plan_coalesce_token(
+    root: &Path,
+    gate: bool,
+    request: &BatchCheckRequest,
+) -> Option<String> {
+    if gate {
+        if request_overlay_touches_project_check_manifest(root, request) {
+            eprintln!(
+                "[cargoless:obs] witness-gate root={} coalesce=false reason={} overlay changed",
+                root.display(),
+                PROJECT_CHECK_MANIFEST_NAME
+            );
+            return None;
+        }
+        let base_ref = request.base_ref.trim();
+        eprintln!(
+            "[cargoless:obs] witness-gate root={} coalesce=true base_ref={}",
+            root.display(),
+            base_ref
+        );
+        return Some(format!("witness-gate:{}", base_ref));
+    }
+    project_check_plan_coalesce_token(root, request)
+}
+
 fn project_check_plan_coalesce_token(root: &Path, request: &BatchCheckRequest) -> Option<String> {
     if request_overlay_touches_project_check_manifest(root, request) {
         eprintln!(
@@ -2014,7 +2066,11 @@ impl ServeVerdictState {
         };
         request.members = vec![member];
         request.corun = true;
-        request.coalesce_key = Some(project_check_plan_coalesce_token(&context.root, &request)?);
+        request.coalesce_key = Some(gated_or_plan_coalesce_token(
+            &context.root,
+            context.gate,
+            &request,
+        )?);
 
         // coalesce_key was set above, so this is always Some; `?` keeps the
         // defensive None-path (empty-after-trim) without a clippy::question_mark lint.
@@ -5169,6 +5225,158 @@ checks:
         assert!(
             project_check_plan_coalesce_token(&project.root, &request).is_none(),
             "manifest edits must evaluate after overlay materialization, not via a stale base plan"
+        );
+    }
+
+    /// Gated (hard witness) pushes coalesce by BASE, not by changed-file plan.
+    /// Two gated pushes with DIFFERENT changed files must land in the SAME
+    /// coalesce token so they flatten into one physical `run_batch` — the fix
+    /// for witness-lane serialization under a hot trunk (each PR's file set
+    /// differs → the per-plan fingerprint fragments → N serial release compiles).
+    #[test]
+    fn gated_witness_pushes_coalesce_by_base_across_different_files() {
+        let project = setup_batch_project("gated-coalesce-by-base");
+
+        let mk = |wt: &str, file: &str| {
+            let mut request = batch_request(
+                "gated",
+                &project.root,
+                vec![BatchMember {
+                    worktree: wt.to_string(),
+                    files: vec![(
+                        project.root.join(file).to_string_lossy().into_owned(),
+                        format!("pub fn f() {{}} // {file}\n"),
+                    )],
+                    changed_files: vec![file.to_string()],
+                }],
+            );
+            request.options.repo_relative = false;
+            request
+        };
+
+        let req_a = mk("/client/a", "src/alpha.rs");
+        let req_b = mk("/client/b", "src/beta.rs");
+
+        // Sanity: the OLD (non-gated) per-plan token CAN differ across distinct
+        // file sets — that fragmentation is exactly what defeated coalescing.
+        // (We do not assert they differ — select_for_changes may pick the same
+        // plan — only that the GATED token is base-stable regardless.)
+        let gated_a = gated_or_plan_coalesce_token(&project.root, true, &req_a)
+            .expect("clean gated push should be coalesceable");
+        let gated_b = gated_or_plan_coalesce_token(&project.root, true, &req_b)
+            .expect("clean gated push should be coalesceable");
+        assert_eq!(
+            gated_a, gated_b,
+            "two gated pushes on the same base must share one coalesce token \
+             regardless of their changed-file sets (got {gated_a:?} vs {gated_b:?})"
+        );
+        assert!(
+            gated_a.starts_with("witness-gate:"),
+            "gated token must be the coarse base-keyed form, got {gated_a:?}"
+        );
+
+        // …and they produce equal BatchCoalesceKeys (the actual queue key).
+        let mut keyed_a = req_a.clone();
+        keyed_a.coalesce_key = Some(gated_a);
+        let mut keyed_b = req_b.clone();
+        keyed_b.coalesce_key = Some(gated_b);
+        assert_eq!(
+            batch_coalesce_key(&keyed_a),
+            batch_coalesce_key(&keyed_b),
+            "same gated token ⇒ same BatchCoalesceKey ⇒ same coalescer queue"
+        );
+    }
+
+    /// Manifest safety survives the gated coarse-key path: a gated push whose
+    /// overlay edits `cargoless.checks.yaml` must NOT get a shared base key
+    /// (it changes the plan itself), so it returns None → solo fallback.
+    #[test]
+    fn gated_witness_push_touching_manifest_does_not_coalesce() {
+        let project = setup_batch_project("gated-manifest-edit");
+        let mut request = batch_request(
+            "gated-manifest",
+            &project.root,
+            vec![BatchMember {
+                worktree: "/client/manifest".to_string(),
+                files: vec![(
+                    project
+                        .root
+                        .join("cargoless.checks.yaml")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "version: 1\nchecks: []\n".to_string(),
+                )],
+                changed_files: vec!["cargoless.checks.yaml".to_string()],
+            }],
+        );
+        request.options.repo_relative = false;
+
+        assert!(
+            gated_or_plan_coalesce_token(&project.root, true, &request).is_none(),
+            "a gated push editing the check manifest must fall back to a solo run"
+        );
+    }
+
+    /// CGLS-27 × W4 interaction: when N gated pushes coalesce into ONE
+    /// physical run and that run is stranded by an RA respawn, every
+    /// co-run member must independently publish `unknown` — the coarse
+    /// base-keyed coalescing must not swallow per-member attribution.
+    ///
+    /// Attributions are recorded per-WT at overlay-consume (one entry per
+    /// gated pusher, keyed by its own worktree path), and the CGLS-27
+    /// drain scoped to the respawned cluster's worktrees returns ONE
+    /// entry per stranded member. This test pins that shape so the
+    /// coarse-key coalescing cannot regress it silently.
+    #[test]
+    fn stranded_witness_publishes_unknown_to_every_coalesced_member() {
+        let api = ServeVerdictState::new();
+
+        // Three gated pushes on the same base_ref land in the same
+        // coalescer queue (proven by gated_witness_pushes_coalesce_by_base_
+        // across_different_files above); each pusher's SwitchOverlay arm
+        // records its OWN worktree's attribution.
+        let base_sha = "shared-base-sha-abc";
+        let wts = ["/client/gated-a", "/client/gated-b", "/client/gated-c"];
+        for wt in wts {
+            api.record_push_attribution(wt, &stranded_pushed(base_sha));
+        }
+
+        // The physical run this coalesced trio would have shared is
+        // stranded by a respawn (RA reset drops the in-flight txn per
+        // #247). `reset_after_respawn` drains attributions scoped to the
+        // respawned cluster's worktrees — i.e., all three co-run members.
+        let cluster_keys: BTreeSet<String> = wts.iter().map(|s| s.to_string()).collect();
+        let drained = api.drain_push_attributions_for(&cluster_keys);
+
+        // The load-bearing shape: one drained attribution per coalesced
+        // member — not one for the whole batch. `publish_stranded_unknown`
+        // is called once per drained pair, so each member-WT publishes
+        // its own honest `unknown` (ra_respawn_stranded_push, exit 75).
+        assert_eq!(
+            drained.len(),
+            wts.len(),
+            "every coalesced gated member must strand independently — a coarse \
+             base-keyed batch must not swallow per-member attribution"
+        );
+        let mut drained_wts: Vec<String> = drained.iter().map(|(k, _)| k.clone()).collect();
+        drained_wts.sort();
+        let mut expected: Vec<String> = wts.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            drained_wts, expected,
+            "every co-run member must appear in the drain — none lost to the coarse key"
+        );
+        for (_, attribution) in &drained {
+            assert_eq!(
+                attribution.base_sha.as_deref(),
+                Some(base_sha),
+                "the shared base survives per-member attribution"
+            );
+        }
+        // Publish-once: a second respawn cannot re-publish the same batch.
+        assert!(
+            api.drain_push_attributions_for(&cluster_keys).is_empty(),
+            "a second respawn must find nothing to re-publish for the coalesced set"
         );
     }
 
