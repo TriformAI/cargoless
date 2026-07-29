@@ -387,7 +387,7 @@ fn compute_macro_blind_hit(
 /// The serve-loop's live verdict state, presented as the shipped logical
 /// [`VerdictService`]. `Send + Sync` (the trait demands it so the
 /// HTTP/Unix adapters can share one service across connection threads):
-/// the four `Mutex`-guarded fields satisfy that by construction.
+/// the `Mutex`-guarded fields satisfy that by construction.
 #[derive(Default)]
 pub struct ServeVerdictState {
     /// worktree-key → last published status. Keyed by the SAME string
@@ -523,6 +523,16 @@ pub struct ServeVerdictState {
     /// RAII release needs no lifetime gymnastics: the guard holds the `Arc`
     /// and stores `false` on drop. Keyed by the warm-dir key.
     warm_target_locks: Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// CGLS-26 — cumulative warm-target outcomes, keyed by the same
+    /// `mode:reason` pair the obs line carries (`warm:hit`,
+    /// `cold-fallback:contended:in-proc`, …). Surfaced on `GET /daemon` as
+    /// `warm_target`, which is what makes a `cold-fallback` alertable: the
+    /// eprintln alone was never consumed, and on these pods it cannot be —
+    /// both witness instances sit on triform-5, whose log-shipping agent has
+    /// been crash-looping for weeks. A pull-based counter needs no log
+    /// pipeline. Monotonic for the process lifetime; a restart zeroes it,
+    /// which a `increase()`-style query handles correctly.
+    warm_target_stats: Mutex<BTreeMap<String, u64>>,
 }
 
 #[derive(Default)]
@@ -1962,6 +1972,44 @@ impl ServeVerdictState {
     /// concurrency against one target dir (per-check target split, a higher
     /// `max_parallel`, a second daemon on the same PVC) is removing a CGLS-24
     /// guard, so pair it with evidence that #4 still covers the gap.
+    /// Emit the warm-target obs line AND bump the matching counter.
+    ///
+    /// One call site for both so the two can never disagree — the failure
+    /// this repo keeps hitting is an optimisation whose telemetry silently
+    /// stops matching its behaviour. Every `resolve_warm_target` exit goes
+    /// through here.
+    fn record_warm_obs(&self, warm_dir: &Path, mode: &str, reason: &str) {
+        eprintln!(
+            "[cargoless:obs] witness-warm-target dir={} mode={mode} reason={reason}",
+            warm_dir.display()
+        );
+        *poisoned(&self.warm_target_stats)
+            .entry(format!("{mode}:{}", warm_obs_bucket(reason)))
+            .or_insert(0) += 1;
+    }
+
+    /// Snapshot of [`Self::warm_target_stats`] for `GET /daemon`. `None` when
+    /// nothing has resolved yet, so a daemon that runs no witness compiles
+    /// omits the field entirely rather than publishing a misleading zero.
+    pub(crate) fn warm_target_stats_json(&self) -> Option<serde_json::Value> {
+        let stats = poisoned(&self.warm_target_stats);
+        if stats.is_empty() {
+            return None;
+        }
+        let mut warm: u64 = 0;
+        let mut cold: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for (k, v) in stats.iter() {
+            match k.split_once(':') {
+                Some(("warm", _)) => warm += v,
+                Some(("cold-fallback", reason)) => {
+                    cold.insert(reason.to_string(), serde_json::json!(v));
+                }
+                _ => {}
+            }
+        }
+        Some(serde_json::json!({ "warm": warm, "cold_fallback": cold }))
+    }
+
     fn resolve_warm_target(
         &self,
         state_dir: &Path,
@@ -1979,7 +2027,7 @@ impl ServeVerdictState {
         let key = warm_target_key(scratch_root)?;
         let warm_dir = state_dir.join("witness-target-warm").join(&key);
         if let Err(e) = std::fs::create_dir_all(&warm_dir) {
-            emit_warm_obs(&warm_dir, "cold-fallback", &format!("mkdir:{e}"));
+            self.record_warm_obs(&warm_dir, "cold-fallback", &format!("mkdir:{e}"));
             return None;
         }
 
@@ -1999,7 +2047,7 @@ impl ServeVerdictState {
             )
             .is_err()
         {
-            emit_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
+            self.record_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
             return None;
         }
         let in_proc = InProcWarmGuard { busy };
@@ -2011,11 +2059,11 @@ impl ServeVerdictState {
         let flock = match WarmFlock::acquire_nb(&lock_path) {
             Ok(Some(fl)) => fl,
             Ok(None) => {
-                emit_warm_obs(&warm_dir, "cold-fallback", "contended:flock");
+                self.record_warm_obs(&warm_dir, "cold-fallback", "contended:flock");
                 return None;
             }
             Err(e) => {
-                emit_warm_obs(&warm_dir, "cold-fallback", &format!("flock-open:{e}"));
+                self.record_warm_obs(&warm_dir, "cold-fallback", &format!("flock-open:{e}"));
                 return None;
             }
         };
@@ -2043,11 +2091,11 @@ impl ServeVerdictState {
         //    Going cold instead costs a slow compile and nothing else, so
         //    this is the same fail-CLOSED trade every rung above makes.
         if let Some(reason) = warm_dir_disk_pressure(&warm_dir) {
-            emit_warm_obs(&warm_dir, "cold-fallback", &reason);
+            self.record_warm_obs(&warm_dir, "cold-fallback", &reason);
             return None;
         }
 
-        emit_warm_obs(&warm_dir, "warm", "hit");
+        self.record_warm_obs(&warm_dir, "warm", "hit");
         Some(WarmTargetGuard {
             dir: warm_dir,
             _in_proc: in_proc,
@@ -2665,6 +2713,10 @@ impl VerdictService for ServeVerdictState {
 
     fn resolved_config(&self) -> Option<serde_json::Value> {
         poisoned(&self.resolved_config).clone()
+    }
+
+    fn warm_target_stats(&self) -> Option<serde_json::Value> {
+        self.warm_target_stats_json()
     }
 
     fn request_quiesce(&self) -> DaemonActivity {
@@ -3336,6 +3388,13 @@ fn prune_warm_target_dirs(state_dir: &Path, active: &Path) {
 /// second key before prune reclaims the old one.
 const WARM_DISK_HEADROOM_X: u64 = 2;
 
+/// Below this size a warm dir is not worth protecting and the ratio check is
+/// skipped outright. 1 GiB: two orders of magnitude under the ~16 GiB live
+/// witness dirs this rung exists for, and far above any unit-test fixture or
+/// freshly-created key. See `warm_dir_disk_pressure` for why a bare ratio
+/// without this floor misfires on a disk-pressured CI runner.
+const WARM_DISK_MIN_INTERESTING_BYTES: u64 = 1 << 30;
+
 /// `None` ⇒ enough headroom, keep the warm dir. `Some(reason)` ⇒ go cold.
 ///
 /// Fails **OPEN** (returns `None`) when free space or dir size can't be
@@ -3347,12 +3406,25 @@ const WARM_DISK_HEADROOM_X: u64 = 2;
 /// Genuine exhaustion still surfaces — cargo reports ENOSPC and the compile
 /// reds honestly.
 fn warm_dir_disk_pressure(warm_dir: &Path) -> Option<String> {
-    let free = free_bytes_at(warm_dir)?;
     let used = dir_size_bytes(warm_dir)?;
+    // Below the floor there is no cache worth protecting, so skip the check
+    // entirely — including the `df` subprocess.
+    //
+    // The floor is load-bearing, not a micro-optimisation. Without it the
+    // ratio alone misfires on a small dir sitting on a nearly-full volume:
+    // 2 x 4 KiB is trivially unavailable at 99% used, so a first-run warm dir
+    // would go cold on a disk with gigabytes free. That is exactly what the
+    // CI runner is (`ci.yml` header: "a disk-pressured Forgejo runner"), and
+    // it turned the CGLS-26 warm-target unit tests RED on the first push of
+    // this rung. The hazard being guarded is a MULTI-GIGABYTE target dir
+    // (~16 GiB live on witness-b); anything this side of the floor cannot
+    // fill a volume no matter how the ratio comes out.
+    let floor = WARM_DISK_MIN_INTERESTING_BYTES;
+    if used < floor {
+        return None;
+    }
+    let free = free_bytes_at(warm_dir)?;
     let need = used.saturating_mul(WARM_DISK_HEADROOM_X);
-    // A cold/empty warm dir (first run for this key) has used == 0 ⇒ need == 0
-    // ⇒ never trips. Correct: there is nothing cached to protect yet, and the
-    // compile has to write somewhere regardless.
     if free < need {
         return Some(format!(
             "disk-pressure:free={}MiB,warm={}MiB,need={}MiB",
@@ -3415,11 +3487,22 @@ fn dir_size_bytes(dir: &Path) -> Option<u64> {
     Some(total)
 }
 
-fn emit_warm_obs(warm_dir: &Path, mode: &str, reason: &str) {
-    eprintln!(
-        "[cargoless:obs] witness-warm-target dir={} mode={mode} reason={reason}",
-        warm_dir.display()
-    );
+/// Collapse a warm-obs `reason` to a BOUNDED label for the counter.
+///
+/// Several reasons embed an errno or byte counts (`mkdir:<io error>`,
+/// `disk-pressure:free=…,warm=…`). Keying the map on the raw string would let
+/// it grow without bound and would fragment the very signal an alert needs to
+/// sum. Keying on the whole prefix before the first `:` would over-collapse
+/// the opposite way — `contended:in-proc` and `contended:flock` are DIFFERENT
+/// interlocks (in-process CAS vs cross-process flock) and which one fired is
+/// the diagnostic.
+///
+/// So: keep `contended:*` two-deep, collapse everything else to its head.
+fn warm_obs_bucket(reason: &str) -> &str {
+    if reason.starts_with("contended:") {
+        return reason;
+    }
+    reason.split([':', ',']).next().unwrap_or(reason)
 }
 
 /// RAII holder for the resolved warm dir + its two locks. Dropping it
@@ -7669,6 +7752,81 @@ checks:
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
+    /// The counter must have BOUNDED cardinality (reasons embed errnos and
+    /// byte counts) while keeping the two contention interlocks apart — which
+    /// one fired is the diagnostic that tells in-process CAS from flock.
+    #[test]
+    fn warm_obs_bucket_bounds_cardinality_but_keeps_interlocks_distinct() {
+        // Variable tails collapse to a stable head.
+        assert_eq!(
+            warm_obs_bucket("mkdir:Permission denied (os error 13)"),
+            "mkdir"
+        );
+        assert_eq!(
+            warm_obs_bucket("flock-open:No such file (os error 2)"),
+            "flock-open"
+        );
+        assert_eq!(
+            warm_obs_bucket("disk-pressure:free=1024MiB,warm=16384MiB,need=32768MiB"),
+            "disk-pressure"
+        );
+        // Two disk-pressure events with different numbers share one bucket —
+        // otherwise every event is its own series and nothing ever sums.
+        assert_eq!(
+            warm_obs_bucket("disk-pressure:free=1MiB,warm=2MiB,need=4MiB"),
+            warm_obs_bucket("disk-pressure:free=9MiB,warm=8MiB,need=16MiB"),
+        );
+        // But the interlocks stay separable.
+        assert_eq!(warm_obs_bucket("contended:in-proc"), "contended:in-proc");
+        assert_eq!(warm_obs_bucket("contended:flock"), "contended:flock");
+        assert_ne!(
+            warm_obs_bucket("contended:in-proc"),
+            warm_obs_bucket("contended:flock"),
+            "collapsing these loses which interlock fired"
+        );
+        assert_eq!(warm_obs_bucket("hit"), "hit");
+    }
+
+    /// `GET /daemon`'s `warm_target` field: absent before anything resolves
+    /// (never a misleading zero), then counting both outcomes.
+    #[test]
+    fn warm_target_stats_json_absent_until_first_resolve_then_counts() {
+        let api = ServeVerdictState::new();
+        assert!(
+            api.warm_target_stats_json().is_none(),
+            "no resolutions yet ⇒ omit the field rather than publish 0"
+        );
+
+        let dir = temp_root("warm-stats");
+        api.record_warm_obs(&dir, "warm", "hit");
+        api.record_warm_obs(&dir, "warm", "hit");
+        api.record_warm_obs(&dir, "cold-fallback", "contended:flock");
+        api.record_warm_obs(
+            &dir,
+            "cold-fallback",
+            "disk-pressure:free=1MiB,warm=2MiB,need=4MiB",
+        );
+        api.record_warm_obs(
+            &dir,
+            "cold-fallback",
+            "disk-pressure:free=7MiB,warm=9MiB,need=18MiB",
+        );
+
+        let v = api.warm_target_stats_json().expect("stats after recording");
+        assert_eq!(v["warm"], 2);
+        assert_eq!(
+            v["cold_fallback"]["disk-pressure"], 2,
+            "byte-count variants aggregate into one alertable series"
+        );
+        assert_eq!(v["cold_fallback"]["contended:flock"], 1);
+        assert!(
+            v["cold_fallback"].get("contended:in-proc").is_none(),
+            "reasons that never fired must not appear"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// `dir_size_bytes` totals the tree, recurses, and does not follow
     /// symlinks out of it. An undercount would defeat the disk rung exactly
     /// when the warm dir is biggest, so this pins the arithmetic.
@@ -7718,17 +7876,18 @@ checks:
         let root = temp_root("warm-diskpressure");
         assert!(
             warm_dir_disk_pressure(&root).is_none(),
-            "empty warm dir ⇒ need=0 ⇒ must not trip, or warm can never bootstrap"
+            "empty warm dir must not trip, or warm can never bootstrap"
         );
 
-        // Small dir on a normal dev/CI filesystem: 2x a few KiB is always
-        // available, so this must stay warm. (Asserting the trip direction
-        // would require filling the volume, so the arithmetic is covered by
-        // `warm_disk_pressure_threshold_arithmetic` instead.)
+        // A small dir must stay warm REGARDLESS of how full the volume is —
+        // that is the floor, not a ratio that happens to pass here. Without
+        // it this very assertion fails on the disk-pressured CI runner while
+        // passing on a roomy laptop, which is how the first push of this rung
+        // turned the two pre-existing CGLS-26 tests RED.
         std::fs::write(root.join("small.bin"), vec![0u8; 4096]).unwrap();
         assert!(
             warm_dir_disk_pressure(&root).is_none(),
-            "4 KiB dir cannot exceed half the free space of a working volume"
+            "4 KiB dir is below WARM_DISK_MIN_INTERESTING_BYTES ⇒ exempt"
         );
 
         // Nonexistent path: `df` fails ⇒ None ⇒ fail OPEN. Unmeasurable is
@@ -7745,7 +7904,11 @@ checks:
     /// below `WARM_DISK_HEADROOM_X` × dir size trips, at-or-above does not.
     #[test]
     fn warm_disk_pressure_threshold_arithmetic() {
-        let trips = |free: u64, used: u64| free < used.saturating_mul(WARM_DISK_HEADROOM_X);
+        // Mirrors `warm_dir_disk_pressure`'s decision, floor first.
+        let trips = |free: u64, used: u64| {
+            used >= WARM_DISK_MIN_INTERESTING_BYTES
+                && free < used.saturating_mul(WARM_DISK_HEADROOM_X)
+        };
         assert_eq!(WARM_DISK_HEADROOM_X, 2, "doc + reason string assume 2x");
         // The live witness-b shape that motivated the rung: ~16 GiB warm dir,
         // and a Cargo.lock change would want a whole second key alongside it.
@@ -7757,10 +7920,26 @@ checks:
             !trips(35 << 30, 16 << 30),
             "35 GiB free vs 16 GiB warm ⇒ warm"
         );
-        assert!(!trips(0, 0), "empty dir never trips");
-        assert!(trips(0, 1), "no space at all with a live cache ⇒ cold");
         // Exactly at the boundary is NOT pressure (`<`, not `<=`).
         assert!(!trips(32 << 30, 16 << 30), "exactly 2x is sufficient");
+
+        // The floor. A tiny dir on a nearly-full volume must NOT trip: the
+        // bare ratio said it should, which reddened the two pre-existing
+        // CGLS-26 warm-target tests on the disk-pressured CI runner
+        // (`ci.yml` header). There is no multi-GiB cache to protect there.
+        assert!(!trips(0, 0), "empty dir never trips");
+        assert!(
+            !trips(0, 4096),
+            "4 KiB dir on a full disk ⇒ below floor ⇒ stay warm"
+        );
+        assert!(
+            !trips(1 << 20, (1 << 30) - 1),
+            "just under the floor is still exempt"
+        );
+        assert!(
+            trips(1 << 20, 1 << 30),
+            "at the floor with 1 MiB free ⇒ genuinely at risk ⇒ cold"
+        );
     }
 
     /// `free_bytes_at` parses `df -Pk` into a plausible byte count for a path

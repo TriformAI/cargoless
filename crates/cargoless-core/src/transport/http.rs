@@ -881,6 +881,11 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
             if let Some(cfg) = svc.resolved_config() {
                 body["ra_config"] = cfg;
             }
+            // CGLS-26: warm-target outcome counters. Additive and omitted for
+            // services that run no witness compiles.
+            if let Some(warm) = svc.warm_target_stats() {
+                body["warm_target"] = warm;
+            }
             (200, body.to_string())
         }
         "/admin/active" => (200, daemon_activity_to_json(&svc.daemon_activity())),
@@ -2096,6 +2101,64 @@ mod tests {
         assert!(
             v.get("ra_config").is_none(),
             "no resolved config ⇒ ra_config omitted: {body}"
+        );
+    }
+
+    /// CGLS-26: `GET /daemon` carries `warm_target` iff the service reports
+    /// warm-target stats. This is the pull-based path that makes a
+    /// `cold-fallback` alertable — the log line alone cannot be, because both
+    /// witness pods sit on a node whose log-shipping agent is crash-looping.
+    #[test]
+    fn daemon_route_includes_warm_target_stats_when_present() {
+        struct WithWarm;
+        impl VerdictService for WithWarm {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+            fn warm_target_stats(&self) -> Option<serde_json::Value> {
+                Some(serde_json::json!({
+                    "warm": 12,
+                    "cold_fallback": { "disk-pressure": 3, "contended:flock": 1 }
+                }))
+            }
+        }
+        let req = HttpReq {
+            method: "GET".into(),
+            path: "/daemon".into(),
+            query: String::new(),
+            bearer: None,
+            content_length: None,
+            content_encoding: None,
+        };
+        let (code, body) = route_oneshot(&WithWarm, &req);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["warm_target"]["warm"], 12, "body: {body}");
+        assert_eq!(v["warm_target"]["cold_fallback"]["disk-pressure"], 3);
+        assert!(
+            v["build_id"].is_string(),
+            "additive, build_id still present"
+        );
+
+        // A service with no witness compiles uses the trait default (None) and
+        // the field is omitted — no misleading zero, wire-compatible.
+        let (_c, body) = route_oneshot(&MockService::new(), &req);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v.get("warm_target").is_none(),
+            "no warm stats ⇒ field omitted: {body}"
         );
     }
 

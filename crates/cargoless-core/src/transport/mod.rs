@@ -486,6 +486,27 @@ pub trait VerdictService: Send + Sync {
         None
     }
 
+    /// CGLS-26 observability: cumulative counts of warm-target resolutions by
+    /// outcome, as `{"warm": N, "cold_fallback": {"<reason>": N, ...}}`.
+    /// `None` ⇒ the service runs no witness compiles (mock/in-proc paths) and
+    /// `GET /daemon` omits the field.
+    ///
+    /// ## Why this is a counter and not just a log line
+    ///
+    /// The CGLS-26 commit calls a contended `cold-fallback` "a serialization-
+    /// violation alarm", but the alarm was only ever an `eprintln!`. Nothing
+    /// consumed it, so the alarm could not fire. Worse, it could not fire even
+    /// in principle on the pods that matter: both witness instances run on
+    /// triform-5, whose `k8s-infra-otel-agent` has been CrashLoopBackOff since
+    /// 2026-07-06 (a stalled HelmRelease, endpointless `otlp` exporter), so
+    /// their stdout never reaches SigNoz at all. A pull-based counter on an
+    /// endpoint the scraper already reaches does not depend on that pipeline.
+    ///
+    /// ADDITIVE with a default body, same discipline as `resolved_config`.
+    fn warm_target_stats(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Admin read: current drain/quiesce state. Default keeps older/mock
     /// services source-compatible and reports "idle, not quiescing".
     fn daemon_activity(&self) -> DaemonActivity {
