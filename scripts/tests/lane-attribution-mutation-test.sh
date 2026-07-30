@@ -108,6 +108,107 @@ mutate "line-sensitive ejection identity" \
   's = s.replace("let fingerprints = fingerprint_counts(&self.root, &owned);", "let mut fingerprints = fingerprint_counts(&self.root, &owned); for d in &owned { fingerprints.insert(format!(\"line:{}\", d.line), 1); }", 1)' \
   "puts line numbers back into the ejection identity, so an unrelated insertion above an error re-blames it"
 
+# ── the staging engine ───────────────────────────────────────────────────
+#
+# `stage` / `fail_fast` / `target_key` live in project_checks.rs, not lane.rs,
+# and their tests are unit tests in that file rather than in lane_policy.rs.
+# Same reasoning applies though: these three decide whether an expensive build
+# starts at all, so a suite that passes regardless of whether they work would
+# convert "we skip the release build on a type error" from a property into a
+# hope.
+#
+# They mutate a different file and run a different suite, so they get their own
+# backup/runner rather than being forced through the lane.rs `mutate` above.
+
+ENGINE="$ROOT/crates/cargoless-core/src/project_checks.rs"
+ENGINE_BACKUP=""
+if [ -f "$ENGINE" ]; then
+    ENGINE_BACKUP="$(mktemp)"
+    cp "$ENGINE" "$ENGINE_BACKUP"
+    # Extend the existing trap so BOTH files are restored on any exit path.
+    restore() {
+        cp "$BACKUP" "$SRC"; rm -f "$BACKUP"
+        [ -n "$ENGINE_BACKUP" ] && cp "$ENGINE_BACKUP" "$ENGINE" && rm -f "$ENGINE_BACKUP"
+    }
+    trap restore EXIT
+fi
+
+run_engine_suite() {
+    (cd "$ROOT" && cargo test -p cargoless-core --lib project_checks --locked) \
+        >/tmp/lane-mutation-engine.log 2>&1
+}
+
+# $1 = name, $2 = python mutation on project_checks.rs, $3 = what it proves
+mutate_engine() {
+    local name="$1" py="$2" proves="$3"
+    [ -n "$ENGINE_BACKUP" ] || return 0
+    cp "$ENGINE_BACKUP" "$ENGINE"
+    python3 - "$ENGINE" <<PY
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+${py}
+p.write_text(s)
+PY
+    if ! cmp -s "$ENGINE" "$ENGINE_BACKUP"; then
+        if run_engine_suite; then
+            echo "  SURVIVED — $name" >&2
+            echo "      the suite passes on code that $proves" >&2
+            survivors=$((survivors + 1))
+        else
+            echo "  ok — caught: $name"
+        fi
+    else
+        echo "  SURVIVED — $name (mutation did not apply; the pattern moved)" >&2
+        echo "      re-anchor this mutation on the current source" >&2
+        survivors=$((survivors + 1))
+    fi
+}
+
+if [ -n "$ENGINE_BACKUP" ]; then
+    echo "== staging-engine mutations =="
+
+    echo "== baseline: the engine suite must PASS on unmutated code =="
+    if ! run_engine_suite; then
+        echo "FAIL: the engine suite is red BEFORE any mutation — fix that first" >&2
+        tail -30 /tmp/lane-mutation-engine.log >&2
+        exit 1
+    fi
+    echo "  ok — baseline green"
+
+    # 5. Stages stop gating: a failed stage no longer stops the next one.
+    #    This is THE property — without it the expensive release build runs
+    #    even though the cheap check already rejected the candidate, and the
+    #    whole staging feature is decoration.
+    mutate_engine "stages do not gate (a red stage no longer halts the next)" \
+      's = s.replace("if stage_red {\n            halted = Some(stage);\n        }", "if false {\n            halted = Some(stage);\n        }", 1)' \
+      "runs a later stage after an earlier stage failed, so an expensive build is paid for a candidate already known bad"
+
+    # 6. Fail-fast never trips. The in-flight sibling runs to completion on a
+    #    candidate that cannot land — the exact waste the flag exists to stop.
+    mutate_engine "fail_fast never trips" \
+      's = s.replace("let tripped = fail_fast && result.required && result.tree == TreeState::Red;", "let tripped = false;", 1)' \
+      "never cancels in-flight work after a required check has already gone red"
+
+    # 7. Fail-fast trips on ANY red, including a non-required one. That would
+    #    silently promote every advisory into a gate.
+    mutate_engine "fail_fast trips on a non-required red" \
+      's = s.replace("let tripped = fail_fast && result.required && result.tree == TreeState::Red;", "let tripped = fail_fast && result.tree == TreeState::Red;", 1)' \
+      "cancels a build over a FAILING ADVISORY, promoting non-required checks into gates"
+
+    # 8. target_key stops separating dirs, so every command check shares one
+    #    target again and declared-parallel legs silently serialize.
+    mutate_engine "target_key ignored (all legs share one target dir)" \
+      's = s.replace("if check.target_key.is_empty() {\n        return base;\n    }", "if true {\n        return base;\n    }", 1)' \
+      "puts every leg back on one CARGO_TARGET_DIR, so legs declared parallel serialize on cargo's .cargo-lock and the parallelism is imaginary"
+
+    # 9. A skipped check is reported GREEN rather than red. Fails OPEN: a gate
+    #    would read "did not run" as "passed".
+    mutate_engine "skipped checks report green" \
+      's = s.replace("fn skipped_stage_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectCheckResult {", "fn skipped_stage_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectCheckResult {\n    if true { let mut r = result_from_diags(check, Vec::new(), 0); r.tree = TreeState::Green; return r; }", 1)' \
+      "reports a check that never ran as GREEN, so a gate reads 'unknown' as 'passed'"
+fi
+
 echo
 if [ "$survivors" -ne 0 ]; then
     echo "FAIL: ${survivors} mutation(s) survived — the lane tests do not actually" >&2
