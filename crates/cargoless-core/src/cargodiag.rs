@@ -96,7 +96,17 @@ pub fn parse_cargo_json_line(root: &Path, line: &str) -> Option<Diagnostic> {
             return None;
         }
     }
-    let message = value.get("message").unwrap_or(&value);
+    // Cargo wraps the diagnostic: `{"reason":…, "message":{…}}`. A bare stream
+    // emits the inner object directly, where `message` is the human STRING.
+    //
+    // `value.get("message").unwrap_or(&value)` looks right and is not: on a
+    // bare object it selects the string, and every later `.get()` on a
+    // JSON string returns None, so the whole line is silently dropped. Select
+    // the nested object only when it IS an object.
+    let message = match value.get("message") {
+        Some(m) if m.is_object() => m,
+        _ => &value,
+    };
 
     let severity = match message.get("level").and_then(serde_json::Value::as_str) {
         Some("error") => Severity::Error,
