@@ -46,6 +46,42 @@ a member on no evidence. Fail-safe.
    Enumerate the tiers instead. In tf-multiverse,
    `scripts/ci/check-lane-profile-isolation.sh` asserts this both ways.
 
+2b. **Switch it on.** The daemon runs no lane unless asked — a lane merges and
+   publishes, so it must never be acquired as a side effect of starting up:
+
+   | env var | meaning |
+   |---|---|
+   | `CARGOLESS_LANE_PROFILE` | the `cargoless.checks.yaml` profile to run. Unset ⇒ no lane, and `GET /lane` 404s. |
+   | `CARGOLESS_LANE_BASE` | ref candidates are built on. Default `main`. |
+   | `CARGOLESS_LANE_ARTIFACT` | path, relative to the candidate root, of the artifact to publish on green. |
+
+   Leave `CARGOLESS_LANE_ARTIFACT` unset for a **check-only lane**: it proves
+   the merged tree compiles and deliberately leaves `.cargoless/latest-green`
+   alone. That is the safe way to start — it cannot move your pointer, so a
+   wrong profile costs build minutes and nothing else.
+
+   Confirm from the boot log rather than assuming:
+
+   ```
+   [cargoless:obs] build-lane enabled profile=lane base=dev artifact=<none: check-only>
+   ```
+
+   No such line means no lane, whatever the environment claims to hold.
+
+### Staging the manifest keys
+
+`stage:`, `target_key:` and `output:` are all subject to the `reject_unknown()`
+ordering rule above — the daemon must ship them before a repo declares them.
+Adding them early does not fail one push; it reds the manifest for **every**
+agent pushing to that repo.
+
+The staged state is fail-safe in the useful direction: without `stage:` the
+cheap check legs run *alongside* the expensive build legs rather than before
+them. That is strictly more work than the staged form and never less coverage.
+Verify that property for your own manifest before staging anything — a staged
+state that ran *fewer* checks until the key landed would fail OPEN, and would
+not be acceptable.
+
 3. **Point a submitter at it.** `POST /lane/enqueue` with `id`, `head`, and
    `changed_files`.
 
