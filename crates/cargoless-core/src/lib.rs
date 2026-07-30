@@ -30,6 +30,7 @@ pub mod barrier;
 pub mod batch;
 pub mod build;
 pub mod cache_layout;
+pub mod cargodiag;
 pub mod cluster;
 pub mod clusterdrv;
 pub mod clustermgr;
