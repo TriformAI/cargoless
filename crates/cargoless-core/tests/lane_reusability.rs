@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use cargoless_core::lane::{LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LaneState};
+use cargoless_core::lane::{LaneAction, LaneEvent, LaneMember, LaneState};
 use cargoless_core::lanedrv::{
     CandidateTree, LandOutcome, LaneDriver, LaneLander, LegOutcome, LegRunner,
 };
