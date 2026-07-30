@@ -1,0 +1,66 @@
+# Egress for the kaniko serve-image build Job.
+#
+# WHY THIS FILE EXISTS AS A SEPARATE OBJECT
+#
+# `cargoless-builder` is default-deny-egress, and the existing allow-policies
+# select specific pod labels. A fresh Job with a NEW label therefore gets NO
+# egress at all — and the failure is deeply unobvious: kaniko cannot clone the
+# git context, and reports it as a `--help` dump that reads like an argument
+# error rather than a network one. (The Dockerfile's own downloads — crates.io,
+# rustup, GitHub-release binaries — fail the same way, later and slower.)
+#
+# So the build Job's label MUST have a matching policy or the build cannot
+# work. Applying build-serve-image.yaml without this is the single most likely
+# way for a first attempt to fail.
+#
+# Mirrors `cargoless-buildkit-egress` (the sanctioned builder policy for
+# `app=cargoless-kube0`) with one addition: that policy's internet rule
+# EXCLUDES RFC1918, which is correct for reaching crates.io but would also
+# block the in-cluster Forgejo and registry. Rule 3 below re-allows in-cluster
+# destinations via namespaceSelector — needed because the git context is
+# forgejo.triform.dev and the push destination is registry.triform.cloud, both
+# of which resolve in-cluster.
+#
+# Apply once, alongside the Job:
+#   kubectl apply -f deploy/jobs/build-serve-image-egress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cargoless-serve-image-builder-egress
+  namespace: cargoless-builder
+spec:
+  podSelector:
+    matchLabels:
+      # Must match the Job template's label in build-serve-image.yaml. If you
+      # rename one, rename both — a mismatch silently yields a build pod with
+      # no network.
+      app: cargoless-serve-image-builder
+  policyTypes:
+    - Egress
+  egress:
+    # 1. DNS — everything else is unreachable without it.
+    - ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+      to:
+        - namespaceSelector: {}
+    # 2. Public internet on 80/443 for crates.io, rustup, and the GitHub
+    #    release downloads the Dockerfile pulls. RFC1918 is excluded here to
+    #    keep this from being a blanket in-cluster allow; rule 3 grants exactly
+    #    the in-cluster reach we need.
+    - ports:
+        - { port: 80, protocol: TCP }
+        - { port: 443, protocol: TCP }
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    # 3. In-cluster: the Forgejo git context and the image registry.
+    - ports:
+        - { port: 80, protocol: TCP }
+        - { port: 443, protocol: TCP }
+      to:
+        - namespaceSelector: {}

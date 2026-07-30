@@ -13,15 +13,35 @@
 #       --docker-server=registry.triform.cloud \
 #       --docker-username=<robot-user> --docker-password=<robot-token>
 #
+# TAG FORMAT — `<unix-epoch>-main-<short-sha>`, e.g. `1785378091-main-0748167`.
+#   NOT the older `0.4.x-main-<sha>`. The epoch prefix is load-bearing: Flux's
+#   ImagePolicy elects the newest image by sorting an extracted field, and
+#   `0.4.x-main-<sha>` has NO orderable component (semver chokes on the
+#   `-main-<sha>` suffix, and there is no total order over commit shas). With a
+#   leading epoch the policy is a plain numerical sort — the same convention
+#   all three triform app lanes already use.
+#   The matching policy lives in tf-multiverse:
+#   deployment/kubernetes/cluster/flux-image-automation/cargoless-serve.yaml
+#   (pattern `^(?P<ts>[0-9]+)-main-[0-9a-f]+$`). A tag that does not match is
+#   simply never elected — the build "succeeds" and nothing ever deploys.
+#
 # USAGE (manual; SOURCE_REF + IMAGE_TAG must be injected — a raw apply fails
 #   closed, mirroring deployment/isolation/jobs/build-artifacts.yaml):
-#     sed -e "s|__SOURCE_REF__|<full-sha>|" -e "s|__IMAGE_TAG__|0.2.x-<sha>|" \
+#     SHA=$(git rev-parse HEAD)
+#     sed -e "s|__SOURCE_REF__|${SHA}|" \
+#         -e "s|__IMAGE_TAG__|$(date -u +%s)-main-${SHA:0:7}|" \
 #       deploy/jobs/build-serve-image.yaml | kubectl apply -f -
 #     kubectl -n cargoless-builder logs -f job/build-cargoless-serve-image
 #
-#   Then bump the image tag in the Flux-authoritative manifest
-#   (tf-multiverse: deployment/cargoless-builder/{serve,shards}.yaml) — that
-#   commit is what actually rolls the daemon. Building != deploying.
+#   DEPLOY IS NOW AUTOMATIC (2026-07-30) for the witness lane: the Flux
+#   ImagePolicy above elects the new tag and the `triform-app-images`
+#   ImageUpdateAutomation rewrites the marked image line in tf-multiverse
+#   deployment/cargoless-builder/serve-witness.yaml. Nothing to hand-edit.
+#
+#   Two caveats. (1) `serve.yaml` / `shards.yaml` are NOT yet marked, so those
+#   lanes still need the manual bump. (2) The witness is replicas:1 +
+#   strategy:Recreate with an 1800s drain, so the roll waits out an in-flight
+#   compile — it lands at the next lull, not instantly.
 #
 # Duration: ~10-15 min cold (release cargo build is the bottleneck); kaniko
 #   layer cache (--cache=true) makes warm rebuilds much faster.
@@ -47,7 +67,12 @@ spec:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:latest
           args:
-            - "--context=git://github.com/TriformAI/cargoless.git#__SOURCE_REF__"
+            # FORGEJO, not github.com. A build pod in this namespace cannot
+            # reach github.com (i/o timeout) — the failure surfaces as a kaniko
+            # `--help` dump, which reads like an argument error rather than a
+            # network one. Forgejo is the source of truth and carries the same
+            # shas. Auth comes from GIT_USERNAME/GIT_PASSWORD below.
+            - "--context=git://forgejo.triform.dev/triform/cargoless.git#__SOURCE_REF__"
             - "--dockerfile=deploy/cargoless-serve.Dockerfile"
             - "--destination=registry.triform.cloud/cargoless/cargoless-serve:__IMAGE_TAG__"
             - "--cache=true"
@@ -59,6 +84,16 @@ spec:
             # from this merged docker config. Mount pull + push secrets and
             # point at the directory; see the prereq note in the header.
             - { name: DOCKER_CONFIG, value: "/kaniko/.docker" }
+            # Git auth for the Forgejo context above. kaniko's git provider
+            # reads exactly these two names; the repo is not anonymously
+            # clonable, and without them the clone fails the same opaque way a
+            # wrong flag does (a `--help` dump).
+            - name: GIT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: GIT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
           volumeMounts:
             - { name: docker-config, mountPath: /kaniko/.docker }
           resources:
