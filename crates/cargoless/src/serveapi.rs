@@ -7873,6 +7873,20 @@ checks:
     /// appserve `CARGOLESS_APP_PARALLEL_BUILDS` tests already exhibit.
     /// (Other tests are unaffected by a transiently-set flag: their scratch
     /// roots have no Cargo.lock, so key resolution fails ⇒ cold, as before.)
+    ///
+    /// **Acquire with [`poisoned`], never `.lock().unwrap()`.** These two
+    /// tests share this mutex, so when one of them panics it POISONS it and
+    /// the sibling then dies on the unwrap — turning a single failure into
+    /// two, and burying the real one under a `PoisonError { .. }` that names
+    /// nothing. That misreporting has now cost a diagnosis twice (`df0ecab`
+    /// on 2026-07-29; again on 2026-07-30), each time sending a reader after
+    /// a lock bug that was never there.
+    ///
+    /// A poisoned env mutex carries no corrupt state to protect: the guard
+    /// exists only to serialize `set_var`/`remove_var`, and each test sets
+    /// the var it needs on entry. Ignoring poison is therefore correct here,
+    /// not a papering-over — it makes the failing test the ONLY test that
+    /// fails, which is the whole point of the guard.
     static WARM_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn warm_scratch_with_lockfile(label: &str) -> PathBuf {
@@ -8179,7 +8193,7 @@ checks:
     /// locks, dirs — would resolve.
     #[test]
     fn resolve_warm_target_flag_off_is_cold() {
-        let _env = WARM_ENV_LOCK.lock().unwrap();
+        let _env = poisoned(&WARM_ENV_LOCK);
         // SAFETY: env mutation is process-global; serialized by
         // WARM_ENV_LOCK against the other warm-flag test, and behavior-
         // neutral for non-warm tests (see WARM_ENV_LOCK doc).
@@ -8201,7 +8215,7 @@ checks:
     /// serialization interlock that keeps CGLS-24 structurally impossible.
     #[test]
     fn resolve_warm_target_contended_key_goes_cold_until_release() {
-        let _env = WARM_ENV_LOCK.lock().unwrap();
+        let _env = poisoned(&WARM_ENV_LOCK);
         // SAFETY: see `resolve_warm_target_flag_off_is_cold`.
         unsafe { std::env::set_var("CARGOLESS_WITNESS_WARM_TARGET", "1") };
         let api = ServeVerdictState::new();
