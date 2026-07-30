@@ -67,6 +67,15 @@ use super::{
 /// client-side preflight defaults in tf-multiverse (scripts/check-remote,
 /// scripts/dev-merge, scripts/cargoless-overlay-preflight).
 pub const MAX_OVERLAY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Cap for `POST /lane/*`.
+///
+/// Deliberately tiny next to [`MAX_OVERLAY_BYTES`]: a lane request is
+/// `(id, head, changed_files)` and never carries file content — the lane
+/// materialises the candidate from the base ref itself. 1 MiB is generous for a
+/// changed-file list and small enough that this route cannot be used as a
+/// memory-pressure lever against the daemon.
+pub const MAX_LANE_BODY_BYTES: usize = 1024 * 1024;
 /// Compress large JSON request bodies before applying the fixed HTTP cap.
 /// This targets full-file generated overlays without changing the logical
 /// push protocol or making small same-host requests pay gzip overhead.
@@ -716,6 +725,82 @@ fn handle(
         return;
     }
 
+    // ── build lane: POST /lane/enqueue, POST /lane/readmit ──
+    // Bearer-gated by the shared #14 seam above. Small bodies — a candidate is
+    // (id, head, changed_files), never file content: the lane materialises the
+    // candidate from the base ref itself, so nothing large crosses this wire.
+    if req.method == "POST" && (req.path == "/lane/enqueue" || req.path == "/lane/readmit") {
+        let body = match req.content_length {
+            None => {
+                write_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    "POST /lane/* requires a numeric Content-Length",
+                );
+                return;
+            }
+            Some(n) if n > MAX_LANE_BODY_BYTES => {
+                write_response(
+                    &mut writer,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    "lane payload exceeds the size cap",
+                );
+                return;
+            }
+            Some(n) => {
+                let mut buf = vec![0u8; n];
+                if reader.read_exact(&mut buf).is_err() {
+                    write_response(
+                        &mut writer,
+                        400,
+                        "Bad Request",
+                        "text/plain",
+                        "lane body shorter than its Content-Length",
+                    );
+                    return;
+                }
+                buf
+            }
+        };
+        let body = match decode_request_body(&req, body) {
+            Ok(body) => body,
+            Err((code, reason, message)) => {
+                write_response(&mut writer, code, reason, "text/plain", &message);
+                return;
+            }
+        };
+        let parsed = Request::from_json(&String::from_utf8_lossy(&body));
+        // The outcome carries a human sentence either way: a caller that is
+        // refused must be able to see WHY without reading daemon logs.
+        let (code, reason, result) = match (req.path.as_str(), parsed) {
+            ("/lane/enqueue", Some(Request::LaneEnqueue(r))) => match svc.lane_enqueue(&r) {
+                Ok(msg) => (202, "Accepted", msg),
+                Err(msg) => (409, "Conflict", msg),
+            },
+            ("/lane/readmit", Some(Request::LaneReadmit { id })) => match svc.lane_readmit(&id) {
+                Ok(msg) => (202, "Accepted", msg),
+                Err(msg) => (409, "Conflict", msg),
+            },
+            _ => (
+                400,
+                "Bad Request",
+                "body is not a valid lane request".to_string(),
+            ),
+        };
+        write_response(
+            &mut writer,
+            code,
+            reason,
+            "application/json",
+            &serde_json::json!({"ok": code == 202, "detail": result}).to_string(),
+        );
+        return;
+    }
+
     // ── self-serve previews: POST /instances, DELETE /instances/<name> ──
     // Bearer-gated (the #14 auth gate above already ran). The daemon enqueues
     // the request onto the single-mutator control loop and answers 202
@@ -892,6 +977,15 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         }
         "/admin/active" => (200, daemon_activity_to_json(&svc.daemon_activity())),
         "/worktrees" => (200, summaries_to_json(&svc.list_worktrees())),
+        // Build lane state: queue depth, the running build, and every live
+        // ejection WITH its reason. 404 (not an empty object) when no lane is
+        // configured — "no lane here" and "a lane with nothing in it" are
+        // different answers, and conflating them would have an operator waiting
+        // on a queue that does not exist.
+        "/lane" => match svc.lane_snapshot() {
+            Some(v) => (200, v.to_string()),
+            None => (404, "null".to_string()),
+        },
         "/status" => match query_param(&req.query, "worktree").map(|w| pct_decode(&w)) {
             // Optional `&base_sha=<commit>` addresses the verdict for exactly
             // that commit (the `<absent>` fix): the witness shares one

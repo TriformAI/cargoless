@@ -113,6 +113,31 @@ jobs:
           fetch-depth: 1
       - run: cargo test --workspace --locked
 
+  # The lane decides who gets blamed for a red build, and tests/lane_policy.rs is
+  # the only thing between that policy and an unjust ejection. This job proves
+  # the suite can actually FAIL: it breaks the attribution four ways and asserts
+  # the tests catch each one. A suite that passes on broken code converts
+  # "unverified" into "verified" — this repo's documented failure mode.
+  #
+  # Separate from `test` deliberately: it rewrites lane.rs in the workspace, and
+  # a job that mutates source must never share a checkout with one reporting a
+  # verdict on it.
+  lane-mutation:
+    name: lane policy mutation proof
+    runs-on: docker
+    container:
+      image: rust:1.85-bookworm
+    steps:
+      - name: Setup (node for checkout + git safe.dir)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends nodejs python3
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: bash scripts/tests/lane-attribution-mutation-test.sh
+
   fmt:
     runs-on: docker
     container:
