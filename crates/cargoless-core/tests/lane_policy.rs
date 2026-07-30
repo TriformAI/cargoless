@@ -148,6 +148,37 @@ fn a_full_queue_does_not_wait_out_the_window() {
 }
 
 #[test]
+fn work_that_was_already_waiting_never_sits_through_a_second_window() {
+    // The window gathers FRESH arrivals. It must never delay work that was
+    // already queued: after a red the survivors have to rebuild AT ONCE, and
+    // making them wait another window would add a full cycle to a queue that is
+    // already behind. (CI caught this: the first implementation opened a window
+    // on every path into the queue, so survivors stalled until the caller
+    // happened to tick.)
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/a.rs"]),
+            member("B", "b1", &["src/b.rs"]),
+        ],
+    );
+    // No Tick between the red and the assertion: the rebuild must not depend on
+    // one.
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/b.rs", 4, "E0308")],
+        },
+    });
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string()][..]),
+        "the survivor rebuilds immediately, with no second capture window"
+    );
+}
+
+#[test]
 fn a_zero_window_builds_immediately() {
     let mut st = LaneState::with_config(
         ROOT,

@@ -164,6 +164,39 @@ struct CheckConfig {
     paths: Vec<String>,
     command: Vec<String>,
     read_only: bool,
+    /// How to read structured diagnostics out of a `kind: command` check.
+    ///
+    /// * absent / `"check-diagnostic"` — cargoless's own
+    ///   `cargoless.check-diagnostic/v1` line protocol (the default; unchanged).
+    /// * `"cargo-json"` — the check emits `cargo --message-format=json`, parsed
+    ///   by [`crate::cargodiag`].
+    ///
+    /// Without this, a check that pipes raw cargo JSON matches no v1 line and
+    /// yields ZERO diagnostics; the non-zero exit then produces one synthetic
+    /// diagnostic pinned at the manifest. Correctly red, but with every file,
+    /// line and code discarded — and those are exactly what the build lane needs
+    /// to decide whose change broke the build.
+    output: CheckOutput,
+}
+
+/// Diagnostic format a `kind: command` check emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CheckOutput {
+    /// `cargoless.check-diagnostic/v1` — the historical default.
+    #[default]
+    CheckDiagnostic,
+    /// `cargo … --message-format=json`.
+    CargoJson,
+}
+
+impl CheckOutput {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "check-diagnostic" | "" => Some(CheckOutput::CheckDiagnostic),
+            "cargo-json" => Some(CheckOutput::CargoJson),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1466,9 +1499,22 @@ fn signal_name(sig: i32) -> &'static str {
 }
 
 fn parse_command_diagnostics(root: &Path, check: &CheckConfig, text: &str) -> Vec<Diagnostic> {
-    text.lines()
-        .filter_map(|line| parse_command_diagnostic_line(root, check, line))
-        .collect()
+    match check.output {
+        // The check speaks cargo's own JSON.
+        //
+        // `source` stays exactly "rustc" — NOT "rustc:<check-id>". Two things
+        // key on that string: the daemon's authoritative-vs-advisory split, and
+        // `attribution::fingerprint`, whose identity is
+        // `source|code|path|message`. Qualifying it would demote real compiler
+        // errors to the advisory tier AND make the same error fingerprint
+        // differently depending on which leg happened to report it — so a
+        // change that only moved a check id would read as a brand-new failure.
+        CheckOutput::CargoJson => crate::cargodiag::parse_cargo_json(root, text),
+        CheckOutput::CheckDiagnostic => text
+            .lines()
+            .filter_map(|line| parse_command_diagnostic_line(root, check, line))
+            .collect(),
+    }
 }
 
 fn parse_command_diagnostic_line(
@@ -1992,6 +2038,7 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
                 "paths",
                 "command",
                 "read_only",
+                "output",
             ],
             item.line(),
         )?;
@@ -2016,6 +2063,18 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
             paths: get_string_list(map, "paths")?.unwrap_or_default(),
             command: get_string_list(map, "command")?.unwrap_or_default(),
             read_only: get_bool(map, "read_only")?.unwrap_or(false),
+            output: {
+                let raw = get_string(map, "output")?.unwrap_or_default();
+                // An unrecognised value is an ERROR, never a silent fallback:
+                // typoing `cargo_json` would otherwise leave every diagnostic
+                // unparsed and the lane unable to attribute a single red.
+                CheckOutput::parse(&raw).ok_or(ParseError {
+                    line: item.line(),
+                    message: format!(
+                        "unknown output {raw:?}; expected \"check-diagnostic\" or \"cargo-json\""
+                    ),
+                })?
+            },
             id,
             kind,
         });

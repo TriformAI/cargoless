@@ -470,6 +470,15 @@ impl LaneState {
                 }
             }
         }
+        self.admit_new(member, actions);
+    }
+
+    /// Queue a member that arrived from outside, opening the capture window if
+    /// the lane was idle and empty.
+    fn admit_new(&mut self, member: LaneMember, actions: &mut Vec<LaneAction>) {
+        if self.phase == LanePhase::Idle && self.queue.is_empty() && self.queued_since.is_none() {
+            self.queued_since = Some(self.now);
+        }
         self.admit(member, actions);
     }
 
@@ -723,14 +732,23 @@ impl LaneState {
             }
             return;
         }
-        // Open the capture window on the first member of an idle lane.
-        let opened = *self.queued_since.get_or_insert(self.now);
+        // The window gathers FRESH arrivals. It must never delay work that was
+        // already waiting: after a red, the survivors requeue and have to
+        // rebuild at once — making them sit through another window would add a
+        // full cycle to a queue that is already behind. Same for a member whose
+        // ejection just lifted, and for anything left over when a build ends.
+        //
+        // `defer_until` is therefore set ONLY by a genuinely new enqueue, and
+        // cleared by everything else. `None` here means "these were waiting
+        // already; build now".
         let full = self.queue.len() >= self.cfg.max_members;
-        let elapsed = self.now.saturating_sub(opened);
-        // Wait for company — but never once the build is already full, and
-        // never when the window is disabled.
-        if !full && self.cfg.capture_window_ticks > 0 && elapsed < self.cfg.capture_window_ticks {
-            return;
+        if !full {
+            if let Some(opened) = self.queued_since {
+                let elapsed = self.now.saturating_sub(opened);
+                if elapsed < self.cfg.capture_window_ticks {
+                    return;
+                }
+            }
         }
         self.queued_since = None;
         let take = self.queue.len().min(self.cfg.max_members);
