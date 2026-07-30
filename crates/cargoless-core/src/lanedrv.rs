@@ -72,6 +72,50 @@ pub trait LegRunner {
 pub struct LegOutcome {
     pub tree: TreeState,
     pub diagnostics: Vec<cargoless_proto::Diagnostic>,
+    /// The rendered artifact this build produced, if any.
+    ///
+    /// `None` is legitimate — a check-only lane proves a tree compiles without
+    /// emitting anything — and the lander deliberately leaves the pointer alone
+    /// rather than erasing the last real green. But a lane that DOES build an
+    /// artifact and reports `None` here silently never publishes, which looks
+    /// exactly like a working lane until someone checks the pointer.
+    pub artifact: Option<String>,
+    /// Per-leg outcomes, in the order the runner reported them.
+    ///
+    /// The rolled-up `tree` answers "did it pass"; this answers "how far did it
+    /// get, and what did each stage cost". For a staged lane that is the
+    /// difference between "the build failed" and "stage 1 rejected it in 4
+    /// minutes, stages 2-3 never ran" — the second is what an operator needs
+    /// and what `GET /lane` should be able to show.
+    pub legs: Vec<LegReport>,
+}
+
+/// One leg's outcome within a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegReport {
+    pub id: String,
+    pub tree: TreeState,
+    pub required: bool,
+    pub duration_ms: u128,
+}
+
+/// Hand-written rather than derived because `TreeState` is a frozen `tf-proto`
+/// seam with no `Default` — and giving it one there would be a contract change
+/// to answer a convenience question here.
+///
+/// Green is the right default for the same reason `TreeState::Green` is the
+/// empty-tree verdict: a run that reported nothing has found nothing wrong.
+/// Callers that care always set `tree` explicitly; this exists so a test can
+/// say `..Default::default()` about the fields it is not testing.
+impl Default for LegOutcome {
+    fn default() -> Self {
+        Self {
+            tree: TreeState::Green,
+            diagnostics: Vec::new(),
+            artifact: None,
+            legs: Vec::new(),
+        }
+    }
 }
 
 /// Runs a named profile from `cargoless.checks.yaml`.
@@ -89,6 +133,15 @@ pub struct ProfileLegRunner {
     /// daemon — but it is opt-in, because sharing a target dir across
     /// concurrent builds is precisely how CGLS-24 happened.
     pub warm_target_dir: Option<PathBuf>,
+    /// Path, relative to the candidate root, where the legs leave the rendered
+    /// artifact for the lander to publish.
+    ///
+    /// `None` means this is a check-only lane and nothing is published. Set it
+    /// and the legs must write that file; a missing file on a green build is
+    /// reported as infra rather than published as an empty pointer, because
+    /// "green but produced nothing it promised" is a build-system fault, not a
+    /// verdict about anyone's code.
+    pub artifact_path: Option<PathBuf>,
 }
 
 impl ProfileLegRunner {
@@ -97,7 +150,16 @@ impl ProfileLegRunner {
             profile: profile.into(),
             check_ids: Vec::new(),
             warm_target_dir: None,
+            artifact_path: None,
         }
+    }
+
+    /// Publish the file the legs write at `path` (relative to the candidate
+    /// root) as this build's artifact.
+    #[must_use]
+    pub fn publishing(mut self, path: impl Into<PathBuf>) -> Self {
+        self.artifact_path = Some(path.into());
+        self
     }
 }
 
@@ -110,9 +172,31 @@ impl LegRunner for ProfileLegRunner {
             Some(changed_files),
             self.warm_target_dir.as_deref(),
         )?;
+        let legs = report
+            .results
+            .iter()
+            .map(|r| LegReport {
+                id: r.id.clone(),
+                tree: r.tree,
+                required: r.required,
+                duration_ms: r.duration_ms,
+            })
+            .collect();
+
+        // Only read the artifact on green. A red build may well have left a
+        // stale file from a previous run in the (warm) target dir, and
+        // publishing that would be the precise failure "never publish red"
+        // exists to prevent.
+        let artifact = match (&self.artifact_path, report.tree) {
+            (Some(rel), TreeState::Green) => Some(std::fs::read_to_string(root.join(rel))?),
+            _ => None,
+        };
+
         Ok(LegOutcome {
             tree: report.tree,
             diagnostics: report.diagnostics,
+            artifact,
+            legs,
         })
     }
 }
@@ -281,17 +365,20 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             // report punishes everyone for a reporting gap. Treat it as infra
             // and say why — the same no-vacuous-red discipline `statusfile`
             // applies when a red arrives without evidence.
-            Ok(LegOutcome { tree, diagnostics })
-                if tree == TreeState::Red && diagnostics.is_empty() =>
-            {
-                LaneBuildOutcome::Infra {
-                    reason: "build reported red with no diagnostics — cannot attribute; \
-                             treating as infrastructure rather than blaming a member"
-                        .to_string(),
-                }
-            }
-            Ok(LegOutcome { tree, diagnostics }) => match tree {
-                TreeState::Green => LaneBuildOutcome::Green { artifact: None },
+            Ok(LegOutcome {
+                tree, diagnostics, ..
+            }) if tree == TreeState::Red && diagnostics.is_empty() => LaneBuildOutcome::Infra {
+                reason: "build reported red with no diagnostics — cannot attribute; \
+                         treating as infrastructure rather than blaming a member"
+                    .to_string(),
+            },
+            Ok(LegOutcome {
+                tree,
+                diagnostics,
+                artifact,
+                ..
+            }) => match tree {
+                TreeState::Green => LaneBuildOutcome::Green { artifact },
                 TreeState::Red => LaneBuildOutcome::Red { diagnostics },
             },
             Err(e) => LaneBuildOutcome::Infra {

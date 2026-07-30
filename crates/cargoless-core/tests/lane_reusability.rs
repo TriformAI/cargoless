@@ -58,6 +58,7 @@ impl LegRunner for ScriptedLegs {
         Ok(self.outcomes.borrow_mut().pop().unwrap_or(LegOutcome {
             tree: TreeState::Green,
             diagnostics: Vec::new(),
+            ..Default::default()
         }))
     }
 }
@@ -68,13 +69,22 @@ impl LegRunner for ScriptedLegs {
 #[derive(Default)]
 struct RecordingLander {
     landed: RefCell<Vec<Vec<String>>>,
+    /// What the lander was actually handed to publish.
+    ///
+    /// Recorded because ignoring it is how the driver got away with dropping
+    /// the artifact: every test asserted WHO landed and none asserted WHAT
+    /// shipped, so a lane that published nothing looked healthy.
+    published: RefCell<Vec<Option<String>>>,
 }
 
 impl LaneLander for RecordingLander {
-    fn land(&self, members: &[LaneMember], _artifact: Option<&str>) -> io::Result<LandOutcome> {
+    fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome> {
         self.landed
             .borrow_mut()
             .push(members.iter().map(|m| m.id.clone()).collect());
+        self.published
+            .borrow_mut()
+            .push(artifact.map(str::to_string));
         Ok(LandOutcome {
             detail: "pointer advanced".to_string(),
         })
@@ -128,6 +138,7 @@ fn a_third_party_project_can_ship_a_change_through_the_lane() {
     let drv = driver(vec![LegOutcome {
         tree: TreeState::Green,
         diagnostics: Vec::new(),
+        ..Default::default()
     }]);
     let mut lane = lane();
 
@@ -169,10 +180,12 @@ fn a_red_ejects_the_author_and_ships_everyone_else() {
         LegOutcome {
             tree: TreeState::Green,
             diagnostics: Vec::new(),
+            ..Default::default()
         },
         LegOutcome {
             tree: TreeState::Red,
             diagnostics: vec![err_in("src/broken.rs")],
+            ..Default::default()
         },
     ]);
     // A capture window so both members ride ONE build — the production shape,
@@ -247,6 +260,58 @@ fn the_default_lander_publishes_and_never_erases_a_previous_green() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The gap this closes: the driver used to hardcode `Green { artifact: None }`,
+/// so `PointerLander` always took its "nothing to publish" branch and the
+/// pointer NEVER advanced. Every lander test passed — the lander was correct —
+/// and the lane still published nothing, which looks exactly like a working
+/// lane until someone reads the pointer.
+///
+/// So this asserts the seam rather than either side of it: an artifact
+/// reported by the legs must reach the lander.
+#[test]
+fn an_artifact_from_the_legs_reaches_the_lander() {
+    let drv = driver(vec![LegOutcome {
+        tree: TreeState::Green,
+        artifact: Some("published-payload".to_string()),
+        ..Default::default()
+    }]);
+    let mut lane = lane();
+
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("m1", "sha1").with_changed_files(["src/lib.rs"])),
+    );
+
+    assert_eq!(
+        drv.lander.published.borrow().as_slice(),
+        &[Some("published-payload".to_string())],
+        "a green build's artifact must be handed to the lander, not dropped"
+    );
+}
+
+/// The other direction: a check-only lane reports no artifact, and the lander
+/// must be told `None` rather than an empty string. `Some("")` would advance
+/// the pointer to nothing — a silent rollback wearing a success's clothes.
+#[test]
+fn a_check_only_lane_hands_the_lander_no_artifact() {
+    let drv = driver(vec![LegOutcome {
+        tree: TreeState::Green,
+        ..Default::default()
+    }]);
+    let mut lane = lane();
+
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("m1", "sha1").with_changed_files(["src/lib.rs"])),
+    );
+
+    assert_eq!(
+        drv.lander.published.borrow().as_slice(),
+        &[None],
+        "no artifact must arrive as None, never as an empty payload"
+    );
 }
 
 #[test]
