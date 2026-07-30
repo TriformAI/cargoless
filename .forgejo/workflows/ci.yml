@@ -33,17 +33,32 @@ on:
 #      share one group and de-dupe for real. Belt and braces: (1) is the fix,
 #      (2) is the guard that stays correct if the triggers change.
 #
-# cancel-in-progress stays TRUE and is deliberate here, NOT an oversight
-# against the repo axiom "never cancel in-progress, only collapse the queue".
-# That axiom is about not killing a run whose verdict someone is waiting on —
-# a cancelled Forgejo run is permanently not-green, so cancelling a run for
-# commit X strands X's required check. Here the key is the COMMIT: the only
-# run this can cancel is an older matrix for the SAME sha, which is by
-# definition redundant work whose verdict is superseded by the run that
-# replaces it. No commit is ever left without a terminal status.
+# cancel-in-progress is FALSE, matching the repo axiom "never cancel
+# in-progress, only collapse the queue" (tf-multiverse enforces the same rule
+# repo-wide in scripts/ci/check-no-cancel-in-progress.sh).
+#
+# An earlier revision of this comment argued TRUE was safe here, reasoning that
+# a commit-keyed group can only cancel a redundant matrix for the SAME sha.
+# Change (1) is what makes that nearly true — and "nearly" is the problem. One
+# case survives: a commit that is simultaneously on main (push) AND the head of
+# an open PR into main (pull_request). Both events then land in the same
+# sha-keyed group, and TRUE lets the later one preempt the earlier. A cancelled
+# Forgejo run never re-reports, so the preempted context is permanently
+# not-green — an unsatisfiable gate on the exact commit someone is trying to
+# land. Rare, self-inflicted, and unrecoverable without a re-push.
+#
+# FALSE loses nothing. `concurrency.group` alone still coalesces: a newer run
+# QUEUES behind the active one instead of killing it. The load win here was
+# never cancellation — it came from change (1) below (measured: 10 jobs per
+# commit before, 5 after). Cancellation was only ever trimming the duplicate
+# that (1) already stopped creating.
+#
+# Note a Forgejo quirk if this is ever revisited: an EXPRESSION-valued
+# cancel-in-progress is treated as TRUTHY whatever it evaluates to, so the
+# literal `false` is the only safe spelling.
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # Split into one job per check. This Forgejo build does not expose run/job
 # logs over the REST API, so job *granularity* is our only failure
