@@ -182,6 +182,40 @@ like nothing happened.
 `GET /lane` is the product surface. An author whose change stops moving needs to
 see which errors are holding it, who else is affected, and what will clear it.
 
+`id` and `head` are **required** on enqueue; a request missing either is
+refused, not defaulted. A member with no identity cannot be attributed, ejected
+or reported on, and an anonymous candidate must never enter a queue that can
+move the trunk. `changed_files` *is* optional — a caller that cannot compute a
+diff still gets queued, and accepts that its reds will be unattributable.
+
+`GET /lane` returns **404** when no lane is configured, rather than an empty
+lane. "No lane here" and "a lane with nothing in it" are different answers, and
+conflating them leaves an operator waiting on a queue that does not exist. For
+the same reason the service-trait defaults *fail* rather than silently
+succeeding: a daemon with no lane answering "enqueued" would leave the caller
+waiting forever for a build that is never going to run.
+
+## Rolling out `output: cargo-json`
+
+`cargoless.checks.yaml` is parsed with `reject_unknown()` — an unrecognised key
+is a hard error, which is what stops a typo from silently disabling a check. It
+also means **the daemon must learn a key before a repo may declare it.**
+
+So adding `output: cargo-json` to a repo whose daemon predates it does not fail
+one push; it reds the manifest for *everyone* pushing to that repo. The order
+is:
+
+1. the daemon version carrying `output` is released,
+2. an image is built from it,
+3. the fleet rolls,
+4. *then* the repo declares the key.
+
+Until step 4 the leg still runs and still reds correctly — its diagnostics are
+just the synthetic `command.failed` one, so a red is unattributable and the lane
+holds the whole queue rather than ejecting a member on no evidence. That is the
+fail-safe direction, which is why staging it this way is safe rather than merely
+tolerable.
+
 ## Testing
 
 The policy is a pure `Event → (State, Vec<Action>)` machine
