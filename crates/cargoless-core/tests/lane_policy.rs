@@ -36,14 +36,38 @@ fn err(path: &str, line: u32, code: &str) -> Diagnostic {
     }
 }
 
+const WINDOW: u64 = 60;
+
+/// A lane with the default capture window.
 fn lane() -> LaneState {
-    LaneState::new(ROOT)
+    LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: WINDOW,
+            ..Default::default()
+        },
+    )
 }
 
+/// Enqueue everyone, let the capture window close, and return the generation of
+/// the build they all landed in.
+///
+/// This is the production shape: arrivals gather during the window, then one
+/// build takes the batch. The assert makes a setup bug (someone left out of the
+/// build) fail here with a clear message rather than surfacing as a confusing
+/// attribution failure further down.
 fn start_build(st: &mut LaneState, members: Vec<LaneMember>) -> u64 {
+    let want = members.len();
     for m in members {
         st.step(LaneEvent::Enqueue(m));
     }
+    st.step(LaneEvent::Tick { now: WINDOW });
+    assert_eq!(
+        st.in_flight().len(),
+        want,
+        "setup expected all {want} members in ONE build; got {:?}",
+        st.in_flight().iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
     st.generation()
 }
 
@@ -79,8 +103,59 @@ fn started(actions: &[LaneAction]) -> Option<Vec<String>> {
 // ── queueing ──────────────────────────────────────────────────────────────
 
 #[test]
-fn first_enqueue_starts_a_build() {
+fn the_capture_window_gathers_a_burst_into_one_build() {
+    // Without this the lane builds whoever arrives first and everyone else
+    // waits a FULL cycle — and a cycle is a real release build, 25-80 minutes.
+    // Two changes landing seconds apart would cost two hours instead of one.
     let mut st = lane();
+    let a = st.step(LaneEvent::Enqueue(member("A", "a1", &["src/a.rs"])));
+    assert!(
+        started(&a).is_none(),
+        "the first arrival opens the window, it does not start a build"
+    );
+
+    st.step(LaneEvent::Enqueue(member("B", "b1", &["src/b.rs"])));
+    st.step(LaneEvent::Enqueue(member("C", "c1", &["src/c.rs"])));
+    assert_eq!(st.phase(), LanePhase::Idle, "still gathering");
+
+    let actions = st.step(LaneEvent::Tick { now: WINDOW });
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string(), "B".to_string(), "C".to_string()][..]),
+        "the whole burst rides one build"
+    );
+}
+
+#[test]
+fn a_full_queue_does_not_wait_out_the_window() {
+    // There is nothing left to capture once the build is full, so waiting would
+    // be pure latency.
+    let mut st = LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            max_members: 2,
+            capture_window_ticks: 600,
+            ..Default::default()
+        },
+    );
+    st.step(LaneEvent::Enqueue(member("A", "a", &["src/a.rs"])));
+    let actions = st.step(LaneEvent::Enqueue(member("B", "b", &["src/b.rs"])));
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string(), "B".to_string()][..]),
+        "a full build starts immediately, window or not"
+    );
+}
+
+#[test]
+fn a_zero_window_builds_immediately() {
+    let mut st = LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
     let actions = st.step(LaneEvent::Enqueue(member("A", "a1", &["src/a.rs"])));
     assert_eq!(started(&actions).as_deref(), Some(&["A".to_string()][..]));
     assert_eq!(st.phase(), LanePhase::Building);

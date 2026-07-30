@@ -201,7 +201,13 @@ impl EjectReason {
         }
     }
 
-    fn fingerprints(&self) -> &FingerprintCounts {
+    /// The error identities that caused this ejection.
+    ///
+    /// Public because `GET /lane` reports them: an author whose change is held
+    /// needs to see *which* errors are holding it, and a fingerprint set that
+    /// changed between two builds is the evidence that a fix took effect.
+    #[must_use]
+    pub fn fingerprints(&self) -> &FingerprintCounts {
         match self {
             EjectReason::Attributed { fingerprints, .. }
             | EjectReason::Unattributed { fingerprints, .. } => fingerprints,
@@ -296,6 +302,24 @@ pub struct LaneConfig {
     pub max_members: usize,
     /// Ticks an ejection survives before lapsing regardless of pushes.
     pub eject_ttl_ticks: u64,
+    /// How long an idle lane waits for company before building.
+    ///
+    /// Without this the lane builds whoever arrives first and everyone else
+    /// waits a full cycle — and a cycle here is a real release build, 25–80
+    /// minutes. Two changes landing seconds apart would take two hours instead
+    /// of one, and the whole point of a lane is that a build carries as many
+    /// changes as it safely can.
+    ///
+    /// The window only ever delays the FIRST member of an idle lane. Once a
+    /// build is running, later arrivals queue against it and are picked up the
+    /// moment it finishes, so the window costs nothing on a busy lane.
+    ///
+    /// It is filled early when the queue reaches [`Self::max_members`] — there
+    /// is nothing to wait for once the build is full.
+    ///
+    /// `0` disables it (build immediately), which is what unit tests and a
+    /// single-developer project want.
+    pub capture_window_ticks: u64,
 }
 
 impl Default for LaneConfig {
@@ -303,6 +327,10 @@ impl Default for LaneConfig {
         Self {
             max_members: 10,
             eject_ttl_ticks: 3_600,
+            // 60s at one tick per second: long enough to gather a burst of
+            // agent pushes, negligible against a build measured in tens of
+            // minutes.
+            capture_window_ticks: 60,
         }
     }
 }
@@ -322,6 +350,9 @@ pub struct LaneState {
     generation: u64,
     ejected: BTreeMap<String, Ejection>,
     now: u64,
+    /// When the currently-idle lane first had something to build. `None` while
+    /// the queue is empty or a build is running. Drives the capture window.
+    queued_since: Option<u64>,
     /// Root the diagnostics' paths are fingerprinted against.
     root: PathBuf,
 }
@@ -342,6 +373,7 @@ impl LaneState {
             generation: 0,
             ejected: BTreeMap::new(),
             now: 0,
+            queued_since: None,
             root: root.into(),
         }
     }
@@ -371,7 +403,8 @@ impl LaneState {
         self.ejected.get(id)
     }
 
-    #[must_use]
+    // No `#[must_use]`: `Iterator` already carries it, and doubling it is a
+    // clippy error under `-D warnings`.
     pub fn ejections(&self) -> impl Iterator<Item = (&String, &Ejection)> {
         self.ejected.iter()
     }
@@ -683,8 +716,23 @@ impl LaneState {
 
     fn maybe_start_build(&mut self, actions: &mut Vec<LaneAction>) {
         if self.phase == LanePhase::Building || self.queue.is_empty() {
+            // An empty idle queue has nothing to capture; reset so the next
+            // arrival opens a fresh window instead of inheriting an old one.
+            if self.queue.is_empty() {
+                self.queued_since = None;
+            }
             return;
         }
+        // Open the capture window on the first member of an idle lane.
+        let opened = *self.queued_since.get_or_insert(self.now);
+        let full = self.queue.len() >= self.cfg.max_members;
+        let elapsed = self.now.saturating_sub(opened);
+        // Wait for company — but never once the build is already full, and
+        // never when the window is disabled.
+        if !full && self.cfg.capture_window_ticks > 0 && elapsed < self.cfg.capture_window_ticks {
+            return;
+        }
+        self.queued_since = None;
         let take = self.queue.len().min(self.cfg.max_members);
         let members: Vec<LaneMember> = self.queue.drain(..take).collect();
         self.generation += 1;
