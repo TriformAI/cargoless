@@ -8213,6 +8213,26 @@ checks:
     /// SAME key while the first guard is held goes cold (in-proc busy CAS);
     /// dropping the guard makes the key warm-resolvable again. This is the
     /// serialization interlock that keeps CGLS-24 structurally impossible.
+    ///
+    /// KNOWN INTERMITTENT (observed 1× in 363 sampled `test` runs, 2026-07-30,
+    /// task 206746): the final assertion — re-resolve after `drop(first)` goes
+    /// warm again — failed once with the other 340 tests passing. Ruled out at
+    /// the time: the poisoned-`WARM_ENV_LOCK` pattern (its sibling
+    /// `resolve_warm_target_flag_off_is_cold` PASSED, so the mutex was never
+    /// poisoned), `prune_warm_target_dirs` (it `continue`s on `path == active`
+    /// and so cannot remove or re-flock the dir being acquired), and the
+    /// disk-pressure rung (exempt below the 1 GiB floor; this dir is a few KiB).
+    ///
+    /// Not root-caused. The unexamined edge is `WarmFlock`, which has no
+    /// explicit `Drop` and relies on the `File` close to release `flock(2)` —
+    /// a same-key re-acquire immediately after that close is where an ordering
+    /// assumption would surface under load. Left as a note rather than a
+    /// speculative fix, and NOT `#[ignore]`d: a 1-in-363 flake that is silenced
+    /// stops being evidence.
+    ///
+    /// Until this landed, such a failure was invisible — the duplicate
+    /// push/pull_request matrices raced and cancelled each other, so a flaky
+    /// run reported as `cancelled` and read as infrastructure noise.
     #[test]
     fn resolve_warm_target_contended_key_goes_cold_until_release() {
         let _env = poisoned(&WARM_ENV_LOCK);
