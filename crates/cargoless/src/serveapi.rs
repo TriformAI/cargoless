@@ -8214,23 +8214,45 @@ checks:
     /// dropping the guard makes the key warm-resolvable again. This is the
     /// serialization interlock that keeps CGLS-24 structurally impossible.
     ///
-    /// KNOWN INTERMITTENT (observed 1× in 363 sampled `test` runs, 2026-07-30,
-    /// task 206746): the final assertion — re-resolve after `drop(first)` goes
-    /// warm again — failed once with the other 340 tests passing. Ruled out at
-    /// the time: the poisoned-`WARM_ENV_LOCK` pattern (its sibling
-    /// `resolve_warm_target_flag_off_is_cold` PASSED, so the mutex was never
-    /// poisoned), `prune_warm_target_dirs` (it `continue`s on `path == active`
-    /// and so cannot remove or re-flock the dir being acquired), and the
-    /// disk-pressure rung (exempt below the 1 GiB floor; this dir is a few KiB).
+    /// KNOWN INTERMITTENT — 2 failures in ~365 sampled `test` runs
+    /// (2026-07-30, tasks 206746 and 207005), with a passing run between them.
+    /// The final assertion fails; the other 340 tests pass.
     ///
-    /// Not root-caused. The unexamined edge is `WarmFlock`, which has no
-    /// explicit `Drop` and relies on the `File` close to release `flock(2)` —
-    /// a same-key re-acquire immediately after that close is where an ordering
-    /// assumption would surface under load. Left as a note rather than a
-    /// speculative fix, and NOT `#[ignore]`d: a 1-in-363 flake that is silenced
-    /// stops being evidence.
+    /// LOCALISED TO THE FLOCK RUNG. Task 207005 captured the obs lines, which
+    /// map one-to-one onto the three resolves:
     ///
-    /// Until this landed, such a failure was invisible — the duplicate
+    ///     mode=warm          reason=hit                #1 takes in-proc + flock
+    ///     mode=cold-fallback reason=contended:in-proc  #2 correct, key busy
+    ///     mode=cold-fallback reason=contended:flock    #3 AFTER drop(first)
+    ///
+    /// Resolve #3 got PAST the in-proc CAS — so `InProcWarmGuard::drop` did
+    /// clear `busy` — and was refused by the flock. That rules out, by
+    /// evidence rather than argument:
+    ///   - the in-process layer (it released; #3 got past it);
+    ///   - `prune_warm_target_dirs` — the refusal is at step 3b, BEFORE prune
+    ///     runs at step 4, so prune is not on the failing path at all;
+    ///   - the disk-pressure rung (step 5, also after);
+    ///   - cross-test interference — `temp_root` is `{label}-{pid}-{nanos}`,
+    ///     and the poisoned-`WARM_ENV_LOCK` pattern is excluded because
+    ///     `resolve_warm_target_flag_off_is_cold` AND
+    ///     `warm_flock_second_acquire_contended_until_release` both passed in
+    ///     the same run.
+    ///
+    /// So an open-file-description still held the lock when #3 opened a new fd,
+    /// and the only one ever created for that path was `first`'s.
+    ///
+    /// STILL NOT ROOT-CAUSED: why the lock outlived the close. `WarmFlock` has
+    /// no explicit `Drop` and relies on `File`'s close to release `flock(2)`.
+    /// Note `warm_flock_second_acquire_contended_until_release` exercises that
+    /// exact acquire/drop/re-acquire cycle directly and passes consistently, so
+    /// the difference is either this guard's field-order drop (`dir`,
+    /// `_in_proc`, `_flock` — flock released last) interacting with timing, or
+    /// something environmental. Not guessing between them here.
+    ///
+    /// Deliberately NOT `#[ignore]`d: at ~2-in-365 a silenced flake stops being
+    /// evidence, and the next occurrence would carry no signal.
+    ///
+    /// Until the CI de-dupe landed such a failure was invisible — the duplicate
     /// push/pull_request matrices raced and cancelled each other, so a flaky
     /// run reported as `cancelled` and read as infrastructure noise.
     #[test]
