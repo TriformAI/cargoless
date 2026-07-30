@@ -417,10 +417,45 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // already resolved `--bind`/`--auth-token` into the FleetConfig and
     // ran `security_check`; THIS is #10's actual binding (the serve.rs
     // module-doc "Stream E #10 binds it; #3 only resolves+carries" seam).
-    let api = Arc::new(
-        crate::serveapi::ServeVerdictState::new()
-            .with_project_check_state_dir(scope.fleet.state_dir_abs(&scope.repo_root)),
-    );
+    // The build lane is OPT-IN and off by default. It merges candidates and
+    // publishes on green, so a daemon must never acquire one as a side effect
+    // of starting up — an operator asks for it by naming the profile whose
+    // legs are the project's own build.
+    //
+    //   CARGOLESS_LANE_PROFILE   the cargoless.checks.yaml profile to run
+    //   CARGOLESS_LANE_BASE      base ref to build candidates on (default: main)
+    //   CARGOLESS_LANE_ARTIFACT  path, relative to the candidate root, of the
+    //                            artifact to publish on green. Unset = a
+    //                            check-only lane that proves the merged tree
+    //                            compiles and deliberately leaves the pointer
+    //                            alone rather than advancing it to nothing.
+    let state_dir = scope.fleet.state_dir_abs(&scope.repo_root);
+    let mut api_state =
+        crate::serveapi::ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+    // Not a let-chain: this workspace is Edition 2024 / MSRV 1.85 and
+    // `if let ... && cond` does not compile here.
+    let lane_profile = std::env::var("CARGOLESS_LANE_PROFILE")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    if let Some(profile) = lane_profile {
+        let base = std::env::var("CARGOLESS_LANE_BASE").unwrap_or_else(|_| "main".to_string());
+        let artifact = std::env::var("CARGOLESS_LANE_ARTIFACT")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from);
+        // Announce it. A lane that can move the trunk must be visible in the
+        // boot log, not inferred from behaviour — the same reasoning as the
+        // resolved-caps lines below.
+        eprintln!(
+            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={}",
+            artifact
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none: check-only>".to_string())
+        );
+        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, &profile, artifact);
+    }
+    let api = Arc::new(api_state);
     // Path D + R3 — publish the resolved caps at startup so an operator
     // can verify what the daemon actually read from env (a knob whose
     // effect is invisible is dead machinery per the
