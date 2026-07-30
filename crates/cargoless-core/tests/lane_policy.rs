@@ -71,6 +71,22 @@ fn start_build(st: &mut LaneState, members: Vec<LaneMember>) -> u64 {
     st.generation()
 }
 
+/// Same as [`start_build`] but for a lane whose capture window is 0, so no Tick
+/// is needed and the clock stays at its initial value.
+fn start_build_now(st: &mut LaneState, members: Vec<LaneMember>) -> u64 {
+    let want = members.len();
+    for m in members {
+        st.step(LaneEvent::Enqueue(m));
+    }
+    assert_eq!(
+        st.in_flight().len(),
+        want,
+        "setup expected all {want} members in ONE build; got {:?}",
+        st.in_flight().iter().map(|m| &m.id).collect::<Vec<_>>()
+    );
+    st.generation()
+}
+
 fn ejected_ids(actions: &[LaneAction]) -> Vec<String> {
     actions
         .iter()
@@ -572,16 +588,51 @@ fn ttl_expiry_readmits_as_a_backstop() {
     });
     assert!(st.ejection("A").is_some());
 
-    st.step(LaneEvent::Tick { now: 5 });
+    // `start_build` ticks the clock to WINDOW to close the capture window, so
+    // the ejection was created at now=WINDOW and expires at WINDOW + ttl.
+    // Ticking to a smaller absolute time would move the clock BACKWARDS.
+    st.step(LaneEvent::Tick { now: WINDOW + 5 });
     assert!(st.ejection("A").is_some(), "not yet");
 
-    let actions = st.step(LaneEvent::Tick { now: 11 });
+    let actions = st.step(LaneEvent::Tick { now: WINDOW + 11 });
     assert!(st.ejection("A").is_none(), "TTL lapsed");
     assert!(
         actions
             .iter()
             .any(|a| matches!(a, LaneAction::Readmit { .. })),
         "expiry is reported, never silent"
+    );
+}
+
+#[test]
+fn the_clock_never_rewinds() {
+    // `Tick.now` is absolute. A caller passing a smaller value — a restarted
+    // counter, a test reusing a literal — must not rewind time and resurrect an
+    // ejection that already lapsed, which would hold a member past its TTL with
+    // nothing to show why.
+    let mut st = LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            eject_ttl_ticks: 10,
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let build_gen = start_build_now(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    st.step(LaneEvent::Tick { now: 100 });
+    assert!(st.ejection("A").is_none(), "lapsed at 100");
+
+    // Going backwards must not undo it.
+    st.step(LaneEvent::Tick { now: 1 });
+    assert!(
+        st.ejection("A").is_none(),
+        "a backwards tick must not resurrect a lapsed ejection"
     );
 }
 

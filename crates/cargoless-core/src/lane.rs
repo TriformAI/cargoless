@@ -428,7 +428,12 @@ impl LaneState {
                 outcome,
             } => self.on_build_finished(generation, outcome, &mut actions),
             LaneEvent::Tick { now } => {
-                self.now = now;
+                // `now` is ABSOLUTE, and the clock only moves forward. A caller
+                // passing a smaller value (a restarted counter, a test reusing
+                // a literal) must not rewind time and resurrect an ejection
+                // that has already lapsed — the lane would then hold a member
+                // for longer than its TTL with no way to tell.
+                self.now = self.now.max(now);
                 self.expire_ejections(&mut actions);
             }
         }
