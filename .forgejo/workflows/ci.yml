@@ -1,20 +1,48 @@
 name: ci
 
 on:
+  # `push` is scoped to main. A branch with an open PR is covered by the
+  # `pull_request` trigger below, so listening to every push ran the SAME tree
+  # twice — see the concurrency note.
   push:
+    branches: [main]
   pull_request:
     branches: [main]
 
-# De-dupe concurrent runs for the same ref. Without this, a push to a branch
-# that ALSO has an open PR fires TWO full 5-job matrices (the `push` event and
-# the `pull_request` event) with no cancellation. On a single, occasionally
-# disk-pressured Forgejo runner they contend on the checkout-prereq step and
-# produce contradictory per-context results for an identical tree (e.g. a 19s
-# "build failure" in one matrix while the other builds green in ~2 min). Group
-# by workflow + ref and cancel the older in-flight run so each ref has at most
-# one live matrix; a new push supersedes its own prior run instead of racing it.
+# De-dupe concurrent runs for the same COMMIT.
+#
+# The previous key was `${{ github.workflow }}-${{ github.ref }}`, and its
+# comment described exactly the bug it failed to prevent: a push to a branch
+# that ALSO has an open PR fires TWO full 5-job matrices which contend on the
+# checkout-prereq step and can report contradictory results for an identical
+# tree (a 19s "build failure" in one while the other builds green in ~2 min).
+#
+# The key could never catch that. `push` and `pull_request` carry DIFFERENT
+# refs for the same commit — measured on PR #96 @62ac0ee:
+#     event=push          head_branch=agent/serve-image-tag-epoch
+#     event=pull_request  head_branch=#96
+# Different refs -> different groups -> the de-dupe never fires. 10 runs for
+# one commit, every commit: double the load on the shared 8-runner `docker`
+# pool, and the contention the comment warns about, permanently on.
+#
+# Two changes, both needed:
+#   1. `push` restricted to main, so branch pushes no longer duplicate the
+#      PR run. This alone removes the double matrix.
+#   2. Group on `github.sha` instead of `github.ref`, so if the two events
+#      ever coincide again (e.g. a push to main that is also a PR head) they
+#      share one group and de-dupe for real. Belt and braces: (1) is the fix,
+#      (2) is the guard that stays correct if the triggers change.
+#
+# cancel-in-progress stays TRUE and is deliberate here, NOT an oversight
+# against the repo axiom "never cancel in-progress, only collapse the queue".
+# That axiom is about not killing a run whose verdict someone is waiting on —
+# a cancelled Forgejo run is permanently not-green, so cancelling a run for
+# commit X strands X's required check. Here the key is the COMMIT: the only
+# run this can cancel is an older matrix for the SAME sha, which is by
+# definition redundant work whose verdict is superseded by the run that
+# replaces it. No commit is ever left without a terminal status.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
 # Split into one job per check. This Forgejo build does not expose run/job
