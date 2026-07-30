@@ -222,6 +222,13 @@ pub struct Ejection {
     /// The head that was ejected. A member re-enqueued at this same head is
     /// still ejected — nothing about the candidate changed.
     pub head: String,
+    /// The member's changed set at the moment it was ejected.
+    ///
+    /// Kept so a forced re-admission can restore the member intact. Without it
+    /// the member would come back with an empty changed set and be silently
+    /// **unattributable** for every build it subsequently rides — a red it
+    /// caused would land as "could not attribute" and hold the whole queue.
+    pub changed_files: Vec<String>,
     /// Tick at which the ejection lapses regardless. The backstop against a
     /// permanently-stuck member if attribution is ever wrong.
     pub expires_at_tick: u64,
@@ -254,6 +261,19 @@ pub enum LaneEvent {
     },
     /// Withdraw a member entirely (PR closed, superseded).
     Withdraw { id: String },
+    /// Lift an ejection by hand, without consulting the attribution.
+    ///
+    /// The escape hatch behind `POST /lane/readmit`, for a fix the attribution
+    /// cannot see — a dependency bump, a toolchain change, a red that was
+    /// never the member's fault. It is deliberately NOT modelled as a
+    /// [`LaneEvent::HeadMoved`] to the same head: that path asks
+    /// "does this change touch a failing file?" and answers no, which is the
+    /// correct answer to a different question.
+    ///
+    /// Using it does not make the previous failure untrue, and the next build
+    /// is still the verification — it just declines to require evidence the
+    /// operator already has.
+    ForceReadmit { id: String },
     /// A build finished. `generation` is checked against the lane's current
     /// build; a stale completion is discarded.
     BuildFinished {
@@ -423,6 +443,7 @@ impl LaneState {
                 self.queue.retain(|m| m.id != id);
                 self.ejected.remove(&id);
             }
+            LaneEvent::ForceReadmit { id } => self.on_force_readmit(&id, &mut actions),
             LaneEvent::BuildFinished {
                 generation,
                 outcome,
@@ -500,6 +521,35 @@ impl LaneState {
             id: member.id,
             state: "queued".to_string(),
         });
+    }
+
+    /// Lift an ejection because an operator said so.
+    ///
+    /// Re-queues at the SAME head the ejection recorded — a forced re-admission
+    /// asserts the tree is now buildable, not that the submission changed. The
+    /// member's original changed-file set is preserved so a subsequent red can
+    /// still be attributed to it; dropping it would quietly make this member
+    /// unblameable for every future build it rides.
+    fn on_force_readmit(&mut self, id: &str, actions: &mut Vec<LaneAction>) {
+        let Some(ejection) = self.ejected.remove(id) else {
+            actions.push(LaneAction::Report {
+                id: id.to_string(),
+                state: "not ejected; nothing to re-admit".to_string(),
+            });
+            return;
+        };
+        actions.push(LaneAction::Readmit {
+            id: id.to_string(),
+            why: "re-admitted by hand — the previous failure still stands, but \
+                  the operator has evidence the attribution cannot see"
+                .to_string(),
+        });
+        let member = LaneMember {
+            id: id.to_string(),
+            head: ejection.head,
+            changed_files: ejection.changed_files,
+        };
+        self.admit(member, actions);
     }
 
     fn on_head_moved(
@@ -678,6 +728,7 @@ impl LaneState {
                     Ejection {
                         reason: reason.clone(),
                         head: m.head.clone(),
+                        changed_files: m.changed_files.clone(),
                         expires_at_tick: expires,
                     },
                 );
@@ -711,6 +762,7 @@ impl LaneState {
                     Ejection {
                         reason: reason.clone(),
                         head: m.head.clone(),
+                        changed_files: m.changed_files.clone(),
                         expires_at_tick: expires,
                     },
                 );

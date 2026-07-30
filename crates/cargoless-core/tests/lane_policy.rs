@@ -570,6 +570,87 @@ fn re_enqueue_at_the_same_head_does_not_clear_an_ejection() {
     assert!(started(&actions).is_none());
 }
 
+/// The escape hatch. `POST /lane/readmit` exists for a fix the attribution
+/// cannot see — a dependency bump, a toolchain change, a red that was never the
+/// member's fault. It lifts the ejection without asking for evidence.
+#[test]
+fn a_forced_readmission_lifts_an_ejection_the_attribution_would_keep() {
+    let mut st = lane();
+    let build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    assert!(st.ejection("A").is_some(), "precondition: A is ejected");
+
+    let actions = st.step(LaneEvent::ForceReadmit {
+        id: "A".to_string(),
+    });
+    assert!(st.ejection("A").is_none(), "the ejection must be lifted");
+    assert_eq!(
+        started(&actions),
+        Some(vec!["A".to_string()]),
+        "and A must be back in a build"
+    );
+}
+
+/// The subtle half. A forced re-admission must restore the member's changed
+/// files, or it comes back **unattributable**: a red it causes would land as
+/// "could not attribute" and hold the whole queue instead of ejecting it again.
+/// Silently laundering a member out of accountability is worse than refusing
+/// the re-admission.
+#[test]
+fn a_forced_readmission_keeps_the_member_attributable() {
+    let mut st = lane();
+    let g1 = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    st.step(LaneEvent::BuildFinished {
+        generation: g1,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    st.step(LaneEvent::ForceReadmit {
+        id: "A".to_string(),
+    });
+
+    // Same failure again. If the changed set survived, A owns it and is
+    // ejected as Attributed rather than sliding into Unattributed.
+    let g2 = st.generation();
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: g2,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    assert_eq!(ejected_ids(&actions), vec!["A".to_string()]);
+    assert!(
+        matches!(eject_reason(&actions, "A"), EjectReason::Attributed { .. }),
+        "a re-admitted member must still be blameable for the file it changed"
+    );
+}
+
+/// Force-readmitting something that is not ejected reports rather than
+/// silently succeeding — an operator who typos an id must not believe they
+/// unblocked something.
+#[test]
+fn a_forced_readmission_of_an_unejected_member_says_so() {
+    let mut st = lane();
+    let actions = st.step(LaneEvent::ForceReadmit {
+        id: "nobody".to_string(),
+    });
+    assert!(started(&actions).is_none());
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            LaneAction::Report { id, state }
+                if id == "nobody" && state.contains("not ejected")
+        )),
+        "expected a Report explaining nothing was re-admitted; got {actions:?}"
+    );
+}
+
 #[test]
 fn ttl_expiry_readmits_as_a_backstop() {
     let mut st = LaneState::with_config(
