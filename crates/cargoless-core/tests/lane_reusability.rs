@@ -210,6 +210,46 @@ fn a_red_ejects_the_author_and_ships_everyone_else() {
 }
 
 #[test]
+fn the_default_lander_publishes_and_never_erases_a_previous_green() {
+    use cargoless_core::lanedrv::PointerLander;
+
+    let root = std::env::temp_dir().join(format!(
+        "cargoless-lane-pointer-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let lander = PointerLander::new(&root);
+    let members = vec![LaneMember::new("m1", "s1")];
+
+    // A green build WITH an artifact advances the pointer.
+    lander
+        .land(&members, Some("artifact-payload-v1"))
+        .expect("publish");
+    assert_eq!(
+        std::fs::read_to_string(lander.pointer_path()).unwrap(),
+        "artifact-payload-v1",
+        "the pointer carries exactly what the build published"
+    );
+
+    // A green build with NO artifact must leave it byte-untouched. A
+    // check-only lane proves the tree compiles without emitting anything, and
+    // treating that as "publish nothing" would erase the last real green — a
+    // silent rollback dressed up as a success.
+    lander.land(&members, None).expect("green, nothing to ship");
+    assert_eq!(
+        std::fs::read_to_string(lander.pointer_path()).unwrap(),
+        "artifact-payload-v1",
+        "a green-with-no-artifact must NOT erase the previous green"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn the_lane_needs_no_knowledge_of_a_forge() {
     // The proof-by-construction: a member is (id, head, changed_files) — three
     // strings. Nothing here names a PR, a branch, a remote, or a merge. If a

@@ -150,28 +150,55 @@ pub struct PointerLander {
     pub project_root: PathBuf,
 }
 
+impl PointerLander {
+    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            project_root: project_root.into(),
+        }
+    }
+
+    /// Where the pointer lives, for callers that want to read it back.
+    #[must_use]
+    pub fn pointer_path(&self) -> PathBuf {
+        crate::build::latest_green_path(&self.project_root)
+    }
+}
+
 impl LaneLander for PointerLander {
     fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome> {
         let ids: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
-        match artifact {
-            Some(a) => Ok(LandOutcome {
-                detail: format!(
-                    "published artifact {a} for {} member(s): {}",
-                    ids.len(),
-                    ids.join(", ")
-                ),
-            }),
+        let Some(published) = artifact else {
             // A green build that produced no artifact is legitimate — a
             // check-only lane proves the tree compiles without emitting one.
-            // Saying so beats implying something shipped.
-            None => Ok(LandOutcome {
+            // Say so rather than implying something shipped, and do NOT touch
+            // the pointer: advancing it to nothing would erase the last real
+            // green.
+            return Ok(LandOutcome {
                 detail: format!(
                     "green, no artifact to publish; {} member(s) cleared: {}",
                     ids.len(),
                     ids.join(", ")
                 ),
-            }),
+            });
+        };
+
+        // `artifact` is the rendered `PublishedArtifact` the build produced.
+        // Written atomically (temp + fsync + rename) by `write_pointer_atomic`,
+        // so a crash mid-write leaves the previous pointer byte-untouched —
+        // AC#4, never publish red, extended to never publish HALF.
+        let path = self.pointer_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
         }
+        crate::build::write_pointer_atomic(&path, published)?;
+        Ok(LandOutcome {
+            detail: format!(
+                "advanced {} for {} member(s): {}",
+                path.display(),
+                ids.len(),
+                ids.join(", ")
+            ),
+        })
     }
 }
 
