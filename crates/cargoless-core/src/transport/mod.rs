@@ -486,6 +486,32 @@ pub trait VerdictService: Send + Sync {
         unsupported_batch_report(request, "batch_check unsupported by this service")
     }
 
+    /// Build lane — submit a candidate to the serialized build-before-merge
+    /// queue. `Err(reason)` when this service has no lane configured.
+    ///
+    /// ADDITIVE with a default that FAILS, never one that silently succeeds: a
+    /// caller told "enqueued" by a daemon with no lane would wait forever for a
+    /// build that is never going to run.
+    fn lane_enqueue(&self, _request: &LaneEnqueueRequest) -> Result<String, String> {
+        Err("build lane not enabled on this daemon".to_string())
+    }
+
+    /// Build lane — lift an ejection by hand.
+    fn lane_readmit(&self, _id: &str) -> Result<String, String> {
+        Err("build lane not enabled on this daemon".to_string())
+    }
+
+    /// Build lane — queue depth, the running build, and every live ejection
+    /// with its reason. `None` ⇒ no lane on this daemon, so `GET /lane` 404s
+    /// rather than reporting an empty lane that does not exist.
+    ///
+    /// This is the lane's product surface: an author whose change stops moving
+    /// needs to see which errors hold it, who else is implicated, and what will
+    /// clear it.
+    fn lane_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// C1 observability: the resolved RA configuration this daemon hands
     /// rust-analyzer (features / all_features / cfgs / proc-macro / cargo-
     /// check / project-checks mode), as a JSON object. `None` ⇒ the service
@@ -890,6 +916,36 @@ pub enum Request {
     /// one candidate merge set, then falls back to solo checks only when the
     /// combined set is red.
     BatchCheck(BatchCheckRequest),
+    /// Build lane — submit a candidate for the serialized build-before-merge
+    /// queue (see [`crate::lane`]). Appended last, like every verb before it:
+    /// the variants above are byte-frozen and must never be reordered.
+    LaneEnqueue(LaneEnqueueRequest),
+    /// Build lane — lift an ejection by hand.
+    ///
+    /// The lane re-admits automatically when the error changes, so this is an
+    /// escape hatch for the case the automation cannot see: a fix that landed
+    /// somewhere the attribution did not implicate. Named `force` because that
+    /// is what it is — using it does not make the previous failure untrue.
+    LaneReadmit {
+        id: String,
+    },
+}
+
+/// One candidate submitted to the build lane.
+///
+/// `changed_files` is what makes attribution possible: without it a red build
+/// cannot be traced to whoever caused it, and the lane must hold the entire
+/// queue. Callers that cannot compute a diff should send an empty list and
+/// accept that their reds will be unattributable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LaneEnqueueRequest {
+    /// Caller-chosen stable identity — a PR number, a branch, a ticket.
+    pub id: String,
+    /// Immutable content identity of this submission (a commit sha). A moved
+    /// head is a different candidate, which is how staleness detects itself.
+    pub head: String,
+    /// Repo-relative paths this candidate changes.
+    pub changed_files: Vec<String>,
 }
 
 impl Request {
@@ -953,6 +1009,34 @@ impl Request {
                 }
             }
             "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(&v))),
+            "lane_enqueue" => {
+                let id = v.get("id").and_then(serde_json::Value::as_str)?.to_string();
+                let head = v
+                    .get("head")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_string();
+                // `id` and `head` are REQUIRED (note the `?` above): a member
+                // with no identity cannot be attributed, ejected or reported
+                // on, and silently defaulting them would put an anonymous
+                // candidate into a queue that can move the trunk.
+                Some(Request::LaneEnqueue(LaneEnqueueRequest {
+                    id,
+                    head,
+                    changed_files: v
+                        .get("changed_files")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }))
+            }
+            "lane_readmit" => Some(Request::LaneReadmit {
+                id: v.get("id").and_then(serde_json::Value::as_str)?.to_string(),
+            }),
             _ => None,
         }
     }
@@ -1043,6 +1127,16 @@ impl Request {
                 v
             }
             Request::BatchCheck(request) => batch_check_request_to_json(request),
+            Request::LaneEnqueue(r) => serde_json::json!({
+                "op": "lane_enqueue",
+                "id": r.id,
+                "head": r.head,
+                "changed_files": r.changed_files,
+            }),
+            Request::LaneReadmit { id } => serde_json::json!({
+                "op": "lane_readmit",
+                "id": id,
+            }),
         };
         v.to_string()
     }
@@ -1921,6 +2015,51 @@ mod tests {
         assert_eq!(Request::from_json(r#"{"op":"nope"}"#), None);
         assert_eq!(Request::from_json("not json"), None);
         assert_eq!(Request::from_json("{}"), None);
+    }
+
+    #[test]
+    fn lane_requests_roundtrip_and_require_an_identity() {
+        let enq = Request::LaneEnqueue(LaneEnqueueRequest {
+            id: "pr-4242".into(),
+            head: "cafebabe".into(),
+            changed_files: vec!["portal/src/page.rs".into(), "Cargo.lock".into()],
+        });
+        assert_eq!(
+            Request::from_json(&enq.to_json()),
+            Some(enq.clone()),
+            "lane_enqueue must roundtrip exactly"
+        );
+
+        let re = Request::LaneReadmit {
+            id: "pr-4242".into(),
+        };
+        assert_eq!(Request::from_json(&re.to_json()), Some(re));
+
+        // `changed_files` may be absent — a caller that cannot compute a diff
+        // still gets queued, and accepts that its reds will be unattributable.
+        assert_eq!(
+            Request::from_json(r#"{"op":"lane_enqueue","id":"x","head":"h"}"#),
+            Some(Request::LaneEnqueue(LaneEnqueueRequest {
+                id: "x".into(),
+                head: "h".into(),
+                changed_files: Vec::new(),
+            }))
+        );
+
+        // But identity is NOT optional. A member with no id or no head cannot
+        // be attributed, ejected or reported on, and defaulting it would put an
+        // anonymous candidate into a queue that can move the trunk.
+        for bad in [
+            r#"{"op":"lane_enqueue","head":"h"}"#,
+            r#"{"op":"lane_enqueue","id":"x"}"#,
+            r#"{"op":"lane_readmit"}"#,
+        ] {
+            assert_eq!(
+                Request::from_json(bad),
+                None,
+                "a lane request without an identity must be rejected: {bad}"
+            );
+        }
     }
 
     #[test]
