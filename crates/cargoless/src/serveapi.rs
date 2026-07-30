@@ -646,6 +646,26 @@ impl Drop for InflightGuard<'_> {
 struct WitnessInflightGate {
     state: Mutex<u32>,
     cv: Condvar,
+    /// Witness workers currently PARKED waiting for a slot, distinct from
+    /// `state` (workers currently holding one). Observability only — never
+    /// read by `acquire`, so it cannot affect admission.
+    ///
+    /// This counter exists because its absence hid the real serialization
+    /// point. `/admin/active` reported only the BatchCoalescer's queue, which
+    /// sits DOWNSTREAM of this gate: `acquire_witness_slot()` is taken in the
+    /// witness worker before `run_project_checks_and_log` reaches the
+    /// coalescer, so with `limit = 1` the coalescer sees one member at a time
+    /// and reports a near-empty queue while N witnesses are in fact stacked up
+    /// HERE. An operator reading the old snapshot concluded the batcher was
+    /// starved of arrivals; it was starved by this gate.
+    ///
+    /// An `AtomicU64` rather than a second `Mutex` deliberately: `acquire`
+    /// mutates it while holding `state`, so a second lock would introduce a
+    /// lock ORDER between the two, and a reader taking them the other way
+    /// round would deadlock the witness lane. An atomic has no such order,
+    /// and a purely-observational counter does not need to be consistent with
+    /// `state` under one lock. `Relaxed` suffices — nothing branches on it.
+    waiting: AtomicU64,
     limit: u32,
     /// Budget a queued witness waits for a slot before running UNGATED
     /// (fail-OPEN: losing serialization is a resource regression, never a
@@ -660,6 +680,7 @@ impl Default for WitnessInflightGate {
         Self {
             state: Mutex::new(0),
             cv: Condvar::new(),
+            waiting: AtomicU64::new(0),
             limit: configured_batch_u32("CARGOLESS_WITNESS_MAX_INFLIGHT", 0),
             queue_budget: Duration::from_millis(configured_batch_u64(
                 "CARGOLESS_WITNESS_QUEUE_WAIT_MS",
@@ -706,6 +727,12 @@ impl WitnessInflightGate {
         }
         let deadline = Instant::now() + self.queue_budget;
         let mut s = poisoned(&self.state);
+        // Observational only. Counted from BEFORE the first admission test so a
+        // worker that parks is visible for its whole park; `WaitingTicket`'s Drop
+        // decrements on EVERY exit — immediate grant, fail-open timeout, or a
+        // panic unwinding through here — so the gauge cannot leak upward and
+        // strand a phantom queue on `/admin/active`.
+        let _waiting = WaitingTicket::new(&self.waiting);
         loop {
             if *s < self.limit {
                 *s = s.saturating_add(1);
@@ -718,6 +745,11 @@ impl WitnessInflightGate {
             if remaining.is_zero() {
                 // Fail-open: run ungated rather than starve the witness. The
                 // supervisor watchdog still bounds the verdict independently.
+                eprintln!(
+                    "[cargoless:obs] witness-gate-fail-open limit={} budget_ms={} — running UNGATED",
+                    self.limit,
+                    self.queue_budget.as_millis(),
+                );
                 return WitnessInflightGuard {
                     gate: self,
                     counted: false,
@@ -729,12 +761,56 @@ impl WitnessInflightGate {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s = guard;
             if timed_out.timed_out() && *s >= self.limit {
+                eprintln!(
+                    "[cargoless:obs] witness-gate-fail-open limit={} budget_ms={} — running UNGATED",
+                    self.limit,
+                    self.queue_budget.as_millis(),
+                );
                 return WitnessInflightGuard {
                     gate: self,
                     counted: false,
                 };
             }
         }
+    }
+
+    /// Snapshot `(holding, waiting)` for `/admin/active`.
+    ///
+    /// Takes `state` only momentarily. That is safe despite this being served
+    /// on the HTTP thread: `acquire`'s park is `Condvar::wait_timeout`, which
+    /// RELEASES the mutex while a witness is queued, so `state` is only ever
+    /// held across the short admission test — never across a compile. The two
+    /// values are read under different synchronisation and may be momentarily
+    /// inconsistent with each other, which is correct for a gauge.
+    fn counts(&self) -> (u32, u32) {
+        let holding = *poisoned(&self.state);
+        let waiting = self.waiting.load(Ordering::Relaxed).min(u32::MAX as u64) as u32;
+        (holding, waiting)
+    }
+}
+
+/// RAII gauge for [`WitnessInflightGate::waiting`]. Increment on construction,
+/// decrement on Drop — including on panic — so the counter can never drift up.
+struct WaitingTicket<'a> {
+    counter: &'a AtomicU64,
+}
+
+impl<'a> WaitingTicket<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for WaitingTicket<'_> {
+    fn drop(&mut self) {
+        // `fetch_update` rather than `fetch_sub`: saturating at zero keeps a
+        // stray double-drop from wrapping the gauge to u64::MAX.
+        let _ = self
+            .counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -2191,6 +2267,34 @@ impl ServeVerdictState {
             .batch_coalescer
             .submit(key, &request, |combined| self.run_batch_check_now(combined));
 
+        // The coalescing HIT, not the eligibility. `witness-gate ... coalesce=true`
+        // (emitted by `gated_or_plan_coalesce_token`) says only that this push
+        // *could* share a run; it is emitted identically whether the physical run
+        // ended up with 1 member or 40. These three fields are the outcome, and
+        // they are the only way to tell a working coalescer from an inert one:
+        //
+        //   executed_members — members in the PHYSICAL run this verdict came from.
+        //                      1 means we did not coalesce, whatever the plan said.
+        //   batch_id         — `coalesced:<key>:run-<seq>`; two pushes reporting the
+        //                      SAME id provably shared one compile.
+        //   queue_wait_ms    — time this member sat in the coalescer queue, which
+        //                      separates "compiling for 40min" from "queued for 40min".
+        //
+        // Read off the report before `members` is consumed below. This is the
+        // measurement the CGLS by-base fix (1e33c2d) has to be judged on: it must
+        // be a measured hit rate, never an assumed one — the documented failure
+        // mode in this fleet is an optimisation that silently no-ops while
+        // exiting 0.
+        eprintln!(
+            "[cargoless:obs] witness-batch wt={} executed_members={} batch_id={} queue_wait_ms={} combined_checks={} solo_checks={}",
+            wt_key,
+            report.executed_members,
+            report.executed_batch_id.as_deref().unwrap_or("-"),
+            report.queue_wait_ms,
+            report.combined_checks,
+            report.solo_checks,
+        );
+
         // Find this WT's slice in the returned report.
         let member_result = report.members.into_iter().find(|m| m.worktree == wt_key);
 
@@ -2296,6 +2400,7 @@ impl ServeVerdictState {
     fn activity_snapshot(&self) -> DaemonActivity {
         let drain = poisoned(&self.drain);
         let batch_counts = self.batch_coalescer.counts();
+        let (witness_inflight, witness_waiting) = self.witness_gate.counts();
         DaemonActivity {
             quiescing: drain.quiescing,
             active_worktrees: drain.active_worktrees.len() as u32,
@@ -2308,6 +2413,8 @@ impl ServeVerdictState {
             pending_batch_waiters: batch_counts.waiters,
             pending_batch_members: batch_counts.members,
             inflight_batch_runs: batch_counts.inflight_runs,
+            inflight_witness_compiles: witness_inflight,
+            waiting_witness_compiles: witness_waiting,
         }
     }
 
@@ -4755,6 +4862,7 @@ checks:
         WitnessInflightGate {
             state: Mutex::new(0),
             cv: Condvar::new(),
+            waiting: AtomicU64::new(0),
             limit,
             queue_budget: Duration::from_millis(budget_ms),
         }
@@ -4890,6 +4998,113 @@ checks:
         // A fresh acquire still works (not permanently blocked).
         let _slot = gate.acquire();
         assert_eq!(*poisoned(&gate.state), 1, "next witness acquires cleanly");
+    }
+
+    /// THE observability regression test. A witness parked on the gate must be
+    /// COUNTED as waiting, because its absence is exactly what hid the real
+    /// serialization point: `/admin/active` reported only the BatchCoalescer's
+    /// queue, which sits DOWNSTREAM of this gate, so N stacked-up witnesses
+    /// showed as a near-empty batch queue and read as "the batcher has nothing
+    /// to coalesce" when in truth this gate was admitting one at a time.
+    #[test]
+    fn witness_gate_waiting_gauge_exposes_the_upstream_queue() {
+        let gate = Arc::new(test_witness_gate(1, 60_000));
+        assert_eq!(
+            gate.counts(),
+            (0, 0),
+            "idle gate: nothing held, nothing queued"
+        );
+
+        let hold_start = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let gate_h = Arc::clone(&gate);
+        let hs = Arc::clone(&hold_start);
+        let rel = Arc::clone(&release);
+        let holder = thread::spawn(move || {
+            let _slot = gate_h.acquire();
+            hs.wait();
+            rel.wait(); // hold until the assertions below have run
+        });
+        hold_start.wait();
+        assert_eq!(gate.counts().0, 1, "holder occupies the only slot");
+
+        // A second witness parks. It must become VISIBLE as waiting.
+        let gate_w = Arc::clone(&gate);
+        let waiter = thread::spawn(move || {
+            let _slot = gate_w.acquire();
+        });
+        let mut observed_waiting = 0;
+        for _ in 0..200 {
+            observed_waiting = gate.counts().1;
+            if observed_waiting >= 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            observed_waiting >= 1,
+            "a parked witness MUST appear in the waiting gauge — this is the \
+             field whose absence made the upstream gate invisible (got {observed_waiting})"
+        );
+
+        release.wait();
+        holder.join().expect("holder");
+        waiter.join().expect("waiter");
+
+        // And it must drain back to zero: a gauge that leaks upward would
+        // strand a phantom queue on /admin/active forever.
+        assert_eq!(
+            gate.counts(),
+            (0, 0),
+            "every acquire path must decrement the waiting gauge on exit"
+        );
+    }
+
+    /// Fail-open is the one path where a waiter leaves WITHOUT a slot. It must
+    /// still decrement the gauge, or every timed-out witness permanently
+    /// inflates the reported queue.
+    #[test]
+    fn witness_gate_fail_open_still_decrements_waiting_gauge() {
+        let gate = Arc::new(test_witness_gate(1, 50));
+        let hold_start = Arc::new(Barrier::new(2));
+        let gate_h = Arc::clone(&gate);
+        let hs = Arc::clone(&hold_start);
+        let holder = thread::spawn(move || {
+            let _slot = gate_h.acquire();
+            hs.wait();
+            thread::sleep(Duration::from_millis(300)); // outlast the 50ms budget
+        });
+        hold_start.wait();
+        {
+            let _slot = gate.acquire(); // fails open
+        }
+        assert_eq!(
+            gate.counts().1,
+            0,
+            "a fail-open waiter must not leak a waiting count"
+        );
+        holder.join().expect("holder");
+        assert_eq!(gate.counts(), (0, 0), "gate returns fully idle");
+    }
+
+    /// A panic unwinding through `acquire`'s parked section must not leak the
+    /// gauge either (RAII drop on unwind), mirroring
+    /// `witness_gate_panicking_holder_releases_slot` for the slot counter.
+    #[test]
+    fn witness_gate_panicking_holder_releases_waiting_gauge() {
+        let gate = Arc::new(test_witness_gate(1, 60_000));
+        let gate_p = Arc::clone(&gate);
+        let panicked = thread::spawn(move || {
+            let _slot = gate_p.acquire();
+            panic!("witness worker panicked mid-compile");
+        })
+        .join();
+        assert!(panicked.is_err(), "the worker did panic");
+        assert_eq!(
+            gate.counts(),
+            (0, 0),
+            "panic must release BOTH the slot and the waiting gauge"
+        );
     }
 
     // ── Change 2: cross-run culprit ejection tests ────────────────────────

@@ -172,6 +172,8 @@ fn daemon_activity_to_json(activity: &DaemonActivity) -> String {
         "pending_batch_waiters": activity.pending_batch_waiters,
         "pending_batch_members": activity.pending_batch_members,
         "inflight_batch_runs": activity.inflight_batch_runs,
+        "inflight_witness_compiles": activity.inflight_witness_compiles,
+        "waiting_witness_compiles": activity.waiting_witness_compiles,
     })
     .to_string()
 }
