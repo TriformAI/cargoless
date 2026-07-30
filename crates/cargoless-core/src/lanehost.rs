@@ -97,8 +97,14 @@ impl LaneSnapshot {
 }
 
 /// A lane running on its own thread.
+///
+/// The `Sender` is behind a `Mutex` because `mpsc::Sender` is `Send` but not
+/// `Sync`, and this is shared across connection threads via
+/// `VerdictService: Send + Sync`. The lock is held only for the `send` — a
+/// pointer hand-off, never a build — so it cannot become the contention point
+/// the snapshot design exists to avoid.
 pub struct LaneHost {
-    tx: Sender<LaneEvent>,
+    tx: Mutex<Sender<LaneEvent>>,
     snapshot: Arc<Mutex<LaneSnapshot>>,
     running: Arc<AtomicBool>,
 }
@@ -139,7 +145,7 @@ impl LaneHost {
             .expect("spawn lane worker");
 
         Self {
-            tx,
+            tx: Mutex::new(tx),
             snapshot,
             running,
         }
@@ -186,8 +192,14 @@ impl LaneHost {
         if !self.running.load(Ordering::SeqCst) {
             return Err("build lane worker is not running".to_string());
         }
-        self.tx
-            .send(event)
+        let tx = match self.tx.lock() {
+            Ok(tx) => tx,
+            // A poisoned send-lock means a previous caller panicked mid-send.
+            // The channel itself is unaffected — recovering keeps the lane
+            // reachable rather than bricking it over an unrelated panic.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        tx.send(event)
             // A dead worker must be reported, never swallowed: a caller told
             // "queued" for a lane that will never build would wait forever.
             .map_err(|_| "build lane worker has stopped".to_string())
