@@ -80,6 +80,23 @@ fn dispatch_oneshot(svc: &dyn VerdictService, req: &Request) -> String {
             Some(options),
         )),
         Request::BatchCheck(request) => batchreport_to_json(&svc.batch_check(request)),
+        // Build lane. One-shots like the rest: the caller gets an ack, and the
+        // build's outcome arrives via `GET /lane` or the member's own status —
+        // a lane build runs for tens of minutes, so holding a socket open for
+        // it is not a thing anyone wants.
+        //
+        // The match is exhaustive on purpose (no `_` arm): adding a verb should
+        // make BOTH transports fail to compile until someone decides what it
+        // means here, rather than silently working over HTTP and returning
+        // nothing over the Unix socket.
+        Request::LaneEnqueue(request) => match svc.lane_enqueue(request) {
+            Ok(detail) => serde_json::json!({"ok": true, "detail": detail}).to_string(),
+            Err(detail) => serde_json::json!({"ok": false, "detail": detail}).to_string(),
+        },
+        Request::LaneReadmit { id } => match svc.lane_readmit(id) {
+            Ok(detail) => serde_json::json!({"ok": true, "detail": detail}).to_string(),
+            Err(detail) => serde_json::json!({"ok": false, "detail": detail}).to_string(),
+        },
     }
 }
 
