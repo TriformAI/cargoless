@@ -387,7 +387,7 @@ fn compute_macro_blind_hit(
 /// The serve-loop's live verdict state, presented as the shipped logical
 /// [`VerdictService`]. `Send + Sync` (the trait demands it so the
 /// HTTP/Unix adapters can share one service across connection threads):
-/// the four `Mutex`-guarded fields satisfy that by construction.
+/// the `Mutex`-guarded fields satisfy that by construction.
 #[derive(Default)]
 pub struct ServeVerdictState {
     /// worktree-key → last published status. Keyed by the SAME string
@@ -523,6 +523,16 @@ pub struct ServeVerdictState {
     /// RAII release needs no lifetime gymnastics: the guard holds the `Arc`
     /// and stores `false` on drop. Keyed by the warm-dir key.
     warm_target_locks: Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// CGLS-26 — cumulative warm-target outcomes, keyed by the same
+    /// `mode:reason` pair the obs line carries (`warm:hit`,
+    /// `cold-fallback:contended:in-proc`, …). Surfaced on `GET /daemon` as
+    /// `warm_target`, which is what makes a `cold-fallback` alertable: the
+    /// eprintln alone was never consumed, and on these pods it cannot be —
+    /// both witness instances sit on triform-5, whose log-shipping agent has
+    /// been crash-looping for weeks. A pull-based counter needs no log
+    /// pipeline. Monotonic for the process lifetime; a restart zeroes it,
+    /// which a `increase()`-style query handles correctly.
+    warm_target_stats: Mutex<BTreeMap<String, u64>>,
 }
 
 #[derive(Default)]
@@ -1918,6 +1928,88 @@ impl ServeVerdictState {
     /// a shared target dir can be corrupted by two concurrent `cargo`s
     /// (CGLS-24), so the locks are a hard interlock — if anything else is in
     /// the warm dir, this run goes cold rather than share it.
+    ///
+    /// ## There are FOUR interlocks, not two — know all of them before tuning
+    ///
+    /// The two locks below (in-process CAS, cross-process flock) are the ones
+    /// this function owns, and they guard the dir at RUN granularity. They are
+    /// not the whole story:
+    ///
+    /// | # | Interlock | Granularity | Owner |
+    /// |---|---|---|---|
+    /// | 1 | key = sha256(schema, toolchain, `Cargo.lock`) | dep-graph | this fn |
+    /// | 2 | per-key in-process `AtomicBool` CAS, non-blocking | run | this fn |
+    /// | 3 | `flock(2)` `LOCK_NB` on `<warm>/.witness-lock` | run/process | this fn |
+    /// | 4 | cargo's `<target>/<layout>/.cargo-lock`, **blocking** | check | cargo |
+    ///
+    /// **#4 is the one carrying intra-run load, and nothing here enforces it.**
+    /// `MAX_INFLIGHT` and the two locks above gate witness *runs*; within one
+    /// run `project_checks::run_parallel` fans out to the profile's
+    /// `max_parallel`, and every `command` check inherits the SAME
+    /// `CARGO_TARGET_DIR`. Observed live 2026-07-30 with three witnesses on one
+    /// warm dir — one builder, two parked in `locks_lock_inode_wait`:
+    ///
+    /// ```text
+    /// FLOCK ADVISORY WRITE 91447 …2767534        <- wasm holds release/
+    ///    -> FLOCK ADVISORY WRITE 91467 …2767534  <- csr blocked
+    ///    -> FLOCK ADVISORY WRITE 91489 …2767534  <- ssr blocked
+    /// ```
+    ///
+    /// Two consequences worth writing down:
+    ///
+    /// - Interlocks #2/#3 are *quiet* about this. They are per-run and
+    ///   uncontended in the fast path, so a clean `mode=warm reason=hit` log
+    ///   says nothing about how many `cargo`s are queued inside that run.
+    /// - The intra-run sharing PREDATES the warm dir. Cold pins
+    ///   `<root>/.cargoless-target` — per-*run*, not per-*check* — so those
+    ///   same checks always shared a dir. Warm did not create it; warm
+    ///   extended it across runs. Reverting warm would not remove it.
+    ///
+    /// `project_checks::run_parallel` now holds shared-warm-dir checks in a
+    /// serial class so they queue in `pending` instead of in the kernel. That
+    /// is a resource fix layered ON TOP of #4, **not a replacement for it** —
+    /// #4 is still the correctness backstop. Anything that raises effective
+    /// concurrency against one target dir (per-check target split, a higher
+    /// `max_parallel`, a second daemon on the same PVC) is removing a CGLS-24
+    /// guard, so pair it with evidence that #4 still covers the gap.
+    /// Emit the warm-target obs line AND bump the matching counter.
+    ///
+    /// One call site for both so the two can never disagree — the failure
+    /// this repo keeps hitting is an optimisation whose telemetry silently
+    /// stops matching its behaviour. Every `resolve_warm_target` exit goes
+    /// through here.
+    fn record_warm_obs(&self, warm_dir: &Path, mode: &str, reason: &str) {
+        eprintln!(
+            "[cargoless:obs] witness-warm-target dir={} mode={mode} reason={reason}",
+            warm_dir.display()
+        );
+        *poisoned(&self.warm_target_stats)
+            .entry(format!("{mode}:{}", warm_obs_bucket(reason)))
+            .or_insert(0) += 1;
+    }
+
+    /// Snapshot of [`Self::warm_target_stats`] for `GET /daemon`. `None` when
+    /// nothing has resolved yet, so a daemon that runs no witness compiles
+    /// omits the field entirely rather than publishing a misleading zero.
+    pub(crate) fn warm_target_stats_json(&self) -> Option<serde_json::Value> {
+        let stats = poisoned(&self.warm_target_stats);
+        if stats.is_empty() {
+            return None;
+        }
+        let mut warm: u64 = 0;
+        let mut cold: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for (k, v) in stats.iter() {
+            match k.split_once(':') {
+                Some(("warm", _)) => warm += v,
+                Some(("cold-fallback", reason)) => {
+                    cold.insert(reason.to_string(), serde_json::json!(v));
+                }
+                _ => {}
+            }
+        }
+        Some(serde_json::json!({ "warm": warm, "cold_fallback": cold }))
+    }
+
     fn resolve_warm_target(
         &self,
         state_dir: &Path,
@@ -1935,7 +2027,7 @@ impl ServeVerdictState {
         let key = warm_target_key(scratch_root)?;
         let warm_dir = state_dir.join("witness-target-warm").join(&key);
         if let Err(e) = std::fs::create_dir_all(&warm_dir) {
-            emit_warm_obs(&warm_dir, "cold-fallback", &format!("mkdir:{e}"));
+            self.record_warm_obs(&warm_dir, "cold-fallback", &format!("mkdir:{e}"));
             return None;
         }
 
@@ -1955,7 +2047,7 @@ impl ServeVerdictState {
             )
             .is_err()
         {
-            emit_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
+            self.record_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
             return None;
         }
         let in_proc = InProcWarmGuard { busy };
@@ -1967,11 +2059,11 @@ impl ServeVerdictState {
         let flock = match WarmFlock::acquire_nb(&lock_path) {
             Ok(Some(fl)) => fl,
             Ok(None) => {
-                emit_warm_obs(&warm_dir, "cold-fallback", "contended:flock");
+                self.record_warm_obs(&warm_dir, "cold-fallback", "contended:flock");
                 return None;
             }
             Err(e) => {
-                emit_warm_obs(&warm_dir, "cold-fallback", &format!("flock-open:{e}"));
+                self.record_warm_obs(&warm_dir, "cold-fallback", &format!("flock-open:{e}"));
                 return None;
             }
         };
@@ -1984,7 +2076,26 @@ impl ServeVerdictState {
         let _ = std::fs::write(warm_dir.join(".last-used"), "");
         prune_warm_target_dirs(state_dir, &warm_dir);
 
-        emit_warm_obs(&warm_dir, "warm", "hit");
+        // 5. Disk-pressure rung, checked AFTER prune so a reclaimable stale
+        //    key counts as free space rather than tripping the guard.
+        //
+        //    Why this rung exists: prune keeps WARM_TARGET_KEEP=2 and runs
+        //    after create, so a `Cargo.lock` change transiently holds THREE
+        //    keyed dirs. Measured 2026-07-30 on witness-b, whose warm keys are
+        //    ~16G and ~6G on a 59G volume — 3 keys would not fit. And running
+        //    cargo out of space is the bad failure: it surfaces as a compile
+        //    error on a tree that compiles fine, i.e. a false RED on a
+        //    required check, which is exactly the class the per-run dirs were
+        //    introduced to stop.
+        //
+        //    Going cold instead costs a slow compile and nothing else, so
+        //    this is the same fail-CLOSED trade every rung above makes.
+        if let Some(reason) = warm_dir_disk_pressure(&warm_dir) {
+            self.record_warm_obs(&warm_dir, "cold-fallback", &reason);
+            return None;
+        }
+
+        self.record_warm_obs(&warm_dir, "warm", "hit");
         Some(WarmTargetGuard {
             dir: warm_dir,
             _in_proc: in_proc,
@@ -2602,6 +2713,10 @@ impl VerdictService for ServeVerdictState {
 
     fn resolved_config(&self) -> Option<serde_json::Value> {
         poisoned(&self.resolved_config).clone()
+    }
+
+    fn warm_target_stats(&self) -> Option<serde_json::Value> {
+        self.warm_target_stats_json()
     }
 
     fn request_quiesce(&self) -> DaemonActivity {
@@ -3266,11 +3381,128 @@ fn prune_warm_target_dirs(state_dir: &Path, active: &Path) {
     }
 }
 
-fn emit_warm_obs(warm_dir: &Path, mode: &str, reason: &str) {
-    eprintln!(
-        "[cargoless:obs] witness-warm-target dir={} mode={mode} reason={reason}",
-        warm_dir.display()
-    );
+/// Headroom multiple required to keep using the warm dir: free space must be
+/// at least `WARM_DISK_HEADROOM_X` times the dir's current size. 1× would be
+/// the naive "it fits" test, but the dir is about to GROW during the compile
+/// it is protecting, and a `Cargo.lock` change can transiently add a whole
+/// second key before prune reclaims the old one.
+const WARM_DISK_HEADROOM_X: u64 = 2;
+
+/// Below this size a warm dir is not worth protecting and the ratio check is
+/// skipped outright. 1 GiB: two orders of magnitude under the ~16 GiB live
+/// witness dirs this rung exists for, and far above any unit-test fixture or
+/// freshly-created key. See `warm_dir_disk_pressure` for why a bare ratio
+/// without this floor misfires on a disk-pressured CI runner.
+const WARM_DISK_MIN_INTERESTING_BYTES: u64 = 1 << 30;
+
+/// `None` ⇒ enough headroom, keep the warm dir. `Some(reason)` ⇒ go cold.
+///
+/// Fails **OPEN** (returns `None`) when free space or dir size can't be
+/// measured. That is the opposite polarity from the rest of the ladder, and
+/// deliberate: an unmeasurable disk is not evidence of a full one, and this
+/// rung is a resource optimisation. Every rung above guards CORRECTNESS
+/// (clobber ⇒ false RED), so those fail closed; blanking the cache because
+/// `df` is unavailable would trade a real cost for a hypothetical one.
+/// Genuine exhaustion still surfaces — cargo reports ENOSPC and the compile
+/// reds honestly.
+fn warm_dir_disk_pressure(warm_dir: &Path) -> Option<String> {
+    let used = dir_size_bytes(warm_dir)?;
+    // Below the floor there is no cache worth protecting, so skip the check
+    // entirely — including the `df` subprocess.
+    //
+    // The floor is load-bearing, not a micro-optimisation. Without it the
+    // ratio alone misfires on a small dir sitting on a nearly-full volume:
+    // 2 x 4 KiB is trivially unavailable at 99% used, so a first-run warm dir
+    // would go cold on a disk with gigabytes free. That is exactly what the
+    // CI runner is (`ci.yml` header: "a disk-pressured Forgejo runner"), and
+    // it turned the CGLS-26 warm-target unit tests RED on the first push of
+    // this rung. The hazard being guarded is a MULTI-GIGABYTE target dir
+    // (~16 GiB live on witness-b); anything this side of the floor cannot
+    // fill a volume no matter how the ratio comes out.
+    let floor = WARM_DISK_MIN_INTERESTING_BYTES;
+    if used < floor {
+        return None;
+    }
+    let free = free_bytes_at(warm_dir)?;
+    let need = used.saturating_mul(WARM_DISK_HEADROOM_X);
+    if free < need {
+        return Some(format!(
+            "disk-pressure:free={}MiB,warm={}MiB,need={}MiB",
+            free >> 20,
+            used >> 20,
+            need >> 20
+        ));
+    }
+    None
+}
+
+/// Free bytes on the filesystem holding `path`, via `df -Pk`.
+///
+/// `df` rather than `statvfs(2)`: this crate carries no `libc` dependency, and
+/// the `statvfs` struct layout is platform-specific — a hand-rolled `extern
+/// "C"` binding with a wrong field offset would return a plausible-looking
+/// wrong number and silently mis-gate. A subprocess is measurably slower and
+/// completely unambiguous, and this runs once per witness compile (minutes),
+/// not per file. Same precedent as `warm_toolchain_id`'s `rustc -vV`.
+///
+/// `-P` is POSIX output: exactly one line per filesystem, so a long device
+/// name cannot wrap and shift the column index (verified on the deploy image,
+/// whose Longhorn device paths are 53 chars).
+fn free_bytes_at(path: &Path) -> Option<u64> {
+    let out = Command::new("df").arg("-Pk").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Field 3 (0-indexed) of the data line is 1024-byte blocks available.
+    let kb: u64 = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(kb.saturating_mul(1024))
+}
+
+/// Recursive apparent size of `dir` in bytes. `None` if the walk hits an
+/// error, so the caller fails open rather than acting on a partial total —
+/// an undercount here would defeat the guard exactly when the tree is
+/// largest. Symlinks are not followed (`symlink_metadata`), so a link into
+/// the repo cannot inflate the number or escape the subtree.
+fn dir_size_bytes(dir: &Path) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        for entry in std::fs::read_dir(&next).ok()? {
+            let entry = entry.ok()?;
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Collapse a warm-obs `reason` to a BOUNDED label for the counter.
+///
+/// Several reasons embed an errno or byte counts (`mkdir:<io error>`,
+/// `disk-pressure:free=…,warm=…`). Keying the map on the raw string would let
+/// it grow without bound and would fragment the very signal an alert needs to
+/// sum. Keying on the whole prefix before the first `:` would over-collapse
+/// the opposite way — `contended:in-proc` and `contended:flock` are DIFFERENT
+/// interlocks (in-process CAS vs cross-process flock) and which one fired is
+/// the diagnostic.
+///
+/// So: keep `contended:*` two-deep, collapse everything else to its head.
+fn warm_obs_bucket(reason: &str) -> &str {
+    if reason.starts_with("contended:") {
+        return reason;
+    }
+    reason.split([':', ',']).next().unwrap_or(reason)
 }
 
 /// RAII holder for the resolved warm dir + its two locks. Dropping it
@@ -7518,6 +7750,213 @@ checks:
             "stale unlocked dir past keep-count is removed"
         );
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    /// The counter must have BOUNDED cardinality (reasons embed errnos and
+    /// byte counts) while keeping the two contention interlocks apart — which
+    /// one fired is the diagnostic that tells in-process CAS from flock.
+    #[test]
+    fn warm_obs_bucket_bounds_cardinality_but_keeps_interlocks_distinct() {
+        // Variable tails collapse to a stable head.
+        assert_eq!(
+            warm_obs_bucket("mkdir:Permission denied (os error 13)"),
+            "mkdir"
+        );
+        assert_eq!(
+            warm_obs_bucket("flock-open:No such file (os error 2)"),
+            "flock-open"
+        );
+        assert_eq!(
+            warm_obs_bucket("disk-pressure:free=1024MiB,warm=16384MiB,need=32768MiB"),
+            "disk-pressure"
+        );
+        // Two disk-pressure events with different numbers share one bucket —
+        // otherwise every event is its own series and nothing ever sums.
+        assert_eq!(
+            warm_obs_bucket("disk-pressure:free=1MiB,warm=2MiB,need=4MiB"),
+            warm_obs_bucket("disk-pressure:free=9MiB,warm=8MiB,need=16MiB"),
+        );
+        // But the interlocks stay separable.
+        assert_eq!(warm_obs_bucket("contended:in-proc"), "contended:in-proc");
+        assert_eq!(warm_obs_bucket("contended:flock"), "contended:flock");
+        assert_ne!(
+            warm_obs_bucket("contended:in-proc"),
+            warm_obs_bucket("contended:flock"),
+            "collapsing these loses which interlock fired"
+        );
+        assert_eq!(warm_obs_bucket("hit"), "hit");
+    }
+
+    /// `GET /daemon`'s `warm_target` field: absent before anything resolves
+    /// (never a misleading zero), then counting both outcomes.
+    #[test]
+    fn warm_target_stats_json_absent_until_first_resolve_then_counts() {
+        let api = ServeVerdictState::new();
+        assert!(
+            api.warm_target_stats_json().is_none(),
+            "no resolutions yet ⇒ omit the field rather than publish 0"
+        );
+
+        let dir = temp_root("warm-stats");
+        api.record_warm_obs(&dir, "warm", "hit");
+        api.record_warm_obs(&dir, "warm", "hit");
+        api.record_warm_obs(&dir, "cold-fallback", "contended:flock");
+        api.record_warm_obs(
+            &dir,
+            "cold-fallback",
+            "disk-pressure:free=1MiB,warm=2MiB,need=4MiB",
+        );
+        api.record_warm_obs(
+            &dir,
+            "cold-fallback",
+            "disk-pressure:free=7MiB,warm=9MiB,need=18MiB",
+        );
+
+        let v = api.warm_target_stats_json().expect("stats after recording");
+        assert_eq!(v["warm"], 2);
+        assert_eq!(
+            v["cold_fallback"]["disk-pressure"], 2,
+            "byte-count variants aggregate into one alertable series"
+        );
+        assert_eq!(v["cold_fallback"]["contended:flock"], 1);
+        assert!(
+            v["cold_fallback"].get("contended:in-proc").is_none(),
+            "reasons that never fired must not appear"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `dir_size_bytes` totals the tree, recurses, and does not follow
+    /// symlinks out of it. An undercount would defeat the disk rung exactly
+    /// when the warm dir is biggest, so this pins the arithmetic.
+    #[test]
+    fn dir_size_bytes_totals_recursively_without_following_symlinks() {
+        let root = temp_root("warm-dirsize");
+        std::fs::write(root.join("a.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::create_dir_all(root.join("nested/deep")).unwrap();
+        std::fs::write(root.join("nested/b.bin"), vec![0u8; 2000]).unwrap();
+        std::fs::write(root.join("nested/deep/c.bin"), vec![0u8; 3000]).unwrap();
+
+        let plain = dir_size_bytes(&root).expect("readable tree");
+        assert_eq!(plain, 6000, "recursive total across all three files");
+
+        // A symlink to a large file outside the tree must not be followed —
+        // it would inflate the total and could point anywhere.
+        let outside = temp_root("warm-dirsize-outside");
+        std::fs::write(outside.join("big.bin"), vec![0u8; 500_000]).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("big.bin"), root.join("link.bin")).unwrap();
+            let with_link = dir_size_bytes(&root).expect("readable tree");
+            assert!(
+                with_link < 6000 + 500_000,
+                "symlink target must not be counted; got {with_link}"
+            );
+        }
+
+        // Missing dir ⇒ None ⇒ caller fails OPEN (keeps warm).
+        assert!(
+            dir_size_bytes(&root.join("does-not-exist")).is_none(),
+            "unreadable ⇒ None so the caller cannot act on a partial total"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// The disk rung's decision logic, pinned at both polarities.
+    ///
+    /// An empty warm dir must NEVER trip (need == 0): that is the first run
+    /// for a key, when there is no cache to protect and the compile has to
+    /// write somewhere regardless. A tripping empty dir would mean warm could
+    /// never bootstrap.
+    #[test]
+    fn warm_dir_disk_pressure_never_trips_on_empty_and_fails_open_when_unmeasurable() {
+        let root = temp_root("warm-diskpressure");
+        assert!(
+            warm_dir_disk_pressure(&root).is_none(),
+            "empty warm dir must not trip, or warm can never bootstrap"
+        );
+
+        // A small dir must stay warm REGARDLESS of how full the volume is —
+        // that is the floor, not a ratio that happens to pass here. Without
+        // it this very assertion fails on the disk-pressured CI runner while
+        // passing on a roomy laptop, which is how the first push of this rung
+        // turned the two pre-existing CGLS-26 tests RED.
+        std::fs::write(root.join("small.bin"), vec![0u8; 4096]).unwrap();
+        assert!(
+            warm_dir_disk_pressure(&root).is_none(),
+            "4 KiB dir is below WARM_DISK_MIN_INTERESTING_BYTES ⇒ exempt"
+        );
+
+        // Nonexistent path: `df` fails ⇒ None ⇒ fail OPEN. Unmeasurable is
+        // not evidence of full, and this rung guards cost, not correctness.
+        assert!(
+            warm_dir_disk_pressure(&root.join("nope")).is_none(),
+            "unmeasurable ⇒ fail open (opposite polarity from the lock rungs)"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The threshold itself, independent of any real filesystem: free space
+    /// below `WARM_DISK_HEADROOM_X` × dir size trips, at-or-above does not.
+    #[test]
+    fn warm_disk_pressure_threshold_arithmetic() {
+        // Mirrors `warm_dir_disk_pressure`'s decision, floor first.
+        let trips = |free: u64, used: u64| {
+            used >= WARM_DISK_MIN_INTERESTING_BYTES
+                && free < used.saturating_mul(WARM_DISK_HEADROOM_X)
+        };
+        assert_eq!(WARM_DISK_HEADROOM_X, 2, "doc + reason string assume 2x");
+        // The live witness-b shape that motivated the rung: ~16 GiB warm dir,
+        // and a Cargo.lock change would want a whole second key alongside it.
+        assert!(
+            trips(20 << 30, 16 << 30),
+            "20 GiB free vs 16 GiB warm ⇒ cold"
+        );
+        assert!(
+            !trips(35 << 30, 16 << 30),
+            "35 GiB free vs 16 GiB warm ⇒ warm"
+        );
+        // Exactly at the boundary is NOT pressure (`<`, not `<=`).
+        assert!(!trips(32 << 30, 16 << 30), "exactly 2x is sufficient");
+
+        // The floor. A tiny dir on a nearly-full volume must NOT trip: the
+        // bare ratio said it should, which reddened the two pre-existing
+        // CGLS-26 warm-target tests on the disk-pressured CI runner
+        // (`ci.yml` header). There is no multi-GiB cache to protect there.
+        assert!(!trips(0, 0), "empty dir never trips");
+        assert!(
+            !trips(0, 4096),
+            "4 KiB dir on a full disk ⇒ below floor ⇒ stay warm"
+        );
+        assert!(
+            !trips(1 << 20, (1 << 30) - 1),
+            "just under the floor is still exempt"
+        );
+        assert!(
+            trips(1 << 20, 1 << 30),
+            "at the floor with 1 MiB free ⇒ genuinely at risk ⇒ cold"
+        );
+    }
+
+    /// `free_bytes_at` parses `df -Pk` into a plausible byte count for a path
+    /// that certainly exists, and returns `None` for one that does not.
+    #[test]
+    fn free_bytes_at_parses_df_and_fails_open_on_bad_path() {
+        let root = temp_root("warm-freebytes");
+        let free = free_bytes_at(&root).expect("df works on the temp dir");
+        assert!(
+            free > (1 << 20),
+            "a usable temp filesystem should report more than 1 MiB free, got {free}"
+        );
+        assert!(
+            free_bytes_at(Path::new("/definitely/not/a/real/mount/point")).is_none(),
+            "df failure ⇒ None ⇒ caller fails open"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Default OFF: with the flag unset, `resolve_warm_target` is `None`
