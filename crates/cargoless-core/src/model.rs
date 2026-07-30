@@ -1544,19 +1544,46 @@ mod tests {
     // remove_var-on-exit guard below keeps them deterministic.
     // -----------------------------------------------------------------------
 
+    /// Serializes every test that mutates `TF_DEBOUNCE_MS`.
+    ///
+    /// The comment above says "serializing tests … keeps them deterministic",
+    /// but nothing actually did: `cargo test` runs the test fns on parallel
+    /// THREADS of one process, and the env is process-global. Three tests
+    /// write this var, so one could `set_var("2500")` and have a sibling's
+    /// `remove_var` land before it read the value back — observed on
+    /// 2026-07-30, where `watch_debounce_accepts_large_values_for_flicker_
+    /// free_refactor` asserted 2.5s and got 150ms (the default, i.e. the var
+    /// was unset underneath it).
+    ///
+    /// The old SAFETY note — "this module's tests do not spawn threads that
+    /// read the env" — was true of the tests and beside the point: the
+    /// HARNESS is the threads.
+    ///
+    /// Held for the guard's whole lifetime (acquired in `set`, released in
+    /// `Drop`) so the set → read → restore sequence is atomic against the
+    /// other writers. Acquired ignoring poison: a panicking test leaves no
+    /// corrupt state here, and unwrapping would turn one failure into two —
+    /// the same collateral-failure trap that WARM_ENV_LOCK hit in serveapi.
+    static DEBOUNCE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     /// RAII guard: set `TF_DEBOUNCE_MS` for the test's scope, restore the
     /// pre-test value (or unset) on drop.
     struct EnvGuard {
         prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(value: &str) -> Self {
+            let lock = DEBOUNCE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var("TF_DEBOUNCE_MS").ok();
-            // SAFETY: tests gated on `#[cfg(test)]`; this module's tests do
-            // not spawn threads that read the env.
+            // SAFETY: `DEBOUNCE_ENV_LOCK` is held for this guard's entire
+            // lifetime, so no sibling test mutates or reads TF_DEBOUNCE_MS
+            // concurrently.
             unsafe { std::env::set_var("TF_DEBOUNCE_MS", value) };
-            Self { prev }
+            Self { prev, _lock: lock }
         }
     }
 
