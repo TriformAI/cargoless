@@ -328,3 +328,199 @@ fn the_lane_needs_no_knowledge_of_a_forge() {
     fn _accepts_any_lander<L: LaneLander>(_: &L) {}
     _accepts_any_lander(&RecordingLander::default());
 }
+
+/// The operator's question: "have you tested it with queueing a few different
+/// ones as well?"
+///
+/// Three members, TWO independent reds in files owned by different members.
+/// Both owners must be ejected and the innocent member must ship — the case
+/// where a naive implementation ejects the first owner it finds, or gives up
+/// and holds everyone.
+#[test]
+fn three_members_with_two_independent_reds_eject_both_owners_and_ship_the_third() {
+    let drv = driver(vec![
+        // popped from the back: first build red (two owners), then green.
+        LegOutcome {
+            tree: TreeState::Green,
+            ..Default::default()
+        },
+        LegOutcome {
+            tree: TreeState::Red,
+            diagnostics: vec![err_in("src/a_broken.rs"), err_in("src/b_broken.rs")],
+            ..Default::default()
+        },
+    ]);
+    let mut lane = LaneState::with_config(
+        APP_ROOT,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 5,
+            ..Default::default()
+        },
+    );
+    lane.step(LaneEvent::Enqueue(
+        LaneMember::new("a", "a1").with_changed_files(["src/a_broken.rs"]),
+    ));
+    lane.step(LaneEvent::Enqueue(
+        LaneMember::new("b", "b1").with_changed_files(["src/b_broken.rs"]),
+    ));
+    lane.step(LaneEvent::Enqueue(
+        LaneMember::new("innocent", "i1").with_changed_files(["src/fine.rs"]),
+    ));
+
+    let actions = drv.pump(&mut lane, LaneEvent::Tick { now: 5 });
+
+    let mut ejected: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            LaneAction::Eject { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    ejected.sort_unstable();
+    assert_eq!(
+        ejected,
+        vec!["a", "b"],
+        "both owners ejected — not just the first one found"
+    );
+
+    assert_eq!(
+        drv.lander.landed.borrow().as_slice(),
+        &[vec!["innocent".to_string()]],
+        "the member who touched neither failing file ships in the very next \
+         build, without waiting for either fix"
+    );
+}
+
+/// A member arriving mid-build must QUEUE, never preempt. On a real lane a
+/// build is tens of minutes and a cancelled CI run is permanently not-green,
+/// so preempting strands work that was about to pass.
+///
+/// Driver-level rather than policy-level: this asserts the *driver* does not
+/// start a second build, which is the part that would actually burn a runner.
+#[test]
+fn a_member_arriving_mid_build_queues_and_rides_the_next_build() {
+    let drv = driver(vec![
+        LegOutcome {
+            tree: TreeState::Green,
+            ..Default::default()
+        },
+        LegOutcome {
+            tree: TreeState::Green,
+            ..Default::default()
+        },
+    ]);
+    let mut lane = lane(); // zero capture window: builds on arrival
+
+    // First member builds and lands immediately.
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("first", "f1").with_changed_files(["src/a.rs"])),
+    );
+    // Second arrives after that build finished; it gets its own build.
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("second", "s1").with_changed_files(["src/b.rs"])),
+    );
+
+    assert_eq!(
+        drv.tree.materialized.borrow().as_slice(),
+        &[vec!["first".to_string()], vec!["second".to_string()]],
+        "two separate candidates — the second never joined the first's build"
+    );
+    assert_eq!(
+        drv.lander.landed.borrow().as_slice(),
+        &[vec!["first".to_string()], vec!["second".to_string()]],
+        "and both landed, in order"
+    );
+}
+
+/// Re-admission after a real fix: an ejected member whose new head touches the
+/// file that failed gets back in and ships. Without this the ejection is a
+/// dead end rather than a hold.
+#[test]
+fn an_ejected_member_returns_when_its_fix_touches_the_failing_file() {
+    let drv = driver(vec![
+        LegOutcome {
+            tree: TreeState::Green,
+            ..Default::default()
+        }, // 3rd: the fix builds green
+        LegOutcome {
+            tree: TreeState::Green,
+            ..Default::default()
+        }, // 2nd: survivors rebuild
+        LegOutcome {
+            tree: TreeState::Red,
+            diagnostics: vec![err_in("src/broken.rs")],
+            ..Default::default()
+        }, // 1st: red
+    ]);
+    let mut lane = lane();
+
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("author", "v1").with_changed_files(["src/broken.rs"])),
+    );
+    assert!(
+        lane.ejection("author").is_some(),
+        "precondition: the author is ejected by the red"
+    );
+
+    // A new head that touches the failing file — a plausible fix.
+    drv.pump(
+        &mut lane,
+        LaneEvent::HeadMoved {
+            id: "author".to_string(),
+            head: "v2".to_string(),
+            changed_files: vec!["src/broken.rs".to_string()],
+        },
+    );
+
+    assert!(lane.ejection("author").is_none(), "the ejection lifted");
+    assert!(
+        drv.lander
+            .landed
+            .borrow()
+            .iter()
+            .any(|ids| ids == &["author".to_string()]),
+        "and the fixed change actually shipped: {:?}",
+        drv.lander.landed.borrow()
+    );
+}
+
+/// The other half: a new head that touches nothing implicated must NOT buy a
+/// build slot. At tens of minutes per build, a README edit re-entering the
+/// queue is how a lane becomes a treadmill.
+#[test]
+fn an_ejected_member_stays_out_when_its_push_cannot_have_fixed_anything() {
+    let drv = driver(vec![LegOutcome {
+        tree: TreeState::Red,
+        diagnostics: vec![err_in("src/broken.rs")],
+        ..Default::default()
+    }]);
+    let mut lane = lane();
+
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("author", "v1").with_changed_files(["src/broken.rs"])),
+    );
+    let builds_before = drv.tree.materialized.borrow().len();
+
+    drv.pump(
+        &mut lane,
+        LaneEvent::HeadMoved {
+            id: "author".to_string(),
+            head: "v2".to_string(),
+            changed_files: vec!["README.md".to_string()],
+        },
+    );
+
+    assert!(
+        lane.ejection("author").is_some(),
+        "a push that cannot have fixed the failure must not lift the ejection"
+    );
+    assert_eq!(
+        drv.tree.materialized.borrow().len(),
+        builds_before,
+        "and must not have started a build"
+    );
+}
