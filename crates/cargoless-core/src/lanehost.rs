@@ -17,7 +17,13 @@
 //! lock the worker holds for the duration of a build, the endpoint would block
 //! for the whole build — and the endpoint exists precisely so someone whose
 //! change stopped moving can find out why. The worker therefore publishes an
-//! immutable snapshot after every pump, and readers only ever touch that.
+//! immutable snapshot, and readers only ever touch that.
+//!
+//! Publishing happens on **every state transition**, not just when the pump
+//! returns. The transition that flips the phase to `Building` is immediately
+//! followed by the blocking build, so publishing only afterwards would report
+//! `idle` for the entire duration of every build — the exact window the
+//! endpoint exists to explain.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -129,12 +135,29 @@ impl LaneHost {
                 // `recv` ends when every Sender is dropped, i.e. when the host
                 // goes away. No shutdown flag to get wrong.
                 while let Ok(event) = rx.recv() {
-                    driver.pump(&mut lane, event);
-                    // Publish AFTER the pump so a reader never observes a
-                    // half-applied build. Poisoning is ignored deliberately:
-                    // a panicked reader must not silently stop the lane from
-                    // reporting, and the snapshot is rebuilt from scratch here
-                    // anyway so there is no corrupt state to inherit.
+                    // Publish on EVERY transition, not just when the pump
+                    // returns.
+                    //
+                    // `pump` runs the whole build inside itself — tens of
+                    // minutes for a real lane — and the transition that flips
+                    // the phase to Building happens just before that blocking
+                    // call. Publishing only afterwards meant `GET /lane`
+                    // reported `idle` for the entire duration of every build:
+                    // precisely the window the endpoint exists to explain. An
+                    // author whose change stopped moving would look, see
+                    // "idle", and reasonably conclude the lane never received
+                    // their submission.
+                    //
+                    // Poisoning is ignored deliberately: a panicked reader must
+                    // not silently stop the lane from reporting, and the
+                    // snapshot is rebuilt from scratch each time so there is no
+                    // corrupt state to inherit.
+                    driver.pump_observed(&mut lane, event, |live| match worker_snapshot.lock() {
+                        Ok(mut s) => *s = LaneSnapshot::of(live),
+                        Err(poisoned) => *poisoned.into_inner() = LaneSnapshot::of(live),
+                    });
+                    // And once more after, so the terminal state of the last
+                    // transition is visible even if the loop exits here.
                     match worker_snapshot.lock() {
                         Ok(mut s) => *s = LaneSnapshot::of(&lane),
                         Err(poisoned) => *poisoned.into_inner() = LaneSnapshot::of(&lane),
@@ -283,6 +306,12 @@ mod tests {
 
         // The worker is now parked inside the build. A snapshot must still
         // return promptly rather than waiting it out.
+        // Two independent properties, asserted separately.
+        //
+        // 1. The read does not BLOCK. This is the whole reason the host
+        //    publishes a snapshot instead of letting readers take the lane's
+        //    lock: the worker is parked inside a build right now, and a reader
+        //    sharing that lock would wait out the entire build.
         let t0 = Instant::now();
         let snap = host.snapshot();
         assert!(
@@ -290,7 +319,24 @@ mod tests {
             "snapshot blocked for {:?} — readers are sharing the build's lock",
             t0.elapsed()
         );
-        assert_eq!(snap.phase, "building");
+
+        // 2. The snapshot REFLECTS the running build. `started_rx` fires from
+        //    inside the leg runner, which the worker reaches a few instructions
+        //    after publishing — so poll briefly rather than racing it. The
+        //    earlier version asserted immediately and flaked, reading the
+        //    pre-build `idle`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut snap = snap;
+        while snap.phase != "building" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            snap = host.snapshot();
+        }
+        assert_eq!(
+            snap.phase, "building",
+            "a build is in flight, so `GET /lane` must say so — reporting idle \
+             for the duration of a build is exactly what makes an author think \
+             the lane never received their submission"
+        );
         assert_eq!(snap.in_flight, vec!["A".to_string()]);
 
         let _ = release_tx.send(());

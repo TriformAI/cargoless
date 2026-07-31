@@ -433,6 +433,28 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     /// Drive the lane until it is quiet, collecting every action for the caller
     /// to report. Bounded so a policy bug cannot spin forever.
     pub fn pump(&self, lane: &mut LaneState, event: LaneEvent) -> Vec<LaneAction> {
+        self.pump_observed(lane, event, |_| {})
+    }
+
+    /// [`Self::pump`] with a callback fired after every state transition, before
+    /// the resulting actions are executed.
+    ///
+    /// The reason this exists: `execute` runs the BUILD, which for a real lane
+    /// is tens of minutes, and the transition that flips the phase to
+    /// `Building` happens on the line above it. A host that only observes the
+    /// lane after `pump` returns therefore reports `idle` for the entire
+    /// duration of every build — exactly the window `GET /lane` exists to
+    /// explain. An author whose change stopped moving would look, see "idle",
+    /// and reasonably conclude the lane never received their submission.
+    ///
+    /// The callback runs on the pump thread and must not block; it is for
+    /// publishing a snapshot, not for work.
+    pub fn pump_observed(
+        &self,
+        lane: &mut LaneState,
+        event: LaneEvent,
+        mut observe: impl FnMut(&LaneState),
+    ) -> Vec<LaneAction> {
         const MAX_STEPS: usize = 64;
         let mut all = Vec::new();
         let mut pending = std::collections::VecDeque::from(vec![event]);
@@ -446,6 +468,10 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                 break;
             }
             let actions = lane.step(ev);
+            // Observe the NEW state before running the actions it produced.
+            // `lane.step` has already set phase/in_flight; `execute` is what
+            // blocks.
+            observe(lane);
             for a in &actions {
                 pending.extend(self.execute(a));
             }
