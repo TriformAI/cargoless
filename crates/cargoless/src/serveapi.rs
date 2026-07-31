@@ -9753,13 +9753,8 @@ checks:
             semantic: Some(context.clone()),
             ..Default::default()
         };
-        let ack = api.push_overlay_with_options(
-            "/wt-gate",
-            "origin/main",
-            &files,
-            None,
-            Some(&options),
-        );
+        let ack =
+            api.push_overlay_with_options("/wt-gate", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted);
         assert!(
             matches!(
