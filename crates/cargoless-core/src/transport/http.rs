@@ -952,9 +952,12 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
     if let Some(rest) = req.path.strip_prefix("/worktrees/") {
         if let Some(w) = rest.strip_suffix("/diagnostics") {
             let w = pct_decode(w);
+            let base_sha = query_param(&req.query, "base_sha").map(|s| pct_decode(&s));
             return (
                 200,
-                crate::diagnostics_store::serialize(&svc.get_diagnostics(&w)),
+                crate::diagnostics_store::serialize(
+                    &svc.get_diagnostics_attributed(&w, base_sha.as_deref()),
+                ),
             );
         }
     }
@@ -2019,6 +2022,61 @@ mod tests {
         assert!(
             !body.contains("base_sha"),
             "absent base_sha omits the wire key (None): {body}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_route_threads_base_sha_into_attributed_lookup() {
+        struct EchoDiagnosticsSha;
+        impl VerdictService for EchoDiagnosticsSha {
+            fn get_status(&self, _w: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_verdict(&self, _w: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _w: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn get_diagnostics_attributed(
+                &self,
+                worktree: &str,
+                base_sha: Option<&str>,
+            ) -> Vec<Diagnostic> {
+                vec![Diagnostic {
+                    file_path: std::path::PathBuf::from(format!(
+                        "{worktree}/{}",
+                        base_sha.unwrap_or("none")
+                    )),
+                    line: 1,
+                    col: 1,
+                    severity: crate::Severity::Error,
+                    code: Some("TEST".to_string()),
+                    message: "attributed".to_string(),
+                    source: Some("test".to_string()),
+                }]
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+        }
+
+        let req = HttpReq {
+            method: "GET".to_string(),
+            path: "/worktrees/%2Fshared/diagnostics".to_string(),
+            query: "base_sha=a%2Fb".to_string(),
+            bearer: None,
+            content_length: None,
+            content_encoding: None,
+        };
+        let (code, body) = route_oneshot(&EchoDiagnosticsSha, &req);
+        assert_eq!(code, 200);
+        assert!(
+            body.contains("/shared/a/b"),
+            "worktree and base_sha must both be percent-decoded: {body}"
         );
     }
 

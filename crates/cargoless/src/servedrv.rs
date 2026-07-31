@@ -41,31 +41,21 @@
 //!   only ever sees `ClusterAction`) ⇒ pre-settle attribution stays
 //!   unrepresentable through the composition.
 //!
-//!   **CGLS-27/CGLS-11 — three DISPATCH sites, still one WRITE site.**
-//!   Three callers reach `publish_verdict`:
+//!   **CGLS-27 — multiple dispatch paths, still one WRITE site.**
+//!   Production callers reach `publish_verdict` through:
 //!
 //!   1. the `ClusterAction::EmitVerdict` match arm — the only site that
-//!      can express *any* verdict (Green / Red / Unknown), and the only
-//!      one that observes a settled barrier;
-//!   2. `publish_stranded_unknown`, called from the respawn handler for
-//!      a push the respawn stranded — structurally `Unknown`-ONLY;
-//!   3. the CGLS-11 forced-reopen cap arm inside the `SwitchOverlay`
-//!      exec, when the per-(wt, base_sha) nudge budget is exhausted —
-//!      also structurally `Unknown`-ONLY (constructs
-//!      `VerdictPayload::unknown("ra_reopen_cap_exceeded")` inline).
+//!      can publish a rust-analyzer result, after correlated diagnostic
+//!      pulls have settled its barrier;
+//!   2. the hard-witness supervisor — the only site that can publish a
+//!      direct exact-Git Cargo result, after the witness process completes;
+//!   3. `publish_stranded_unknown`, called from the respawn handler for
+//!      a push the respawn stranded — structurally `Unknown`-ONLY.
 //!
-//!   Sites 2 and 3 are **safe widenings, not weakenings**: neither takes
-//!   a verdict parameter — both build `VerdictPayload::unknown`
-//!   internally, so Green and Red are unrepresentable there *by
-//!   signature at the call site* (site 2 by function signature; site 3
-//!   by the inline literal). The property this doctrine protects — "no
-//!   verdict is attributed outside a settled barrier" — is preserved,
-//!   because an `Unknown` attributes no analysis result; it reports that
-//!   no analysis could be completed. The `verdict.publish` span's
-//!   `trigger_source` distinguishes the three dispatch sites
-//!   (`EmitVerdict` / `RaRespawnStranded` / `Cgls11ReopenCapExceeded`),
-//!   so the split stays visible in telemetry rather than folded into one
-//!   label.
+//!   The property this doctrine protects is therefore: every Green or Red
+//!   is backed by a completed analysis mechanism, while paths that did not
+//!   complete can express only Unknown. The `verdict.publish` span's
+//!   `trigger_source` keeps those paths visible in telemetry.
 //! * **(v) respawn-staleness closure:** the cluster's
 //!   `OverlayMultiplexer::reset()` is called at EXACTLY ONE site — the
 //!   `Spawned` control-message handler, which is the sole place a
@@ -151,13 +141,6 @@ struct ClusterState {
     /// Worktrees with a routed batch that arrived before the current RA
     /// instance reached project-ready.
     deferred: VecDeque<WtId>,
-    /// CGLS-11 — per-(wt_key, base_sha) count of forced close+reopen
-    /// fires. Bounded by CARGOLESS_RA_REOPEN_CAP (default 3). Beyond
-    /// cap → publish unknown(ra_reopen_cap_exceeded) instead of nudging.
-    /// A new base_sha for the same wt_key resets the budget: entries
-    /// whose wt_key matches the current push but whose base_sha differs
-    /// are evicted on entry to the CGLS-11 guard.
-    forced_reopen_count: BTreeMap<(String, Option<String>), u32>,
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -216,23 +199,10 @@ fn select_boot_warm_target(
         })
 }
 
-fn ra_native_settle_delay() -> Duration {
-    std::env::var("CARGOLESS_RA_SETTLE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(2_000))
-}
-
-/// CGLS-11 — cap on how many times the forced close+reopen nudge is
-/// allowed to fire for the SAME (wt_key, base_sha) pair. Beyond the cap
-/// the guard publishes `unknown(ra_reopen_cap_exceeded)` instead of
-/// nudging RA again, bounding the balloon-driver storm from repeated
-/// zero-verb re-pushes of the same content. A value of `0` disables the
-/// cap (unlimited nudges — the pre-cap behavior). Default is 3, which
-/// permits the first N nudges (so a genuinely stuck-once re-push still
-/// gets the nudge; only sustained storms hit the cap).
+// Historical close/reopen cap model retained only for regression tests that
+// document the removed workaround. Production diagnostic completion no
+// longer consults this state or performs a forced reopen.
+#[cfg(test)]
 fn ra_reopen_cap() -> u32 {
     std::env::var("CARGOLESS_RA_REOPEN_CAP")
         .ok()
@@ -240,32 +210,14 @@ fn ra_reopen_cap() -> u32 {
         .unwrap_or(3)
 }
 
-/// CGLS-11 — result of consulting the forced-reopen cap for a
-/// (wt_key, base_sha) pair.
 #[derive(Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ReopenBudget {
-    /// The nudge fires; `count` is the post-increment fire count for
-    /// this (wt_key, base_sha).
     Nudge { count: u32, cap: u32 },
-    /// The cap fired; the caller must publish
-    /// `unknown(ra_reopen_cap_exceeded)` instead of nudging.
     CapExceeded { count: u32, cap: u32 },
 }
 
-/// CGLS-11 — consult and update the per-(wt, base_sha) forced-reopen
-/// budget. Evicts stale entries whose wt matches but whose base_sha
-/// differs (a new push on the same wt resets the budget), then returns
-/// [`ReopenBudget::CapExceeded`] if `cap > 0 && count >= cap`; otherwise
-/// increments the counter and returns [`ReopenBudget::Nudge`]. Pure so
-/// the cap semantics are unit-testable without a live daemon (5 tests).
-///
-/// Load-bearing: `cap > 0 && count >= cap` is structurally unreachable
-/// when `count == 0` (`0 >= cap` requires `cap == 0`, which the guard
-/// excludes). The first N nudges always fire; only sustained storms hit
-/// the cap. `cgls11_forced_reopen_cap_first_push_still_nudges` pins
-/// this — a regression here re-opens the "zero-verb re-push with NO
-/// nudge → unknown forever" failure the original CGLS-11 fix closed
-/// (commit `6fb3aa1`).
+#[cfg(test)]
 fn consult_reopen_budget(
     map: &mut BTreeMap<(String, Option<String>), u32>,
     wt_key: &str,
@@ -442,6 +394,8 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // that race by construction.
     let (push_tx, push_rx) = channel::<String>();
     api.attach_push_signal(push_tx);
+    let (direct_gate_tx, direct_gate_rx) = channel::<crate::serveapi::DirectGateRequest>();
+    api.attach_direct_gate_signal(direct_gate_tx);
 
     // C1 observability — record the resolved RA config for `GET /daemon`.
     // Resolved from the SAME env + repo root the per-cluster RA spawn uses
@@ -663,6 +617,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // next iteration from the new RA cannot interleave with the dead
         // state.
         drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
+
+        // Gated project checks are authoritative Cargo jobs over isolated
+        // scratch worktrees. Dispatch them directly from ingest; they do not
+        // enter the shared rust-analyzer transaction queue.
+        while let Ok(request) = direct_gate_rx.try_recv() {
+            dispatch_direct_gate(request, Arc::clone(&api));
+        }
 
         // #240/2b — overlay-push ingest drain. The PushOverlay write-plane
         // wakeup signal: every `api.push_overlay(...)` call sends the
@@ -1045,7 +1006,6 @@ fn spawn_cluster(
             next_ver: 2,
             ready: false,
             deferred: VecDeque::new(),
-            forced_reopen_count: BTreeMap::new(),
         },
     );
 }
@@ -1274,7 +1234,7 @@ fn exec(
             )
             .entered();
             // #247 obs: log the wire-side check-start (the SwitchOverlay
-            // arm dispatching mux.switch_to + did_save = the flycheck
+            // arm dispatching mux.switch_to + diagnostic pulls = the analysis
             // trigger). Pairs with `flycheck-end` (step's EmitVerdict
             // detection) and `verdict-emit` (publish_verdict) to give a
             // grep-able sequence per WT per generation. Dep-free.
@@ -1303,14 +1263,6 @@ fn exec(
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
-            // CGLS-11: track whether this SwitchOverlay cycle is sourced
-            // from a pushed overlay (true) or the FS-watch path (false).
-            // Used below to gate the forced-reopen guard.
-            let mut is_from_pushed_overlay = false;
-            // CGLS-11 forced-reopen cap: capture the pushed base_sha so
-            // the guard can key its per-push budget by (wt_key, base_sha)
-            // — a new base_sha for the same wt resets the budget.
-            let mut pushed_base_sha: Option<String> = None;
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
                 // #A2/#A7 — stamp attribution (base_sha + receipt/consume
                 // clocks) the instant the push is consumed, BEFORE the
@@ -1318,7 +1270,6 @@ fn exec(
                 // sole attribution site.
                 api.record_push_attribution(&wt_key, &pushed);
                 pushed_check_profile = pushed.check_profile;
-                pushed_base_sha = pushed.base_sha.clone();
                 let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
                 let materialize_overlay = pushed.analysis_root.is_some();
                 api.record_project_check_context(
@@ -1327,13 +1278,14 @@ fn exec(
                         root: project_root,
                         changed_files: pushed.changed_files.clone(),
                         base_ref: pushed.base_ref.clone(),
+                        source_ref: pushed.source_ref.clone(),
+                        source_sha: pushed.source_sha.clone(),
                         overlay_files: pushed.files.clone(),
                         materialize_overlay,
                         gate: pushed.gate,
                         check_ids: pushed.check_ids.clone(),
                     },
                 );
-                is_from_pushed_overlay = true;
                 pushed.files
             } else {
                 // #A2 — this verdict cycle is FS-derived. A leftover
@@ -1369,106 +1321,19 @@ fn exec(
             // still iterate for dispatch. `switch_to` returns a `Vec` so this
             // is a single allocation regardless.
             let verbs = cs.mux.switch_to(&target);
-            let zero_verbs = verbs.is_empty();
             for verb in verbs {
                 match verb {
                     LspVerb::DidOpen { path, content } => {
                         let _ = lsp.did_open(&path.to_string_lossy(), &content, 1);
                     }
                     LspVerb::DidChange { path, content } => {
-                        // CGLS verdict-flow fix: a bare `textDocument/didChange`
-                        // does NOT make rust-analyzer re-publish diagnostics for
-                        // an already-open document here (empirically: with
-                        // checkOnSave off / RA-native-only, the first push of a
-                        // file `didOpen`s → RA analyzes → green, but every
-                        // SUBSEQUENT push of the SAME file `didChange`s → RA stays
-                        // silent → the 2s liveness timer settles an empty window →
-                        // verdict=unknown, FOREVER, because agents iterating a
-                        // branch re-push the same changed files. Confirmed live: a
-                        // close+reopen of the path restores analysis (green); a
-                        // didChange does not, even 25s later. So re-open the
-                        // document (close → open) instead of changing it, which
-                        // forces RA to re-run native analysis on the new content.
-                        // The OverlayMultiplexer's proven `applied`/open-set core
-                        // is untouched; we keep `self.open` truthful by closing
-                        // before re-opening at the wire seam.
                         let v = cs.next_ver;
                         cs.next_ver += 1;
                         let p = path.to_string_lossy();
-                        let _ = lsp.did_close(&p);
-                        let _ = lsp.did_open(&p, &content, v);
+                        let _ = lsp.did_change(&p, &content, v);
                     }
                     LspVerb::DidClose { path } => {
                         let _ = lsp.did_close(&path.to_string_lossy());
-                    }
-                }
-            }
-            // CGLS-11 fix — forced close+reopen for identical-content
-            // re-pushes on the pool ingress path.
-            //
-            // When `overlay::diff` yields zero verbs (the minimality
-            // property: identical content in `applied` and `target` ⇒ no
-            // ops), RA receives no LSP notification → no `publishDiagnostics`
-            // → `real_flycheck_activity_seen` stays false → the 2s settle
-            // timer fires on an empty window → the CGLS-9 fail-closed guard
-            // publishes `verdict=unknown(ra_native_timer_settled_no_flycheck_
-            // activity)`. Observed live: agents iterating a branch re-push the
-            // same changed-file content on every attempt; the first push gets a
-            // real verdict, every subsequent push is unknown forever.
-            //
-            // Fix: when all three conditions hold —
-            //   1. `is_from_pushed_overlay` — this is a pool-push cycle, not
-            //      the FS-watch path (the FS path must be byte-identical to the
-            //      pre-fix behavior; non-regression test pins this).
-            //   2. `zero_verbs` — `overlay::diff` found no delta; RA is
-            //      otherwise not notified. When verbs were emitted, RA is
-            //      already triggered by the loop above; no extra nudge needed.
-            //   3. `target` is non-empty — there IS an overlay to analyze (an
-            //      intentional empty push clears all overlays; nothing to nudge).
-            // — force a close+reopen of the lexicographically first .rs file in
-            // the overlay. This is the SAME close+reopen mechanic already used
-            // for `DidChange` above (confirmed live: a close+reopen forces RA to
-            // re-run native analysis; a bare `didChange` does not). The
-            // `OverlayMultiplexer` state stays correct: `applied` already equals
-            // `target` after `switch_to`, so the multiplexer's open-set reflects
-            // reality — the forced close+reopen simply ensures RA re-analyzes
-            // content it otherwise believed was unchanged.
-            //
-            // Determinism: `first_rs_in_overlay` picks the lex-first key from
-            // the `OverlaySet`'s internal `BTreeMap`, which is sorted and stable.
-            if is_from_pushed_overlay && zero_verbs && !target.is_empty() {
-                // CGLS-11 forced-reopen cap — bound the per-(wt, base_sha)
-                // nudge count so an unbounded storm of zero-verb re-pushes
-                // stops pinning RA into repeated inference-diagnostic
-                // recomputations (the balloon-driver observed on pod-A).
-                // A new base_sha for the same wt resets the budget
-                // (handled inside `consult_reopen_budget`).
-                match consult_reopen_budget(
-                    &mut cs.forced_reopen_count,
-                    &wt_key,
-                    &pushed_base_sha,
-                    ra_reopen_cap(),
-                ) {
-                    ReopenBudget::CapExceeded { count, cap } => {
-                        let attribution = api.take_push_attribution(&wt_key);
-                        publish_reopen_cap_exceeded(&wt, count, cap, attribution, api);
-                        return;
-                    }
-                    ReopenBudget::Nudge { count, cap } => {
-                        if let Some((path, content)) = first_rs_in_overlay(&target) {
-                            eprintln!(
-                                "[cargoless:obs] cgls11-forced-reopen wt={} path={} count={} cap={} (zero-verb re-push nudge)",
-                                wt.display(),
-                                path.display(),
-                                count,
-                                cap,
-                            );
-                            let v = cs.next_ver;
-                            cs.next_ver += 1;
-                            let p = path.to_string_lossy();
-                            let _ = lsp.did_close(&p);
-                            let _ = lsp.did_open(&p, &content, v);
-                        }
                     }
                 }
             }
@@ -1482,16 +1347,21 @@ fn exec(
                     wt.display()
                 );
             }
-            // The replacement verdict path has no didSave/runFlycheck and no
-            // direct Cargo subprocess. A delayed synthetic settle lets RA
-            // publish diagnostics for the just-applied overlay before the
-            // existing barrier publishes the worktree bit.
-            spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
+            let diagnostic_paths: Vec<PathBuf> =
+                target.iter_rs().map(|(path, _)| path.to_owned()).collect();
+            spawn_ra_diagnostic_pull(
+                &wt,
+                cs.cluster.clone(),
+                cs.lsp_tx.clone(),
+                lsp,
+                diagnostic_paths,
+            );
         }
         ClusterAction::EmitVerdict {
             wt,
             authoritative_error,
             real_flycheck_activity_seen,
+            analysis_failure_reason,
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
             //
@@ -1572,6 +1442,7 @@ fn exec(
                         authoritative_error,
                         timer_settled_no_flycheck,
                         macro_blind_hit,
+                        analysis_failure_reason.as_deref(),
                     )
                 }
                 ProjectChecksMode::Warn => {
@@ -1587,6 +1458,7 @@ fn exec(
                         authoritative_error,
                         timer_settled_no_flycheck,
                         macro_blind_hit,
+                        analysis_failure_reason.as_deref(),
                     )
                 }
                 ProjectChecksMode::Hard => {
@@ -1655,6 +1527,7 @@ fn is_rust_source_path(path: &str) -> bool {
 /// deterministic and reproducible across runs. Returns `None` when the
 /// overlay contains no `.rs` entries (all Cargo.toml / Cargo.lock / etc.)
 /// — in that case the guard is a no-op (nothing to nudge RA with).
+#[cfg(test)]
 fn first_rs_in_overlay(target: &OverlaySet) -> Option<(PathBuf, String)> {
     target
         .iter_rs()
@@ -1672,24 +1545,67 @@ fn overlay_path_for_wt(wt: &WtId, path: &str) -> PathBuf {
     }
 }
 
-fn spawn_ra_native_settle(
+fn spawn_ra_diagnostic_pull(
     wt: &WtId,
     h: WorkspaceConfigHash,
     tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    lsp: Arc<LspClient>,
+    paths: Vec<PathBuf>,
 ) {
     let wt = wt.clone();
-    let delay = ra_native_settle_delay();
     let _ = std::thread::Builder::new()
-        .name("tf-ra-settle".into())
+        .name("tf-ra-diagnostic-pull".into())
         .spawn(move || {
+            const PULL_TIMEOUT: Duration = Duration::from_secs(30);
+            const CANCEL_RETRIES: usize = 3;
             eprintln!(
-                "[cargoless:obs] ra-native-settle-started wt={} delay_ms={} (#tfmv)",
+                "[cargoless:obs] ra-diagnostic-pull-started wt={} documents={} timeout_ms={}",
                 wt.display(),
-                delay.as_millis()
+                paths.len(),
+                PULL_TIMEOUT.as_millis(),
             );
-            std::thread::sleep(delay);
+            if paths.is_empty() {
+                let _ = tx.send((
+                    h,
+                    LspEvent::FlycheckFailed {
+                        message: "ra_diagnostic_pull:no Rust documents in transaction".to_string(),
+                    },
+                ));
+                return;
+            }
+            let deadline = Instant::now() + PULL_TIMEOUT;
+            for path in paths {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let _ = tx.send((
+                        h,
+                        LspEvent::FlycheckFailed {
+                            message: "ra_diagnostic_pull:transaction deadline exceeded".to_string(),
+                        },
+                    ));
+                    return;
+                }
+                match lsp.pull_diagnostics(&path.to_string_lossy(), remaining, CANCEL_RETRIES) {
+                    Ok(reports) => {
+                        for report in reports {
+                            if tx.send((h.clone(), LspEvent::Diagnostics(report))).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send((
+                            h,
+                            LspEvent::FlycheckFailed {
+                                message: format!("ra_diagnostic_pull:{error}"),
+                            },
+                        ));
+                        return;
+                    }
+                }
+            }
             eprintln!(
-                "[cargoless:obs] ra-native-settle-ended wt={} status=settled (#tfmv)",
+                "[cargoless:obs] ra-diagnostic-pull-ended wt={} status=settled",
                 wt.display()
             );
             let _ = tx.send((h, LspEvent::FlycheckEnded));
@@ -1876,17 +1792,10 @@ fn publish_verdict(
 /// the `ra_respawn_` prefix.
 const STRANDED_PUSH_REASON: &str = "ra_respawn_stranded_push";
 
-/// CGLS-11 — stable classifier for a verdict published when the
-/// forced-reopen cap fires. Downstream dashboards group on this literal;
-/// changing it is a telemetry break.
+#[cfg(test)]
 const REOPEN_CAP_EXCEEDED_REASON: &str = "ra_reopen_cap_exceeded";
 
-/// CGLS-11 — publish an honest `unknown` when the per-(wt, base_sha)
-/// forced-reopen budget is exhausted. This is the third dispatch site
-/// documented in the module-doc's `publish_verdict` doctrine block;
-/// like [`publish_stranded_unknown`] it takes NO verdict parameter and
-/// constructs [`statusfile::VerdictPayload::unknown`] internally, so
-/// Green and Red are unrepresentable here by signature.
+#[cfg(test)]
 fn publish_reopen_cap_exceeded(
     wt: &Path,
     count: u32,
@@ -1895,18 +1804,17 @@ fn publish_reopen_cap_exceeded(
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     eprintln!(
-        "[cargoless:obs] cgls11-reopen-cap-exceeded wt={} count={} cap={} verdict=unknown reason={} (CGLS-11)",
+        "[cargoless:obs] historical-reopen-cap wt={} count={} cap={}",
         wt.display(),
         count,
         cap,
-        REOPEN_CAP_EXCEEDED_REASON,
     );
     publish_verdict(
         wt,
         statusfile::VerdictPayload::unknown(REOPEN_CAP_EXCEEDED_REASON),
         attribution,
         Vec::new(),
-        "Cgls11ReopenCapExceeded",
+        "HistoricalReopenCapTest",
         api,
     );
 }
@@ -2050,7 +1958,11 @@ fn ra_native_payload(
     authoritative_error: bool,
     timer_settled_no_flycheck: bool,
     macro_blind_hit: bool,
+    analysis_failure_reason: Option<&str>,
 ) -> statusfile::VerdictPayload {
+    if let Some(reason) = analysis_failure_reason {
+        return statusfile::VerdictPayload::unknown(reason);
+    }
     if timer_settled_no_flycheck {
         return statusfile::VerdictPayload::unknown("ra_native_timer_settled_no_flycheck_activity");
     }
@@ -2090,7 +2002,7 @@ fn compose_hard_mode_payload(
 ) -> statusfile::VerdictPayload {
     use statusfile::VerdictPayload;
     match (authoritative_error, summary) {
-        (_, ProjectCheckSummary::Red { error_count }) => VerdictPayload::red(error_count),
+        (_, ProjectCheckSummary::Red { error_count, .. }) => VerdictPayload::red(error_count),
         (_, ProjectCheckSummary::Indeterminate { reason, detail }) => {
             VerdictPayload::unknown(format!("{reason}: {detail}"))
         }
@@ -2129,7 +2041,7 @@ fn spawn_project_checks_warn(
                 match &summary {
                     ProjectCheckSummary::Green => "green".to_string(),
                     ProjectCheckSummary::Empty => "empty".to_string(),
-                    ProjectCheckSummary::Red { error_count } => {
+                    ProjectCheckSummary::Red { error_count, .. } => {
                         format!("red(errors={error_count})")
                     }
                     ProjectCheckSummary::Indeterminate { reason, .. } => {
@@ -2222,6 +2134,19 @@ fn apply_require_checks(summary: ProjectCheckSummary, require: bool) -> ProjectC
         },
         other => other,
     }
+}
+
+fn dispatch_direct_gate(
+    request: crate::serveapi::DirectGateRequest,
+    api: Arc<crate::serveapi::ServeVerdictState>,
+) {
+    spawn_project_checks_hard(
+        request.wt,
+        false,
+        Some(request.context),
+        Some(request.attribution),
+        api,
+    );
 }
 
 /// #A4.3 — Hard-mode witness, OFF the serve loop, watchdog included.
@@ -2391,8 +2316,13 @@ fn spawn_project_checks_hard_with_timeout(
                 );
             }
             let summary = apply_require_checks(summary, require_checks);
+            let retained_diagnostics = match &summary {
+                ProjectCheckSummary::Red { diagnostics, .. } => diagnostics.clone(),
+                _ => Vec::new(),
+            };
             let payload = compose_hard_mode_payload(authoritative_error, summary);
             if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
+                api.retain_diagnostics(&wt_key, witness_base_sha.as_deref(), retained_diagnostics);
                 publish_verdict(
                     &wt,
                     payload,
@@ -2428,6 +2358,7 @@ fn spawn_project_checks_hard_with_timeout(
         );
         if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
             // No supervisor thread spawned ⇒ no witness ran ⇒ no gated checks.
+            api.retain_diagnostics(&wt_key, witness_base_sha.as_deref(), Vec::new());
             publish_verdict(
                 &wt,
                 payload,
@@ -2504,7 +2435,10 @@ pub(crate) enum ProjectCheckSummary {
     Green,
     /// Checks ran and at least one required check failed; `error_count`
     /// is the count of error-severity diagnostics.
-    Red { error_count: u32 },
+    Red {
+        error_count: u32,
+        diagnostics: Vec<cargoless_core::Diagnostic>,
+    },
     /// Checks could not run (manifest load error, overlay-apply error,
     /// etc.). `reason` is the stable classifier; `detail` is the
     /// human-readable tail for diagnosis. Maps to `Verdict::Unknown`,
@@ -2693,7 +2627,13 @@ fn run_project_checks_and_log(
                         ran_check_ids,
                     )
                 } else {
-                    (ProjectCheckSummary::Red { error_count }, ran_check_ids)
+                    (
+                        ProjectCheckSummary::Red {
+                            error_count,
+                            diagnostics: report.diagnostics,
+                        },
+                        ran_check_ids,
+                    )
                 }
             } else {
                 (ProjectCheckSummary::Green, ran_check_ids)
@@ -2837,6 +2777,8 @@ mod tests {
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("deadbeef".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -2885,6 +2827,8 @@ mod tests {
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -2943,6 +2887,8 @@ mod tests {
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["Cargo.toml".into()]),
             gate: false,
             check_ids: None,
@@ -3343,6 +3289,8 @@ mod tests {
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("beefface".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -3512,7 +3460,13 @@ mod tests {
 
     #[test]
     fn compose_clean_red_is_red_with_diagnostics() {
-        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Red { error_count: 12 });
+        let p = compose_hard_mode_payload(
+            false,
+            ProjectCheckSummary::Red {
+                error_count: 12,
+                diagnostics: Vec::new(),
+            },
+        );
         assert_eq!(p.verdict, statusfile::Verdict::Red);
         assert_eq!(p.red_diagnostics, 12);
         assert!(
@@ -3549,7 +3503,13 @@ mod tests {
         // Both inputs error, but project-checks have specific diagnostic
         // evidence; the composition uses that evidence rather than
         // collapsing to a generic Unknown.
-        let p = compose_hard_mode_payload(true, ProjectCheckSummary::Red { error_count: 3 });
+        let p = compose_hard_mode_payload(
+            true,
+            ProjectCheckSummary::Red {
+                error_count: 3,
+                diagnostics: Vec::new(),
+            },
+        );
         assert_eq!(p.verdict, statusfile::Verdict::Red);
         assert_eq!(p.red_diagnostics, 3);
     }
@@ -3619,8 +3579,17 @@ mod tests {
                 ProjectCheckSummary::Green
             );
             assert_eq!(
-                apply_require_checks(ProjectCheckSummary::Red { error_count: 3 }, require),
-                ProjectCheckSummary::Red { error_count: 3 }
+                apply_require_checks(
+                    ProjectCheckSummary::Red {
+                        error_count: 3,
+                        diagnostics: Vec::new(),
+                    },
+                    require,
+                ),
+                ProjectCheckSummary::Red {
+                    error_count: 3,
+                    diagnostics: Vec::new(),
+                }
             );
             let indeterminate = ProjectCheckSummary::Indeterminate {
                 reason: "witness",
@@ -3667,6 +3636,8 @@ mod tests {
                 "physics/src/runtime/wire/lib.rs".to_string(),
             ]),
             base_ref: "origin/dev".to_string(),
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![
                 (
                     "physics/src/runtime/wire/executor.rs".to_string(),
@@ -3714,7 +3685,7 @@ mod tests {
     #[test]
     fn ra_native_payload_clean_non_blind_is_green() {
         // The ONLY green path: a real, witnessed, non-blind clean window.
-        let p = ra_native_payload(false, false, false);
+        let p = ra_native_payload(false, false, false, None);
         assert_eq!(p.verdict, statusfile::Verdict::Green);
         assert!(p.analysis_failure_reason.is_none());
     }
@@ -3725,7 +3696,7 @@ mod tests {
         // NOT green — RA could not witness the expanded macro. This is the
         // view!-macro false-GREEN closer. The historical behavior here was
         // `from_bool_unattributed(false)` ⇒ GREEN.
-        let p = ra_native_payload(false, false, true);
+        let p = ra_native_payload(false, false, true, None);
         assert_eq!(
             p.verdict,
             statusfile::Verdict::Unknown,
@@ -3745,7 +3716,7 @@ mod tests {
         // unknown) whether or not the path is blind — the blind downgrade
         // only ever turns a GREEN into unknown, never masks a real error.
         for blind in [false, true] {
-            let p = ra_native_payload(true, false, blind);
+            let p = ra_native_payload(true, false, blind, None);
             assert_eq!(p.verdict, statusfile::Verdict::Unknown, "blind={blind}");
             assert_eq!(
                 p.analysis_failure_reason.as_deref(),
@@ -3761,7 +3732,7 @@ mod tests {
         // the timer reason regardless of the blind bit (RA never ran at
         // all, which subsumes "RA ran but is macro-blind").
         for blind in [false, true] {
-            let p = ra_native_payload(false, true, blind);
+            let p = ra_native_payload(false, true, blind, None);
             assert_eq!(p.verdict, statusfile::Verdict::Unknown, "blind={blind}");
             assert_eq!(
                 p.analysis_failure_reason.as_deref(),
@@ -4124,6 +4095,8 @@ checks:
             root: root.clone(),
             changed_files: Some(vec!["src/added.rs".into()]),
             base_ref: "origin/main".to_string(),
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![(
                 root.join("src/added.rs").to_string_lossy().into_owned(),
                 "pub fn added() {}\n".to_string(),

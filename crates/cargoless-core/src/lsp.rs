@@ -27,12 +27,14 @@
 //! [`LspClient`] is generic over `Read`/`Write`, so the handshake is testable
 //! against a scripted fake server too.
 
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use cargoless_proto::{Diagnostic, Severity};
 use serde_json::{Value, json};
@@ -882,12 +884,16 @@ pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
     let params = v.get("params")?;
     let uri = params.get("uri")?.as_str()?.to_string();
     let diags = params.get("diagnostics")?.as_array()?;
+    Some(publish_diagnostics_from_items(&uri, diags))
+}
+
+fn publish_diagnostics_from_items(uri: &str, diags: &[Value]) -> PublishDiagnostics {
     let mut authoritative_errors = 0usize;
     let mut advisory_errors = 0usize;
     // Pre-compute the per-publish file_path once. `path_from_uri` returns
     // `None` for non-`file:` schemes (e.g. `untitled:`); fall back to the raw
     // URI string so callers still get something stable.
-    let file_path = path_from_uri(&uri)
+    let file_path = path_from_uri(uri)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(&uri));
     let mut rich = Vec::with_capacity(diags.len());
@@ -901,13 +907,66 @@ pub fn extract_publish_diagnostics(v: &Value) -> Option<PublishDiagnostics> {
         }
         rich.push(extract_one_diagnostic(d, &file_path));
     }
-    Some(PublishDiagnostics {
-        uri,
+    PublishDiagnostics {
+        uri: uri.to_string(),
         authoritative_errors,
         advisory_errors,
         total: diags.len(),
         diagnostics: rich,
-    })
+    }
+}
+
+fn parse_document_report(
+    uri: &str,
+    report: &Value,
+) -> Result<PublishDiagnostics, DiagnosticPullError> {
+    let kind = report.get("kind").and_then(Value::as_str).unwrap_or("full");
+    if kind == "unchanged" {
+        return Err(DiagnosticPullError::Protocol(format!(
+            "server returned an unchanged report for {uri} without a previousResultId"
+        )));
+    }
+    let items = report
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DiagnosticPullError::Protocol(format!("full diagnostic report for {uri} omitted items"))
+        })?;
+    Ok(publish_diagnostics_from_items(uri, items))
+}
+
+fn parse_document_diagnostic_response(
+    response: &Value,
+    requested_uri: &str,
+) -> Result<Vec<PublishDiagnostics>, DiagnosticPullError> {
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_i64);
+        if code == Some(-32802) {
+            let retrigger = error
+                .get("data")
+                .and_then(|data| data.get("retriggerRequest"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return Err(DiagnosticPullError::ServerCancelled { retrigger });
+        }
+        return Err(DiagnosticPullError::Protocol(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown JSON-RPC error")
+                .to_string(),
+        ));
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| DiagnosticPullError::Protocol("response omitted result".to_string()))?;
+    let mut reports = vec![parse_document_report(requested_uri, result)?];
+    if let Some(related) = result.get("relatedDocuments").and_then(Value::as_object) {
+        for (uri, report) in related {
+            reports.push(parse_document_report(uri, report)?);
+        }
+    }
+    Ok(reports)
 }
 
 /// Common pre-check: `v` is a `$/progress` notification with `kind: "end"`.
@@ -1071,10 +1130,12 @@ pub fn path_from_uri(uri: &str) -> Option<String> {
 /// the `initialize`/`initialized` handshake synchronously (enabling flycheck
 /// via `checkOnSave`), then a reader thread streams [`LspEvent`]s.
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+type PendingResponses = Arc<Mutex<BTreeMap<i64, Sender<Value>>>>;
 
 pub struct LspClient {
     writer: SharedWriter,
     next_id: AtomicI64,
+    pending_responses: PendingResponses,
 }
 
 impl LspClient {
@@ -1117,7 +1178,11 @@ impl LspClient {
                     "window": { "workDoneProgress": true },
                     "workspace": { "configuration": true },
                     "textDocument": {
-                        "publishDiagnostics": { "relatedInformation": false }
+                        "publishDiagnostics": { "relatedInformation": false },
+                        "diagnostic": {
+                            "dynamicRegistration": false,
+                            "relatedDocumentSupport": true
+                        }
                     }
                 }
             }
@@ -1161,17 +1226,22 @@ impl LspClient {
         write_lsp_message(&writer, &config)?;
 
         let (tx, rx): (Sender<LspEvent>, Receiver<LspEvent>) = channel();
+        let pending_responses: PendingResponses = Arc::new(Mutex::new(BTreeMap::new()));
         let reader_writer = Arc::clone(&writer);
         let reader_config = init_options.clone();
+        let reader_pending = Arc::clone(&pending_responses);
         let _reader: JoinHandle<()> = thread::Builder::new()
             .name("tf-lsp-reader".into())
-            .spawn(move || reader_loop(br, tx, reader_writer, reader_config))
+            .spawn(move || {
+                reader_loop(br, tx, reader_writer, reader_config, reader_pending);
+            })
             .expect("spawn tf-lsp-reader thread");
 
         Ok((
             Self {
                 writer,
                 next_id: AtomicI64::new(2),
+                pending_responses,
             },
             rx,
         ))
@@ -1248,7 +1318,104 @@ impl LspClient {
     pub fn next_request_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// Pull rust-analyzer diagnostics for one open document. Unlike
+    /// `publishDiagnostics`, a successful response is an explicit completion
+    /// boundary even when the report is empty or unchanged on the server.
+    ///
+    /// `ServerCancelled` responses that ask the client to retrigger are
+    /// retried up to `max_retries` inside the single overall `timeout`.
+    pub fn pull_diagnostics(
+        &self,
+        abs_path: &str,
+        timeout: Duration,
+        max_retries: usize,
+    ) -> Result<Vec<PublishDiagnostics>, DiagnosticPullError> {
+        let deadline = Instant::now() + timeout;
+        let mut retries = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DiagnosticPullError::Timeout);
+            }
+            match self.pull_diagnostics_once(abs_path, remaining) {
+                Err(DiagnosticPullError::ServerCancelled { retrigger: true })
+                    if retries < max_retries =>
+                {
+                    retries += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn pull_diagnostics_once(
+        &self,
+        abs_path: &str,
+        timeout: Duration,
+    ) -> Result<Vec<PublishDiagnostics>, DiagnosticPullError> {
+        let id = self.next_request_id();
+        let (tx, rx) = channel();
+        self.pending_responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/diagnostic",
+            "params": {
+                "textDocument": { "uri": uri_from_path(abs_path) }
+            }
+        });
+        if let Err(error) = write_lsp_message(&self.writer, &request) {
+            self.pending_responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            return Err(DiagnosticPullError::Transport(error.to_string()));
+        }
+        let response = match rx.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(RecvTimeoutError::Timeout) => {
+                self.pending_responses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+                return Err(DiagnosticPullError::Timeout);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(DiagnosticPullError::Transport(
+                    "rust-analyzer response channel closed".to_string(),
+                ));
+            }
+        };
+        parse_document_diagnostic_response(&response, &uri_from_path(abs_path))
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticPullError {
+    Timeout,
+    Transport(String),
+    ServerCancelled { retrigger: bool },
+    Protocol(String),
+}
+
+impl std::fmt::Display for DiagnosticPullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("diagnostic pull timed out"),
+            Self::Transport(detail) => write!(f, "diagnostic pull transport error: {detail}"),
+            Self::ServerCancelled { retrigger } => {
+                write!(f, "diagnostic pull cancelled (retrigger={retrigger})")
+            }
+            Self::Protocol(detail) => write!(f, "diagnostic pull protocol error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for DiagnosticPullError {}
 
 fn write_lsp_message(writer: &SharedWriter, msg: &Value) -> io::Result<()> {
     let bytes = encode_message(msg.to_string().as_bytes());
@@ -1386,7 +1553,13 @@ fn nested_ra_config(config: &Value) -> Value {
     Value::Object(out)
 }
 
-fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>, writer: SharedWriter, config: Value) {
+fn reader_loop<R: BufRead>(
+    mut br: R,
+    tx: Sender<LspEvent>,
+    writer: SharedWriter,
+    config: Value,
+    pending_responses: PendingResponses,
+) {
     loop {
         match read_message(&mut br) {
             Ok(None) => break, // RA exited cleanly
@@ -1396,6 +1569,18 @@ fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>, writer: SharedWriter
                     continue;
                 };
                 if matches!(respond_to_server_request(&v, &writer, &config), Ok(true)) {
+                    continue;
+                }
+                if v.get("method").is_none() {
+                    if let Some(id) = v.get("id").and_then(Value::as_i64) {
+                        if let Some(waiter) = pending_responses
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&id)
+                        {
+                            let _ = waiter.send(v);
+                        }
+                    }
                     continue;
                 }
                 trace_lsp_notification(&v);
@@ -1416,6 +1601,13 @@ fn reader_loop<R: BufRead>(mut br: R, tx: Sender<LspEvent>, writer: SharedWriter
             }
         }
     }
+    // A supervisor respawn closes stdout. Drop every outstanding response
+    // sender immediately so pull waiters fail as disconnected instead of
+    // sleeping until their per-request deadline against a dead analyzer.
+    pending_responses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 #[cfg(test)]
@@ -1496,6 +1688,43 @@ mod tests {
         assert_eq!(read_message(&mut cur).unwrap().unwrap(), b"AAAA");
         assert_eq!(read_message(&mut cur).unwrap().unwrap(), b"BB");
         assert!(read_message(&mut cur).unwrap().is_none());
+    }
+
+    #[test]
+    fn reader_correlates_out_of_order_json_rpc_responses_and_cancels_stragglers() {
+        let pending: PendingResponses = Arc::new(Mutex::new(BTreeMap::new()));
+        let (tx7, rx7) = channel();
+        let (tx9, rx9) = channel();
+        let (tx11, rx11) = channel();
+        {
+            let mut map = pending.lock().unwrap();
+            map.insert(7, tx7);
+            map.insert(9, tx9);
+            map.insert(11, tx11);
+        }
+
+        let mut stream =
+            encode_message(br#"{"jsonrpc":"2.0","id":9,"result":{"kind":"full","items":[]}}"#);
+        stream.extend(encode_message(
+            br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32802,"message":"cancelled","data":{"retriggerRequest":true}}}"#,
+        ));
+        let (events_tx, _events_rx) = channel();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+        reader_loop(
+            Cursor::new(stream),
+            events_tx,
+            writer,
+            json!({}),
+            Arc::clone(&pending),
+        );
+
+        assert_eq!(rx9.recv().unwrap()["id"], json!(9));
+        assert_eq!(rx7.recv().unwrap()["id"], json!(7));
+        assert!(
+            rx11.recv().is_err(),
+            "EOF/respawn must disconnect a request that never received a response"
+        );
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2504,5 +2733,75 @@ mod tests {
                 message: "Flycheck failed to run the following command: cargo check".into()
             }
         );
+    }
+
+    #[test]
+    fn pull_diagnostic_full_empty_report_is_a_successful_completion() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "kind": "full", "items": [] }
+        });
+        let reports =
+            parse_document_diagnostic_response(&response, "file:///r/src/lib.rs").unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].uri, "file:///r/src/lib.rs");
+        assert!(reports[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn pull_diagnostic_includes_related_document_reports() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "kind": "full",
+                "items": [{
+                    "severity": 1,
+                    "source": "rust-analyzer",
+                    "message": "broken",
+                    "range": { "start": { "line": 4, "character": 2 } }
+                }],
+                "relatedDocuments": {
+                    "file:///r/src/other.rs": { "kind": "full", "items": [] }
+                }
+            }
+        });
+        let reports =
+            parse_document_diagnostic_response(&response, "file:///r/src/lib.rs").unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].advisory_errors, 1);
+        assert_eq!(reports[0].diagnostics[0].line, 5);
+        assert_eq!(reports[1].uri, "file:///r/src/other.rs");
+    }
+
+    #[test]
+    fn pull_diagnostic_server_cancelled_preserves_retrigger_bit() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+                "code": -32802,
+                "message": "cancelled",
+                "data": { "retriggerRequest": true }
+            }
+        });
+        assert_eq!(
+            parse_document_diagnostic_response(&response, "file:///r/src/lib.rs"),
+            Err(DiagnosticPullError::ServerCancelled { retrigger: true })
+        );
+    }
+
+    #[test]
+    fn pull_diagnostic_rejects_unchanged_without_previous_result_id() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "kind": "unchanged", "resultId": "old" }
+        });
+        assert!(matches!(
+            parse_document_diagnostic_response(&response, "file:///r/src/lib.rs"),
+            Err(DiagnosticPullError::Protocol(_))
+        ));
     }
 }

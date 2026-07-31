@@ -144,6 +144,12 @@ pub struct PushOverlayOptions {
     /// Client's resolved base SHA, diagnostics-only. The server still fetches
     /// its own latest base ref before accepting central-mode pushes.
     pub base_sha: Option<String>,
+    /// Advertised remote ref containing the candidate commit. Central
+    /// daemons fetch only this ref from their fixed `origin`.
+    pub source_ref: Option<String>,
+    /// Exact candidate commit to check. When paired with `source_ref`, the
+    /// daemon verifies reachability and checks this Git tree directly.
+    pub source_sha: Option<String>,
     /// Repo-relative files changed by the client diff. These are distinct
     /// from `files`: the overlay payload also includes workspace config files
     /// needed for cluster routing, while project-check triggers should see
@@ -173,6 +179,8 @@ impl PushOverlayOptions {
                 .trim()
                 .is_empty()
             && self.base_sha.as_deref().unwrap_or("").trim().is_empty()
+            && self.source_ref.as_deref().unwrap_or("").trim().is_empty()
+            && self.source_sha.as_deref().unwrap_or("").trim().is_empty()
             && self
                 .changed_files
                 .as_ref()
@@ -422,6 +430,17 @@ pub trait VerdictService: Send + Sync {
     /// detail" and "green" the same — correct, a green tree retains
     /// nothing; see [`crate::diagnostics_store`]).
     fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic>;
+
+    /// Diagnostics addressed by the same immutable verdict identity as
+    /// [`Self::get_status_attributed`]. The default preserves compatibility
+    /// for services without per-commit retention.
+    fn get_diagnostics_attributed(
+        &self,
+        worktree: &str,
+        _base_sha: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        self.get_diagnostics(worktree)
+    }
 
     /// All discovered worktrees with their light verdict summary.
     fn list_worktrees(&self) -> Vec<WorktreeSummary>;
@@ -1090,6 +1109,18 @@ impl Request {
                             serde_json::Value::String(sha.to_string()),
                         );
                     }
+                    if let Some(source_ref) = options.source_ref.as_deref() {
+                        map.insert(
+                            "source_ref".to_string(),
+                            serde_json::Value::String(source_ref.to_string()),
+                        );
+                    }
+                    if let Some(source_sha) = options.source_sha.as_deref() {
+                        map.insert(
+                            "source_sha".to_string(),
+                            serde_json::Value::String(source_sha.to_string()),
+                        );
+                    }
                     if let Some(changed_files) = options
                         .changed_files
                         .as_ref()
@@ -1232,6 +1263,18 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
                 serde_json::Value::String(sha.to_string()),
             );
         }
+        if let Some(source_ref) = options.source_ref.as_deref() {
+            map.insert(
+                "source_ref".to_string(),
+                serde_json::Value::String(source_ref.to_string()),
+            );
+        }
+        if let Some(source_sha) = options.source_sha.as_deref() {
+            map.insert(
+                "source_sha".to_string(),
+                serde_json::Value::String(source_sha.to_string()),
+            );
+        }
         if let Some(changed_files) = options
             .changed_files
             .as_ref()
@@ -1282,6 +1325,16 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .filter(|s| !s.trim().is_empty()),
         base_sha: v
             .get("base_sha")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        source_ref: v
+            .get("source_ref")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        source_sha: v
+            .get("source_sha")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty()),
@@ -2090,6 +2143,8 @@ mod tests {
             repo_relative: true,
             analysis_root: Some("/workspace/repo".into()),
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -2386,6 +2441,8 @@ mod tests {
                 repo_relative: true,
                 analysis_root: Some("/workspace/tf-multiverse".into()),
                 base_sha: Some("abc123".into()),
+                source_ref: Some("refs/pull/42/head".into()),
+                source_sha: Some("0123456789012345678901234567890123456789".into()),
                 changed_files: Some(vec!["src/lib.rs".into()]),
                 gate: true,
                 check_ids: None,

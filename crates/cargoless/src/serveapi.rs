@@ -118,6 +118,10 @@ pub struct PushedOverlay {
     /// Client's resolved base SHA, diagnostics-only. The server fetch/reset
     /// result remains authoritative.
     pub base_sha: Option<String>,
+    /// Advertised remote ref used to fetch the exact candidate.
+    pub source_ref: Option<String>,
+    /// Verified candidate commit used by git-native project checks.
+    pub source_sha: Option<String>,
     /// Unix timestamp of the push receipt. Diagnostics-only for 2b;
     /// future idle-evict policy (Wave-2) reads this.
     pub last_push_unix: u64,
@@ -147,6 +151,8 @@ pub(crate) struct ProjectCheckRunContext {
     pub root: PathBuf,
     pub changed_files: Option<Vec<String>>,
     pub base_ref: String,
+    pub source_ref: Option<String>,
+    pub source_sha: Option<String>,
     pub overlay_files: Vec<(String, String)>,
     pub materialize_overlay: bool,
     /// Carried from [`PushedOverlay::gate`]: the EmitVerdict arm promotes
@@ -156,6 +162,17 @@ pub(crate) struct ProjectCheckRunContext {
     /// for the gated lane. Only consulted when `gate` is true.
     pub check_ids: Option<Vec<String>>,
 }
+
+/// Owned handoff from HTTP ingest to the hard-witness dispatcher. Gated
+/// checks do not enter the rust-analyzer transaction queue.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectGateRequest {
+    pub wt: PathBuf,
+    pub context: ProjectCheckRunContext,
+    pub attribution: PushAttribution,
+}
+
+type AttributedDiagnostics = BTreeMap<(String, Option<String>), Vec<Diagnostic>>;
 
 /// Verdict-attribution record for one consumed push (#A2/#A7). Captured by
 /// the serve loop's SwitchOverlay arm at the moment a [`PushedOverlay`] is
@@ -395,6 +412,10 @@ pub struct ServeVerdictState {
     /// remote `get_status(<wt>)` resolves the exact tree the loop
     /// attributed.
     statuses: Mutex<BTreeMap<String, WorktreeStatus>>,
+    /// Full diagnostics keyed by the same `(worktree, base_sha)` identity as
+    /// attributed verdict history. This prevents simultaneous PRs sharing a
+    /// worktree key from reading each other's compiler output.
+    diagnostics: Mutex<AttributedDiagnostics>,
     /// Live transition-event subscribers (the SSE / in-proc fan-out).
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
@@ -435,6 +456,10 @@ pub struct ServeVerdictState {
     /// `HttpServer::bind` exposes `push_overlay` to clients (so no
     /// push can race the channel-not-yet-attached window).
     push_signal: Mutex<Option<Sender<String>>>,
+    /// Direct gated-check handoff, wired before HTTP bind just like
+    /// `push_signal`. A gate push is accepted only when this dispatcher is
+    /// available; it is never queued behind rust-analyzer.
+    direct_gate_signal: Mutex<Option<Sender<DirectGateRequest>>>,
     /// Admin drain state. A restart requests quiesce through HTTP; after
     /// that, new pushes are refused while accepted pushed worktrees stay
     /// active until their next authoritative verdict is published.
@@ -1625,6 +1650,18 @@ impl ServeVerdictState {
             while ring.len() > self.witness_history_cap {
                 ring.pop_front();
             }
+            let retained_shas: BTreeSet<String> = ring
+                .iter()
+                .filter_map(|entry| entry.base_sha.clone())
+                .collect();
+            drop(hist);
+            poisoned(&self.diagnostics).retain(|(key_wt, key_sha), _| {
+                key_wt != &worktree
+                    || key_sha.is_none()
+                    || key_sha
+                        .as_ref()
+                        .is_some_and(|candidate| retained_shas.contains(candidate))
+            });
         }
         // The slot is last-writer-wins, but never regresses to a STRICTLY
         // staler timestamp — two Hard-witness supervisor threads can publish
@@ -1668,6 +1705,11 @@ impl ServeVerdictState {
     /// fail-soft transport ethos applied to the write-plane wakeup.
     pub fn attach_push_signal(&self, tx: Sender<String>) {
         *poisoned(&self.push_signal) = Some(tx);
+    }
+
+    /// Wire the direct hard-witness dispatcher before exposing HTTP ingest.
+    pub(crate) fn attach_direct_gate_signal(&self, tx: Sender<DirectGateRequest>) {
+        *poisoned(&self.direct_gate_signal) = Some(tx);
     }
 
     /// C1 observability — record the resolved RA config JSON
@@ -1758,6 +1800,24 @@ impl ServeVerdictState {
         worktree: &str,
     ) -> Option<ProjectCheckRunContext> {
         poisoned(&self.project_check_context).remove(worktree)
+    }
+
+    pub(crate) fn retain_diagnostics(
+        &self,
+        worktree: &str,
+        base_sha: Option<&str>,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        let mut retained = poisoned(&self.diagnostics);
+        let key = (
+            worktree.to_string(),
+            base_sha.filter(|sha| !sha.is_empty()).map(str::to_string),
+        );
+        if diagnostics.is_empty() {
+            retained.remove(&key);
+        } else {
+            retained.insert(key, diagnostics);
+        }
     }
 
     /// #A2/#A7 — stamp the attribution for the push just consumed by the
@@ -1916,6 +1976,10 @@ impl ServeVerdictState {
         if let Some(state_dir) = self.project_check_state_dir.as_deref() {
             return self.with_project_check_scratch_overlay(context, state_dir, f);
         }
+        if context.source_sha.is_some() {
+            let fallback_state = context.root.join(".cargoless");
+            return self.with_project_check_scratch_overlay(context, &fallback_state, f);
+        }
 
         self.with_project_check_locked_overlay(context, f)
     }
@@ -1954,8 +2018,18 @@ impl ServeVerdictState {
 
         {
             let _guard = poisoned(&self.sync_lock);
-            sync_analysis_root(&context.root, &context.base_ref)?;
-            prepare_project_check_scratch(&context.root, &scratch_root, &context.base_ref)?;
+            let checkout_ref = if let Some(source_sha) = context.source_sha.as_deref() {
+                if !local_commit_exists(&context.root, source_sha) {
+                    return Err(format!(
+                        "verified source commit {source_sha} is no longer present locally"
+                    ));
+                }
+                source_sha
+            } else {
+                sync_analysis_root(&context.root, &context.base_ref)?;
+                context.base_ref.as_str()
+            };
+            prepare_project_check_scratch(&context.root, &scratch_root, checkout_ref)?;
         }
 
         // CGLS-26 — resolve a WARM shared target dir (or None = cold per-run).
@@ -1965,13 +2039,17 @@ impl ServeVerdictState {
         let warm = self.resolve_warm_target(state_dir, &scratch_root);
         let warm_dir = warm.as_ref().map(|w| w.dir.as_path());
 
-        let result = match materialize_overlay_files_from_root(
-            &context.root,
-            &scratch_root,
-            &context.overlay_files,
-        ) {
-            Ok(()) => Ok(f(&scratch_root, warm_dir)),
-            Err(e) => Err(e),
+        let result = if context.source_sha.is_some() {
+            Ok(f(&scratch_root, warm_dir))
+        } else {
+            match materialize_overlay_files_from_root(
+                &context.root,
+                &scratch_root,
+                &context.overlay_files,
+            ) {
+                Ok(()) => Ok(f(&scratch_root, warm_dir)),
+                Err(e) => Err(e),
+            }
         };
         // Warm-lock guard drops here (after the compile), releasing both
         // layers. Explicit for clarity — the locks must outlive `f`.
@@ -2217,6 +2295,12 @@ impl ServeVerdictState {
         wt: &Path,
         context: &ProjectCheckRunContext,
     ) -> Option<(crate::servedrv::ProjectCheckSummary, Vec<String>)> {
+        // Git-native candidates are already complete, immutable trees. Until
+        // the batch API carries per-member source SHAs, never union them into
+        // a base-ref overlay batch: exactness outranks this optimization.
+        if context.source_sha.is_some() {
+            return None;
+        }
         let base_ref = context.base_ref.trim();
         let root_str = context.root.to_string_lossy();
         if base_ref.is_empty() || root_str.trim().is_empty() {
@@ -2239,6 +2323,8 @@ impl ServeVerdictState {
             repo_relative: false,
             analysis_root: Some(root_str.into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None, // changed_files live on the member, not the options
             // Carry the push's gate + witness-only filter through the coalesced
             // lane. `run_batch_check_now` reads these off `request.options` to
@@ -2346,7 +2432,10 @@ impl ServeVerdictState {
                             )
                         } else {
                             (
-                                crate::servedrv::ProjectCheckSummary::Red { error_count },
+                                crate::servedrv::ProjectCheckSummary::Red {
+                                    error_count,
+                                    diagnostics: m.diagnostics.clone(),
+                                },
                                 ran_check_ids,
                             )
                         }
@@ -2592,13 +2681,28 @@ impl VerdictService for ServeVerdictState {
             .map(|s| s.verdict.clone())
     }
 
-    fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
-        // Honest Inc-0 boundary: the serve loop does not yet thread
-        // `diagnostics_store` retention (a later increment). Empty here is
-        // the *correct* answer for the state the loop computes — never a
-        // fabricated diagnostic. (`get_diagnostics` empty ⇒ "no detail",
-        // the same contract `transport` documents for green/unknown.)
-        Vec::new()
+    fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic> {
+        let current_sha = poisoned(&self.statuses)
+            .get(worktree)
+            .and_then(|status| status.base_sha.clone());
+        poisoned(&self.diagnostics)
+            .get(&(worktree.to_string(), current_sha))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get_diagnostics_attributed(
+        &self,
+        worktree: &str,
+        base_sha: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        let Some(base_sha) = base_sha.filter(|sha| !sha.is_empty()) else {
+            return self.get_diagnostics(worktree);
+        };
+        poisoned(&self.diagnostics)
+            .get(&(worktree.to_string(), Some(base_sha.to_string())))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn list_worktrees(&self) -> Vec<WorktreeSummary> {
@@ -2622,15 +2726,10 @@ impl VerdictService for ServeVerdictState {
     /// #240/2b — overlay-push ingest. The WRITE-PLANE entry for the
     /// pushed-mode central-daemon topology (D-PUSHOVERLAY §2.4 / §4).
     ///
-    /// 1. Record the `(base_ref, files)` pair in the per-WT pushed
-    ///    store. A subsequent push for the same WT REPLACES (latest
-    ///    wins; per-WT serialization is the natural BTreeMap semantic).
-    /// 2. Signal the serve loop via the attached `push_signal` channel
-    ///    (best-effort: a wedged send leaves the overlay stored, only
-    ///    the wakeup is lost). The loop synthesizes a
-    ///    `DriverEvent::RoutedBatch` for this WT, which feeds the
-    ///    proven core EXACTLY as if it came from the FS watcher path
-    ///    — same event shape, no new emission seam.
+    /// 1. Plain pushes record `(base_ref, files)` in the per-WT queue
+    ///    and wake the rust-analyzer serve loop.
+    /// 2. Gated pushes are handed directly to the isolated Cargo witness
+    ///    dispatcher and never enter the rust-analyzer overlay queue.
     /// 3. Return an ack: `accepted=true` + `applied_files` count. The
     ///    ack does NOT block on the verdict; the client uses the
     ///    already-shipped subscribe (SSE) or `get_status` for the
@@ -2668,6 +2767,8 @@ impl VerdictService for ServeVerdictState {
         let mut mapped_files = files.to_vec();
         let mut analysis_root = None;
         let mut base_sha = None;
+        let mut source_ref = None;
+        let mut source_sha = None;
         let mut changed_files = None;
         let mut gate = false;
         let mut check_ids = None;
@@ -2687,6 +2788,59 @@ impl VerdictService for ServeVerdictState {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            source_ref = options
+                .source_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            source_sha = options
+                .source_sha
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            if source_ref.is_some() != source_sha.is_some() {
+                return rejected_push(
+                    worktree,
+                    "source_ref and source_sha must be supplied together",
+                );
+            }
+            if let Some(source_ref) = source_ref.as_deref() {
+                if let Err(e) = validate_source_ref(source_ref) {
+                    return rejected_push(worktree, &e);
+                }
+            }
+            if let Some(source_sha) = source_sha.as_deref() {
+                if !is_commit_hash(source_sha) {
+                    return rejected_push(
+                        worktree,
+                        "source_sha must be a full 40- or 64-hex object id",
+                    );
+                }
+                if !files.is_empty() {
+                    return rejected_push(
+                        worktree,
+                        "exact-Git push must carry an empty files array",
+                    );
+                }
+                if base_sha.as_deref() != Some(source_sha) {
+                    return rejected_push(
+                        worktree,
+                        "base_sha must equal source_sha for exact-Git attribution",
+                    );
+                }
+                if !gate {
+                    return rejected_push(worktree, "exact-Git source requires gate=true");
+                }
+                if analysis_root.is_none() {
+                    return rejected_push(
+                        worktree,
+                        "exact-Git source requires an analysis_root checkout",
+                    );
+                }
+            }
 
             if options.repo_relative {
                 let Some(root) = analysis_root.as_ref() else {
@@ -2711,7 +2865,7 @@ impl VerdictService for ServeVerdictState {
             // "revert RA to the on-disk tree" operation. Placed BEFORE
             // `ensure_analysis_root` so a doomed push never spends the
             // sync_lock on a fetch.
-            if files.is_empty() {
+            if files.is_empty() && source_sha.is_none() {
                 if let Some(changed) = changed_files.as_ref().filter(|c| !c.is_empty()) {
                     return rejected_push(
                         worktree,
@@ -2732,11 +2886,20 @@ impl VerdictService for ServeVerdictState {
             }
 
             if let Some(root) = analysis_root.as_ref() {
-                let base = base_ref.trim();
-                if !base.is_empty() {
+                if let (Some(source_ref), Some(source_sha)) =
+                    (source_ref.as_deref(), source_sha.as_deref())
+                {
                     let _guard = poisoned(&self.sync_lock);
-                    if let Err(e) = ensure_analysis_root(root, base, base_sha.as_deref()) {
+                    if let Err(e) = fetch_verified_source(root, source_ref, source_sha) {
                         return rejected_push(worktree, &e);
+                    }
+                } else {
+                    let base = base_ref.trim();
+                    if !base.is_empty() {
+                        let _guard = poisoned(&self.sync_lock);
+                        if let Err(e) = ensure_analysis_root(root, base, base_sha.as_deref()) {
+                            return rejected_push(worktree, &e);
+                        }
                     }
                 }
             }
@@ -2752,12 +2915,68 @@ impl VerdictService for ServeVerdictState {
             files: mapped_files,
             analysis_root,
             base_sha,
+            source_ref,
+            source_sha,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files,
             check_profile: check_profile.cloned(),
             gate,
             check_ids,
         };
+        if pushed.gate {
+            let Some(tx) = poisoned(&self.direct_gate_signal).as_ref().cloned() else {
+                self.mark_worktree_published(worktree);
+                return rejected_push(worktree, "direct gate dispatcher is unavailable");
+            };
+            let now = crate::statusfile::now_unix();
+            let attribution = PushAttribution {
+                base_sha: pushed.base_sha.clone(),
+                macro_blind_hit: compute_macro_blind_hit(
+                    pushed.changed_files.as_deref(),
+                    &macro_blind_globs(),
+                    &pushed.files,
+                    &macro_blind_macros(),
+                ),
+                push_received_unix: pushed.last_push_unix,
+                consumed_unix: now,
+                consumed_at: Instant::now(),
+            };
+            let project_root = pushed
+                .analysis_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(worktree));
+            let request = DirectGateRequest {
+                wt: PathBuf::from(worktree),
+                context: ProjectCheckRunContext {
+                    root: project_root,
+                    changed_files: pushed.changed_files.clone(),
+                    base_ref: pushed.base_ref.clone(),
+                    source_ref: pushed.source_ref.clone(),
+                    source_sha: pushed.source_sha.clone(),
+                    overlay_files: pushed.files.clone(),
+                    materialize_overlay: pushed.analysis_root.is_some(),
+                    gate: true,
+                    check_ids: pushed.check_ids.clone(),
+                },
+                attribution,
+            };
+            if tx.send(request).is_err() {
+                self.mark_worktree_published(worktree);
+                return rejected_push(worktree, "direct gate dispatcher disconnected");
+            }
+            eprintln!(
+                "[cargoless:obs] witness-direct-dispatch wt={} source_sha={} files={}",
+                worktree,
+                pushed.source_sha.as_deref().unwrap_or("overlay"),
+                pushed.files.len()
+            );
+            return PushOverlayAck {
+                worktree: worktree.to_string(),
+                accepted: true,
+                applied_files,
+                ..Default::default()
+            };
+        }
         // CGLS-25 — base_sha-keyed enqueue: a concurrent PR pushing on the
         // same hardcoded worktree key must not destroy this one's pending
         // overlay before the serve loop consumes it. But a rapid re-push of
@@ -2911,6 +3130,8 @@ impl ServeBatchChecker<'_> {
             root: self.root.clone(),
             changed_files: changed_files.clone(),
             base_ref: self.base_ref.clone(),
+            source_ref: None,
+            source_sha: None,
             overlay_files,
             materialize_overlay: true,
             gate: self.gate,
@@ -3224,6 +3445,75 @@ fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
         return Err("repo-relative push carried an empty path".to_string());
     }
     Ok(out)
+}
+
+fn validate_source_ref(source_ref: &str) -> Result<(), String> {
+    let allowed_namespace =
+        source_ref.starts_with("refs/heads/") || source_ref.starts_with("refs/pull/");
+    if !allowed_namespace
+        || source_ref.contains("..")
+        || source_ref.contains("@{")
+        || source_ref.ends_with('/')
+        || source_ref.bytes().any(|b| {
+            b.is_ascii_control()
+                || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        return Err(format!(
+            "source_ref `{source_ref}` is not an allowed heads/pull ref"
+        ));
+    }
+    let valid = Command::new("git")
+        .args(["check-ref-format", source_ref])
+        .status()
+        .map_err(|e| format!("failed to validate source_ref with git: {e}"))?
+        .success();
+    if !valid {
+        return Err(format!("source_ref `{source_ref}` is not a valid Git ref"));
+    }
+    Ok(())
+}
+
+/// Fetch one advertised ref, then prove the requested immutable candidate is
+/// a commit reachable from it. The checkout itself is not moved: project
+/// checks create a detached scratch worktree at `source_sha`.
+fn fetch_verified_source(root: &Path, source_ref: &str, source_sha: &str) -> Result<(), String> {
+    if !root.join(".git").exists() {
+        return Err(format!(
+            "analysis_root `{}` is not a git checkout",
+            root.display()
+        ));
+    }
+    validate_source_ref(source_ref)?;
+    if !is_commit_hash(source_sha) {
+        return Err("source_sha must be a full 40- or 64-hex object id".to_string());
+    }
+    retry_with_sleeps(
+        &[Duration::from_secs(1), Duration::from_secs(3)],
+        |attempt| {
+            if attempt > 0 {
+                eprintln!(
+                    "[cargoless:git] source fetch retry attempt={attempt} root={}",
+                    root.display()
+                );
+            }
+            run_git(root, &["fetch", "--no-tags", "origin", source_ref])
+        },
+    )?;
+    if !local_commit_exists(root, source_sha) {
+        return Err(format!(
+            "source_sha {source_sha} is not a commit after fetching {source_ref}"
+        ));
+    }
+    if !run_git_success(
+        root,
+        &["merge-base", "--is-ancestor", source_sha, "FETCH_HEAD"],
+    )? {
+        return Err(format!(
+            "source_sha {source_sha} is not reachable from fetched {source_ref}"
+        ));
+    }
+    Ok(())
 }
 
 /// Run `op` up to `1 + sleeps.len()` times, sleeping `sleeps[n]` after
@@ -4245,6 +4535,8 @@ checks:
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -4355,6 +4647,8 @@ checks:
             repo_relative: true,
             analysis_root: Some("/workspace/repo".into()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -5530,6 +5824,8 @@ checks:
                 repo_relative: false,
                 analysis_root: Some(root_str.clone()),
                 base_sha: None,
+                source_ref: None,
+                source_sha: None,
                 changed_files: None,
                 gate: false,
                 check_ids: None,
@@ -5843,6 +6139,8 @@ checks:
             root: project.root.clone(),
             changed_files: Some(vec!["src/added.rs".into()]),
             base_ref: "origin/main".to_string(),
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![(
                 project
                     .root
@@ -6324,42 +6622,83 @@ checks:
     }
 
     #[test]
-    fn get_diagnostics_is_honest_empty_inc0_boundary() {
-        // **INFRA-36 update (was: Inc-0 boundary):** the diagnostics
-        // *list* (per-diag detail) is still not retained at the
-        // serveapi layer — that's a later increment as the original
-        // contract said. But the *count* (`red_diagnostics` on
-        // `WorktreeStatus`) is now honest: when the publish path
-        // supplies a real count, `get_status` returns it.
-        //
-        // This test now pins two things:
-        //   1. The per-diagnostic detail list is still empty here
-        //      (the increment-0 boundary the original test guarded).
-        //   2. But `red_diagnostics` is the real count, NOT 0 — the
-        //      INFRA-36 invariant that closes the "verdict=red, 0
-        //      diagnostics" liar state.
+    fn get_diagnostics_retains_full_red_details_and_clears_on_success() {
         let api = ServeVerdictState::new();
+        let diagnostic = Diagnostic {
+            file_path: PathBuf::from("/r/wt/src/lib.rs"),
+            line: 12,
+            col: 7,
+            severity: Severity::Error,
+            code: Some("E0308".to_string()),
+            message: "mismatched types".to_string(),
+            source: Some("rustc".to_string()),
+        };
+        api.retain_diagnostics("/r/wt", None, vec![diagnostic.clone()]);
         api.publish(
             Path::new("/r/wt"),
-            crate::statusfile::VerdictPayload::red(5),
+            crate::statusfile::VerdictPayload::red(1),
+        );
+        assert_eq!(api.get_diagnostics("/r/wt"), vec![diagnostic]);
+        let status = api.get_status("/r/wt").expect("status present");
+        assert_eq!(status.verdict, "red");
+        assert_eq!(status.red_diagnostics, 1);
+        assert!(
+            status.verdict_failure_reason.is_none(),
+            "a real Red verdict carries its concrete diagnostics, not an infra reason"
+        );
+
+        api.retain_diagnostics("/r/wt", None, Vec::new());
+        api.publish(
+            Path::new("/r/wt"),
+            crate::statusfile::VerdictPayload::green(),
         );
         assert!(
             api.get_diagnostics("/r/wt").is_empty(),
-            "per-diagnostic detail list is not retained at this layer \
-             (the original Inc-0 boundary still holds)"
+            "a later successful run must not expose stale RED diagnostics"
         );
-        let status = api.get_status("/r/wt").expect("status present");
-        assert_eq!(status.verdict, "red");
+    }
+
+    #[test]
+    fn attributed_diagnostics_do_not_cross_between_shared_worktree_prs() {
+        let api = ServeVerdictState::new();
+        let make = |path: &str, message: &str| Diagnostic {
+            file_path: PathBuf::from(path),
+            line: 1,
+            col: 1,
+            severity: Severity::Error,
+            code: Some("E0308".to_string()),
+            message: message.to_string(),
+            source: Some("rustc".to_string()),
+        };
+        let a = make("/repo/a.rs", "PR A");
+        let b = make("/repo/b.rs", "PR B");
+        api.retain_diagnostics("/shared", Some("sha-a"), vec![a.clone()]);
+        api.publish_attributed(
+            Path::new("/shared"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("sha-a".to_string()),
+            false,
+        );
+        api.retain_diagnostics("/shared", Some("sha-b"), vec![b.clone()]);
+        api.publish_attributed(
+            Path::new("/shared"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("sha-b".to_string()),
+            false,
+        );
+
         assert_eq!(
-            status.red_diagnostics, 5,
-            "INFRA-36: red_diagnostics MUST reflect the count supplied \
-             at publish time — not the historical hardcoded 0 that \
-             produced the verdict=red,0-diagnostics liar state"
+            api.get_diagnostics_attributed("/shared", Some("sha-a")),
+            vec![a]
         );
-        assert!(
-            status.verdict_failure_reason.is_none(),
-            "a real Red verdict carries no failure reason — the reason \
-             is the populated-vs-empty diagnostic count itself"
+        assert_eq!(
+            api.get_diagnostics_attributed("/shared", Some("sha-b")),
+            vec![b.clone()]
+        );
+        assert_eq!(
+            api.get_diagnostics("/shared"),
+            vec![b],
+            "unattributed readers see the current live slot only"
         );
     }
 
@@ -6457,6 +6796,8 @@ checks:
             repo_relative: true,
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -6505,6 +6846,8 @@ checks:
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: Some(head),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -6524,6 +6867,150 @@ checks:
         );
         assert!(api.peek_overlay_for("/client/wt").is_some());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_git_gate_fetches_verified_sha_and_checks_it_in_isolated_scratch() {
+        let root = temp_root("exact-git-gate");
+        let remote = temp_root("exact-git-gate-remote");
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        let base_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn candidate() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate"]);
+        let source_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["push", "origin", "HEAD:main"]);
+        git(&root, &["reset", "--hard", &base_sha]);
+
+        let api = ServeVerdictState::new();
+        let (direct_tx, direct_rx) = channel();
+        api.attach_direct_gate_signal(direct_tx);
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some(source_sha.clone()),
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(source_sha.clone()),
+            changed_files: Some(vec!["src/lib.rs".to_string()]),
+            gate: true,
+            check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+        };
+
+        let ack = api.push_overlay_with_options(
+            "/workspace/tf-multiverse",
+            "origin/dev",
+            &[],
+            None,
+            Some(&options),
+        );
+        assert!(ack.accepted, "{:?}", ack.reject_body);
+        assert_eq!(ack.applied_files, 0);
+        assert!(api.peek_overlay_for("/workspace/tf-multiverse").is_none());
+
+        let request = direct_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("direct gate dispatch");
+        assert_eq!(
+            request.context.source_sha.as_deref(),
+            Some(source_sha.as_str())
+        );
+        let seen = api
+            .with_project_check_overlay(&request.context, |scratch, _warm| {
+                (
+                    git_capture(scratch, &["rev-parse", "HEAD"]),
+                    std::fs::read_to_string(scratch.join("src/lib.rs")).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_eq!(seen.0, source_sha);
+        assert_eq!(seen.1, "pub fn candidate() {}\n");
+        assert_eq!(
+            git_capture(&root, &["rev-parse", "HEAD"]),
+            base_sha,
+            "the shared analysis root must not move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn base() {}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[test]
+    fn exact_git_gate_rejects_source_body_or_cross_sha_attribution() {
+        let api = ServeVerdictState::new();
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+        let base = PushOverlayOptions {
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(sha.clone()),
+            base_sha: Some(other),
+            ..Default::default()
+        };
+        let mismatch = api.push_overlay_with_options("/wt", "", &[], None, Some(&base));
+        assert!(!mismatch.accepted);
+
+        let mut with_body = base;
+        with_body.base_sha = Some(sha.clone());
+        let body = vec![("src/lib.rs".to_string(), "ignored".to_string())];
+        let rejected = api.push_overlay_with_options("/wt", "", &body, None, Some(&with_body));
+        assert!(!rejected.accepted);
+
+        let missing_gate = PushOverlayOptions {
+            analysis_root: Some("/workspace/repo".to_string()),
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(sha.clone()),
+            base_sha: Some(sha.clone()),
+            gate: false,
+            ..Default::default()
+        };
+        let rejected = api.push_overlay_with_options("/wt", "", &[], None, Some(&missing_gate));
+        assert!(!rejected.accepted);
+
+        let missing_root = PushOverlayOptions {
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(sha.clone()),
+            base_sha: Some(sha),
+            gate: true,
+            ..Default::default()
+        };
+        let rejected = api.push_overlay_with_options("/wt", "", &[], None, Some(&missing_root));
+        assert!(!rejected.accepted);
+    }
+
+    #[test]
+    fn source_ref_accepts_only_valid_heads_and_pull_refs() {
+        assert!(validate_source_ref("refs/heads/dev").is_ok());
+        assert!(validate_source_ref("refs/pull/123/head").is_ok());
+        for invalid in [
+            "dev",
+            "refs/tags/v1",
+            "refs/heads/../main",
+            "refs/heads/bad name",
+            "refs/heads/.hidden",
+        ] {
+            assert!(
+                validate_source_ref(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -6549,6 +7036,8 @@ checks:
             root: root.clone(),
             changed_files: Some(vec!["src/lib.rs".into(), "new.yaml".into()]),
             base_ref: base,
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![
                 (
                     root.join("src/lib.rs").to_string_lossy().into_owned(),
@@ -6596,6 +7085,8 @@ checks:
             root: project.root.clone(),
             changed_files: Some(vec!["src/lib.rs".into(), "new.yaml".into()]),
             base_ref: "origin/main".to_string(),
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![
                 (
                     project
@@ -6652,6 +7143,8 @@ checks:
             repo_relative: true,
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -6832,8 +7325,10 @@ checks:
             repo_relative: false,
             analysis_root: None,
             base_sha: Some(sha.to_string()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
-            gate: true,
+            gate: false,
             check_ids: None,
         };
         // PR-A pushes, then PR-B pushes on the SAME worktree key before the
@@ -6975,6 +7470,8 @@ checks:
             files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
             analysis_root: None,
             base_sha: Some(sha.into()),
+            source_ref: None,
+            source_sha: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
@@ -7004,6 +7501,8 @@ checks:
             files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
             analysis_root: None,
             base_sha: Some(sha.into()),
+            source_ref: None,
+            source_sha: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
@@ -7145,6 +7644,8 @@ checks:
             files: vec![("portal/src/app.rs".into(), "fn a() {}".into())],
             analysis_root: None,
             base_sha: Some("cafe1234".into()),
+            source_ref: None,
+            source_sha: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: changed,
             check_profile: None,
@@ -7325,6 +7826,8 @@ checks:
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             gate: false,
             check_ids: None,
@@ -7348,6 +7851,8 @@ checks:
             repo_relative: false,
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -7370,6 +7875,8 @@ checks:
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/removed.rs".into()]),
             gate: false,
             check_ids: None,
@@ -7817,21 +8324,33 @@ checks:
     }
 
     #[test]
-    fn push_overlay_with_options_stamps_gate_on_pushed_overlay() {
-        // #A4.3 gate wire: options.gate must survive into the stored
-        // PushedOverlay (SwitchOverlay carries it onward into the
-        // ProjectCheckRunContext the EmitVerdict arm promotes on).
+    fn gated_push_dispatches_directly_without_entering_ra_queue() {
         let api = ServeVerdictState::new();
+        let (direct_tx, direct_rx) = channel();
+        api.attach_direct_gate_signal(direct_tx);
         let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
         let options = PushOverlayOptions {
             gate: true,
+            base_sha: Some("candidate".to_string()),
+            check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
             ..Default::default()
         };
         let ack = api.push_overlay_with_options("/wt-gate", "", &files, None, Some(&options));
         assert!(ack.accepted);
         assert!(
-            api.peek_overlay_for("/wt-gate").expect("stored").gate,
-            "gate=true push stores gate=true"
+            api.peek_overlay_for("/wt-gate").is_none(),
+            "gated work must not enter the shared RA overlay queue"
+        );
+        let direct = direct_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(direct.wt, PathBuf::from("/wt-gate"));
+        assert!(direct.context.gate);
+        assert_eq!(
+            direct.context.check_ids,
+            Some(vec!["ssr-compiler-witness".to_string()])
+        );
+        assert!(
+            direct.context.source_sha.is_none(),
+            "legacy body-overlay gates remain supported during rollout"
         );
 
         let ack = api.push_overlay_with_options("/wt-plain", "", &files, None, None);
@@ -7851,6 +8370,8 @@ checks:
                 root: PathBuf::from("/root"),
                 changed_files: None,
                 base_ref: String::new(),
+                source_ref: None,
+                source_sha: None,
                 overlay_files: Vec::new(),
                 materialize_overlay: false,
                 gate: true,
