@@ -52,11 +52,11 @@ use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
 use cargoless_core::outcome::{
-    Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation, DiagnosticOrigin,
-    DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef, ExecutionId,
-    FailureCause, IndeterminateCause, NonEmptyDiagnostics, NonEmptyText, OutcomeEnvelope,
-    PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind, RetryDirective,
-    Subject, Surface,
+    AttemptId, Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation,
+    DiagnosticOrigin, DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef,
+    ExecutionId, FailureCause, IndeterminateCause, NonEmptyDiagnostics, NonEmptyText,
+    OutcomeEnvelope, PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind,
+    RetryDirective, Subject, Surface,
 };
 use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::sha256_hex;
@@ -1779,6 +1779,11 @@ impl ServeVerdictState {
         }
         self.remember_outcome_v3(outcome.clone());
         outcome
+    }
+
+    fn forget_outcome_v3(&self, attempt_id: &AttemptId) {
+        poisoned(&self.outcomes_v3).remove(attempt_id);
+        poisoned(&self.outcome_order_v3).retain(|existing| existing != attempt_id);
     }
 
     pub(crate) fn record_ra_evidence_v3(
@@ -3978,7 +3983,19 @@ impl VerdictService for ServeVerdictState {
                 },
                 attribution,
             };
+            if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
+                self.begin_outcome_v3(
+                    context,
+                    Surface::Overlay,
+                    subject,
+                    Phase::Queued,
+                    "gated overlay accepted and queued for compiler witness",
+                );
+            }
             if tx.send(request).is_err() {
+                if let Some(context) = semantic.as_ref() {
+                    self.forget_outcome_v3(&context.attempt_id);
+                }
                 self.mark_worktree_published(worktree);
                 return rejected_push(worktree, "direct gate dispatcher disconnected");
             }
@@ -9728,14 +9745,26 @@ checks:
         let (direct_tx, direct_rx) = channel();
         api.attach_direct_gate_signal(direct_tx);
         let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let context = attempt_context("attempt-gated", 1);
         let options = PushOverlayOptions {
             gate: true,
             base_sha: Some("candidate".to_string()),
             check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+            semantic: Some(context.clone()),
             ..Default::default()
         };
-        let ack = api.push_overlay_with_options("/wt-gate", "", &files, None, Some(&options));
+        let ack =
+            api.push_overlay_with_options("/wt-gate", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted);
+        assert!(
+            matches!(
+                api.get_outcome_v3(&context.attempt_id)
+                    .expect("accepted gated attempt must publish an outcome synchronously")
+                    .conclusion,
+                Conclusion::Pending { .. }
+            ),
+            "POST /v3/attempts must never acknowledge a gated attempt before its pending outcome exists"
+        );
         assert!(
             api.peek_overlay_for("/wt-gate").is_none(),
             "gated work must not enter the shared RA overlay queue"
@@ -9757,6 +9786,35 @@ checks:
         assert!(
             !api.peek_overlay_for("/wt-plain").expect("stored").gate,
             "optionless push defaults gate=false (warn-fast posture)"
+        );
+    }
+
+    #[test]
+    fn disconnected_gate_dispatcher_does_not_strand_a_pending_outcome() {
+        let api = ServeVerdictState::new();
+        let (direct_tx, direct_rx) = channel();
+        drop(direct_rx);
+        api.attach_direct_gate_signal(direct_tx);
+        let context = attempt_context("attempt-disconnected-gate", 1);
+        let options = PushOverlayOptions {
+            gate: true,
+            base_sha: Some("candidate".to_string()),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+
+        let ack = api.push_overlay_with_options(
+            "/wt-disconnected-gate",
+            "origin/main",
+            &[("src/lib.rs".to_string(), "pub fn x() {}".to_string())],
+            None,
+            Some(&options),
+        );
+
+        assert!(!ack.accepted);
+        assert!(
+            api.get_outcome_v3(&context.attempt_id).is_none(),
+            "a rejected dispatch must be retryable with the same attempt id"
         );
     }
 
