@@ -472,9 +472,16 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             // do not let the lane be the thing that reports it, and do not
             // silently continue into the fallback either.
             Err(e) => {
+                // `ManifestError` has no Display impl, and `{:?}` would print a
+                // struct dump. Its three public fields already say exactly what
+                // an operator needs — file, line, and what is wrong — in the
+                // same `path:line: message` shape every other tool uses.
                 eprintln!(
-                    "[cargoless] FATAL: CARGOLESS_LANE_PROFILE is set but \
-                     cargoless.checks.yaml could not be read: {e}"
+                    "[cargoless] FATAL: CARGOLESS_LANE_PROFILE is set but the \
+                     manifest could not be read: {}:{}: {}",
+                    e.path.display(),
+                    e.line,
+                    e.message
                 );
                 std::process::exit(2);
             }
