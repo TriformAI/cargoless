@@ -3733,7 +3733,7 @@ checks:
     tier: lane
     read_only: true
     timeout_ms: 20000
-    command: ["bash", "-lc", "sleep 1; echo ran > real.out"]
+    command: ["bash", "-lc", "sleep 6; echo ran > real.out"]
     cache: none
 "#,
         )
@@ -3745,9 +3745,21 @@ checks:
             TreeState::Green,
             "a failing advisory must not red the tree"
         );
+        // The load-bearing assertion, and the reason `bb-real` sleeps 6s rather
+        // than 1s: the advisory exits INSTANTLY, so a `fail_fast` that wrongly
+        // counted non-required reds would fire while the required check is
+        // still running and kill it mid-sleep — leaving `real.out` unwritten.
+        //
+        // With a 1s sleep the mutation survived: the required check finished
+        // before the wrongful cancel could reach it, so the test passed either
+        // way and proved nothing. Caught by the mutation harness reporting
+        // "SURVIVED — fail_fast trips on a non-required red", which is exactly
+        // the job that harness exists to do.
         assert!(
             root.join("real.out").exists(),
-            "the required check must still have run to completion"
+            "the required check must run to COMPLETION — a failing advisory \
+             must never cancel in-flight work, or every non-required check \
+             silently becomes a gate"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -3778,7 +3790,7 @@ checks:
     kind: command
     read_only: true
     timeout_ms: 20000
-    command: ["bash", "-lc", "sleep 1; echo ran > other.out"]
+    command: ["bash", "-lc", "sleep 6; echo ran > other.out"]
     cache: none
 "#,
         )
@@ -3786,9 +3798,15 @@ checks:
 
         let report = run_profile(&root, "dev", None).unwrap();
         assert_eq!(report.tree, TreeState::Red);
+        // 6s, not 1s, for the same reason as the advisory test above: the
+        // failing check exits instantly, so a regression that made fail_fast
+        // the DEFAULT would cancel this one mid-sleep. With a 1s sleep it
+        // finishes first and the test passes either way.
         assert!(
             root.join("other.out").exists(),
-            "default profiles must keep running every check"
+            "default profiles must keep running every check to completion — \
+             fail_fast is opt-in, and a profile that never asked for it must \
+             never have work cancelled underneath it"
         );
 
         let _ = fs::remove_dir_all(root);
