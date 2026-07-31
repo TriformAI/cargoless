@@ -9728,14 +9728,25 @@ checks:
         let (direct_tx, direct_rx) = channel();
         api.attach_direct_gate_signal(direct_tx);
         let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let context = attempt_context("attempt-gated", 1);
         let options = PushOverlayOptions {
             gate: true,
             base_sha: Some("candidate".to_string()),
             check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+            semantic: Some(context.clone()),
             ..Default::default()
         };
         let ack = api.push_overlay_with_options("/wt-gate", "", &files, None, Some(&options));
         assert!(ack.accepted);
+        assert!(
+            matches!(
+                api.get_outcome_v3(&context.attempt_id)
+                    .expect("accepted gated attempt must publish an outcome synchronously")
+                    .conclusion,
+                Conclusion::Pending { .. }
+            ),
+            "POST /v3/attempts must never acknowledge a gated attempt before its pending outcome exists"
+        );
         assert!(
             api.peek_overlay_for("/wt-gate").is_none(),
             "gated work must not enter the shared RA overlay queue"
