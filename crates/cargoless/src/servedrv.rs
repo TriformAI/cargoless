@@ -438,6 +438,47 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         .ok()
         .filter(|p| !p.trim().is_empty());
     if let Some(profile) = lane_profile {
+        // REFUSE an unknown profile name rather than inherit project_checks'
+        // fallback. That fallback synthesises `include: ["*"]` with a 12-second
+        // budget, and `"*"` matches every check regardless of tier — so a single
+        // typo here selects the WHOLE manifest, including any 25-80 minute
+        // release build, times nearly all of it out, and hands the lane ~130
+        // error diagnostics pinned at `cargoless.checks.yaml:1:1`. Those are
+        // attributable to nobody, so the lane ejects the entire queue as
+        // `Unattributed` on its first build — the gate appearing to decide
+        // everyone is guilty, on evidence that is a scheduler artifact.
+        //
+        // Fail closed and loud. A daemon that refuses to boot is fixed in ten
+        // seconds; one that boots with a silently-wrong lane is not.
+        match cargoless_core::project_checks::profile_names(&scope.repo_root) {
+            Ok(names) if !names.iter().any(|n| n == &profile) => {
+                eprintln!(
+                    "[cargoless] FATAL: CARGOLESS_LANE_PROFILE={profile:?} is not declared in \
+                     cargoless.checks.yaml. Declared profiles: {}",
+                    if names.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+                eprintln!(
+                    "[cargoless] Refusing to start: an unrecognised profile would run EVERY \
+                     check under a 12s budget and eject the whole lane queue."
+                );
+                std::process::exit(2);
+            }
+            Ok(_) => {}
+            // A manifest that will not parse is its own hard error elsewhere;
+            // do not let the lane be the thing that reports it, and do not
+            // silently continue into the fallback either.
+            Err(e) => {
+                eprintln!(
+                    "[cargoless] FATAL: CARGOLESS_LANE_PROFILE is set but \
+                     cargoless.checks.yaml could not be read: {e}"
+                );
+                std::process::exit(2);
+            }
+        }
         let base = std::env::var("CARGOLESS_LANE_BASE").unwrap_or_else(|_| "main".to_string());
         let artifact = std::env::var("CARGOLESS_LANE_ARTIFACT")
             .ok()
@@ -852,6 +893,20 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
             }
         }
+
+        // Build-lane tick. The lane's capture window and ejection TTLs are
+        // measured in ticks and its clock advances ONLY here — without this the
+        // window never elapses and a lane that has been enqueued to just sits
+        // there, which reads as a broken transport rather than a missing
+        // heartbeat. Seconds since the epoch: monotonic enough for a window
+        // measured in tens of seconds, and `LaneState` clamps the clock forward
+        // so a wall-clock step backwards cannot resurrect a lapsed ejection.
+        api.lane_tick(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
 
         // Activity tick → deactivation edges (proven WtLifecycle).
         for wt in activity.tick(Instant::now()) {

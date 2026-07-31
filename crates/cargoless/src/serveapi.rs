@@ -1500,15 +1500,69 @@ impl ServeVerdictState {
             state_dir.join("lane-candidates"),
             base_ref,
         );
+        let publishing = artifact_path.is_some();
         let mut legs = cargoless_core::lanedrv::ProfileLegRunner::new(profile);
         legs.artifact_path = artifact_path;
-        let lander = cargoless_core::lanedrv::PointerLander::new(repo);
-        let driver = cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander);
-        self.lane = Some(LaneHost::spawn(LaneState::new(repo), driver));
+        // The lander follows the artifact setting so the two cannot disagree.
+        //
+        // No artifact ⇒ report-only: the lane proves the merged tree builds and
+        // ships nothing. That is the shape to shadow-run in, and it makes the
+        // safe configuration also the DEFAULT one — an operator who omits
+        // `CARGOLESS_LANE_ARTIFACT` gets a lane that cannot touch the pointer,
+        // rather than one that publishes an empty payload.
+        //
+        // Pairing them here rather than exposing two independent knobs removes
+        // the state where a check-only lane still holds a publishing lander:
+        // it would take the "green with no artifact" branch every time, which
+        // is harmless today but is one refactor away from advancing a pointer
+        // to nothing.
+        //
+        // Two spawn calls rather than one over a boxed lander: `LaneHost::spawn`
+        // is generic, so each branch monomorphises its own driver and neither
+        // needs dynamic dispatch on a path that runs once at boot.
+        self.lane = Some(if publishing {
+            LaneHost::spawn(
+                LaneState::new(repo),
+                cargoless_core::lanedrv::LaneDriver::new(
+                    tree,
+                    legs,
+                    cargoless_core::lanedrv::PointerLander::new(repo),
+                ),
+            )
+        } else {
+            LaneHost::spawn(
+                LaneState::new(repo),
+                cargoless_core::lanedrv::LaneDriver::new(
+                    tree,
+                    legs,
+                    cargoless_core::lanedrv::ReportOnlyLander,
+                ),
+            )
+        });
         self
     }
 
     /// Test hook: set the addressing + push queue caps explicitly, without
+    /// Advance the build lane's clock. No-op when no lane is configured.
+    ///
+    /// **The lane does not run without this.** Its capture window and ejection
+    /// TTLs are both measured in ticks, and `LaneState`'s clock moves ONLY on
+    /// `LaneEvent::Tick` — so with nothing driving it `now` stays 0 forever, the
+    /// default 60-tick window never elapses, and a build only ever starts when
+    /// the queue happens to reach `max_members`. A lane that accepts
+    /// submissions, reports "queued", and silently never builds is the worst
+    /// possible failure: it looks like a transport or auth problem, not a
+    /// missing heartbeat.
+    ///
+    /// Ejection TTLs lapse on the same signal, so without it an ejection is
+    /// permanent — the backstop that is supposed to guarantee nothing is stuck
+    /// forever would itself never fire.
+    pub fn lane_tick(&self, now: u64) {
+        if let Some(lane) = self.lane.as_ref() {
+            lane.tick(now);
+        }
+    }
+
     /// mutating process env. Used by the cap unit tests so the shipped
     /// [`Self::new`] env-read path stays untouched. Retains the historical
     /// stored value for the other cap so a test only overrides what it

@@ -286,6 +286,43 @@ impl LaneLander for PointerLander {
     }
 }
 
+/// Reports a green candidate and ships nothing.
+///
+/// For shadow-running a lane against a real project before anything depends on
+/// it: the members are cleared and `GET /lane` shows the verdict, but no
+/// pointer moves, no tag is pushed, no PR is touched. Whatever normally lands
+/// changes stays authoritative.
+///
+/// This is the honest default for a fleet whose real "publish" means an epoch
+/// tag plus an image pin plus a PR reconcile — none of which should happen on
+/// the first run of a leg runner that has never executed. Cargoless does not
+/// know how to do those things anyway (that is what [`LaneLander`] is for), so
+/// the choice is between doing nothing and *saying so*, or doing nothing and
+/// implying something shipped. This says so.
+pub struct ReportOnlyLander;
+
+impl LaneLander for ReportOnlyLander {
+    fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome> {
+        let ids: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
+        // Name the artifact's existence without publishing it. "green, would
+        // have published N bytes" is the shadow signal worth having: it proves
+        // the legs really produced something, which is exactly what a later
+        // arming decision needs to know.
+        let produced = match artifact {
+            Some(a) => format!("{} byte artifact produced (NOT published)", a.len()),
+            None => "no artifact (check-only)".to_string(),
+        };
+        Ok(LandOutcome {
+            detail: format!(
+                "green, reported only — nothing landed or published; {produced}; \
+                 {} member(s) cleared: {}",
+                ids.len(),
+                ids.join(", ")
+            ),
+        })
+    }
+}
+
 /// Drives one [`LaneAction`] to completion, feeding results back into the lane.
 ///
 /// Deliberately synchronous and one-action-at-a-time. The lane's whole

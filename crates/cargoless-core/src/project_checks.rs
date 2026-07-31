@@ -406,6 +406,23 @@ pub fn list(root: &Path) -> Result<Vec<CheckSummary>, ManifestError> {
         .unwrap_or_default())
 }
 
+/// Every profile the manifest declares, sorted. Empty when there is no
+/// manifest at all.
+///
+/// Exists so a caller can REFUSE an unknown profile name instead of inheriting
+/// [`profile_for`]'s fallback. That fallback synthesises `include: ["*"]` with
+/// a 12-second budget, and `"*"` matches every check regardless of tier — so a
+/// typo silently selects the entire manifest, including any 25-80 minute
+/// release build, and times almost all of it out. Tolerable for an interactive
+/// `checks run --profile x`; catastrophic for the build lane, where the
+/// resulting flood of manifest-pinned timeout diagnostics is attributable to
+/// nobody and ejects the whole queue.
+pub fn profile_names(root: &Path) -> Result<Vec<String>, ManifestError> {
+    Ok(load_manifest(root)?
+        .map(|m| m.profiles.keys().cloned().collect())
+        .unwrap_or_default())
+}
+
 pub fn explain(root: &Path, id: &str) -> Result<Option<CheckExplanation>, ManifestError> {
     Ok(load_manifest(root)?.and_then(|m| m.explain(id)))
 }
