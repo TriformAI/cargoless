@@ -3904,15 +3904,30 @@ checks:
         assert_eq!(report.tree, TreeState::Green);
 
         let seen = fs::read_to_string(root.join("target-dir.out")).unwrap();
-        assert!(
-            !seen.contains(".."),
-            "traversal must be sanitised out of the target dir, got {seen}"
-        );
+
+        // The property is CONTAINMENT, not the absence of dots. `../../etc`
+        // sanitises to the leaf `.._.._etc`, which still contains ".." as a
+        // substring while being a perfectly ordinary directory name — the dots
+        // are no longer path components, which is the whole point.
+        //
+        // An earlier version of this test asserted `!seen.contains("..")` and
+        // failed on correct output. That is the worse kind of wrong test: it
+        // reddens on a working sanitiser, so the natural "fix" is to weaken the
+        // sanitiser until the test passes.
         let canonical_root = fs::canonicalize(&root).unwrap();
+        let resolved = Path::new(&seen);
         assert!(
-            Path::new(&seen).starts_with(&canonical_root),
+            resolved.starts_with(&canonical_root),
             "target dir {seen} escaped the run root {}",
             canonical_root.display()
+        );
+        // No component may be a traversal — this is the check that actually
+        // forbids escaping, and it holds regardless of how the leaf is spelled.
+        assert!(
+            !resolved
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "no path COMPONENT may be `..`, got {seen}"
         );
 
         let _ = fs::remove_dir_all(root);
