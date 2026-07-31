@@ -39,6 +39,7 @@ use std::thread;
 use std::time::Duration;
 
 use cargoless_proto::Diagnostic;
+use cargoless_proto::outcome::{AttemptId, Conclusion, OutcomeEnvelope, PROTOCOL_HEADER_VALUE};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -103,6 +104,7 @@ struct HttpReq {
     /// Optional request body encoding. `gzip` is accepted on the bounded POST
     /// routes; unknown encodings fail closed with `415`.
     content_encoding: Option<String>,
+    protocol: Option<String>,
 }
 
 /// Parse the request line + headers (method/path/query +
@@ -123,6 +125,7 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
     let mut bearer = None;
     let mut content_length = None;
     let mut content_encoding = None;
+    let mut protocol = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok()? == 0 {
@@ -144,6 +147,8 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
                 content_length = v.trim().parse::<usize>().ok();
             } else if k.eq_ignore_ascii_case("content-encoding") {
                 content_encoding = Some(v.trim().to_ascii_lowercase());
+            } else if k.eq_ignore_ascii_case("x-cargoless-protocol") {
+                protocol = Some(v.trim().to_string());
             }
         }
     }
@@ -154,6 +159,7 @@ fn parse_request(reader: &mut impl BufRead) -> Option<HttpReq> {
         bearer,
         content_length,
         content_encoding,
+        protocol,
     })
 }
 
@@ -170,6 +176,22 @@ fn write_response(w: &mut impl Write, code: u16, reason: &str, ctype: &str, body
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
+    let _ = w.flush();
+}
+
+fn write_v3_response(w: &mut impl Write, code: u16, reason: &str, body: &str) {
+    write_v3_document(w, code, reason, "application/json", body.as_bytes());
+}
+
+fn write_v3_document(w: &mut impl Write, code: u16, reason: &str, content_type: &str, body: &[u8]) {
+    let _ = write!(
+        w,
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {content_type}\r\n\
+         X-Cargoless-Protocol: {PROTOCOL_HEADER_VALUE}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = w.write_all(body);
     let _ = w.flush();
 }
 
@@ -527,6 +549,298 @@ fn handle(
             "Unauthorized",
             "text/plain",
             "unauthorized",
+        );
+        return;
+    }
+
+    // ── outcome-v3 exact-attempt protocol ───────────────────────────────
+    // Version selection is explicit in both the URI and a required header.
+    // This prevents a client from accidentally decoding a legacy colour
+    // status as a semantic outcome during a rolling replacement.
+    if req.path == "/v3/attempts"
+        || req.path.starts_with("/v3/attempts/")
+        || req.path == "/v3/metrics"
+    {
+        if req.protocol.as_deref() != Some(PROTOCOL_HEADER_VALUE) {
+            write_v3_response(
+                &mut writer,
+                426,
+                "Upgrade Required",
+                &serde_json::json!({
+                    "schema": "cargoless.protocol-error/v3",
+                    "code": "protocol.version_required",
+                    "required": PROTOCOL_HEADER_VALUE,
+                    "summary": "send X-Cargoless-Protocol: outcome-v3",
+                })
+                .to_string(),
+            );
+            return;
+        }
+        if req.method == "GET" && req.path == "/v3/metrics" {
+            match svc.outcome_metrics_v3() {
+                Some(metrics) => write_v3_response(&mut writer, 200, "OK", &metrics.to_string()),
+                None => write_v3_response(
+                    &mut writer,
+                    404,
+                    "Not Found",
+                    &serde_json::json!({
+                        "schema": "cargoless.protocol-error/v3",
+                        "code": "metrics.not_available",
+                        "summary": "this service does not produce outcome-v3 metrics",
+                    })
+                    .to_string(),
+                ),
+            }
+            return;
+        }
+        if req.method == "GET" && req.path.starts_with("/v3/attempts/") {
+            let raw = req.path.strip_prefix("/v3/attempts/").unwrap_or("");
+            let evidence_route = raw
+                .strip_suffix("/evidence")
+                .map(|attempt| (attempt, "meta.json"))
+                .or_else(|| raw.split_once("/evidence/"));
+            if let Some((raw_attempt, artifact)) = evidence_route {
+                let document = AttemptId::new(raw_attempt)
+                    .ok()
+                    .and_then(|attempt_id| svc.get_evidence_v3(&attempt_id, artifact));
+                match document {
+                    Some(document) => {
+                        let content_type = if artifact.ends_with(".json") {
+                            "application/json"
+                        } else if artifact.ends_with(".ndjson") {
+                            "application/x-ndjson"
+                        } else {
+                            "text/plain; charset=utf-8"
+                        };
+                        write_v3_document(&mut writer, 200, "OK", content_type, &document);
+                    }
+                    None => write_v3_response(
+                        &mut writer,
+                        404,
+                        "Not Found",
+                        &serde_json::json!({
+                            "schema": "cargoless.protocol-error/v3",
+                            "code": "evidence.not_found",
+                            "attempt_id": raw_attempt,
+                            "artifact": artifact,
+                            "summary": "the requested allow-listed evidence artifact is not retained",
+                        })
+                        .to_string(),
+                    ),
+                }
+                return;
+            }
+            let attempt_id = AttemptId::new(raw);
+            match attempt_id
+                .ok()
+                .and_then(|attempt_id| svc.get_outcome_v3(&attempt_id))
+            {
+                Some(outcome) => write_v3_response(
+                    &mut writer,
+                    200,
+                    "OK",
+                    &serde_json::to_string(&outcome).expect("outcome-v3 serializes"),
+                ),
+                None => write_v3_response(
+                    &mut writer,
+                    404,
+                    "Not Found",
+                    &serde_json::json!({
+                        "schema": "cargoless.protocol-error/v3",
+                        "code": "attempt.not_found",
+                        "attempt_id": raw,
+                        "summary": "no outcome exists for this exact attempt id",
+                    })
+                    .to_string(),
+                ),
+            }
+            return;
+        }
+        if req.method == "POST" && req.path == "/v3/attempts" {
+            let body = match req.content_length {
+                None => {
+                    write_v3_response(
+                        &mut writer,
+                        400,
+                        "Bad Request",
+                        &serde_json::json!({
+                            "schema": "cargoless.protocol-error/v3",
+                            "code": "request.content_length_required",
+                            "summary": "POST /v3/attempts requires a numeric Content-Length",
+                        })
+                        .to_string(),
+                    );
+                    return;
+                }
+                Some(n) if n > MAX_OVERLAY_BYTES => {
+                    write_v3_response(
+                        &mut writer,
+                        413,
+                        "Payload Too Large",
+                        &serde_json::json!({
+                            "schema": "cargoless.protocol-error/v3",
+                            "code": "request.payload_too_large",
+                            "maximum_bytes": MAX_OVERLAY_BYTES,
+                            "summary": "attempt payload exceeds the bounded input cap",
+                        })
+                        .to_string(),
+                    );
+                    return;
+                }
+                Some(n) => {
+                    let mut buf = vec![0u8; n];
+                    if reader.read_exact(&mut buf).is_err() {
+                        write_v3_response(
+                            &mut writer,
+                            400,
+                            "Bad Request",
+                            &serde_json::json!({
+                                "schema": "cargoless.protocol-error/v3",
+                                "code": "request.body_truncated",
+                                "summary": "request body is shorter than Content-Length",
+                            })
+                            .to_string(),
+                        );
+                        return;
+                    }
+                    buf
+                }
+            };
+            let body = match decode_request_body(&req, body) {
+                Ok(body) => body,
+                Err((code, reason, message)) => {
+                    write_v3_response(
+                        &mut writer,
+                        code,
+                        reason,
+                        &serde_json::json!({
+                            "schema": "cargoless.protocol-error/v3",
+                            "code": "request.body_decode_failed",
+                            "summary": message,
+                        })
+                        .to_string(),
+                    );
+                    return;
+                }
+            };
+            match Request::from_json(&String::from_utf8_lossy(&body)) {
+                Some(Request::PushOverlayV2 {
+                    worktree,
+                    base_ref,
+                    files,
+                    check_profile,
+                    options,
+                }) if options.semantic.is_some() => {
+                    let context = options.semantic.clone().expect("guarded above");
+                    let ack = svc.push_overlay_with_options(
+                        &worktree,
+                        &base_ref,
+                        &files,
+                        check_profile.as_ref(),
+                        Some(&options),
+                    );
+                    if ack.accepted {
+                        match svc.get_outcome_v3(&context.attempt_id) {
+                            Some(outcome) => {
+                                let (code, reason) =
+                                    if matches!(outcome.conclusion, Conclusion::Pending { .. }) {
+                                        (202, "Accepted")
+                                    } else {
+                                        (200, "OK")
+                                    };
+                                write_v3_response(
+                                    &mut writer,
+                                    code,
+                                    reason,
+                                    &serde_json::to_string(&outcome)
+                                        .expect("outcome-v3 serializes"),
+                                );
+                            }
+                            None => write_v3_response(
+                                &mut writer,
+                                500,
+                                "Internal Server Error",
+                                &serde_json::json!({
+                                    "schema": "cargoless.protocol-error/v3",
+                                    "code": "contract.accepted_without_outcome",
+                                    "attempt_id": context.attempt_id.as_str(),
+                                    "summary": "daemon accepted the attempt but did not publish its pending outcome",
+                                })
+                                .to_string(),
+                            ),
+                        }
+                    } else {
+                        write_v3_response(
+                            &mut writer,
+                            ack.reject_http_status.unwrap_or(409),
+                            "Rejected",
+                            &serde_json::json!({
+                                "schema": "cargoless.submission-rejection/v3",
+                                "state": "rejected",
+                                "code": "submission.rejected",
+                                "request_id": context.request_id.as_str(),
+                                "attempt_id": context.attempt_id.as_str(),
+                                "trace_id": context.trace_id.as_str(),
+                                "retry": {
+                                    "kind": "automatic",
+                                    "attempt": context.attempt_number,
+                                    "maximum_attempts": context.maximum_attempts,
+                                    "after_ms": context.retry_after_ms,
+                                },
+                                "summary": ack.reject_body.unwrap_or_else(|| {
+                                    "daemon rejected the attempt without a legacy detail body"
+                                        .to_string()
+                                }),
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
+                Some(Request::BatchCheck(request)) if request.options.semantic.is_some() => {
+                    match svc.submit_batch_v3(&request) {
+                        Some(outcome) => write_v3_response(
+                            &mut writer,
+                            200,
+                            "OK",
+                            &serde_json::to_string(&outcome).expect("outcome-v3 serializes"),
+                        ),
+                        None => write_v3_response(
+                            &mut writer,
+                            501,
+                            "Not Implemented",
+                            &serde_json::json!({
+                                "schema": "cargoless.protocol-error/v3",
+                                "code": "producer.batch_not_supported",
+                                "summary": "this daemon does not implement the outcome-v3 batch producer",
+                            })
+                            .to_string(),
+                        ),
+                    }
+                }
+                _ => write_v3_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    &serde_json::json!({
+                        "schema": "cargoless.protocol-error/v3",
+                        "code": "request.invalid_attempt",
+                        "summary": "body must be a supported request with a complete options.semantic identity block",
+                    })
+                    .to_string(),
+                ),
+            }
+            return;
+        }
+        write_v3_response(
+            &mut writer,
+            405,
+            "Method Not Allowed",
+            &serde_json::json!({
+                "schema": "cargoless.protocol-error/v3",
+                "code": "request.method_not_allowed",
+                "summary": "use POST /v3/attempts or GET /v3/attempts/{attempt_id}",
+            })
+            .to_string(),
         );
         return;
     }
@@ -1312,6 +1626,7 @@ impl HttpClient {
             "content-length",
             "content-type",
             "connection",
+            "x-cargoless-protocol",
         ] {
             if name_trimmed.eq_ignore_ascii_case(reserved) {
                 return Err(TransportError::Protocol(format!(
@@ -1405,6 +1720,11 @@ impl HttpClient {
         if let Some(encoding) = prepared.content_encoding {
             req.extend_from_slice(format!("Content-Encoding: {encoding}\r\n").as_bytes());
         }
+        if path.starts_with("/v3/") {
+            req.extend_from_slice(
+                format!("X-Cargoless-Protocol: {PROTOCOL_HEADER_VALUE}\r\n").as_bytes(),
+            );
+        }
         if let Some(tok) = &self.token {
             req.extend_from_slice(format!("Authorization: Bearer {tok}\r\n").as_bytes());
         }
@@ -1438,6 +1758,9 @@ impl HttpClient {
         )?;
         if let Some(tok) = &self.token {
             write!(stream, "Authorization: Bearer {tok}\r\n")?;
+        }
+        if path_and_query.starts_with("/v3/") {
+            write!(stream, "X-Cargoless-Protocol: {PROTOCOL_HEADER_VALUE}\r\n")?;
         }
         write!(stream, "{}", self.extra_header_lines())?;
         write!(stream, "\r\n")?;
@@ -1570,6 +1893,57 @@ impl HttpClient {
             .get("build_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string))
+    }
+
+    pub fn submit_attempt_v3(&self, body: &str) -> Result<OutcomeEnvelope, TransportError> {
+        let (code, body) = self.post_json(
+            "/v3/attempts",
+            body,
+            CLIENT_IO_TIMEOUT,
+            "outcome-v3 attempt",
+        )?;
+        match code {
+            200 | 202 => {
+                let outcome: OutcomeEnvelope = serde_json::from_str(&body).map_err(|error| {
+                    TransportError::Protocol(format!(
+                        "outcome-v3 response is not a valid envelope: {error}"
+                    ))
+                })?;
+                outcome.validate().map_err(|error| {
+                    TransportError::Protocol(format!("invalid outcome-v3 response: {error}"))
+                })?;
+                Ok(outcome)
+            }
+            401 => Err(TransportError::Unauthorized),
+            other => Err(TransportError::Protocol(format!(
+                "POST /v3/attempts returned {other}: {body}"
+            ))),
+        }
+    }
+
+    pub fn get_attempt_v3(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<OutcomeEnvelope>, TransportError> {
+        let (code, body) = self.get(&format!("/v3/attempts/{attempt_id}"))?;
+        match code {
+            200 => {
+                let outcome: OutcomeEnvelope = serde_json::from_str(&body).map_err(|error| {
+                    TransportError::Protocol(format!(
+                        "outcome-v3 response is not a valid envelope: {error}"
+                    ))
+                })?;
+                outcome.validate().map_err(|error| {
+                    TransportError::Protocol(format!("invalid outcome-v3 response: {error}"))
+                })?;
+                Ok(Some(outcome))
+            }
+            404 => Ok(None),
+            401 => Err(TransportError::Unauthorized),
+            other => Err(TransportError::Protocol(format!(
+                "GET /v3/attempts/{attempt_id} returned {other}: {body}"
+            ))),
+        }
     }
 }
 
@@ -1953,6 +2327,25 @@ mod tests {
     }
 
     #[test]
+    fn outcome_v3_requires_explicit_version_and_client_sends_it() {
+        let s = server();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (code, body) = raw_get(s.addr(), "/v3/metrics");
+        assert_eq!(code, 426);
+        assert!(
+            body.contains("\"code\":\"protocol.version_required\""),
+            "an unversioned consumer gets an explicit protocol error: {body}"
+        );
+
+        // The typed client injects the reserved header automatically. A mock
+        // with no such attempt therefore reaches the versioned route and gets
+        // the honest `None`/404 result; without the header this would be 426.
+        let attempt_id = AttemptId::new("attempt.exact.1").unwrap();
+        assert_eq!(client_for(&s).get_attempt_v3(&attempt_id).unwrap(), None);
+    }
+
+    #[test]
     fn status_route_threads_base_sha_into_get_status_attributed() {
         // The `<absent>` fix at the wire: `GET /status?worktree=W&base_sha=X`
         // must reach `get_status_attributed(W, Some("X"))`, and an absent
@@ -2003,6 +2396,7 @@ mod tests {
             bearer: None,
             content_length: None,
             content_encoding: None,
+            protocol: None,
         };
         // With base_sha: it must round-trip through the route.
         let (code, body) = route_oneshot(&EchoBaseSha, &req("worktree=/wt&base_sha=abc123"));
@@ -2071,6 +2465,7 @@ mod tests {
             bearer: None,
             content_length: None,
             content_encoding: None,
+            protocol: None,
         };
         let (code, body) = route_oneshot(&EchoDiagnosticsSha, &req);
         assert_eq!(code, 200);
@@ -2218,6 +2613,7 @@ mod tests {
             bearer: None,
             content_length: None,
             content_encoding: None,
+            protocol: None,
         };
         let (code, body) = route_oneshot(&WithConfig, &daemon_req());
         assert_eq!(code, 200);
@@ -2295,6 +2691,7 @@ mod tests {
             bearer: None,
             content_length: None,
             content_encoding: None,
+            protocol: None,
         };
         let (code, body) = route_oneshot(&WithWarm, &req);
         assert_eq!(code, 200);

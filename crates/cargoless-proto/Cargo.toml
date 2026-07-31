@@ -11,3 +11,7 @@ description = "Shared contract types for the TF-Trunk daemon, build pipeline, an
 workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

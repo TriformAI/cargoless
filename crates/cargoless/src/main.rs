@@ -32,6 +32,7 @@ mod clean;
 mod config;
 mod cratemap;
 mod orphan;
+mod outcome_adapter;
 mod preview; // self-serve previews — thin client (POST/DELETE /instances).
 mod push; // #240/2c — thin push-client (POST /overlay).
 mod serve;

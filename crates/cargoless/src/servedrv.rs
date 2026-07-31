@@ -1059,6 +1059,10 @@ fn drain_spawned(
             for (wt_key, attribution) in
                 api.drain_push_attributions_for(&worktree_keys_for_cluster(wt_hash, &h))
             {
+                api.record_ra_evidence_v3(
+                    attribution.semantic.as_ref(),
+                    cs._supervisor.stderr_snapshot(),
+                );
                 publish_stranded_unknown(Path::new(&wt_key), attribution, api);
             }
             cs.mux.reset();
@@ -1231,6 +1235,9 @@ fn exec(
                 worktree = %wt.display(),
                 file_count = tracing::field::Empty,
                 overlay_size_bytes = tracing::field::Empty,
+                request_id = tracing::field::Empty,
+                attempt_id = tracing::field::Empty,
+                trace_id = tracing::field::Empty,
             )
             .entered();
             // #247 obs: log the wire-side check-start (the SwitchOverlay
@@ -1264,6 +1271,18 @@ fn exec(
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
+                if let Some(context) = pushed.semantic.as_ref() {
+                    _span.record("request_id", context.request_id.as_str());
+                    _span.record("attempt_id", context.attempt_id.as_str());
+                    _span.record("trace_id", context.trace_id.as_str());
+                    tracing::info!(
+                        request_id = %context.request_id,
+                        attempt_id = %context.attempt_id,
+                        trace_id = %context.trace_id,
+                        worktree = %wt.display(),
+                        "attempt entered rust-analyzer overlay transaction"
+                    );
+                }
                 // #A2/#A7 — stamp attribution (base_sha + receipt/consume
                 // clocks) the instant the push is consumed, BEFORE the
                 // partial moves below; `publish_verdict` pops it at the
@@ -1408,6 +1427,12 @@ fn exec(
             // base_sha onto the first push's verdict — silent
             // cross-attribution, the exact failure #A2 exists to prevent.
             let attribution = api.take_push_attribution(&wt.to_string_lossy());
+            api.record_ra_evidence_v3(
+                attribution
+                    .as_ref()
+                    .and_then(|value| value.semantic.as_ref()),
+                cs._supervisor.stderr_snapshot(),
+            );
             // #A4.3 gate promotion: an explicit `--gate` push gets the
             // witness-gated (Hard) verdict even while the daemon-wide
             // default stays Warn — the deployed posture keeps ~2s
@@ -1712,6 +1737,21 @@ fn publish_verdict(
             .as_ref()
             .and_then(|a| a.base_sha.as_deref())
             .unwrap_or(""),
+        request_id = attribution
+            .as_ref()
+            .and_then(|a| a.semantic.as_ref())
+            .map(|context| context.request_id.as_str())
+            .unwrap_or(""),
+        attempt_id = attribution
+            .as_ref()
+            .and_then(|a| a.semantic.as_ref())
+            .map(|context| context.attempt_id.as_str())
+            .unwrap_or(""),
+        trace_id = attribution
+            .as_ref()
+            .and_then(|a| a.semantic.as_ref())
+            .map(|context| context.trace_id.as_str())
+            .unwrap_or(""),
         // #A8 — lets a SigNoz query split "green on a blind path"
         // (necessary-not-sufficient) from plain green without joining
         // against the push side.
@@ -1775,9 +1815,10 @@ fn publish_verdict(
     api.publish_attributed_with_checks(
         wt,
         payload,
-        attribution.and_then(|a| a.base_sha),
+        attribution.as_ref().and_then(|a| a.base_sha.clone()),
         ra_blind_paths,
         gated_checks_ran,
+        attribution.and_then(|a| a.semantic),
     );
 }
 
@@ -2782,6 +2823,7 @@ mod tests {
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack =
             api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options));
@@ -2832,6 +2874,7 @@ mod tests {
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -2892,6 +2935,7 @@ mod tests {
             changed_files: Some(vec!["Cargo.toml".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3294,6 +3338,7 @@ mod tests {
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack =
             api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options));
@@ -3816,6 +3861,7 @@ mod tests {
             push_received_unix: statusfile::now_unix(),
             consumed_unix: statusfile::now_unix(),
             consumed_at: Instant::now(),
+            semantic: None,
         }
     }
 

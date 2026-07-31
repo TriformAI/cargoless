@@ -45,15 +45,25 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cargoless_core::analyzer::RaStderrSnapshot;
 use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
+use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
+use cargoless_core::outcome::{
+    Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation, DiagnosticOrigin,
+    DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef, ExecutionId,
+    FailureCause, IndeterminateCause, NonEmptyDiagnostics, NonEmptyText, OutcomeEnvelope,
+    PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind, RetryDirective,
+    Subject, Surface,
+};
 use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
-    BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck, PushOverlayOptions,
-    TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
+    AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck,
+    PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
+    batchreport_to_json,
 };
 use cargoless_core::{Diagnostic, Severity, TreeState};
 
@@ -86,6 +96,7 @@ const HARD_WITNESS_HISTORY_CAP_DEFAULT: usize = 64;
 /// 128 MiB per `transport::http`'s cap). Same-base_sha still latest-wins
 /// (replace in place) even at the cap. Override via env.
 const PUSHED_MAX_PER_WT_DEFAULT: usize = 8;
+const OUTCOME_V3_MEMORY_CAP: usize = 1024;
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 /// CGLS-26 — bump when the warm shared-target-dir layout or keying changes,
 /// so a daemon rolling a new image never reuses an incompatible warm tree
@@ -144,6 +155,9 @@ pub struct PushedOverlay {
     /// environmental reds) through a gating verdict. `None`/empty ⇒ the
     /// gated lane runs the full profile (prior behavior).
     pub check_ids: Option<Vec<String>>,
+    /// Exact v3 attempt identity. Legacy/local pushes omit it and retain the
+    /// historical status-only behavior.
+    pub semantic: Option<AttemptContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +216,9 @@ pub(crate) struct PushAttribution {
     /// granularity) + exact analysis time (consume→publish, monotonic ms).
     pub consumed_unix: u64,
     pub consumed_at: Instant,
+    /// Kept on the consumed push so final publication can update exactly the
+    /// attempt that caused it, even when the same SHA is retried.
+    pub semantic: Option<AttemptContext>,
 }
 
 impl PushAttribution {
@@ -225,6 +242,154 @@ fn latency_ms(push_received_unix: u64, consumed_unix: u64, analysis: Duration) -
         .saturating_sub(push_received_unix)
         .saturating_mul(1000)
         .saturating_add(u64::try_from(analysis.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn text_v3(value: impl Into<String>) -> NonEmptyText {
+    NonEmptyText::new(value).expect("v3 producer must construct non-empty semantic text")
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn producer_v3() -> Producer {
+    Producer {
+        daemon_build_id: text_v3(cargoless_core::build_id()),
+        process_id: std::process::id(),
+        process_generation: 1,
+        pod_uid: std::env::var("POD_UID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(text_v3),
+        rust_analyzer_generation: None,
+    }
+}
+
+fn reaction_state_name(state: cargoless_core::outcome::CheckState) -> &'static str {
+    match state {
+        cargoless_core::outcome::CheckState::Pending => "pending",
+        cargoless_core::outcome::CheckState::Success => "success",
+        cargoless_core::outcome::CheckState::Failure => "failure",
+        cargoless_core::outcome::CheckState::Error => "error",
+        cargoless_core::outcome::CheckState::NoUpdate => "no_update",
+    }
+}
+
+fn evidence_mut_v3(conclusion: &mut Conclusion) -> Option<&mut EvidenceRef> {
+    match conclusion {
+        Conclusion::Passed { evidence, .. }
+        | Conclusion::Failed { evidence, .. }
+        | Conclusion::Indeterminate { evidence, .. }
+        | Conclusion::Rejected { evidence, .. }
+        | Conclusion::Cancelled { evidence, .. }
+        | Conclusion::Superseded { evidence, .. } => Some(evidence),
+        Conclusion::Pending { .. } => None,
+    }
+}
+
+/// Evidence durability is part of the result, not an out-of-band warning.
+/// A real code failure remains a failure if harvesting breaks; every other
+/// conclusion becomes an operational error so a missing bundle can never be
+/// mistaken for a proven pass.
+fn mark_evidence_unavailable_v3(outcome: &mut OutcomeEnvelope, explanation: String) {
+    let explanation_text = text_v3(explanation);
+    let mut conclusion = outcome.conclusion.clone();
+    let Some(evidence) = evidence_mut_v3(&mut conclusion) else {
+        return;
+    };
+    evidence.availability = EvidenceAvailability::Unavailable {
+        explanation: explanation_text.clone(),
+    };
+    let evidence = evidence.clone();
+    match conclusion {
+        Conclusion::Failed {
+            cause,
+            path_overlap,
+            ..
+        } => outcome.conclude(Conclusion::Failed {
+            cause,
+            path_overlap,
+            evidence,
+            summary: text_v3(format!(
+                "code failure retained, but its durable evidence bundle is unavailable: {}",
+                explanation_text.as_str()
+            )),
+        }),
+        _ => outcome.conclude(Conclusion::Rejected {
+            cause: IndeterminateCause::DependencyUnavailable {
+                component: OutcomeComponent::EvidenceStore,
+            },
+            retry: RetryDirective::OperatorRequired,
+            evidence,
+            summary: text_v3(format!(
+                "result cannot be accepted because durable evidence is unavailable: {}",
+                explanation_text.as_str()
+            )),
+        }),
+    }
+}
+
+fn canonical_pairs_digest(files: &[(String, String)]) -> String {
+    let mut files = files.to_vec();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut bytes = Vec::new();
+    for (path, content) in files {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(content.len().to_string().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(sha256_hex(content.as_bytes()).as_bytes());
+        bytes.push(b'\n');
+    }
+    sha256_hex(&bytes)
+}
+
+fn canonical_strings_digest(values: &[String]) -> String {
+    let mut values = values.to_vec();
+    values.sort();
+    values.dedup();
+    sha256_hex(values.join("\n").as_bytes())
+}
+
+fn overlay_subject_v3(
+    worktree: &str,
+    base_ref: &str,
+    files: &[(String, String)],
+    profile: Option<&CheckProfile>,
+    options: &PushOverlayOptions,
+) -> Result<Subject, &'static str> {
+    let base_sha = options
+        .base_sha
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("v3 overlay requires base_sha")?;
+    let repository = options
+        .analysis_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(worktree);
+    if repository.trim().is_empty() || worktree.trim().is_empty() || base_ref.trim().is_empty() {
+        return Err("v3 overlay requires repository, worktree, and base_ref");
+    }
+    let changed_files = options.changed_files.as_deref().unwrap_or_default();
+    let plan = format!(
+        "profile={profile:?};gate={};check_ids={:?}",
+        options.gate, options.check_ids
+    );
+    Ok(Subject::Overlay {
+        repository: text_v3(repository),
+        worktree_key: text_v3(worktree),
+        base_ref: text_v3(base_ref),
+        base_sha: text_v3(base_sha),
+        overlay_digest: text_v3(canonical_pairs_digest(files)),
+        changed_files_digest: text_v3(canonical_strings_digest(changed_files)),
+        check_plan_digest: text_v3(sha256_hex(plan.as_bytes())),
+    })
 }
 
 /// #A8 — the operator's proc-macro-blind path globs, comma-separated in
@@ -493,6 +658,14 @@ pub struct ServeVerdictState {
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
     project_check_state_dir: Option<PathBuf>,
+    /// Exact attempt-keyed semantic state. This is intentionally independent
+    /// of the last-writer-wins worktree status slot.
+    outcomes_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, OutcomeEnvelope>>,
+    outcome_order_v3: Mutex<VecDeque<cargoless_core::outcome::AttemptId>>,
+    /// Durable proof store, configured alongside the daemon state directory.
+    evidence_store_v3: Option<EvidenceStore>,
+    ra_evidence_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, RaStderrSnapshot>>,
+    outcome_metrics_v3: Mutex<OutcomeMetricsV3>,
     /// Per-`(worktree, base_sha)` Hard-witness generation counter. The latest
     /// generation for each key is the only witness that may publish; stale
     /// witnesses (from a prior push whose EmitVerdict fired while a newer
@@ -564,6 +737,16 @@ pub struct ServeVerdictState {
 struct DrainState {
     quiescing: bool,
     active_worktrees: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct OutcomeMetricsV3 {
+    terminal_by_code: BTreeMap<String, u64>,
+    reactions_by_state: BTreeMap<String, u64>,
+    ra_storm_outcomes: u64,
+    evidence_persist_failures: u64,
+    last_ra_error_lines: u64,
+    last_ra_suppressed_lines: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1519,8 +1702,420 @@ impl ServeVerdictState {
     /// project-check scratch worktrees. This keeps slow advisory/project
     /// checks out of the shared mutable analysis root.
     pub fn with_project_check_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.evidence_store_v3 = Some(EvidenceStore::new(&state_dir));
         self.project_check_state_dir = Some(state_dir);
         self
+    }
+
+    fn remember_outcome_v3(&self, outcome: OutcomeEnvelope) {
+        let attempt_id = outcome.attempt_id.clone();
+        let mut outcomes = poisoned(&self.outcomes_v3);
+        let mut order = poisoned(&self.outcome_order_v3);
+        if outcomes.insert(attempt_id.clone(), outcome).is_some() {
+            order.retain(|existing| existing != &attempt_id);
+        }
+        order.push_back(attempt_id);
+        while order.len() > OUTCOME_V3_MEMORY_CAP {
+            if let Some(expired) = order.pop_front() {
+                outcomes.remove(&expired);
+            }
+        }
+    }
+
+    fn begin_outcome_v3(
+        &self,
+        context: &AttemptContext,
+        surface: Surface,
+        subject: Subject,
+        phase: Phase,
+        summary: impl Into<String>,
+    ) -> OutcomeEnvelope {
+        let now = now_unix_ms();
+        let mut outcome = OutcomeEnvelope::new(
+            context.request_id.clone(),
+            context.attempt_id.clone(),
+            context.trace_id.clone(),
+            surface,
+            subject,
+            producer_v3(),
+            Conclusion::Pending {
+                phase,
+                retry: None,
+                summary: text_v3(summary),
+            },
+        );
+        let attempt_digest = sha256_hex(context.attempt_id.as_str().as_bytes());
+        let execution_id = ExecutionId::new(format!(
+            "execution.{}.{}.{}",
+            std::process::id(),
+            now,
+            &attempt_digest[..16]
+        ))
+        .expect("generated execution identity is contract-safe");
+        outcome.execution_id = Some(execution_id.clone());
+        outcome.relations.push(Relation {
+            kind: RelationKind::ExecutedBy,
+            attempt_id: None,
+            execution_id: Some(execution_id),
+        });
+        outcome.timeline = vec![
+            PhaseRecord {
+                phase: Phase::Accepted,
+                started_at_unix_ms: now,
+                finished_at_unix_ms: Some(now),
+            },
+            PhaseRecord {
+                phase,
+                started_at_unix_ms: now,
+                finished_at_unix_ms: None,
+            },
+        ];
+        if let Some(previous_attempt_id) = context.previous_attempt_id.clone() {
+            outcome.relations.push(Relation {
+                kind: RelationKind::RetriedFrom,
+                attempt_id: Some(previous_attempt_id),
+                execution_id: None,
+            });
+        }
+        self.remember_outcome_v3(outcome.clone());
+        outcome
+    }
+
+    pub(crate) fn record_ra_evidence_v3(
+        &self,
+        context: Option<&AttemptContext>,
+        snapshot: RaStderrSnapshot,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        poisoned(&self.ra_evidence_v3).insert(context.attempt_id.clone(), snapshot);
+    }
+
+    fn finish_outcome_v3(
+        &self,
+        context: &AttemptContext,
+        payload: &crate::statusfile::VerdictPayload,
+        gated_checks_ran: &[String],
+        worktree: &str,
+    ) {
+        let Some(mut outcome) = poisoned(&self.outcomes_v3)
+            .get(&context.attempt_id)
+            .cloned()
+        else {
+            tracing::error!(
+                attempt_id = %context.attempt_id,
+                request_id = %context.request_id,
+                "outcome-v3 publish has no accepted attempt"
+            );
+            return;
+        };
+
+        let published_at = now_unix_ms();
+        if let Some(queued) = outcome
+            .timeline
+            .iter_mut()
+            .rev()
+            .find(|record| record.finished_at_unix_ms.is_none())
+        {
+            queued.finished_at_unix_ms = Some(published_at);
+        }
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Publishing,
+            started_at_unix_ms: published_at,
+            finished_at_unix_ms: Some(published_at),
+        });
+
+        let mut evidence = EvidenceBundle::default();
+        let ra_snapshot = poisoned(&self.ra_evidence_v3).remove(&context.attempt_id);
+        evidence.push(
+            ArtifactKind::Events,
+            format!(
+                "{{\"at_unix_ms\":{published_at},\"event\":\"verdict.publish\",\
+                 \"attempt_id\":\"{}\",\"request_id\":\"{}\",\"trace_id\":\"{}\",\
+                 \"worktree\":{},\"verdict\":\"{}\",\"red_diagnostics\":{},\
+                 \"failure_reason\":{}}}\n",
+                context.attempt_id,
+                context.request_id,
+                context.trace_id,
+                serde_json::to_string(worktree).expect("worktree JSON"),
+                payload.verdict.as_str(),
+                payload.red_diagnostics,
+                serde_json::to_string(&payload.analysis_failure_reason).expect("reason JSON"),
+            ),
+        );
+        let (
+            ra_process_generation,
+            ra_pid,
+            ra_total_lines,
+            ra_error_lines,
+            ra_suppressed_lines,
+            ra_overflow_fingerprints,
+            ra_fingerprints,
+        ) = match ra_snapshot.as_ref() {
+            Some(snapshot) => (
+                snapshot.process_generation,
+                snapshot.pid,
+                snapshot.total_lines,
+                snapshot.error_lines,
+                snapshot.suppressed_lines,
+                snapshot.overflow_fingerprints,
+                snapshot
+                    .fingerprints
+                    .iter()
+                    .map(|fingerprint| {
+                        serde_json::json!({
+                            "fingerprint": fingerprint.fingerprint,
+                            "count": fingerprint.count,
+                            "level": fingerprint.level,
+                            "sample": fingerprint.sample,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            None => (0, None, 0, 0, 0, 0, Vec::new()),
+        };
+        let ra_storm = ra_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .fingerprints
+                .iter()
+                .filter(|fingerprint| fingerprint.level == "error")
+                .max_by_key(|fingerprint| fingerprint.count)
+                .filter(|fingerprint| fingerprint.count >= 1000)
+                .cloned()
+        });
+        evidence.push(
+            ArtifactKind::RustAnalyzerSummary,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "cargoless.rust-analyzer-summary/v3",
+                "classification": if gated_checks_ran.is_empty() {
+                    "rust_analyzer_flycheck"
+                } else {
+                    "project_check"
+                },
+                "process_generation": ra_process_generation,
+                "pid": ra_pid,
+                "stderr": {
+                    "total_lines": ra_total_lines,
+                    "error_lines": ra_error_lines,
+                    "duplicates_suppressed": ra_suppressed_lines,
+                    "overflow_fingerprints": ra_overflow_fingerprints,
+                    "fingerprints": ra_fingerprints,
+                },
+                "reported_error_diagnostics": payload.red_diagnostics,
+                "item_level_diagnostics_retained": false,
+                "gated_checks_executed": gated_checks_ran,
+            }))
+            .expect("summary JSON"),
+        );
+        if let Some(snapshot) = ra_snapshot {
+            if !snapshot.tail.is_empty() {
+                evidence.push(
+                    ArtifactKind::StderrTail,
+                    format!("{}\n", snapshot.tail.join("\n")),
+                );
+            }
+            for (index, stack) in snapshot.stack_captures.into_iter().enumerate() {
+                evidence.push(ArtifactKind::Stack(index as u32 + 1), stack);
+            }
+        }
+        let reference_store = self
+            .evidence_store_v3
+            .clone()
+            .unwrap_or_else(|| EvidenceStore::new("."));
+        let evidence_ref = match reference_store.reference_for(&context.attempt_id, &evidence) {
+            Ok(reference) => reference,
+            Err(error) => {
+                tracing::error!(
+                    attempt_id = %context.attempt_id,
+                    error = %error,
+                    "could not construct outcome-v3 evidence reference"
+                );
+                return;
+            }
+        };
+
+        let origin = if gated_checks_ran.is_empty() {
+            DiagnosticOrigin::RustAnalyzerFlycheck
+        } else {
+            DiagnosticOrigin::ProjectCheck
+        };
+        let conclusion = match payload.verdict {
+            crate::statusfile::Verdict::Green => Conclusion::Passed {
+                basis: if gated_checks_ran.is_empty() {
+                    PassBasis::DiagnosticsClear { origin }
+                } else {
+                    PassBasis::ChecksPassed {
+                        requested_check_ids: gated_checks_ran.iter().map(text_v3).collect(),
+                        executed_check_ids: gated_checks_ran.iter().map(text_v3).collect(),
+                    }
+                },
+                evidence: evidence_ref,
+                summary: text_v3(if gated_checks_ran.is_empty() {
+                    "rust-analyzer flycheck completed with no blocking diagnostics"
+                } else {
+                    "every requested blocking project check executed and passed"
+                }),
+            },
+            crate::statusfile::Verdict::Red
+                if gated_checks_ran.is_empty() && ra_storm.is_some() =>
+            {
+                let storm = ra_storm.as_ref().expect("guarded by is_some");
+                Conclusion::Indeterminate {
+                    cause: cargoless_core::outcome::IndeterminateCause::AnalyzerPathology {
+                        component: OutcomeComponent::RustAnalyzer,
+                        signature: text_v3(&storm.fingerprint),
+                        repeated_events: storm.count,
+                    },
+                    retry: RetryDirective::OperatorRequired,
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "rust-analyzer emitted the same internal error {} times; this is an analyzer pathology, not a compiler diagnostic",
+                        storm.count
+                    )),
+                }
+            }
+            crate::statusfile::Verdict::Red => {
+                let count = std::num::NonZeroU32::new(payload.red_diagnostics)
+                    .expect("VerdictPayload makes red-with-zero unrepresentable");
+                Conclusion::Failed {
+                    cause: cargoless_core::outcome::FailureCause::UnlocatedDiagnosticReport {
+                        origin,
+                        authority: Authority::Blocking,
+                        reported_count: count,
+                        producer: text_v3("legacy_verdict_payload"),
+                        raw_report_digest: text_v3(sha256_hex(
+                            format!(
+                                "{}:{}:{:?}",
+                                payload.verdict.as_str(),
+                                payload.red_diagnostics,
+                                payload.analysis_failure_reason
+                            )
+                            .as_bytes(),
+                        )),
+                    },
+                    path_overlap: PathOverlap::NotComputable,
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "producer reported {} blocking diagnostic(s), but item-level file, line, \
+                         code, and message records were not retained",
+                        payload.red_diagnostics
+                    )),
+                }
+            }
+            crate::statusfile::Verdict::Unknown => {
+                let reason = payload
+                    .analysis_failure_reason
+                    .as_deref()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .unwrap_or("producer returned unknown without a reason");
+                let (cause, retry) = if matches!(
+                    reason,
+                    "ra_blind_path_green_unwitnessed"
+                        | "ra_native_timer_settled_no_flycheck_activity"
+                ) {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::CompilerWitnessRequired {
+                            component: OutcomeComponent::RustAnalyzer,
+                            limitation: text_v3(
+                                "rust-analyzer did not observe authoritative compiler activity for this input",
+                            ),
+                        },
+                        RetryDirective::NewInputRequired,
+                    )
+                } else if reason.starts_with("ra_respawn_") {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::ProcessLost {
+                            component: OutcomeComponent::RustAnalyzer,
+                            respawned: true,
+                        },
+                        RetryDirective::Automatic {
+                            attempt: context.attempt_number,
+                            maximum_attempts: context.maximum_attempts,
+                            after_ms: context.retry_after_ms,
+                        },
+                    )
+                } else if reason.contains("timeout") {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::BudgetExhausted {
+                            component: OutcomeComponent::ProjectCheck,
+                            budget: text_v3(reason),
+                        },
+                        RetryDirective::Automatic {
+                            attempt: context.attempt_number,
+                            maximum_attempts: context.maximum_attempts,
+                            after_ms: context.retry_after_ms,
+                        },
+                    )
+                } else {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::InternalContractViolation {
+                            invariant: text_v3(reason),
+                        },
+                        RetryDirective::OperatorRequired,
+                    )
+                };
+                Conclusion::Indeterminate {
+                    cause,
+                    retry,
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "evaluation was indeterminate because {reason}; this is not a code failure"
+                    )),
+                }
+            }
+        };
+        outcome.conclude(conclusion);
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: published_at,
+            finished_at_unix_ms: Some(published_at),
+        });
+        if ra_process_generation > 0 {
+            outcome.producer.rust_analyzer_generation = Some(ra_process_generation);
+        }
+        let evidence_error = if let Some(store) = self.evidence_store_v3.as_ref() {
+            let class = if matches!(outcome.conclusion, Conclusion::Passed { .. }) {
+                EvidenceClass::Success
+            } else {
+                EvidenceClass::Terminal
+            };
+            store
+                .persist(&outcome, class, &evidence)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            Some("durable evidence store is not configured".to_string())
+        };
+        if let Some(error) = evidence_error {
+            mark_evidence_unavailable_v3(&mut outcome, error.clone());
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            metrics.evidence_persist_failures = metrics.evidence_persist_failures.saturating_add(1);
+            drop(metrics);
+            tracing::error!(
+                attempt_id = %context.attempt_id,
+                error = %error,
+                "outcome-v3 durable evidence persistence failed"
+            );
+        }
+        {
+            let reaction_state = reaction_state_name(outcome.reaction.state);
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            *metrics
+                .terminal_by_code
+                .entry(outcome.conclusion.semantic_code().to_string())
+                .or_insert(0) += 1;
+            *metrics
+                .reactions_by_state
+                .entry(reaction_state.to_string())
+                .or_insert(0) += 1;
+            if ra_storm.is_some() {
+                metrics.ra_storm_outcomes = metrics.ra_storm_outcomes.saturating_add(1);
+            }
+            metrics.last_ra_error_lines = ra_error_lines;
+            metrics.last_ra_suppressed_lines = ra_suppressed_lines;
+        }
+        self.remember_outcome_v3(outcome);
     }
 
     /// CGLS-25 — acquire a Hard-witness compile slot from the global gate.
@@ -1582,7 +2177,14 @@ impl ServeVerdictState {
         base_sha: Option<String>,
         ra_blind_paths: bool,
     ) {
-        self.publish_attributed_with_checks(wt, payload, base_sha, ra_blind_paths, Vec::new());
+        self.publish_attributed_with_checks(
+            wt,
+            payload,
+            base_sha,
+            ra_blind_paths,
+            Vec::new(),
+            None,
+        );
     }
 
     /// [`Self::publish_attributed`] carrying the ids of the project checks
@@ -1604,6 +2206,7 @@ impl ServeVerdictState {
         base_sha: Option<String>,
         ra_blind_paths: bool,
         gated_checks_ran: Vec<String>,
+        semantic: Option<AttemptContext>,
     ) {
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
@@ -1627,7 +2230,7 @@ impl ServeVerdictState {
             // The witness's positive "the gated check ran" proof. Empty for
             // FS-watch / coalesced / RA-native verdicts (no enumerated
             // report) ⇒ absent on the wire (additive, same as base_sha).
-            gated_checks_ran,
+            gated_checks_ran: gated_checks_ran.clone(),
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -1690,6 +2293,9 @@ impl ServeVerdictState {
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
         self.mark_worktree_published(&worktree);
+        if let Some(context) = semantic.as_ref() {
+            self.finish_outcome_v3(context, &payload, &gated_checks_ran, &worktree);
+        }
     }
 
     /// #240/2b — wire the push-arrival signal channel. Called ONCE by
@@ -1863,6 +2469,7 @@ impl ServeVerdictState {
                 push_received_unix: pushed.last_push_unix,
                 consumed_unix: crate::statusfile::now_unix(),
                 consumed_at: Instant::now(),
+                semantic: pushed.semantic.clone(),
             },
         );
     }
@@ -2204,7 +2811,10 @@ impl ServeVerdictState {
             self.record_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
             return None;
         }
-        let in_proc = InProcWarmGuard { busy };
+        let in_proc = InProcWarmGuard {
+            busy,
+            released: false,
+        };
 
         // 3b. Cross-process advisory flock (insurance for a future
         //     multi-daemon topology; today serve is single-replica). LOCK_NB
@@ -2252,8 +2862,8 @@ impl ServeVerdictState {
         self.record_warm_obs(&warm_dir, "warm", "hit");
         Some(WarmTargetGuard {
             dir: warm_dir,
-            _in_proc: in_proc,
-            _flock: flock,
+            in_proc,
+            flock: Some(flock),
         })
     }
 
@@ -2336,6 +2946,7 @@ impl ServeVerdictState {
             // on the same root+base.
             gate: context.gate,
             check_ids: context.check_ids.clone(),
+            semantic: None,
         };
         request.members = vec![member];
         request.corun = true;
@@ -2609,6 +3220,342 @@ impl ServeVerdictState {
         }
         stitch_suspect_members(inner, &members, &suspect_reasons)
     }
+
+    fn execute_batch_report(&self, request: &BatchCheckRequest) -> BatchReport {
+        if let Some(key) = batch_coalesce_key(request) {
+            self.batch_coalescer
+                .submit(key, request, |combined| self.run_batch_check_now(combined))
+        } else {
+            self.run_batch_check_now(request)
+        }
+    }
+
+    fn execute_batch_outcome_v3(&self, request: &BatchCheckRequest) -> Option<OutcomeEnvelope> {
+        let context = request.options.semantic.as_ref()?;
+        context.validate().ok()?;
+        if let Some(existing) = self.get_outcome_v3(&context.attempt_id) {
+            return Some(existing);
+        }
+
+        let mut member_identity = Vec::new();
+        for member in &request.members {
+            member_identity.extend_from_slice(member.worktree.as_bytes());
+            member_identity.push(0);
+            member_identity.extend_from_slice(canonical_pairs_digest(&member.files).as_bytes());
+            member_identity.push(0);
+            for path in &member.changed_files {
+                member_identity.extend_from_slice(path.as_bytes());
+                member_identity.push(0);
+            }
+        }
+        let check_plan = serde_json::json!({
+            "check_profile": request.check_profile.as_ref().map(|profile| format!("{profile:?}")),
+            "check_ids": request.options.check_ids,
+            "corun": request.corun,
+        });
+        let subject = Subject::Batch {
+            batch_id: NonEmptyText::new(request.batch_id.clone()).ok()?,
+            base_sha: text_v3(
+                request
+                    .options
+                    .base_sha
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&request.base_ref),
+            ),
+            ordered_member_digest: text_v3(sha256_hex(&member_identity)),
+            check_plan_digest: text_v3(sha256_hex(check_plan.to_string().as_bytes())),
+        };
+        let mut outcome = self.begin_outcome_v3(
+            context,
+            Surface::Batch,
+            subject,
+            Phase::WaitingForExecutionSlot,
+            "batch accepted and waiting for its physical execution",
+        );
+        let started = now_unix_ms();
+        if let Some(queued) = outcome.timeline.last_mut() {
+            queued.finished_at_unix_ms = Some(started);
+        }
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Executing,
+            started_at_unix_ms: started,
+            finished_at_unix_ms: None,
+        });
+        self.remember_outcome_v3(outcome.clone());
+
+        let report = self.execute_batch_report(request);
+        let report_json = batchreport_to_json(&report);
+        let mut evidence = EvidenceBundle::default();
+        evidence.push(ArtifactKind::BatchReport, report_json.clone());
+        evidence.push(
+            ArtifactKind::Events,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": "batch_terminal",
+                    "attempt_id": context.attempt_id.as_str(),
+                    "execution_id": outcome.execution_id.as_ref().map(ToString::to_string),
+                    "batch_id": report.batch_id,
+                    "executed_batch_id": report.executed_batch_id,
+                    "combined_checks": report.combined_checks,
+                    "solo_checks": report.solo_checks,
+                    "executed_members": report.executed_members,
+                    "duration_ms": report.duration_ms,
+                    "queue_wait_ms": report.queue_wait_ms,
+                })
+            ),
+        );
+        let store = self
+            .evidence_store_v3
+            .clone()
+            .unwrap_or_else(|| EvidenceStore::new("."));
+        let evidence_ref = store.reference_for(&context.attempt_id, &evidence).ok()?;
+
+        let requested_check_ids = request
+            .options
+            .check_ids
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(text_v3)
+            .collect();
+        let mut executed_check_ids: BTreeSet<String> = BTreeSet::new();
+        for member in &report.members {
+            executed_check_ids.extend(member.ran_check_ids.iter().cloned());
+        }
+        let executed_check_ids = executed_check_ids.into_iter().map(text_v3).collect();
+
+        let conclusion = match report.verdict {
+            BatchVerdict::Green => Conclusion::Passed {
+                basis: PassBasis::ChecksPassed {
+                    requested_check_ids,
+                    executed_check_ids,
+                },
+                evidence: evidence_ref,
+                summary: text_v3(format!(
+                    "batch passed: {} submitted member(s), {} physical member(s), {} combined and {} solo check(s)",
+                    request.members.len(),
+                    report.executed_members,
+                    report.combined_checks,
+                    report.solo_checks
+                )),
+            },
+            BatchVerdict::Red => {
+                let mut diagnostics = Vec::new();
+                for member in &report.members {
+                    diagnostics.extend(
+                        member
+                            .diagnostics
+                            .iter()
+                            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                            .map(diagnostic_record_v3),
+                    );
+                }
+                let cause = if let Some(first) = diagnostics.first().cloned() {
+                    FailureCause::Diagnostics {
+                        diagnostics: NonEmptyDiagnostics::new(
+                            first,
+                            diagnostics.into_iter().skip(1).collect(),
+                        ),
+                    }
+                } else {
+                    let red_members = report
+                        .members
+                        .iter()
+                        .filter(|member| member.verdict == BatchVerdict::Red)
+                        .count()
+                        .max(1);
+                    FailureCause::UnlocatedDiagnosticReport {
+                        origin: DiagnosticOrigin::ProjectCheck,
+                        authority: Authority::Blocking,
+                        reported_count: std::num::NonZeroU32::new(
+                            u32::try_from(red_members).unwrap_or(u32::MAX),
+                        )
+                        .expect("red member count is clamped to at least one"),
+                        producer: text_v3("batch_report_v1"),
+                        raw_report_digest: text_v3(sha256_hex(report_json.as_bytes())),
+                    }
+                };
+                Conclusion::Failed {
+                    cause,
+                    path_overlap: batch_path_overlap(&report, request),
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "batch failed: {} of {} returned member result(s) are red; see batch-report.json for every member and provenance",
+                        report
+                            .members
+                            .iter()
+                            .filter(|member| member.verdict == BatchVerdict::Red)
+                            .count(),
+                        report.members.len()
+                    )),
+                }
+            }
+            BatchVerdict::Indeterminate => Conclusion::Indeterminate {
+                cause: IndeterminateCause::AttributionUnavailable {
+                    producer: text_v3("batch_report_v1"),
+                },
+                retry: RetryDirective::Automatic {
+                    attempt: context.attempt_number,
+                    maximum_attempts: context.maximum_attempts,
+                    after_ms: context.retry_after_ms,
+                },
+                evidence: evidence_ref,
+                summary: text_v3(
+                    "batch execution did not produce a trustworthy code conclusion; legacy detail is retained in batch-report.json",
+                ),
+            },
+        };
+        outcome.conclude(conclusion);
+        let terminal = now_unix_ms();
+        if let Some(executing) = outcome.timeline.last_mut() {
+            executing.finished_at_unix_ms = Some(terminal);
+        }
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: terminal,
+            finished_at_unix_ms: Some(terminal),
+        });
+
+        let evidence_error = if let Some(durable) = self.evidence_store_v3.as_ref() {
+            let class = if matches!(outcome.conclusion, Conclusion::Passed { .. }) {
+                EvidenceClass::Success
+            } else {
+                EvidenceClass::Terminal
+            };
+            durable
+                .persist(&outcome, class, &evidence)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            Some("durable evidence store is not configured".to_string())
+        };
+        if let Some(error) = evidence_error {
+            mark_evidence_unavailable_v3(&mut outcome, error);
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            metrics.evidence_persist_failures = metrics.evidence_persist_failures.saturating_add(1);
+        }
+        {
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            *metrics
+                .terminal_by_code
+                .entry(outcome.conclusion.semantic_code().to_string())
+                .or_insert(0) += 1;
+            *metrics
+                .reactions_by_state
+                .entry(reaction_state_name(outcome.reaction.state).to_string())
+                .or_insert(0) += 1;
+        }
+        self.remember_outcome_v3(outcome.clone());
+        Some(outcome)
+    }
+}
+
+fn diagnostic_record_v3(diagnostic: &Diagnostic) -> DiagnosticRecord {
+    let path = diagnostic.file_path.to_string_lossy();
+    let origin = match diagnostic.source.as_deref() {
+        Some("rustc") => DiagnosticOrigin::Rustc,
+        Some(source) if source.contains("rust-analyzer") => DiagnosticOrigin::RustAnalyzerNative,
+        Some("cargoless") => DiagnosticOrigin::SyntheticCheck,
+        _ => DiagnosticOrigin::ProjectCheck,
+    };
+    let severity = match diagnostic.severity {
+        Severity::Error => DiagnosticSeverity::Error,
+        Severity::Warning => DiagnosticSeverity::Warning,
+        Severity::Info => DiagnosticSeverity::Information,
+        Severity::Hint => DiagnosticSeverity::Hint,
+    };
+    let location = if diagnostic.line > 0
+        && !path.trim().is_empty()
+        && !path.starts_with("<cargoless-")
+    {
+        DiagnosticLocation::Located {
+            file: text_v3(path.as_ref()),
+            line: diagnostic.line,
+            column: diagnostic.col,
+        }
+    } else {
+        DiagnosticLocation::Unlocated {
+            explanation: text_v3("the producing project check did not retain a source location"),
+        }
+    };
+    let message = if diagnostic.message.trim().is_empty() {
+        "producer emitted an empty diagnostic message"
+    } else {
+        diagnostic.message.as_str()
+    };
+    let fingerprint = sha256_hex(
+        format!(
+            "{origin:?}|{:?}|{}|{}|{}|{}|{}",
+            diagnostic.severity,
+            path,
+            diagnostic.line,
+            diagnostic.col,
+            diagnostic.code.as_deref().unwrap_or("-"),
+            message
+        )
+        .as_bytes(),
+    );
+    DiagnosticRecord {
+        origin,
+        severity,
+        authority: if diagnostic.severity == Severity::Error {
+            Authority::Blocking
+        } else {
+            Authority::Advisory
+        },
+        location,
+        code: diagnostic
+            .code
+            .as_deref()
+            .filter(|code| !code.trim().is_empty())
+            .map(text_v3),
+        message: text_v3(message),
+        fingerprint: text_v3(fingerprint),
+    }
+}
+
+fn batch_path_overlap(report: &BatchReport, request: &BatchCheckRequest) -> PathOverlap {
+    let changed: Vec<&str> = request
+        .members
+        .iter()
+        .flat_map(|member| member.changed_files.iter().map(String::as_str))
+        .collect();
+    let diagnostics: Vec<&Diagnostic> = report
+        .members
+        .iter()
+        .flat_map(|member| member.diagnostics.iter())
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect();
+    if diagnostics.is_empty() || changed.is_empty() {
+        return PathOverlap::NotComputable;
+    }
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.line == 0
+            || diagnostic
+                .file_path
+                .to_string_lossy()
+                .starts_with("<cargoless-")
+    }) {
+        return PathOverlap::NotComputable;
+    }
+    let overlaps = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            let path = diagnostic.file_path.to_string_lossy();
+            let normalized = path.trim_start_matches("./");
+            changed.iter().any(|changed_path| {
+                let changed_path = changed_path.trim_start_matches("./");
+                normalized == changed_path || normalized.ends_with(&format!("/{changed_path}"))
+            })
+        })
+        .count();
+    match overlaps {
+        0 => PathOverlap::NoPathsOverlap,
+        count if count == diagnostics.len() => PathOverlap::AllPathsOverlap,
+        _ => PathOverlap::SomePathsOverlap,
+    }
 }
 
 impl VerdictService for ServeVerdictState {
@@ -2705,6 +3652,46 @@ impl VerdictService for ServeVerdictState {
             .unwrap_or_default()
     }
 
+    fn get_outcome_v3(
+        &self,
+        attempt_id: &cargoless_core::outcome::AttemptId,
+    ) -> Option<OutcomeEnvelope> {
+        if let Some(outcome) = poisoned(&self.outcomes_v3).get(attempt_id).cloned() {
+            return Some(outcome);
+        }
+        self.evidence_store_v3
+            .as_ref()
+            .and_then(|store| store.read_outcome(attempt_id).ok().flatten())
+    }
+
+    fn outcome_metrics_v3(&self) -> Option<serde_json::Value> {
+        let metrics = poisoned(&self.outcome_metrics_v3);
+        let pending_attempts = poisoned(&self.outcomes_v3)
+            .values()
+            .filter(|outcome| matches!(outcome.conclusion, Conclusion::Pending { .. }))
+            .count();
+        Some(serde_json::json!({
+            "schema": "cargoless.metrics/v3",
+            "pending_attempts": pending_attempts,
+            "terminal_by_code": &metrics.terminal_by_code,
+            "reactions_by_state": &metrics.reactions_by_state,
+            "ra_storm_outcomes": metrics.ra_storm_outcomes,
+            "evidence_persist_failures": metrics.evidence_persist_failures,
+            "last_ra_error_lines": metrics.last_ra_error_lines,
+            "last_ra_duplicates_suppressed": metrics.last_ra_suppressed_lines,
+        }))
+    }
+
+    fn get_evidence_v3(
+        &self,
+        attempt_id: &cargoless_core::outcome::AttemptId,
+        artifact: &str,
+    ) -> Option<Vec<u8>> {
+        self.evidence_store_v3
+            .as_ref()
+            .and_then(|store| store.read_named(attempt_id, artifact).ok().flatten())
+    }
+
     fn list_worktrees(&self) -> Vec<WorktreeSummary> {
         poisoned(&self.statuses)
             .values()
@@ -2761,6 +3748,35 @@ impl VerdictService for ServeVerdictState {
         check_profile: Option<&CheckProfile>,
         options: Option<&PushOverlayOptions>,
     ) -> PushOverlayAck {
+        let semantic = options.and_then(|options| options.semantic.clone());
+        if let Some(context) = semantic.as_ref() {
+            if let Err(reason) = context.validate() {
+                return rejected_push(worktree, reason);
+            }
+            if poisoned(&self.outcomes_v3).contains_key(&context.attempt_id) {
+                // Attempt submission is idempotent. A network retry must not
+                // enqueue the same execution twice or overwrite its terminal
+                // result; callers poll the existing exact attempt.
+                return PushOverlayAck {
+                    worktree: worktree.to_string(),
+                    accepted: true,
+                    applied_files: files.len() as u32,
+                    ..Default::default()
+                };
+            }
+        }
+        let semantic_subject = match (semantic.as_ref(), options) {
+            (Some(_), Some(options)) => {
+                match overlay_subject_v3(worktree, base_ref, files, check_profile, options) {
+                    Ok(subject) => Some(subject),
+                    Err(reason) => return rejected_push(worktree, reason),
+                }
+            }
+            (Some(_), None) => {
+                return rejected_push(worktree, "v3 overlay requires semantic options");
+            }
+            (None, _) => None,
+        };
         if self.quiescing() {
             return rejected_push(worktree, "daemon is quiescing");
         }
@@ -2922,6 +3938,7 @@ impl VerdictService for ServeVerdictState {
             check_profile: check_profile.cloned(),
             gate,
             check_ids,
+            semantic: semantic.clone(),
         };
         if pushed.gate {
             let Some(tx) = poisoned(&self.direct_gate_signal).as_ref().cloned() else {
@@ -2940,6 +3957,7 @@ impl VerdictService for ServeVerdictState {
                 push_received_unix: pushed.last_push_unix,
                 consumed_unix: now,
                 consumed_at: Instant::now(),
+                semantic: pushed.semantic.clone(),
             };
             let project_root = pushed
                 .analysis_root
@@ -2999,7 +4017,13 @@ impl VerdictService for ServeVerdictState {
         {
             let mut store = poisoned(&self.pushed);
             let queue = store.entry(worktree.to_string()).or_default();
-            match queue.iter_mut().find(|q| q.base_sha == pushed.base_sha) {
+            match queue
+                .iter_mut()
+                .find(|queued| match (&queued.semantic, &pushed.semantic) {
+                    (Some(left), Some(right)) => left.attempt_id == right.attempt_id,
+                    (None, None) => queued.base_sha == pushed.base_sha,
+                    _ => false,
+                }) {
                 Some(existing) => *existing = pushed,
                 None => {
                     if queue.len() >= self.pushed_max_per_wt {
@@ -3016,6 +4040,15 @@ impl VerdictService for ServeVerdictState {
         if let Some(tx) = poisoned(&self.push_signal).as_ref() {
             let _ = tx.send(worktree.to_string());
         }
+        if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
+            self.begin_outcome_v3(
+                context,
+                Surface::Overlay,
+                subject,
+                Phase::Queued,
+                "overlay accepted and queued for analysis",
+            );
+        }
         PushOverlayAck {
             worktree: worktree.to_string(),
             accepted: true,
@@ -3025,12 +4058,11 @@ impl VerdictService for ServeVerdictState {
     }
 
     fn batch_check(&self, request: &BatchCheckRequest) -> BatchReport {
-        if let Some(key) = batch_coalesce_key(request) {
-            self.batch_coalescer
-                .submit(key, request, |combined| self.run_batch_check_now(combined))
-        } else {
-            self.run_batch_check_now(request)
-        }
+        self.execute_batch_report(request)
+    }
+
+    fn submit_batch_v3(&self, request: &BatchCheckRequest) -> Option<OutcomeEnvelope> {
+        self.execute_batch_outcome_v3(request)
     }
 
     fn daemon_activity(&self) -> DaemonActivity {
@@ -3902,12 +4934,27 @@ fn warm_obs_bucket(reason: &str) -> &str {
     reason.split([':', ',']).next().unwrap_or(reason)
 }
 
-/// RAII holder for the resolved warm dir + its two locks. Dropping it
-/// releases the in-process busy flag and the flock (the compile is done).
+/// RAII holder for the resolved warm dir + its two locks. Dropping it releases
+/// the cross-process flock *before* publishing the in-process key as idle.
+/// That ordering is load-bearing: another thread may acquire the in-process
+/// flag as soon as it becomes false, so exposing false while the prior flock
+/// is still held creates a spurious `contended:flock` cold fallback.
 struct WarmTargetGuard {
     dir: PathBuf,
-    _in_proc: InProcWarmGuard,
-    _flock: WarmFlock,
+    in_proc: InProcWarmGuard,
+    flock: Option<WarmFlock>,
+}
+
+impl Drop for WarmTargetGuard {
+    fn drop(&mut self) {
+        // `WarmFlock::drop` performs an explicit LOCK_UN and then closes the
+        // fd. Complete that transition before a racing resolver can observe
+        // the in-process key as available.
+        if let Some(flock) = self.flock.take() {
+            drop(flock);
+        }
+        self.in_proc.release();
+    }
 }
 
 /// Clears the per-key busy flag on drop (normal return OR panic-unwind), so a
@@ -3915,11 +4962,21 @@ struct WarmTargetGuard {
 /// busy. Holds the `Arc` so the flag outlives the daemon map entry if pruned.
 struct InProcWarmGuard {
     busy: Arc<std::sync::atomic::AtomicBool>,
+    released: bool,
+}
+
+impl InProcWarmGuard {
+    fn release(&mut self) {
+        if !self.released {
+            self.busy.store(false, std::sync::atomic::Ordering::Release);
+            self.released = true;
+        }
+    }
 }
 
 impl Drop for InProcWarmGuard {
     fn drop(&mut self) {
-        self.busy.store(false, std::sync::atomic::Ordering::Release);
+        self.release();
     }
 }
 
@@ -3928,7 +4985,7 @@ impl Drop for InProcWarmGuard {
 /// single-replica. Holds the open `File` (fd) for the compile; closing it at
 /// Drop releases the lock.
 struct WarmFlock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
 impl WarmFlock {
@@ -3949,7 +5006,7 @@ impl WarmFlock {
             flock(file.as_raw_fd(), LOCK_EX_NB)
         };
         if rc == 0 {
-            Ok(Some(WarmFlock { _file: file }))
+            Ok(Some(WarmFlock { file }))
         } else {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
@@ -3959,6 +5016,24 @@ impl WarmFlock {
                 _ => Err(err),
             }
         }
+    }
+}
+
+impl Drop for WarmFlock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // LOCK_UN = 8 on Linux and macOS. Closing the fd is also specified to
+        // release flock, but doing that implicitly left the lock transition
+        // unobservable and produced rare post-drop contention in CI. Make the
+        // release synchronous and explicit; close remains the final backstop.
+        const LOCK_UN: i32 = 8;
+        // SAFETY: the File owns a valid fd for the duration of this Drop call.
+        let _ = unsafe {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            flock(self.file.as_raw_fd(), LOCK_UN)
+        };
     }
 }
 
@@ -4234,8 +5309,8 @@ mod tests {
     use cargoless_core::batch::{BatchMember, BatchProvenance, BatchReport, BatchVerdict};
     use cargoless_core::transport::http::{HttpClient, HttpServer};
     use cargoless_core::transport::{
-        AllowAll, BatchCheckRequest, CargoSubcommand, PushOverlayOptions, TransportClient,
-        VerdictService,
+        AllowAll, AttemptContext, BatchCheckRequest, CargoSubcommand, PushOverlayOptions,
+        TransportClient, VerdictService,
     };
 
     use super::*;
@@ -4252,6 +5327,315 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn attempt_context(id: &str, attempt_number: u32) -> AttemptContext {
+        AttemptContext {
+            request_id: cargoless_core::outcome::RequestId::new("request-1").unwrap(),
+            attempt_id: cargoless_core::outcome::AttemptId::new(id).unwrap(),
+            trace_id: cargoless_core::outcome::TraceId::new("0123456789abcdef").unwrap(),
+            previous_attempt_id: (attempt_number > 1)
+                .then(|| cargoless_core::outcome::AttemptId::new("attempt-one").unwrap()),
+            attempt_number,
+            maximum_attempts: 3,
+            retry_after_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn outcome_v3_keeps_retries_distinct_and_classes_ra_storm_as_analyzer_pathology() {
+        let state_dir = temp_root("outcome-v3");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let files = vec![("src/lib.rs".to_string(), "pub fn broken() {}".to_string())];
+        let options = |attempt_id: &str, attempt_number: u32| PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(attempt_context(attempt_id, attempt_number)),
+            ..PushOverlayOptions::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options("attempt-1", 1)),
+            )
+            .accepted
+        );
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options("attempt-2", 2)),
+            )
+            .accepted
+        );
+        assert_eq!(
+            poisoned(&api.pushed).get("/client/wt").unwrap().len(),
+            2,
+            "same commit retries remain distinct execution attempts"
+        );
+
+        let first = api.take_overlay_for("/client/wt").expect("first attempt");
+        api.record_push_attribution("/client/wt", &first);
+        let attribution = api
+            .take_push_attribution("/client/wt")
+            .expect("attempt attribution");
+        let context = attribution.semantic.clone().expect("v3 identity");
+        api.record_ra_evidence_v3(
+            Some(&context),
+            RaStderrSnapshot {
+                process_generation: 7,
+                pid: Some(4242),
+                total_lines: 1_500,
+                error_lines: 1_500,
+                suppressed_lines: 1_499,
+                overflow_fingerprints: 0,
+                fingerprints: vec![cargoless_core::analyzer::RaStderrFingerprint {
+                    fingerprint: "storm-fingerprint".into(),
+                    count: 1_500,
+                    level: "error".into(),
+                    sample: "ERROR inference diagnostic in desugared expr".into(),
+                }],
+                tail: vec!["ERROR inference diagnostic in desugared expr".into()],
+                stack_captures: vec![b"thread apply all bt".to_vec()],
+            },
+        );
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::red(1),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let first_outcome = api
+            .get_outcome_v3(&context.attempt_id)
+            .expect("terminal exact attempt");
+        match &first_outcome.conclusion {
+            Conclusion::Indeterminate {
+                cause:
+                    cargoless_core::outcome::IndeterminateCause::AnalyzerPathology {
+                        component,
+                        signature,
+                        repeated_events,
+                    },
+                summary,
+                ..
+            } => {
+                assert_eq!(*component, OutcomeComponent::RustAnalyzer);
+                assert_eq!(signature.as_str(), "storm-fingerprint");
+                assert_eq!(*repeated_events, 1_500);
+                assert!(
+                    summary.as_str().contains("analyzer pathology"),
+                    "the semantic conclusion must name the analyzer pathology"
+                );
+            }
+            other => panic!("expected analyzer pathology, got {other:?}"),
+        }
+        assert_eq!(
+            first_outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            first_outcome.reaction.code.as_str(),
+            "indeterminate.analyzer_pathology"
+        );
+        assert!(matches!(
+            api.get_outcome_v3(&cargoless_core::outcome::AttemptId::new("attempt-2").unwrap())
+                .unwrap()
+                .conclusion,
+            Conclusion::Pending { .. }
+        ));
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-1/ra-summary.json")
+                .is_file()
+        );
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-1/stack-001.txt")
+                .is_file()
+        );
+
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        assert_eq!(
+            reopened
+                .get_outcome_v3(&context.attempt_id)
+                .expect("durable outcome after process-state loss"),
+            first_outcome
+        );
+        let metrics = api.outcome_metrics_v3().unwrap();
+        assert_eq!(metrics["ra_storm_outcomes"], 1);
+        assert_eq!(metrics["reactions_by_state"]["error"], 1);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn evidence_failure_preserves_code_red_but_marks_bundle_unavailable() {
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "broken".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(attempt_context("attempt-no-store", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").unwrap();
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api.take_push_attribution("/client/wt").unwrap();
+        let context = attribution.semantic.clone().unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::red(1),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+        let outcome = api.get_outcome_v3(&context.attempt_id).unwrap();
+        assert_eq!(
+            outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Failure,
+            "an evidence-store outage must not erase a real code failure"
+        );
+        let Conclusion::Failed {
+            evidence, summary, ..
+        } = outcome.conclusion
+        else {
+            panic!("code red was not retained");
+        };
+        assert!(matches!(
+            evidence.availability,
+            EvidenceAvailability::Unavailable { .. }
+        ));
+        assert!(summary.as_str().contains("code failure retained"));
+        assert_eq!(
+            api.outcome_metrics_v3().unwrap()["evidence_persist_failures"],
+            1
+        );
+    }
+
+    #[test]
+    fn analyzer_blind_result_requires_a_compiler_witness_by_typed_code() {
+        let state_dir = temp_root("outcome-v3-blind");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/view.rs".into()]),
+            semantic: Some(attempt_context("attempt-blind", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &[("src/view.rs".into(), "view! { <div/> }".into())],
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").unwrap();
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api.take_push_attribution("/client/wt").unwrap();
+        let context = attribution.semantic.clone().unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::unknown(
+                "ra_native_timer_settled_no_flycheck_activity",
+            ),
+            attribution.base_sha,
+            true,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let outcome = api.get_outcome_v3(&context.attempt_id).unwrap();
+        assert!(matches!(
+            outcome.conclusion,
+            Conclusion::Indeterminate {
+                cause: IndeterminateCause::CompilerWitnessRequired { .. },
+                retry: RetryDirective::NewInputRequired,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            outcome.reaction.code.as_str(),
+            "indeterminate.compiler_witness_required"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn batch_outcome_v3_is_typed_persisted_and_retry_bounded() {
+        let state_dir = temp_root("batch-outcome-v3");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let request = |attempt_number| {
+            let mut request = BatchCheckRequest::new("physical-batch-42", "origin/dev");
+            request.members = vec![BatchMember::new("member-a")];
+            request.options.semantic = Some(attempt_context(
+                &format!("batch-attempt-{attempt_number}"),
+                attempt_number,
+            ));
+            request
+        };
+
+        let first = api.submit_batch_v3(&request(1)).unwrap();
+        assert_eq!(first.surface, Surface::Batch);
+        assert!(matches!(
+            first.conclusion,
+            Conclusion::Indeterminate {
+                cause: IndeterminateCause::AttributionUnavailable { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            first.reaction.state,
+            cargoless_core::outcome::CheckState::Pending
+        );
+        assert!(
+            api.get_evidence_v3(&first.attempt_id, "batch-report.json")
+                .is_some()
+        );
+
+        let final_attempt = api.submit_batch_v3(&request(3)).unwrap();
+        assert_eq!(
+            final_attempt.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            final_attempt.reaction.code.as_str(),
+            "indeterminate.attribution"
+        );
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        assert_eq!(
+            reopened
+                .get_outcome_v3(&final_attempt.attempt_id)
+                .unwrap()
+                .reaction,
+            final_attempt.reaction
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     fn git_capture(root: &Path, args: &[&str]) -> String {
@@ -4540,6 +5924,7 @@ checks:
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         request.members = members;
         request
@@ -4652,6 +6037,7 @@ checks:
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         request.members = vec![BatchMember::new(member)];
         request
@@ -5829,6 +7215,7 @@ checks:
                 changed_files: None,
                 gate: false,
                 check_ids: None,
+                semantic: None,
             };
             request.members = vec![cargoless_core::batch::BatchMember {
                 worktree: wt.clone(),
@@ -6801,6 +8188,7 @@ checks:
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -6851,6 +8239,7 @@ checks:
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options(
@@ -6909,6 +8298,7 @@ checks:
             changed_files: Some(vec!["src/lib.rs".to_string()]),
             gate: true,
             check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options(
@@ -7148,6 +8538,7 @@ checks:
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -7330,6 +8721,7 @@ checks:
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         // PR-A pushes, then PR-B pushes on the SAME worktree key before the
         // serve loop has consumed A.
@@ -7477,6 +8869,7 @@ checks:
             check_profile: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         api.record_push_attribution("/wt", &pushed("first"));
         api.record_push_attribution("/wt", &pushed("second"));
@@ -7508,6 +8901,7 @@ checks:
             check_profile: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         }
     }
 
@@ -7651,6 +9045,7 @@ checks:
             check_profile: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
         api.record_push_attribution_with_globs(
@@ -7831,6 +9226,7 @@ checks:
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&options));
         assert!(!ack.accepted, "truncation signature must be rejected");
@@ -7856,6 +9252,7 @@ checks:
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack = api.push_overlay_with_options("/wt", "", &[], None, Some(&options));
         assert!(
@@ -7880,6 +9277,7 @@ checks:
             changed_files: Some(vec!["src/removed.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted, "delete-only diff (empty content) must pass");
@@ -8282,6 +9680,7 @@ checks:
             Some("abc123".into()),
             false,
             vec!["wasm-compiler-witness".into(), "fmt".into()],
+            None,
         );
 
         // Retrievable by base_sha with the ran ids intact (the witness polls
@@ -8735,9 +10134,8 @@ checks:
     /// dropping the guard makes the key warm-resolvable again. This is the
     /// serialization interlock that keeps CGLS-24 structurally impossible.
     ///
-    /// KNOWN INTERMITTENT — 2 failures in ~365 sampled `test` runs
-    /// (2026-07-30, tasks 206746 and 207005), with a passing run between them.
-    /// The final assertion fails; the other 340 tests pass.
+    /// This test caught 3 intermittent failures across the 2026-07-30/31 CI
+    /// runs. The final assertion failed while every other test passed.
     ///
     /// LOCALISED TO THE FLOCK RUNG. Task 207005 captured the obs lines, which
     /// map one-to-one onto the three resolves:
@@ -8759,19 +10157,14 @@ checks:
     ///     `warm_flock_second_acquire_contended_until_release` both passed in
     ///     the same run.
     ///
-    /// So an open-file-description still held the lock when #3 opened a new fd,
-    /// and the only one ever created for that path was `first`'s.
-    ///
-    /// STILL NOT ROOT-CAUSED: why the lock outlived the close. `WarmFlock` has
-    /// no explicit `Drop` and relies on `File`'s close to release `flock(2)`.
-    /// Note `warm_flock_second_acquire_contended_until_release` exercises that
-    /// exact acquire/drop/re-acquire cycle directly and passes consistently, so
-    /// the difference is either this guard's field-order drop (`dir`,
-    /// `_in_proc`, `_flock` — flock released last) interacting with timing, or
-    /// something environmental. Not guessing between them here.
-    ///
-    /// Deliberately NOT `#[ignore]`d: at ~2-in-365 a silenced flake stops being
-    /// evidence, and the next occurrence would carry no signal.
+    /// The lifecycle bug was that `WarmTargetGuard` exposed the in-process key
+    /// as idle before releasing its flock: Rust drops struct fields in
+    /// declaration order, and `_in_proc` preceded `_flock`. A racing resolver
+    /// could therefore pass the CAS while the prior file description still
+    /// owned the kernel lock. The guard now explicitly `LOCK_UN`s and closes
+    /// the flock before its idempotent in-process release. This assertion pins
+    /// the complete handoff and remains unignored so that either lock leaking
+    /// becomes a visible regression.
     ///
     /// Until the CI de-dupe landed such a failure was invisible — the duplicate
     /// push/pull_request matrices raced and cancelled each other, so a flaky

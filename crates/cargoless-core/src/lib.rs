@@ -37,6 +37,8 @@ pub mod clustermgr;
 pub mod config;
 pub mod corun;
 pub mod diagnostics_store;
+pub mod evidence;
+pub use cargoless_proto::outcome;
 pub mod idle;
 pub mod l4proxy;
 pub mod lane;

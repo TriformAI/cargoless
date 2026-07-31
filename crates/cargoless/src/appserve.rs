@@ -2107,6 +2107,53 @@ fn resolve_ref(repo: &Path, git_ref: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Process environment is shared by every test thread. Keep all tests that
+    /// exercise `CARGOLESS_APP_PARALLEL_BUILDS` in one critical section and
+    /// restore the caller's value on exit, including panic-unwind.
+    static PARALLEL_BUILDS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ParallelBuildsEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ParallelBuildsEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = PARALLEL_BUILDS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("CARGOLESS_APP_PARALLEL_BUILDS");
+            // SAFETY: every test mutation of this variable holds the shared
+            // lock for the guard's full lifetime.
+            unsafe {
+                match value {
+                    Some(value) => {
+                        std::env::set_var("CARGOLESS_APP_PARALLEL_BUILDS", value);
+                    }
+                    None => std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS"),
+                }
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ParallelBuildsEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: `_lock` remains held until after this Drop body.
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => {
+                        std::env::set_var("CARGOLESS_APP_PARALLEL_BUILDS", previous);
+                    }
+                    None => std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn port_range_parses_and_validates() {
         assert_eq!(
@@ -2352,11 +2399,7 @@ mod tests {
     /// nor the env var is set.
     #[test]
     fn default_off_guard_max_concurrent_is_1() {
-        // Remove the env var in case a parent process set it.
-        // SAFETY: env mutation is inherently racy with parallel tests; these
-        // tests only assert `resolve_max_concurrent` logic and the window is
-        // minimal. set_var/remove_var are unsafe in Edition 2024.
-        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        let _env = ParallelBuildsEnvGuard::set(None);
         let opts = AppServeOpts::default(); // max_concurrent_builds = 0
         assert_eq!(
             resolve_max_concurrent(&opts),
@@ -2368,7 +2411,7 @@ mod tests {
     /// The CLI flag overrides the default.
     #[test]
     fn max_concurrent_flag_overrides_default() {
-        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        let _env = ParallelBuildsEnvGuard::set(None);
         let opts = AppServeOpts {
             max_concurrent_builds: 2,
             ..Default::default()
@@ -2379,18 +2422,16 @@ mod tests {
     /// The env var is read when the flag is absent.
     #[test]
     fn max_concurrent_env_var_is_read() {
-        // SAFETY: single-threaded env mutation; unsafe in Edition 2024.
-        unsafe { std::env::set_var("CARGOLESS_APP_PARALLEL_BUILDS", "2") };
+        let _env = ParallelBuildsEnvGuard::set(Some("2"));
         let opts = AppServeOpts::default();
         let result = resolve_max_concurrent(&opts);
-        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
         assert_eq!(result, 2);
     }
 
     /// The cap of 2 is enforced even if a higher value is requested.
     #[test]
     fn max_concurrent_capped_at_2() {
-        unsafe { std::env::remove_var("CARGOLESS_APP_PARALLEL_BUILDS") };
+        let _env = ParallelBuildsEnvGuard::set(None);
         let opts = AppServeOpts {
             max_concurrent_builds: 99,
             ..Default::default()
