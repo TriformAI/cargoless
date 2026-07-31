@@ -3742,7 +3742,13 @@ checks:
     required: false
     output: cargo-json
     timeout_ms: 20000
-    command: ["bash", "-lc", "printf '%s\\n' '{\"reason\":\"compiler-message\",\"message\":{\"level\":\"error\",\"message\":\"advisory boom\",\"spans\":[{\"file_name\":\"src/advisory.rs\",\"line_start\":1,\"column_start\":1,\"is_primary\":true}]}}'; exit 1"]
+    # `echo`, NOT `printf '%s\n'`. `unquote_yaml` replaces `\n` BEFORE `\\`, so
+    # a `\\n` written here becomes a real newline rather than a literal
+    # backslash-n — which split the printf format string across two lines and
+    # emitted nothing parseable. Caught by the fixture-precondition assertion
+    # below, which is exactly the job it exists for. `echo` supplies the
+    # trailing newline anyway, so the escape was never needed.
+    command: ["bash", "-lc", "echo '{\"reason\":\"compiler-message\",\"message\":{\"level\":\"error\",\"message\":\"advisory boom\",\"spans\":[{\"file_name\":\"src/advisory.rs\",\"line_start\":1,\"column_start\":1,\"is_primary\":true}]}}'; exit 1"]
     cache: none
   - id: bb-real
     kind: command
