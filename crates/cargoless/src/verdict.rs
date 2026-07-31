@@ -635,6 +635,7 @@ mod tests {
             base_sha: base_sha.map(str::to_string),
             ra_blind_paths: false,
             gated_checks_ran: Vec::new(),
+            red_files: Vec::new(),
             heartbeat_age_secs: 1,
             published_at,
         }
@@ -1002,6 +1003,7 @@ mod tests {
                 base_sha: Some(self.sha.clone()),
                 ra_blind_paths: false,
                 gated_checks_ran: Vec::new(),
+                red_files: Vec::new(),
                 heartbeat_age_secs: 0,
                 published_at: 2000,
             })

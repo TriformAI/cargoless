@@ -276,9 +276,38 @@ pub struct WorktreeStatus {
     /// verdicts ran no project checks and leave it empty too. Additive wire
     /// key; omitted on the wire when empty (same discipline as `base_sha`).
     pub gated_checks_ran: Vec<String>,
+    /// The distinct source files carrying the error-severity diagnostics
+    /// behind a RED verdict — repo-relative where derivable, sorted, capped
+    /// at [`RED_FILES_CAP`]. Empty on green/unknown, and empty on a red the
+    /// daemon could not attribute to files.
+    ///
+    /// **Why a terse payload carries this at all.** `red_diagnostics` is a
+    /// COUNT, and the asymmetric principle (terse status, detail on demand
+    /// via `get_diagnostics`) assumes the detail channel is addressable to
+    /// the same subject. On the tf-multiverse witness it is not: every PR
+    /// shares ONE worktree key, so `GET /worktrees/<wt>/diagnostics` returns
+    /// whichever branch published last. `WorktreeStatus`, by contrast, is
+    /// resolved out of the base_sha-addressable ring
+    /// (`get_status_attributed`) and therefore belongs to the asking commit.
+    /// Riding the file list on the attributed record is what makes it
+    /// *this PR's* files rather than *a* PR's files.
+    ///
+    /// Files, not messages, deliberately: a path is what a reader diffs
+    /// against their own changed-file set to answer "is this red mine?",
+    /// and it keeps the status payload bounded. Full
+    /// `file:line:col:code:message` detail stays on `get_diagnostics`.
+    ///
+    /// Additive wire key; omitted when empty (same discipline as `base_sha`
+    /// and `gated_checks_ran`), so pre-existing clients see no new key.
+    pub red_files: Vec<String>,
     pub heartbeat_age_secs: u64,
     pub published_at: u64,
 }
+
+/// Max distinct files named in [`WorktreeStatus::red_files`]. A status
+/// payload is a status payload — the authoritative count stays in
+/// `red_diagnostics` and the unbounded detail on `get_diagnostics`.
+pub const RED_FILES_CAP: usize = 12;
 
 /// Light per-worktree summary for `list_worktrees` (§10.1) — just enough
 /// for a dashboard without the heavy diagnostics payload (asymmetric
@@ -1510,6 +1539,19 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
                 ),
             );
     }
+    if !s.red_files.is_empty() {
+        obj.as_object_mut()
+            .expect("status_to_json constructed an object literal")
+            .insert(
+                "red_files".to_string(),
+                serde_json::Value::Array(
+                    s.red_files
+                        .iter()
+                        .map(|f| serde_json::Value::String(f.clone()))
+                        .collect(),
+                ),
+            );
+    }
     obj.to_string()
 }
 
@@ -1552,6 +1594,15 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .unwrap_or(false),
         gated_checks_ran: v
             .get("gated_checks_ran")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        red_files: v
+            .get("red_files")
             .and_then(serde_json::Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -1980,6 +2031,13 @@ mod tests {
             // gated_checks_ran case: the witness asserts a specific id is
             // present; a populated list must survive the wire in order.
             gated_checks_ran: vec!["wasm-compiler-witness".into(), "fmt".into()],
+            // red_files case: the whole point of the field is that a poller
+            // can diff these against its own changed-file list, so they must
+            // survive the wire verbatim and in order.
+            red_files: vec![
+                "portal/src/canvas/mod.rs".into(),
+                "portal/src/canvas/relationship_tiles.rs".into(),
+            ],
             heartbeat_age_secs: 2,
             published_at: 1234567890,
         };
@@ -1991,6 +2049,12 @@ mod tests {
         assert!(
             wire.contains(r#""gated_checks_ran":["wasm-compiler-witness","fmt"]"#),
             "ran-check ids must appear on the wire in order: {wire}"
+        );
+        assert!(
+            wire.contains(
+                r#""red_files":["portal/src/canvas/mod.rs","portal/src/canvas/relationship_tiles.rs"]"#
+            ),
+            "red files must appear on the wire in order: {wire}"
         );
         assert_eq!(status_from_json(&wire), Some(s));
 
@@ -2017,6 +2081,9 @@ mod tests {
             // Empty ran-checks (coalesced / RA-native) ⇒ key absent on the
             // wire, same additive discipline as base_sha.
             gated_checks_ran: Vec::new(),
+            // A red the daemon could not attribute to files ⇒ key absent on
+            // the wire. Honest: no files named beats files guessed.
+            red_files: Vec::new(),
             heartbeat_age_secs: 0,
             published_at: 42,
         };
@@ -2032,6 +2099,10 @@ mod tests {
         assert!(
             !wire.contains("gated_checks_ran"),
             "empty gated_checks_ran must not appear on the wire (additive contract): {wire}"
+        );
+        assert!(
+            !wire.contains("red_files"),
+            "empty red_files must not appear on the wire (additive contract): {wire}"
         );
         assert_eq!(status_from_json(&wire), Some(s2));
     }

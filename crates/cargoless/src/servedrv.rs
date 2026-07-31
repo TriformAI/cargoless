@@ -2401,6 +2401,12 @@ fn run_project_checks_and_log(
                         ran_check_ids,
                     )
                 } else {
+                    // Retain the detail behind this red before it collapses
+                    // to a bare count. The eprintln above already prints
+                    // path/line/code/message — but only to pod stderr, which
+                    // the CI job reading /status cannot reach. Same data,
+                    // put where the client can query it.
+                    api.retain_red_diagnostics(&wt.to_string_lossy(), &report.diagnostics);
                     (ProjectCheckSummary::Red { error_count }, ran_check_ids)
                 }
             } else {

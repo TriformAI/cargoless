@@ -502,7 +502,43 @@ pub struct ServeVerdictState {
     /// RAII release needs no lifetime gymnastics: the guard holds the `Arc`
     /// and stores `false` on drop. Keyed by the warm-dir key.
     warm_target_locks: Mutex<BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Per-worktree retained RED diagnostics — the `get_diagnostics(wt)`
+    /// backing store, and the reason `GET /worktrees/<wt>/diagnostics`
+    /// stops being a stub.
+    ///
+    /// **Why this exists (the "reds nobody can attribute" class).** The
+    /// status payload is deliberately terse: `verdict` + a `red_diagnostics`
+    /// COUNT. That is the documented sidecar discipline — until it meets a
+    /// shared worktree key. The tf-multiverse incremental witness routes
+    /// every PR through ONE worktree key, so a PR author reads
+    /// `RED (1 diagnostics)` with no file, no line, no message, and no way
+    /// to tell their own break from an inherited one. The rational response
+    /// to an unattributable red is to assume it is not yours and wait, so
+    /// reds sit. Measured 2026-07-30: a verdict stamped with a PR's base_sha
+    /// whose `red_diagnostics` climbed 1→2→3 while that PR's SHA never moved.
+    /// A count cannot show that; a file path can.
+    ///
+    /// The daemon has always HAD this detail — `run_project_checks_and_log`
+    /// prints `file_path`/`line`/`code`/`message` to stderr and then drops
+    /// it on the floor when composing the verdict. Pod stderr is not
+    /// reachable by the CI job that needs it. This retains the same list
+    /// on the state the transport already queries.
+    ///
+    /// Mirrors [`cargoless_core::diagnostics_store`]'s asymmetric-honesty
+    /// invariant (#176) in memory: a GREEN transition **overwrites with an
+    /// empty vec** rather than leaving the prior red list to be re-served
+    /// as a false red. Retention is bounded to
+    /// [`RETAINED_DIAGNOSTICS_CAP`] per worktree — a red with 4000
+    /// diagnostics must not turn this map into the daemon's memory
+    /// problem, and the first N are what a human reads anyway (the
+    /// authoritative total stays in `red_diagnostics`).
+    retained_diagnostics: Mutex<BTreeMap<String, Vec<Diagnostic>>>,
 }
+
+/// Max retained diagnostics per worktree (see `retained_diagnostics`).
+/// The full count remains authoritative in `WorktreeStatus::red_diagnostics`;
+/// this bounds only how many carry their file/line/message detail.
+pub(crate) const RETAINED_DIAGNOSTICS_CAP: usize = 64;
 
 #[derive(Default)]
 struct DrainState {
@@ -1292,6 +1328,81 @@ impl ServeVerdictState {
         self.ready.store(true, Ordering::Relaxed);
     }
 
+    /// Retain the error-severity diagnostics behind a RED verdict so
+    /// `get_diagnostics(wt)` / `GET /worktrees/<wt>/diagnostics` can name
+    /// the files instead of only counting them. See the
+    /// `retained_diagnostics` field doc for why a count alone leaves reds
+    /// unattributable on a shared worktree key.
+    ///
+    /// Warnings and other non-error severities are filtered out here: the
+    /// verdict is composed from error-severity diagnostics only
+    /// (`ProjectCheckSummary::Red { error_count }`), so retaining anything
+    /// else would let a reader attribute a red to a file that merely has a
+    /// warning in it — precisely the misattribution this is meant to end.
+    pub(crate) fn retain_red_diagnostics(&self, worktree: &str, diagnostics: &[Diagnostic]) {
+        let errors: Vec<Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .take(RETAINED_DIAGNOSTICS_CAP)
+            .cloned()
+            .collect();
+        poisoned(&self.retained_diagnostics).insert(worktree.to_string(), errors);
+    }
+
+    /// Drop any retained diagnostics for `worktree` — the GREEN/UNKNOWN
+    /// transition half of the asymmetric-honesty invariant (#176).
+    ///
+    /// This must run on EVERY non-red publish, not just green: a stale red
+    /// list outliving the red that produced it re-serves a false red, which
+    /// is the exact failure class cargoless exists to eliminate. Inserting
+    /// an empty vec rather than removing the key keeps "we published for
+    /// this worktree and it has nothing actionable" distinguishable from
+    /// "never heard of this worktree" (`None`), matching the on-disk
+    /// store's `[]`-sentinel choice.
+    pub(crate) fn clear_red_diagnostics(&self, worktree: &str) {
+        poisoned(&self.retained_diagnostics).insert(worktree.to_string(), Vec::new());
+    }
+
+    /// The distinct files carrying this worktree's retained RED diagnostics,
+    /// rendered relative to the worktree root, sorted, capped at
+    /// [`cargoless_core::transport::RED_FILES_CAP`].
+    ///
+    /// **Relative, not absolute, on purpose.** The consumer's question is
+    /// "does this red touch a file I changed?", answered by comparing
+    /// against a repo-relative changed-file list. Diagnostics arrive as
+    /// absolute paths under the daemon's analysis root — which is a
+    /// server-side scratch/overlay directory that means nothing to the
+    /// client — so a raw absolute path would never match and would leak the
+    /// daemon's layout. `strip_prefix` against the worktree key normalises
+    /// it; a path outside that root (nothing guarantees one) falls back to
+    /// its own string rather than being dropped, since a weird path is
+    /// still better evidence than no path.
+    ///
+    /// Sorted + deduped so the same red produces the same list across polls
+    /// — an unstable list would read as "the red changed" when it did not,
+    /// which is the confusion this whole change exists to remove.
+    pub(crate) fn red_files_for(&self, worktree: &str) -> Vec<String> {
+        let root = Path::new(worktree);
+        let store = poisoned(&self.retained_diagnostics);
+        let Some(diags) = store.get(worktree) else {
+            return Vec::new();
+        };
+        let mut files: Vec<String> = diags
+            .iter()
+            .map(|d| {
+                d.file_path
+                    .strip_prefix(root)
+                    .unwrap_or(&d.file_path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        files.sort();
+        files.dedup();
+        files.truncate(cargoless_core::transport::RED_FILES_CAP);
+        files
+    }
+
     /// Unattributed convenience wrapper over [`Self::publish_attributed`]
     /// (`base_sha: None`) — the entry point for callers without a push to
     /// attribute (tests, embedded use). servedrv's one `publish_verdict`
@@ -1361,6 +1472,29 @@ impl ServeVerdictState {
         let red_diagnostics = payload.red_diagnostics;
         let failure_reason = payload.analysis_failure_reason.clone();
         let published_at = crate::statusfile::now_unix();
+        // Asymmetric-honesty invariant (#176), in-memory half. EVERY publish
+        // funnels through here, so this is the one place that can guarantee a
+        // retained red list never outlives the red that produced it. A
+        // non-red publish clears; a red keeps whatever the project-check path
+        // retained moments earlier (`retain_red_diagnostics`, called on the
+        // producing thread before the summary collapses to a count).
+        //
+        // Clearing on unknown as well as green is deliberate: "the gate could
+        // not evaluate" must not serve the PREVIOUS run's diagnostics as if
+        // they were current evidence — that is a false red wearing an
+        // honest verdict, the worst of the pair.
+        if verdict_color != "red" {
+            self.clear_red_diagnostics(&worktree);
+        }
+        // Snapshot the files behind THIS red onto the attributed record.
+        // Read after the clear above so a non-red publish can only ever
+        // produce an empty list — the ordering is the invariant, not a
+        // coincidence.
+        let red_files = if verdict_color == "red" {
+            self.red_files_for(&worktree)
+        } else {
+            Vec::new()
+        };
         let status = WorktreeStatus {
             worktree: worktree.clone(),
             verdict: verdict_color.clone(),
@@ -1379,6 +1513,10 @@ impl ServeVerdictState {
             // FS-watch / coalesced / RA-native verdicts (no enumerated
             // report) ⇒ absent on the wire (additive, same as base_sha).
             gated_checks_ran,
+            // The files behind the red, carried on the base_sha-addressable
+            // record so a poller sharing this worktree key reads ITS OWN
+            // commit's files. Empty ⇒ absent on the wire.
+            red_files,
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -1935,6 +2073,14 @@ impl ServeVerdictState {
                                 ran_check_ids,
                             )
                         } else {
+                            // Retain the detail behind this red BEFORE it
+                            // collapses to a bare count. This is the
+                            // coalesced/batch path — the one the
+                            // tf-multiverse witness gate actually takes
+                            // (batch_id=coalesced:witness-gate:*), so
+                            // skipping it here would leave the reds that
+                            // most need attribution still anonymous.
+                            self.retain_red_diagnostics(&wt_key, &m.diagnostics);
                             (
                                 crate::servedrv::ProjectCheckSummary::Red { error_count },
                                 ran_check_ids,
@@ -2179,13 +2325,21 @@ impl VerdictService for ServeVerdictState {
             .map(|s| s.verdict.clone())
     }
 
-    fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
-        // Honest Inc-0 boundary: the serve loop does not yet thread
-        // `diagnostics_store` retention (a later increment). Empty here is
-        // the *correct* answer for the state the loop computes — never a
-        // fabricated diagnostic. (`get_diagnostics` empty ⇒ "no detail",
-        // the same contract `transport` documents for green/unknown.)
-        Vec::new()
+    fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic> {
+        // The Inc-0 boundary this used to document (`Vec::new()`
+        // unconditionally, "the serve loop does not yet thread retention")
+        // is now closed: the project-check paths call
+        // `retain_red_diagnostics` on RED and `clear_red_diagnostics` on
+        // every non-red publish, so this returns the real list.
+        //
+        // Empty remains the honest answer for green/unknown, for a red the
+        // daemon could not attribute, and for a worktree never published —
+        // the same "no detail" contract `transport` documents. It is never
+        // a fabricated diagnostic, and it is never a stale one.
+        poisoned(&self.retained_diagnostics)
+            .get(worktree)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn list_worktrees(&self) -> Vec<WorktreeSummary> {
@@ -6735,6 +6889,146 @@ checks:
         assert!(
             !cargoless_core::transport::status_to_json(&plain).contains("gated_checks_ran"),
             "empty ran-checks list is absent on the wire (additive contract)"
+        );
+    }
+
+    /// Build an error-severity diagnostic at `path` for the retention tests.
+    fn diag_at(path: &str) -> Diagnostic {
+        Diagnostic {
+            file_path: PathBuf::from(path),
+            line: 1,
+            col: 1,
+            severity: Severity::Error,
+            code: Some("E0308".into()),
+            message: "mismatched types".into(),
+            source: Some("rustc".into()),
+        }
+    }
+
+    #[test]
+    fn red_files_name_the_files_on_the_attributed_status() {
+        // THE POINT OF THE CHANGE. Before this, a RED published a bare count
+        // ("1 diagnostics") and a PR author had no way to tell an inherited
+        // red from their own — so reds sat. The files must reach the status
+        // the poller actually reads: the base_sha-addressable one.
+        let api = ServeVerdictState::new();
+        let wt = Path::new("/workspace/tf-multiverse");
+        api.retain_red_diagnostics(
+            "/workspace/tf-multiverse",
+            &[
+                diag_at("/workspace/tf-multiverse/portal/src/canvas/mod.rs"),
+                diag_at("/workspace/tf-multiverse/portal/src/api/canvas.rs"),
+                // Same file twice ⇒ named once (a reader wants files, not
+                // diagnostic count — the count already has its own field).
+                diag_at("/workspace/tf-multiverse/portal/src/canvas/mod.rs"),
+                // A warning must NOT contribute: the verdict is composed from
+                // error-severity only, so naming a warning-only file here
+                // would misattribute the red to it.
+                Diagnostic {
+                    severity: Severity::Warning,
+                    ..diag_at("/workspace/tf-multiverse/portal/src/warned_only.rs")
+                },
+            ],
+        );
+        api.publish_attributed_with_checks(
+            wt,
+            crate::statusfile::VerdictPayload::red(3),
+            Some("abc123".into()),
+            false,
+            vec!["ssr-compiler-witness".into()],
+        );
+
+        let by_sha = api
+            .get_status_attributed("/workspace/tf-multiverse", Some("abc123"))
+            .expect("verdict retrievable by its base_sha");
+        assert_eq!(
+            by_sha.red_files,
+            vec![
+                "portal/src/api/canvas.rs".to_string(),
+                "portal/src/canvas/mod.rs".to_string(),
+            ],
+            "red files are repo-relative, sorted, deduped, errors-only"
+        );
+        let wire = cargoless_core::transport::status_to_json(&by_sha);
+        assert!(
+            wire.contains(r#""red_files":["portal/src/api/canvas.rs","portal/src/canvas/mod.rs"]"#),
+            "red files reach the wire the CI job parses: {wire}"
+        );
+    }
+
+    #[test]
+    fn green_publish_clears_retained_red_files() {
+        // Asymmetric-honesty invariant (#176): a red list that outlives its
+        // red re-serves a FALSE red — worse than no detail at all. A
+        // subsequent non-red publish on the same worktree key must clear.
+        let api = ServeVerdictState::new();
+        let wt = Path::new("/wt");
+        api.retain_red_diagnostics("/wt", &[diag_at("/wt/src/broken.rs")]);
+        api.publish_attributed_with_checks(
+            wt,
+            crate::statusfile::VerdictPayload::red(1),
+            Some("red-sha".into()),
+            false,
+            Vec::new(),
+        );
+        assert!(!api.red_files_for("/wt").is_empty(), "red retained");
+
+        api.publish_attributed(
+            wt,
+            crate::statusfile::VerdictPayload::green(),
+            Some("green-sha".into()),
+            false,
+        );
+        assert!(
+            api.red_files_for("/wt").is_empty(),
+            "a green publish clears the retained red list"
+        );
+        assert!(
+            api.get_diagnostics("/wt").is_empty(),
+            "and get_diagnostics stops serving the stale red"
+        );
+        let green = api
+            .get_status_attributed("/wt", Some("green-sha"))
+            .expect("green verdict present");
+        assert!(green.red_files.is_empty(), "a green status names no files");
+        assert!(
+            !cargoless_core::transport::status_to_json(&green).contains("red_files"),
+            "empty red_files is absent on the wire (additive contract)"
+        );
+
+        // Unknown clears too: "the gate could not evaluate" must never be
+        // dressed in the previous run's evidence.
+        api.retain_red_diagnostics("/wt", &[diag_at("/wt/src/broken.rs")]);
+        api.publish_attributed(
+            wt,
+            crate::statusfile::VerdictPayload::unknown("overlay_apply_error"),
+            Some("unknown-sha".into()),
+            false,
+        );
+        assert!(
+            api.red_files_for("/wt").is_empty(),
+            "an unknown publish clears the retained red list too"
+        );
+    }
+
+    #[test]
+    fn retained_red_diagnostics_are_capped() {
+        // A red with thousands of diagnostics must not become the daemon's
+        // memory problem, and the status payload must stay a status payload.
+        // The authoritative total lives in `red_diagnostics`, not here.
+        let api = ServeVerdictState::new();
+        let many: Vec<Diagnostic> = (0..(RETAINED_DIAGNOSTICS_CAP * 4))
+            .map(|i| diag_at(&format!("/wt/src/f{i}.rs")))
+            .collect();
+        api.retain_red_diagnostics("/wt", &many);
+        assert_eq!(
+            api.get_diagnostics("/wt").len(),
+            RETAINED_DIAGNOSTICS_CAP,
+            "retention is bounded per worktree"
+        );
+        assert!(
+            api.red_files_for("/wt").len() <= cargoless_core::transport::RED_FILES_CAP,
+            "the status payload names at most RED_FILES_CAP files"
         );
     }
 
