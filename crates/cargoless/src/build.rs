@@ -240,6 +240,19 @@ pub fn run(cfg: &Config, out: Option<&Path>) -> ExitCode {
             let crates = if pc.all_errors_attributed {
                 pc.verdicts
             } else {
+                // Omitting `crates=` is correct (a partial map reads as
+                // falsely-all-green) — but silently omitting it ALSO left
+                // `red_diagnostics=N` with nothing to attribute it to. Name
+                // the offenders on the way past so the status is not the
+                // only surviving record.
+                if !pc.unattributed_errors.is_empty() {
+                    eprintln!(
+                        "[cargoless:obs] unattributed-red root={} error_count={} at={}",
+                        root_for_status.display(),
+                        pc.error_count,
+                        pc.unattributed_errors.join(" ")
+                    );
+                }
                 Vec::new()
             };
             (crates, pc.error_count)
