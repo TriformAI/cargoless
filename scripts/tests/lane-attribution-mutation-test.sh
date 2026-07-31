@@ -108,6 +108,43 @@ mutate "line-sensitive ejection identity" \
   's = s.replace("let fingerprints = fingerprint_counts(&self.root, &owned);", "let mut fingerprints = fingerprint_counts(&self.root, &owned); for d in &owned { fingerprints.insert(format!(\"line:{}\", d.line), 1); }", 1)' \
   "puts line numbers back into the ejection identity, so an unrelated insertion above an error re-blames it"
 
+# 5. The infra retry has no backoff. THIS IS WHAT SHIPPED, and it reached a
+#    real deployment: every candidate failed to materialize, the requeued
+#    members were eligible again instantly, and the lane rebuilt roughly every
+#    2.5 seconds forever while `GET /lane` showed a steady `phase=building` —
+#    indistinguishable from a slow compile. No test failed, because no test
+#    asserted that a retry WAITS.
+mutate "infra retry has no backoff (the hot loop)" \
+  's = s.replace("self.infra_retry_after =\n                    Some(self.now.saturating_add(self.cfg.infra_backoff_ticks));", "self.infra_retry_after = None;", 1)' \
+  "retries an infrastructure failure instantly and forever, burning the machine while reporting a phase indistinguishable from a long build"
+
+# 6. The attempt cap never trips, so a PERMANENT infra failure retries forever.
+#    A member whose head commit the daemon cannot reach never becomes buildable
+#    by waiting; retrying it blocks every later submission behind it.
+mutate "infra attempts are unbounded" \
+  's = s.replace("if self.infra_failures >= self.cfg.infra_max_attempts {", "if false {", 1)' \
+  "never gives up on a permanently-broken candidate, so the queue is blocked indefinitely by a build that cannot succeed"
+
+# 7. The failure streak survives a good build. Then a lane hitting the odd
+#    transient over hours eventually ejects a member that never did anything
+#    wrong, for failures spread across unrelated builds.
+mutate "infra streak is not reset by a non-infra outcome" \
+  's = s.replace("if !matches!(outcome, LaneBuildOutcome::Infra { .. }) {\n            self.infra_failures = 0;\n            self.infra_retry_after = None;\n        }", "", 1)' \
+  "accumulates infra failures across successful builds, so an occasional transient eventually ejects an innocent member"
+
+# 8. An infra ejection reports as Unattributed. Those two mean opposite things
+#    to the author who reads them: unattributed says the tree is red and the
+#    owner is unknown (their code IS implicated), infrastructure says nothing
+#    was ever compiled. Conflating them sends someone hunting a bug that was
+#    never diagnosed.
+#    Swapping only the variant head works because both variants carry
+#    `shared_with` — the tail of the initialiser type-checks unchanged, so this
+#    compiles and produces exactly the wrong classification rather than a build
+#    error (a mutation that fails to compile proves nothing).
+mutate "infra ejection masquerades as an unattributed code red" \
+  's = s.replace("reason: EjectReason::Infrastructure {\n                                reason: reason.clone(),\n                                attempts,", "reason: EjectReason::Unattributed {\n                                fingerprints: Default::default(),", 1)' \
+  "reports a build that never ran as a code verdict, so an author debugs a failure that was never diagnosed"
+
 # ── the staging engine ───────────────────────────────────────────────────
 #
 # `stage` / `fail_fast` / `target_key` live in project_checks.rs, not lane.rs,
