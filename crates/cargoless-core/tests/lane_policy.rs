@@ -606,15 +606,21 @@ fn a_persistent_infra_failure_stops_retrying_and_ejects() {
         matches!(reason, EjectReason::Infrastructure { .. }),
         "an infra ejection must not masquerade as a code verdict: {reason:?}"
     );
+    // Borrow rather than destructure by value: `reason` is used again below for
+    // `describe()` and `fingerprints()`, and moving the `String` out here would
+    // leave it partially moved.
     let EjectReason::Infrastructure {
         reason: why,
         attempts,
         ..
-    } = reason
+    } = &reason
     else {
         unreachable!("just asserted the variant")
     };
-    assert_eq!(attempts, INFRA_MAX_ATTEMPTS, "it reports how many it tried");
+    assert_eq!(
+        *attempts, INFRA_MAX_ATTEMPTS,
+        "it reports how many it tried"
+    );
     assert!(
         why.contains("could not be merged"),
         "and carries the build's own words so an operator can fix the cause: {why}"
