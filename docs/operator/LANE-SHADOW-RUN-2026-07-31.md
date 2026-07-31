@@ -118,6 +118,57 @@ appeared to contain none of its members. Always pass `-C <worktree>` *and* an
 explicit rev; `git log` with an ambient cwd will answer about a different repo
 without complaining.
 
+## Defect 3 — the build reported its verdict nowhere
+
+The corrected run compiled for **76 minutes** and then left nothing readable.
+`GET /lane` reports only current state (it went straight back to
+`phase=idle`), `LaneAction::Report` is `Vec::new()` in the driver, and
+`CandidateTree::release` removes the candidate worktree — and with it the
+target dir and every artifact — the moment the build ends. Ten minutes later
+there was no way to tell green from red from inside the pod.
+
+That is fatal to the exercise: a shadow run whose verdict cannot be read cannot
+be compared against `dev-staging-build`, which is the only reason to run one.
+
+Fixed by writing `<state_dir>/lane-runs.log` — one `[cargoless:obs]` line per
+leg (id, tree, required, elapsed_ms) plus one per build outcome. The data was
+already being computed and thrown away: `LegOutcome.legs` carried all of it and
+`run_build` discarded it through two `..` patterns.
+
+The shape is the witness's, not a new invention:
+`scripts/ci/_witness_leg_obs.sh` already appends
+`[cargoless:obs] witness-leg id=… elapsed_s=… rc=…` to `witness-legs.log` in
+the same state dir, for the same reason.
+
+## What this run says about the three pipes
+
+The lane was built as though tf-multiverse had nothing, and each defect above
+was a rediscovery of something the repo already solved:
+
+| defect | already solved in |
+|---|---|
+| PR heads unreachable | `merge-train-controller` fetches per member |
+| infra retry with no backoff/cap | preview tier's ENOSPC non-latching red + retry cap (PR #73) |
+| verdict not persisted | the witness's `witness-legs.log` |
+| wasm-bindgen skew | `build-portal.sh`'s `wbg_bin()` self-heal (PR #5876 + #5877) |
+| build an unmerged ref in isolation | the **preview tier** — `POST /instances`, worktree per instance, exact-sha pin, manifest-driven steps, artifact bundle |
+
+Two further facts the comparison surfaced, both acted on:
+
+* **Coverage.** The lane's three legs miss `feature="csr"`, `cfg(test)` and
+  `feature="vsock"` — the cones behind a ~6h triform.dev outage, 5.5 weeks of
+  silent portal test rot, and an 8-day isolation-bake freeze. Three legs added
+  (`agent/lane-cfg-cone-legs`), bringing the set to exactly
+  `merge-train-candidate.yml`'s five plus bindgen.
+* **Where it compiles.** `ProfileLegRunner` ran `cargo build` on unmerged
+  member code inside a pod holding `FORGEJO_TOKEN`. `cargo` executes `build.rs`
+  and proc-macros, so "we only compile it" is false —
+  `merge-train-candidate.yml` exists precisely to prevent that, and its
+  credential-free contract is test-pinned. The daemon also carries
+  wasm-bindgen 0.2.114 against a workspace that resolves 0.2.118, where the
+  deploy builder pins the right one. Compilation belongs in the builder;
+  the shadow's in-daemon execution was expedient for one run, not the design.
+
 ## Still open
 
 * The comparison itself: lane verdict vs `dev-staging-build` for the same
