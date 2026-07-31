@@ -1520,6 +1520,13 @@ impl ServeVerdictState {
         // Two spawn calls rather than one over a boxed lander: `LaneHost::spawn`
         // is generic, so each branch monomorphises its own driver and neither
         // needs dynamic dispatch on a path that runs once at boot.
+        // The verdict trail, beside the witness's own `witness-legs.log` in the
+        // same state dir. A lane build is tens of minutes and the candidate
+        // worktree (with its target dir) is destroyed the moment it ends, so
+        // without this there is nothing left to read afterwards — measured on
+        // the first shadow run, which compiled for 76 minutes and left no
+        // recoverable verdict.
+        let trail = state_dir.join("lane-runs.log");
         self.lane = Some(if publishing {
             LaneHost::spawn(
                 LaneState::new(repo),
@@ -1527,7 +1534,8 @@ impl ServeVerdictState {
                     tree,
                     legs,
                     cargoless_core::lanedrv::PointerLander::new(repo),
-                ),
+                )
+                .with_trail(trail),
             )
         } else {
             LaneHost::spawn(
@@ -1536,7 +1544,8 @@ impl ServeVerdictState {
                     tree,
                     legs,
                     cargoless_core::lanedrv::ReportOnlyLander,
-                ),
+                )
+                .with_trail(trail),
             )
         });
         self

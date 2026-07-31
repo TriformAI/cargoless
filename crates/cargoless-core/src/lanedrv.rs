@@ -34,7 +34,9 @@
 //! blames people for a runner dying, which is how a fleet learns to distrust
 //! its own gate.
 
+use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use cargoless_proto::TreeState;
@@ -333,11 +335,62 @@ pub struct LaneDriver<T, R, L> {
     pub tree: T,
     pub legs: R,
     pub lander: L,
+    /// Append one line per leg and one per build outcome here. `None` = no
+    /// trail (the default, and what every unit test wants).
+    ///
+    /// This exists because the first real shadow run compiled for 76 minutes
+    /// and reported its verdict NOWHERE. `GET /lane` shows only current state,
+    /// and `CandidateTree::release` removes the worktree — and its target dir —
+    /// the moment the build ends, so afterwards there was no way to tell green
+    /// from red from inside the pod. A build whose result is unreadable ten
+    /// minutes later cannot be compared against anything, which defeats the
+    /// entire purpose of shadowing it.
+    ///
+    /// Shape deliberately copied from tf-multiverse's
+    /// `scripts/ci/_witness_leg_obs.sh`, which solved this for the witness
+    /// tier: one `[cargoless:obs]` line per leg, greppable, appended. Same
+    /// vocabulary means an operator already knows how to read it.
+    pub trail: Option<PathBuf>,
 }
 
 impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     pub fn new(tree: T, legs: R, lander: L) -> Self {
-        Self { tree, legs, lander }
+        Self {
+            tree,
+            legs,
+            lander,
+            trail: None,
+        }
+    }
+
+    /// Record every leg and every build outcome to `path`.
+    #[must_use]
+    pub fn with_trail(mut self, path: impl Into<PathBuf>) -> Self {
+        self.trail = Some(path.into());
+        self
+    }
+
+    /// Append one line. Best-effort by contract: a trail is evidence ABOUT a
+    /// build, never a precondition for one. A full disk or an unwritable state
+    /// dir must not turn a green candidate into a failure — that would make the
+    /// observability the outage.
+    fn trail_line(&self, line: &str) {
+        let Some(path) = self.trail.as_deref() else {
+            return;
+        };
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    fn record_legs(&self, generation: u64, legs: &[LegReport]) {
+        for leg in legs {
+            self.trail_line(&format!(
+                "[cargoless:obs] lane-leg generation={generation} id={} tree={:?} \
+                 required={} elapsed_ms={}",
+                leg.id, leg.tree, leg.required, leg.duration_ms
+            ));
+        }
     }
 
     /// Execute `action`. Returns the event to feed back, if any.
@@ -384,14 +437,26 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             v
         };
 
+        self.trail_line(&format!(
+            "[cargoless:obs] lane-build-start generation={generation} members={}",
+            members
+                .iter()
+                .map(|m| format!("{}@{}", m.id, m.head))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+
         let root = match self.tree.materialize(members) {
             Ok(r) => r,
             Err(e) => {
+                let reason = format!("candidate tree could not be materialized: {e}");
+                self.trail_line(&format!(
+                    "[cargoless:obs] lane-build generation={generation} outcome=infra \
+                     reason={reason}"
+                ));
                 return LaneEvent::BuildFinished {
                     generation,
-                    outcome: LaneBuildOutcome::Infra {
-                        reason: format!("candidate tree could not be materialized: {e}"),
-                    },
+                    outcome: LaneBuildOutcome::Infra { reason },
                 };
             }
         };
@@ -403,25 +468,55 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             // and say why — the same no-vacuous-red discipline `statusfile`
             // applies when a red arrives without evidence.
             Ok(LegOutcome {
-                tree, diagnostics, ..
-            }) if tree == TreeState::Red && diagnostics.is_empty() => LaneBuildOutcome::Infra {
-                reason: "build reported red with no diagnostics — cannot attribute; \
-                         treating as infrastructure rather than blaming a member"
-                    .to_string(),
-            },
+                tree,
+                diagnostics,
+                legs,
+                ..
+            }) if tree == TreeState::Red && diagnostics.is_empty() => {
+                // Record the legs even here. THIS is the case where per-leg
+                // evidence matters most: the build says red and cannot say
+                // why, so "which leg was red, and for how long" is the only
+                // thread an operator has to pull.
+                self.record_legs(generation, &legs);
+                LaneBuildOutcome::Infra {
+                    reason: "build reported red with no diagnostics — cannot attribute; \
+                             treating as infrastructure rather than blaming a member"
+                        .to_string(),
+                }
+            }
             Ok(LegOutcome {
                 tree,
                 diagnostics,
                 artifact,
-                ..
-            }) => match tree {
-                TreeState::Green => LaneBuildOutcome::Green { artifact },
-                TreeState::Red => LaneBuildOutcome::Red { diagnostics },
-            },
+                legs,
+            }) => {
+                self.record_legs(generation, &legs);
+                match tree {
+                    TreeState::Green => LaneBuildOutcome::Green { artifact },
+                    TreeState::Red => LaneBuildOutcome::Red { diagnostics },
+                }
+            }
             Err(e) => LaneBuildOutcome::Infra {
                 reason: format!("build legs could not run: {e}"),
             },
         };
+
+        // One summary line per build, written BEFORE `release` destroys the
+        // candidate worktree. The verdict has to outlive the tree it was
+        // computed from — that is the whole point.
+        match &outcome {
+            LaneBuildOutcome::Green { artifact } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} outcome=green artifact={}",
+                artifact.as_deref().unwrap_or("<none>")
+            )),
+            LaneBuildOutcome::Red { diagnostics } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} outcome=red diagnostics={}",
+                diagnostics.len()
+            )),
+            LaneBuildOutcome::Infra { reason } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} outcome=infra reason={reason}"
+            )),
+        }
 
         self.tree.release(&root);
         LaneEvent::BuildFinished {

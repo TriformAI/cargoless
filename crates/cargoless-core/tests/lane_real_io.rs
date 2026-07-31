@@ -294,3 +294,125 @@ fn report_only_names_the_artifact_it_declined_to_publish() {
         out.detail
     );
 }
+
+/// THE SHADOW-RUN REGRESSION. The first real shadow build compiled for 76
+/// minutes and left no readable verdict anywhere: `GET /lane` reports only
+/// current state, and `CandidateTree::release` removes the candidate worktree —
+/// and with it the target dir and every artifact — the instant the build ends.
+/// Afterwards there was no way to tell green from red from inside the pod, so
+/// the comparison the shadow run existed to produce could not be made.
+///
+/// The assertion that matters is therefore not "a line was written" but "the
+/// verdict outlives the tree it was computed from". The test deletes the whole
+/// repo before reading, which is strictly harsher than what `release` does.
+#[test]
+fn the_verdict_and_per_leg_timings_outlive_the_candidate_worktree() {
+    let root = repo_with_legs(
+        "trail",
+        &format!(
+            "{}\n{}",
+            leg("alpha", "true"),
+            leg("beta", "mkdir -p dist && printf 'ok' > dist/artifact")
+        ),
+    );
+    let a = branch(&root, "a", "a.txt", "a\n");
+
+    // Deliberately OUTSIDE the repo: a trail written inside the tree would be
+    // destroyed by the very cleanup this test exists to survive.
+    let trail = root.with_extension("trail.log");
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let mut legs = ProfileLegRunner::new("lane");
+    legs.artifact_path = Some(PathBuf::from("dist/artifact"));
+    // `trail.clone()`, not `&trail`: `with_trail` takes `impl Into<PathBuf>`
+    // and `&PathBuf` does not implement it (only `&Path` and `&str` do, via
+    // `AsRef`-flavoured impls that `Into` does not cover).
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander).with_trail(trail.clone());
+
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+
+    // Destroy everything the build ran in — harsher than `release`, which only
+    // removes the candidate worktree.
+    let _ = fs::remove_dir_all(&root);
+
+    let log = fs::read_to_string(&trail).expect("the trail must survive the tree");
+
+    assert!(
+        log.contains("lane-build-start generation=1"),
+        "the trail must record that a build started, and which generation: {log}"
+    );
+    assert!(
+        log.contains(&format!("a@{a}")),
+        "and WHICH members were in it, by id@head — without that a verdict \
+         cannot be matched to a candidate: {log}"
+    );
+    assert!(
+        log.contains("outcome=green"),
+        "the verdict itself must be readable after the fact: {log}"
+    );
+
+    // Per-leg lines are what make the trail comparable against
+    // dev-staging-build's phase timings. A single verdict line would say the
+    // build was green without saying where the 76 minutes went.
+    for id in ["alpha", "beta"] {
+        assert!(
+            log.contains(&format!("lane-leg generation=1 id={id}")),
+            "every leg must appear by id, not just the rolled-up verdict: {log}"
+        );
+    }
+    assert!(
+        log.contains("elapsed_ms="),
+        "each leg must carry its own duration: {log}"
+    );
+
+    let _ = fs::remove_file(&trail);
+}
+
+/// A trail is evidence ABOUT a build, never a precondition FOR one. If an
+/// unwritable path could fail a build, the observability would itself be the
+/// outage — and it would fail closed on exactly the disk-pressure days when the
+/// evidence is most wanted.
+#[test]
+fn an_unwritable_trail_never_fails_a_build() {
+    let root = repo_with_legs("trail-unwritable", &leg("only", "true"));
+    let a = branch(&root, "a", "a.txt", "a\n");
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(tree, ProfileLegRunner::new("lane"), ReportOnlyLander)
+        // Descend THROUGH a regular file (`ok.txt`, written by repo_with_legs).
+        // `open(.../ok.txt/nope/trail.log)` is ENOTDIR no matter the
+        // permissions — portable in a way a 0o000 chmod is not, since CI may
+        // run as root, where permission bits are ignored and the open would
+        // unexpectedly succeed.
+        .with_trail(root.join("ok.txt").join("nope").join("trail.log"));
+
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+
+    assert!(
+        actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::LandAndPublish { .. })),
+        "the build must still reach a green landing with the trail unwritable: {actions:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
