@@ -693,6 +693,22 @@ impl LaneState {
                 "new head, and the previous failure could not be attributed to specific files"
                     .to_string(),
             ),
+            // Nothing was ever compiled, so there are no failing files to gate
+            // on — and the member's code was never implicated in the first
+            // place. Any new head earns another attempt, for the same reason
+            // `Unattributed` does but more strongly: here we are certain the
+            // fault was ours.
+            //
+            // Note this readmits even for an UNCHANGED tree once the operator
+            // clears the underlying fault, because the TTL lapse in
+            // `expire_ejections` also applies. That is deliberate: a member
+            // held by a daemon-side problem must not need its author to push
+            // something to escape.
+            EjectReason::Infrastructure { .. } => Some(
+                "new head, and the previous hold was an infrastructure failure — \
+                 the change was never judged"
+                    .to_string(),
+            ),
         }
     }
 
