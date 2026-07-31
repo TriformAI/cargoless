@@ -3706,6 +3706,21 @@ checks:
 
     /// A NON-required red is information, not a verdict. Cancelling a build
     /// over a failing advisory would silently promote it to a gate.
+    ///
+    /// The advisory here MUST use `output: cargo-json`, and that is the whole
+    /// reason this test has teeth. A plain `command` check routes its failure
+    /// through `diag()`, which stamps `Severity::Warning` when `required:
+    /// false` — so `result_from_diags` never sets `Red` and
+    /// `result.tree == TreeState::Red` is unreachable for an advisory. Against
+    /// that manifest the `result.required &&` clause in `run_stage` is dead
+    /// code and dropping it changes nothing, which is exactly why the mutation
+    /// harness kept reporting "SURVIVED — fail_fast trips on a non-required
+    /// red": the mutant was equivalent under the test's own fixture.
+    ///
+    /// `cargodiag::parse_cargo_json` takes severity from cargo's `level` field
+    /// and never consults `check.required`, so an advisory emitting a real
+    /// compiler error is genuinely `required: false` AND `tree == Red` — the
+    /// only state in which the clause under test does any work.
     #[test]
     fn a_non_required_red_never_trips_fail_fast() {
         let root = scratch("fail-fast-advisory");
@@ -3725,8 +3740,9 @@ checks:
     tier: lane
     read_only: true
     required: false
+    output: cargo-json
     timeout_ms: 20000
-    command: ["bash", "-lc", "exit 1"]
+    command: ["bash", "-lc", "printf '%s\\n' '{\"reason\":\"compiler-message\",\"message\":{\"level\":\"error\",\"message\":\"advisory boom\",\"spans\":[{\"file_name\":\"src/advisory.rs\",\"line_start\":1,\"column_start\":1,\"is_primary\":true}]}}'; exit 1"]
     cache: none
   - id: bb-real
     kind: command
@@ -3745,16 +3761,44 @@ checks:
             TreeState::Green,
             "a failing advisory must not red the tree"
         );
+
+        // GUARD THE FIXTURE, not just the behaviour. Everything below only
+        // tests anything if the advisory actually reached `tree == Red` while
+        // staying `required: false` — that pair is the sole input state in
+        // which `fail_fast && result.required && …` differs from
+        // `fail_fast && …`. If a future edit drops `output: cargo-json`, the
+        // advisory silently downgrades to a Warning, the assertions below still
+        // pass, and the test quietly stops testing. Assert the precondition so
+        // that regression fails LOUDLY here rather than showing up months later
+        // as a surviving mutant.
+        let advisory = report
+            .results
+            .iter()
+            .find(|r| r.id == "aa-advisory")
+            .expect("the advisory must appear in the report");
+        assert!(
+            !advisory.required,
+            "fixture precondition: the advisory must be non-required"
+        );
+        assert_eq!(
+            advisory.tree,
+            TreeState::Red,
+            "fixture precondition: the advisory must be genuinely RED — a plain \
+             `command` check stamps Warning when required:false, which makes \
+             the `result.required` clause unreachable and this test vacuous"
+        );
+
         // The load-bearing assertion, and the reason `bb-real` sleeps 6s rather
         // than 1s: the advisory exits INSTANTLY, so a `fail_fast` that wrongly
         // counted non-required reds would fire while the required check is
         // still running and kill it mid-sleep — leaving `real.out` unwritten.
         //
-        // With a 1s sleep the mutation survived: the required check finished
-        // before the wrongful cancel could reach it, so the test passed either
-        // way and proved nothing. Caught by the mutation harness reporting
-        // "SURVIVED — fail_fast trips on a non-required red", which is exactly
-        // the job that harness exists to do.
+        // Timing alone was NOT enough. With a 1s sleep the required check
+        // finished before a wrongful cancel could reach it; lengthening it to
+        // 6s fixed that race but the mutant still survived, because the fixture
+        // could not produce a red advisory at all (see the doc comment). Both
+        // halves are needed: a reachable Red, and enough in-flight work left to
+        // cancel.
         assert!(
             root.join("real.out").exists(),
             "the required check must run to COMPLETION — a failing advisory \

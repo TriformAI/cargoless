@@ -157,6 +157,23 @@ pub enum EjectReason {
         /// Everyone ejected alongside this member (all of them, by definition).
         shared_with: Vec<String>,
     },
+    /// The build never produced a verdict: it could not be set up at all, and
+    /// it kept failing the same way. NOT a statement about anyone's code.
+    ///
+    /// Distinct from `Unattributed` on purpose. `Unattributed` means "your tree
+    /// is red and we could not tell whose change did it" — the code is
+    /// implicated even though the owner is unknown. This means "we never
+    /// compiled anything", which is the lane admitting a fault in itself. An
+    /// author who reads the wrong one of those two goes hunting a bug that does
+    /// not exist.
+    Infrastructure {
+        /// The failure as the build reported it, verbatim.
+        reason: String,
+        /// How many consecutive attempts failed before the lane gave up.
+        attempts: u32,
+        /// Everyone ejected alongside this member (all of them, by definition).
+        shared_with: Vec<String>,
+    },
 }
 
 impl EjectReason {
@@ -198,6 +215,18 @@ impl EjectReason {
                  Any new push re-enqueues you.",
                 shared_with.len().max(1)
             ),
+            // Says plainly that the code was never judged. An author reading
+            // this should NOT go looking at their change — there is no verdict
+            // about it, and the thing to fix is the lane's own environment.
+            EjectReason::Infrastructure {
+                reason, attempts, ..
+            } => format!(
+                "the lane could not build a candidate at all, and the same failure \
+                 repeated across {attempts} attempts: {reason}. This is NOT a verdict \
+                 about your change — nothing was compiled, so nothing was judged. \
+                 Held so the queue can move; an operator has to clear the underlying \
+                 fault. Any new push re-enqueues you, as does the ejection lapsing."
+            ),
         }
     }
 
@@ -208,9 +237,16 @@ impl EjectReason {
     /// changed between two builds is the evidence that a fix took effect.
     #[must_use]
     pub fn fingerprints(&self) -> &FingerprintCounts {
+        // An infrastructure ejection has no fingerprints BY CONSTRUCTION: no
+        // build ran, so no diagnostic exists to fingerprint. Returning an empty
+        // set is the honest answer, and it keeps the "fingerprints changed ⇒ a
+        // fix took effect" reading intact — an empty set never looks like
+        // progress on an error, because it never claimed one.
+        static NONE: std::sync::OnceLock<FingerprintCounts> = std::sync::OnceLock::new();
         match self {
             EjectReason::Attributed { fingerprints, .. }
             | EjectReason::Unattributed { fingerprints, .. } => fingerprints,
+            EjectReason::Infrastructure { .. } => NONE.get_or_init(FingerprintCounts::new),
         }
     }
 }
@@ -340,6 +376,28 @@ pub struct LaneConfig {
     /// `0` disables it (build immediately), which is what unit tests and a
     /// single-developer project want.
     pub capture_window_ticks: u64,
+    /// Ticks to wait after an infrastructure failure before rebuilding the
+    /// same members.
+    ///
+    /// An infra failure is not the members' fault, so they are requeued — but
+    /// requeueing with no delay is a hot loop: the retry hits the same broken
+    /// condition immediately and the lane spins as fast as the failure returns.
+    /// Observed on the first real deployment at roughly one full candidate
+    /// attempt every 2.5 seconds, indefinitely, because the PR head commits
+    /// were missing from the daemon's object store and every materialize
+    /// failed the same way.
+    pub infra_backoff_ticks: u64,
+    /// Consecutive infra failures on the same members before the lane stops
+    /// retrying and ejects them.
+    ///
+    /// Retrying forever assumes every infra failure is transient. Some are
+    /// permanent from the lane's side — an unreachable commit, a scratch
+    /// directory it cannot write — and for those, an infinite retry is strictly
+    /// worse than an ejection: it burns the machine, it never reports, and it
+    /// blocks every later submission behind members that cannot build. Ejecting
+    /// carries the reason to the author and lets the queue move; the ejection
+    /// TTL brings them back once the condition clears.
+    pub infra_max_attempts: u32,
 }
 
 impl Default for LaneConfig {
@@ -351,6 +409,14 @@ impl Default for LaneConfig {
             // agent pushes, negligible against a build measured in tens of
             // minutes.
             capture_window_ticks: 60,
+            // 30s between infra retries. Long enough that a persistent failure
+            // costs ~2 attempts a minute rather than ~24, short enough that a
+            // genuinely transient one (a brief forge outage) recovers without
+            // anyone noticing.
+            infra_backoff_ticks: 30,
+            // Five attempts ≈ 2.5 minutes of retrying before the lane concludes
+            // the failure is not going to clear on its own and says so.
+            infra_max_attempts: 5,
         }
     }
 }
@@ -373,6 +439,11 @@ pub struct LaneState {
     /// When the currently-idle lane first had something to build. `None` while
     /// the queue is empty or a build is running. Drives the capture window.
     queued_since: Option<u64>,
+    /// Consecutive infrastructure failures, and the tick before which the lane
+    /// must not retry. Reset by any outcome that is not `Infra`, so a lane that
+    /// gets one bad build and then succeeds carries nothing forward.
+    infra_failures: u32,
+    infra_retry_after: Option<u64>,
     /// Root the diagnostics' paths are fingerprinted against.
     root: PathBuf,
 }
@@ -394,6 +465,8 @@ impl LaneState {
             ejected: BTreeMap::new(),
             now: 0,
             queued_since: None,
+            infra_failures: 0,
+            infra_retry_after: None,
             root: root.into(),
         }
     }
@@ -653,6 +726,15 @@ impl LaneState {
         let members = std::mem::take(&mut self.in_flight);
         self.phase = LanePhase::Idle;
 
+        // Any outcome that is not `Infra` means the infrastructure worked, so
+        // the failure streak is over. Resetting here rather than in each branch
+        // keeps a future outcome variant from silently inheriting a stale
+        // count and ejecting on its first failure.
+        if !matches!(outcome, LaneBuildOutcome::Infra { .. }) {
+            self.infra_failures = 0;
+            self.infra_retry_after = None;
+        }
+
         match outcome {
             LaneBuildOutcome::Green { artifact } => {
                 for m in &members {
@@ -664,13 +746,68 @@ impl LaneState {
                 actions.push(LaneAction::LandAndPublish { members, artifact });
             }
             LaneBuildOutcome::Infra { reason } => {
+                self.infra_failures = self.infra_failures.saturating_add(1);
+
+                // GIVE UP eventually. Requeueing unconditionally assumes every
+                // infra failure is transient, and some are permanent from the
+                // lane's side: a member whose head commit the daemon cannot
+                // reach never becomes mergeable by waiting. Retrying such a
+                // member forever is worse than ejecting it — it burns the
+                // machine, reports nothing an author can act on, and blocks
+                // every later submission behind a build that cannot succeed.
+                //
+                // Observed on the first real deployment: every candidate failed
+                // to materialize because the PR heads were absent from the
+                // object store, and the lane retried about once every 2.5
+                // seconds, indefinitely, while `GET /lane` showed a steady
+                // `phase=building` — indistinguishable from a long compile.
+                if self.infra_failures >= self.cfg.infra_max_attempts {
+                    let attempts = self.infra_failures;
+                    self.infra_failures = 0;
+                    self.infra_retry_after = None;
+                    let all: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+                    for m in members {
+                        let ejection = Ejection {
+                            reason: EjectReason::Infrastructure {
+                                reason: reason.clone(),
+                                attempts,
+                                shared_with: all.iter().filter(|o| *o != &m.id).cloned().collect(),
+                            },
+                            head: m.head.clone(),
+                            changed_files: m.changed_files.clone(),
+                            expires_at_tick: self.now.saturating_add(self.cfg.eject_ttl_ticks),
+                        };
+                        actions.push(LaneAction::Report {
+                            id: m.id.clone(),
+                            state: ejection.reason.describe(),
+                        });
+                        actions.push(LaneAction::Eject {
+                            id: m.id.clone(),
+                            reason: ejection.reason.clone(),
+                        });
+                        self.ejected.insert(m.id.clone(), ejection);
+                    }
+                    return;
+                }
+
                 // Requeue at the FRONT, preserving order: these members were
                 // already waiting and an infra failure is not their fault.
+                //
+                // The backoff is what stops this being a hot loop. Without it
+                // the retry runs the instant `maybe_start_build` is reached,
+                // hits the same broken condition, and spins as fast as the
+                // failure returns.
+                self.infra_retry_after =
+                    Some(self.now.saturating_add(self.cfg.infra_backoff_ticks));
                 for (i, m) in members.into_iter().enumerate() {
                     actions.push(LaneAction::Report {
                         id: m.id.clone(),
                         state: format!(
-                            "infrastructure failure ({reason}) — still queued, will retry"
+                            "infrastructure failure ({reason}) — still queued, retry {} of {} \
+                             in {} ticks",
+                            self.infra_failures,
+                            self.cfg.infra_max_attempts,
+                            self.cfg.infra_backoff_ticks
                         ),
                     });
                     self.queue.insert(i, m);
@@ -788,6 +925,17 @@ impl LaneState {
                 self.queued_since = None;
             }
             return;
+        }
+        // Serve the infra backoff. This is checked BEFORE the capture window
+        // because the two answer different questions — the window asks "has this
+        // gathered enough company yet", the backoff asks "is it worth trying at
+        // all yet" — and only the backoff can be pending on members that have
+        // already been through a build.
+        if let Some(retry_at) = self.infra_retry_after {
+            if self.now < retry_at {
+                return;
+            }
+            self.infra_retry_after = None;
         }
         // The window gathers FRESH arrivals. It must never delay work that was
         // already waiting: after a red, the survivors requeue and have to

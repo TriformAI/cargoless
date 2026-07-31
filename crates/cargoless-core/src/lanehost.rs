@@ -87,6 +87,15 @@ impl LaneSnapshot {
                         EjectReason::Unattributed { shared_with, .. } => {
                             ("unattributed", Vec::new(), shared_with.clone())
                         }
+                        // A THIRD kind, not folded into "unattributed". They
+                        // clear differently and they mean different things:
+                        // unattributed says the tree is red and the owner is
+                        // unknown, infrastructure says nothing was ever built.
+                        // An operator triaging `GET /lane` needs to tell "go
+                        // find the interaction bug" from "go fix the daemon".
+                        EjectReason::Infrastructure { shared_with, .. } => {
+                            ("infrastructure", Vec::new(), shared_with.clone())
+                        }
                     };
                     EjectionView {
                         id: id.clone(),
