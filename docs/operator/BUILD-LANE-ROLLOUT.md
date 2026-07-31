@@ -68,6 +68,27 @@ a member on no evidence. Fail-safe.
 
    No such line means no lane, whatever the environment claims to hold.
 
+   A **wrong** profile name does not start a lane either — the daemon refuses
+   to boot and names the profiles the manifest actually declares. That is
+   deliberate: an unrecognised name would otherwise inherit a fallback that
+   runs *every* check under a 12-second budget, and the resulting flood of
+   timeout diagnostics is attributable to nobody, so the lane would eject the
+   whole queue on its first build.
+
+2c. **Confirm it is actually building.** Enqueue one member and watch
+   `GET /lane` move off `queue_depth: 1`:
+
+   ```sh
+   curl -s -H "Authorization: Bearer $TOKEN" localhost:8787/lane | jq '.phase, .queue_depth'
+   ```
+
+   A lane stuck at `"idle"` with a non-zero queue for longer than
+   `capture_window_ticks` seconds is not waiting — something is wrong. The
+   window is driven by a tick from the serve loop; if that tick ever stops, the
+   lane accepts submissions and silently never builds, which looks like a
+   transport or auth problem rather than a stalled clock. This was a real bug
+   (nothing drove the tick at all), so it is worth the ten seconds to check.
+
 ### Staging the manifest keys
 
 `stage:`, `target_key:` and `output:` are all subject to the `reject_unknown()`
@@ -87,6 +108,35 @@ not be acceptable.
 
 4. **Run it in shadow first** — compare its verdict against whatever builds your
    trunk today, on the same commit, before anything depends on it.
+
+## Shadow-running before you arm it
+
+Run the lane where it cannot hurt anyone first. Not ceremony — the lane's leg
+runner is the seam between the queue and a real build, and until it has run
+against your project nobody knows what it does there.
+
+Set `CARGOLESS_LANE_PROFILE` and leave `CARGOLESS_LANE_ARTIFACT` **unset**. The
+lane then builds real candidates with your real legs and lands nothing: no
+pointer moves, no tag is pushed, no PR is touched. Whatever merges changes today
+stays authoritative throughout.
+
+Three things to compare per candidate, none of which the lane can tell you
+itself:
+
+| question | how |
+|---|---|
+| does it agree with what you have now? | lane verdict vs your existing build for the same SHA |
+| is the staging actually paying off? | wall-clock to a red — a type error should die in stage 1, minutes not tens of minutes |
+| is attribution right? | on a red, does the member the lane named actually own the failing file? |
+
+**Divergence is a signal to investigate, never a reason to arm.** And a shadow
+lane nobody compares is just a runner burning CPU — if you are not going to read
+the results, do not start it.
+
+Watch for one specific shape: a green build where the legs did not produce the
+artifact you declared. That reports as *infrastructure*, not as a red, and the
+lane holds the whole queue rather than blaming anyone — correct, but it looks
+like a stuck lane. `GET /lane` shows the reason.
 
 ## Reading the lane
 
