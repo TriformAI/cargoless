@@ -52,11 +52,11 @@ use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
 use cargoless_core::outcome::{
-    Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation, DiagnosticOrigin,
-    DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef, ExecutionId,
-    FailureCause, IndeterminateCause, NonEmptyDiagnostics, NonEmptyText, OutcomeEnvelope,
-    PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind, RetryDirective,
-    Subject, Surface,
+    AttemptId, Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation,
+    DiagnosticOrigin, DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef,
+    ExecutionId, FailureCause, IndeterminateCause, NonEmptyDiagnostics, NonEmptyText,
+    OutcomeEnvelope, PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind,
+    RetryDirective, Subject, Surface,
 };
 use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::sha256_hex;
