@@ -36,8 +36,11 @@
 
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cargoless_proto::TreeState;
 
@@ -199,6 +202,227 @@ impl LegRunner for ProfileLegRunner {
             diagnostics: report.diagnostics,
             artifact,
             legs,
+        })
+    }
+}
+
+/// Runs the legs SOMEWHERE ELSE: publishes the candidate on a ref and hands it
+/// to an external builder, which compiles it and reports back.
+///
+/// # Why this exists rather than just using [`ProfileLegRunner`]
+///
+/// `ProfileLegRunner` compiles in this process. For a lane that is a privilege
+/// escalation, and on tf-multiverse it is a demonstrated one: `cargo` executes
+/// `build.rs` and proc-macros from the tree it compiles, that tree is the
+/// candidate merge of code nobody has reviewed yet, and the daemon's container
+/// can read a **push-capable** forge credential from `.git/config` on its
+/// shared volume (verified 2026-07-31 with `git push --dry-run`, which reported
+/// `* [new branch]`). So "we only compile it, we don't run it" is false, and
+/// the blast radius is push access to the trunk.
+///
+/// It is also a fidelity problem: a daemon image is not a build image. On
+/// tf-multiverse the daemon ships wasm-bindgen 0.2.114 against a workspace that
+/// resolves 0.2.118, and has no warm cooked target dir, where the deploy
+/// builder pins the right CLI and keeps a warm cache.
+///
+/// # The contract
+///
+/// The command is spawned with the candidate's ref name and sha in the
+/// environment, and must exit 0 for green, non-zero for red. Anything it prints
+/// on stdout is parsed as cargo JSON, so a red carries real file paths and the
+/// lane can attribute it.
+///
+/// Cargoless stays forge-agnostic: it publishes a ref and runs a command. What
+/// that command does — dispatch a workflow, submit a k8s Job, ssh a builder —
+/// is the operator's business, exactly as [`LaneLander`] is for landing.
+pub struct DispatchLegRunner {
+    /// Argv of the dispatcher. Receives `CARGOLESS_LANE_REF`,
+    /// `CARGOLESS_LANE_SHA` and `CARGOLESS_LANE_CHANGED_FILES` in its env.
+    pub command: Vec<String>,
+    /// Where to publish the candidate so the builder can fetch it. Passed to
+    /// `git push` verbatim, so it may be a remote name or a URL.
+    pub remote: String,
+    /// Ref namespace for published candidates, e.g. `refs/heads/lane-candidate`.
+    /// The sha is appended, so a build is always addressable after the fact and
+    /// two candidates never collide.
+    pub ref_prefix: String,
+    /// How long to wait for the dispatcher before calling it infrastructure.
+    pub timeout: Duration,
+}
+
+impl DispatchLegRunner {
+    pub fn new(
+        command: Vec<String>,
+        remote: impl Into<String>,
+        ref_prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            command,
+            remote: remote.into(),
+            ref_prefix: ref_prefix.into(),
+            // A real release build is 25-80 minutes; 2h leaves headroom for a
+            // queued builder without waiting forever on a dead one.
+            timeout: Duration::from_secs(7200),
+        }
+    }
+
+    /// Run `cmd`, killing its whole process tree if `timeout` elapses.
+    ///
+    /// Returns (success, combined output, elapsed_ms). A timeout is `Err` —
+    /// the lane must not read "we gave up waiting" as a code red.
+    ///
+    /// The pgid + setsid setup mirrors `project_checks::check_command`, for the
+    /// same reason recorded there: killing only the immediate child leaves
+    /// grandchildren reparented to init and still running. It is inlined rather
+    /// than shared because that function's loop is entangled with the check
+    /// cancellation flag, and lifting it out to serve two callers is a bigger
+    /// change than this one earns.
+    fn run_to_completion(mut cmd: Command, timeout: Duration) -> io::Result<(bool, String, u128)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+            // setsid too: `kill_process_tree`'s escapee sweep enumerates the
+            // SESSION (`pgrep -s`), which only finds anything if the child is a
+            // session leader. process_group alone would leave that half inert.
+            //
+            // SAFETY: pre_exec runs post-fork/pre-exec in a single-threaded
+            // child; setsid(2) is async-signal-safe. EPERM (already a leader)
+            // is swallowed. Mirrors project_checks::check_command.
+            unsafe {
+                cmd.pre_exec(|| {
+                    unsafe extern "C" {
+                        fn setsid() -> i32;
+                    }
+                    let _ = setsid();
+                    Ok(())
+                });
+            }
+        }
+        let started = Instant::now();
+        let mut child = cmd.spawn()?;
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let out_t = thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(p) = stdout.as_mut() {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        });
+        let err_t = thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(p) = stderr.as_mut() {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        });
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Ok(s),
+                Ok(None) if Instant::now() >= deadline => {
+                    // The crate's existing reaper, not a hand-rolled kill: it
+                    // SIGKILLs the process group AND sweeps setpgid escapees
+                    // still in the session. That second sweep is what stops a
+                    // timed-out build leaking grandchildren that reparent to
+                    // init and keep compiling (observed 2026-06-08).
+                    crate::project_checks::kill_process_tree(&mut child);
+                    let _ = child.wait();
+                    break Err(io::Error::other(format!(
+                        "dispatcher exceeded {}s",
+                        timeout.as_secs()
+                    )));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(200)),
+                Err(e) => break Err(e),
+            }
+        };
+        let combined = format!(
+            "{}\n{}",
+            out_t.join().unwrap_or_default(),
+            err_t.join().unwrap_or_default()
+        );
+        let elapsed = started.elapsed().as_millis();
+        match status {
+            Ok(s) => Ok((s.success(), combined, elapsed)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn head_sha(root: &Path) -> io::Result<String> {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "could not resolve the candidate HEAD: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+impl LegRunner for DispatchLegRunner {
+    fn run(&self, root: &Path, changed_files: &[String]) -> io::Result<LegOutcome> {
+        let Some(program) = self.command.first() else {
+            return Err(io::Error::other(
+                "dispatch leg runner configured with an empty command",
+            ));
+        };
+        let sha = Self::head_sha(root)?;
+        let refname = format!("{}/{sha}", self.ref_prefix.trim_end_matches('/'));
+
+        // Publish the candidate so an external builder can fetch it. Force is
+        // correct and safe here: the ref name CONTAINS the sha, so the only
+        // thing it can overwrite is a byte-identical rebuild of itself.
+        let push = Command::new("git")
+            .current_dir(root)
+            .args(["push", "--force", &self.remote, &format!("HEAD:{refname}")])
+            .output()?;
+        if !push.status.success() {
+            return Err(io::Error::other(format!(
+                "could not publish the candidate as {refname}: {}",
+                String::from_utf8_lossy(&push.stderr).trim()
+            )));
+        }
+
+        // NOTE: no `current_dir(root)`. The dispatcher must not run inside the
+        // candidate tree — that tree is the unreviewed code, and a dispatcher
+        // that resolved a script relative to it would reintroduce the very
+        // execution this type exists to prevent.
+        let mut cmd = Command::new(program);
+        cmd.args(&self.command[1..])
+            .env("CARGOLESS_LANE_REF", &refname)
+            .env("CARGOLESS_LANE_SHA", &sha)
+            .env("CARGOLESS_LANE_CHANGED_FILES", changed_files.join("\n"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (success, text, duration_ms) = Self::run_to_completion(cmd, self.timeout)?;
+
+        let diagnostics = crate::cargodiag::parse_cargo_json(root, &text);
+        let tree = if success {
+            TreeState::Green
+        } else {
+            TreeState::Red
+        };
+
+        Ok(LegOutcome {
+            tree,
+            diagnostics,
+            // The artifact lives wherever the external builder put it (a
+            // registry tag, a CAS handle); the dispatcher reports it, and the
+            // lander promotes it. Nothing local to publish.
+            artifact: None,
+            legs: vec![LegReport {
+                id: "dispatch".to_string(),
+                tree,
+                required: true,
+                duration_ms,
+            }],
         })
     }
 }

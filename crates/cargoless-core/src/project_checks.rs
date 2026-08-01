@@ -1461,7 +1461,7 @@ fn check_file_exists(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResul
 /// proven reaper in `analyzer::ReapOnDrop`. Without this, a timed-out `cargo`
 /// leaks `rustc` grandchildren that reparent to init and keep compiling past
 /// the deadline (the leak the live warn soak surfaced 2026-06-08).
-fn kill_process_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;

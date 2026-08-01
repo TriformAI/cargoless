@@ -22,7 +22,8 @@ use std::process::Command;
 
 use cargoless_core::lane::{LaneEvent, LaneMember, LaneState};
 use cargoless_core::lanedrv::{
-    LaneDriver, LaneLander, LegRunner, PointerLander, ProfileLegRunner, ReportOnlyLander,
+    DispatchLegRunner, LaneDriver, LaneLander, LegRunner, PointerLander, ProfileLegRunner,
+    ReportOnlyLander,
 };
 use cargoless_core::lanetree::GitCandidateTree;
 use cargoless_proto::{Severity, TreeState};
@@ -376,6 +377,199 @@ fn the_verdict_and_per_leg_timings_outlive_the_candidate_worktree() {
     );
 
     let _ = fs::remove_file(&trail);
+}
+
+/// THE SECURITY PROPERTY, asserted rather than asserted-about.
+///
+/// `ProfileLegRunner` runs `cargo build` in-process, and `cargo` executes
+/// `build.rs` and proc-macros from the tree it compiles. On a lane that tree is
+/// unreviewed code, and the daemon's container can read a push-capable forge
+/// credential (verified 2026-07-31 with `git push --dry-run` from inside
+/// `cargoless-serve`). `DispatchLegRunner` exists to move that compile
+/// somewhere unprivileged.
+///
+/// So the test is: does a `build.rs`-shaped payload in the candidate get
+/// executed by the lane? With dispatch it must not — the dispatcher runs
+/// instead, and it never enters the candidate tree.
+#[test]
+fn dispatching_never_executes_code_from_the_candidate_tree() {
+    let root = repo_with_legs("dispatch-safety", &leg("never-runs", "true"));
+
+    // A bare remote to push candidates at — stands in for the forge.
+    let remote = scratch("dispatch-safety-remote");
+    sh(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    sh(
+        &root,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    sh(&root, &["push", "-q", "origin", "main"]);
+
+    // The canary: a member whose branch carries a script that, if the lane ever
+    // executed anything from the candidate, would leave a mark outside the tree.
+    let marker = scratch("dispatch-safety-marker").join("pwned");
+    let payload = format!("#!/bin/sh\ntouch {}\n", marker.display());
+    sh(&root, &["checkout", "-q", "-B", "m", "main"]);
+    fs::write(root.join("build.rs"), &payload).unwrap();
+    sh(&root, &["add", "build.rs"]);
+    sh(&root, &["commit", "-q", "-m", "m"]);
+    let m = String::from_utf8_lossy(
+        &Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    sh(&root, &["checkout", "-q", "main"]);
+
+    // The dispatcher: reports green, and records what it was handed. Stands in
+    // for "dispatch a credential-free workflow".
+    let seen = scratch("dispatch-safety-seen").join("dispatched");
+    let script = scratch("dispatch-safety-bin").join("dispatch.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$CARGOLESS_LANE_REF\" \"$CARGOLESS_LANE_SHA\" > {}\nexit 0\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let legs = DispatchLegRunner::new(
+        vec![script.to_string_lossy().into_owned()],
+        remote.to_string_lossy().into_owned(),
+        "refs/heads/lane-candidate",
+    );
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander);
+
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("m", &m).with_changed_files(["build.rs"])),
+    );
+
+    assert!(
+        !marker.exists(),
+        "the lane executed code from the candidate tree — that is the escalation \
+         DispatchLegRunner exists to prevent"
+    );
+    let dispatched = fs::read_to_string(&seen).expect("the dispatcher must have been invoked");
+    assert!(
+        dispatched.contains(&m),
+        "the dispatcher must be told WHICH sha to build, or it cannot build the \
+         candidate the lane judged: {dispatched}"
+    );
+    assert!(
+        dispatched.contains("refs/heads/lane-candidate"),
+        "and the ref it was published on: {dispatched}"
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::LandAndPublish { .. })),
+        "a green dispatch must still reach a landing: {actions:?}"
+    );
+
+    // The candidate must be FETCHABLE by the builder — a ref the sandbox cannot
+    // reach is a build that cannot happen.
+    let ls = Command::new("git")
+        .current_dir(&remote)
+        .args(["rev-parse", &format!("refs/heads/lane-candidate/{m}")])
+        .output()
+        .unwrap();
+    assert!(
+        ls.status.success(),
+        "the candidate must be published on the remote under its own sha"
+    );
+
+    for d in [root, remote] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+/// A dispatcher that fails is a RED with real diagnostics, not an infra error —
+/// the whole point of moving the build out is that its verdict still attributes.
+#[test]
+fn a_dispatcher_red_carries_the_builders_cargo_json() {
+    let root = repo_with_legs("dispatch-red", &leg("unused", "true"));
+    let remote = scratch("dispatch-red-remote");
+    sh(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    sh(
+        &root,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    sh(&root, &["push", "-q", "origin", "main"]);
+    let a = branch(&root, "a", "src/broken.rs", "fn x() {}\n");
+
+    let script = scratch("dispatch-red-bin").join("d.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    // Emits exactly what a remote `cargo build --message-format=json` would.
+    fs::write(
+        &script,
+        "#!/bin/sh\necho '{\"reason\":\"compiler-message\",\"message\":{\"level\":\"error\",\
+         \"message\":\"remote boom\",\"spans\":[{\"file_name\":\"src/broken.rs\",\
+         \"line_start\":1,\"column_start\":1,\"is_primary\":true}]}}'\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let legs = DispatchLegRunner::new(
+        vec![script.to_string_lossy().into_owned()],
+        remote.to_string_lossy().into_owned(),
+        "refs/heads/lane-candidate",
+    );
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander);
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["src/broken.rs"])),
+    );
+
+    // Ejected, not held: a remote red with file paths is attributable, which is
+    // what `output: cargo-json` buys and what an infra classification loses.
+    let ejected: Vec<_> = actions
+        .iter()
+        .filter_map(|x| match x {
+            cargoless_core::lane::LaneAction::Eject { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ejected,
+        vec!["a".to_string()],
+        "a dispatcher red must attribute to the member who touched the failing \
+         file, not degrade to infrastructure: {actions:?}"
+    );
+
+    for d in [root, remote] {
+        let _ = fs::remove_dir_all(d);
+    }
 }
 
 /// A trail is evidence ABOUT a build, never a precondition FOR one. If an
