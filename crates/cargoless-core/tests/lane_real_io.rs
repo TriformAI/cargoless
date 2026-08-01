@@ -77,6 +77,12 @@ fn repo_with_legs(tag: &str, legs: &str) -> PathBuf {
 /// Commit `file` on a branch off main; return its sha.
 fn branch(root: &Path, name: &str, file: &str, body: &str) -> String {
     sh(root, &["checkout", "-q", "-B", name, "main"]);
+    // `file` may be nested (`src/broken.rs`); `fs::write` does not create
+    // parents, and the resulting ENOENT surfaces as a bare unwrap panic in this
+    // helper rather than anything resembling the caller's intent.
+    if let Some(parent) = root.join(file).parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
     fs::write(root.join(file), body).unwrap();
     sh(root, &["add", file]);
     sh(root, &["commit", "-q", "-m", name]);
@@ -469,14 +475,27 @@ fn dispatching_never_executes_code_from_the_candidate_tree() {
          DispatchLegRunner exists to prevent"
     );
     let dispatched = fs::read_to_string(&seen).expect("the dispatcher must have been invoked");
-    assert!(
-        dispatched.contains(&m),
-        "the dispatcher must be told WHICH sha to build, or it cannot build the \
-         candidate the lane judged: {dispatched}"
+    // The sha handed over is the CANDIDATE's, not the member's, and that is the
+    // contract: the candidate is a `--no-ff` merge of every member onto the
+    // base, so it is a new commit that exists nowhere else. Asserting the
+    // member's sha here would be asserting that the builder compiles the
+    // unmerged branch — the exact thing the lane exists not to do.
+    let (dispatched_ref, dispatched_sha) = dispatched
+        .trim()
+        .split_once(' ')
+        .expect("the dispatcher records `<ref> <sha>`");
+    assert_ne!(
+        dispatched_sha, m,
+        "the builder must be given the merged candidate, not the member's own head"
     );
     assert!(
-        dispatched.contains("refs/heads/lane-candidate"),
-        "and the ref it was published on: {dispatched}"
+        dispatched_ref.ends_with(dispatched_sha),
+        "the ref must be addressed by the sha it carries, so two candidates \
+         cannot collide and a build stays findable after the fact: {dispatched}"
+    );
+    assert!(
+        dispatched_ref.starts_with("refs/heads/lane-candidate/"),
+        "and it must live under the configured prefix: {dispatched}"
     );
     assert!(
         actions
@@ -486,15 +505,24 @@ fn dispatching_never_executes_code_from_the_candidate_tree() {
     );
 
     // The candidate must be FETCHABLE by the builder — a ref the sandbox cannot
-    // reach is a build that cannot happen.
+    // reach is a build that cannot happen. Resolve the ref the dispatcher was
+    // actually handed, and check it names the same commit on the remote.
     let ls = Command::new("git")
         .current_dir(&remote)
-        .args(["rev-parse", &format!("refs/heads/lane-candidate/{m}")])
+        .args(["rev-parse", dispatched_ref])
         .output()
         .unwrap();
     assert!(
         ls.status.success(),
-        "the candidate must be published on the remote under its own sha"
+        "the candidate must be published on the remote as {dispatched_ref}: {}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ls.stdout).trim(),
+        dispatched_sha,
+        "and the published ref must point at the very commit the dispatcher was \
+         told to build — otherwise the builder compiles a different tree than \
+         the lane judged"
     );
 
     for d in [root, remote] {
