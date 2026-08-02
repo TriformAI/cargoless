@@ -104,6 +104,26 @@ impl CandidateTree for GitCandidateTree {
         // reported, which matters when a merge conflicts: "B conflicts when
         // applied after A" is actionable; "the candidate conflicted" is not.
         for member in members {
+            // A member can LAND between enqueue and here — someone merges the
+            // PR by hand, or a previous candidate already carried it. Its head
+            // is then already an ancestor of the base, and `merge --no-ff`
+            // writes an EMPTY commit rather than failing: the candidate builds,
+            // goes green, and the lander is handed a roster naming a PR that is
+            // already closed. Before landing was armed that was merely untidy;
+            // now it is a real merge API call against a merged PR.
+            //
+            // Reported as a Conflict-shaped ejection with NO files, which the
+            // state machine already handles as `Unattributed` — the member
+            // leaves the queue, everyone else keeps building. Silently skipping
+            // it would make a green candidate that never contained the member
+            // look like one that did.
+            if is_already_in_base(&root, &member.head) {
+                self.release(&root);
+                return Err(MaterializeError::Stale {
+                    id: member.id.clone(),
+                    head: member.head.clone(),
+                });
+            }
             // Read the conflicting paths BEFORE aborting — `merge --abort`
             // clears the index, and with it the only record of which files
             // collided. Those paths are what makes the ejection attributable
@@ -165,6 +185,27 @@ fn merge_one_raw(root: &Path, member: &LaneMember, name: &str, email: &str) -> R
             member.id, member.head
         )),
     }
+}
+
+/// Is this member's head already contained in the tree we are building on?
+///
+/// True means the member landed between enqueue and now — merging it would
+/// write an empty commit and the roster would name a PR that is already closed.
+///
+/// Fails CLOSED (returns `false`) when git cannot answer: an unreadable
+/// ancestry check must not eject a member that is perfectly fine. The cost of a
+/// false `false` is one empty commit in a candidate; the cost of a false `true`
+/// is dropping live work.
+fn is_already_in_base(root: &Path, head: &str) -> bool {
+    // `HEAD` here is the candidate tree as merged SO FAR, not just the base —
+    // which also catches the case where an earlier member in this same roster
+    // already carried this one's commits.
+    Command::new("git")
+        .current_dir(root)
+        .args(["merge-base", "--is-ancestor", head, "HEAD"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Paths git left unmerged, i.e. the files that actually collided.

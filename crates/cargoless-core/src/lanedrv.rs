@@ -76,6 +76,14 @@ pub enum MaterializeError {
         files: Vec<PathBuf>,
         reason: String,
     },
+    /// A named member is ALREADY contained in the tree being built — it landed
+    /// between enqueue and materialize (merged by hand, or carried by an
+    /// earlier candidate). Merging it would write an empty commit and leave the
+    /// roster naming a closed PR for the lander to act on.
+    ///
+    /// Attributable but blameless: nobody's code is wrong, the member is simply
+    /// done. It leaves the queue and the rest of the roster rebuilds.
+    Stale { id: String, head: String },
     /// Anything else: fetch failed, worktree could not be created, disk full.
     /// Not attributable to any member.
     Infra(io::Error),
@@ -88,6 +96,12 @@ impl std::fmt::Display for MaterializeError {
                 write!(
                     f,
                     "member `{id}` could not be merged onto the base: {reason}"
+                )
+            }
+            Self::Stale { id, head } => {
+                write!(
+                    f,
+                    "member `{id}` ({head}) already landed — it is contained in the candidate base"
                 )
             }
             Self::Infra(e) => write!(f, "{e}"),
@@ -1286,6 +1300,27 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                 return LaneEvent::BuildFinished {
                     generation,
                     outcome: LaneBuildOutcome::Conflict { id, files, reason },
+                };
+            }
+            // The member landed while it sat in the queue. Eject it by name with
+            // NO conflicting files, which the state machine already treats as
+            // `Unattributed` — the member leaves, everyone else rebuilds without
+            // it. Reusing the Conflict outcome rather than adding a parallel one
+            // keeps a single ejection path; the trail line says `stale` so the
+            // reason is never mistaken for a genuine merge conflict.
+            Err(MaterializeError::Stale { id, head }) => {
+                let reason = format!("member `{id}` ({head}) already landed before this build");
+                self.trail_line(&format!(
+                    "[cargoless:obs] lane-build generation={generation} outcome=stale \
+                     member={id} head={head}"
+                ));
+                return LaneEvent::BuildFinished {
+                    generation,
+                    outcome: LaneBuildOutcome::Conflict {
+                        id,
+                        files: Vec::new(),
+                        reason,
+                    },
                 };
             }
             Err(MaterializeError::Infra(e)) => {

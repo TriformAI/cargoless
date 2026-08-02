@@ -981,6 +981,86 @@ fn an_unmergeable_member_is_ejected_and_the_queue_keeps_moving() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A member that LANDS while it waits in the queue must leave the queue.
+///
+/// The window is real and now dangerous: a candidate build takes minutes, and
+/// in that time someone can merge the PR by hand, or a previous candidate can
+/// carry it. Its head is then already an ancestor of the base, and
+/// `git merge --no-ff` does not fail — it writes an EMPTY commit. So the
+/// candidate builds, goes green, and the lander is handed a roster naming a PR
+/// that is already closed.
+///
+/// While landing was report-only that was untidy. With auto-merge armed it is a
+/// real merge API call against a merged PR, which is exactly the situation that
+/// makes an auto-merger untrustworthy.
+#[test]
+fn a_member_that_already_landed_is_ejected_instead_of_merged_empty() {
+    let root = repo_with_legs("stale", &leg("build", "true"));
+
+    // `done` is a real branch with a real commit...
+    let done = branch(&root, "done", "shipped.txt", "already in main\n");
+    // ...which then lands on main. This is the mid-flight merge.
+    sh(&root, &["checkout", "-q", "main"]);
+    sh(
+        &root,
+        &["merge", "--no-ff", "-q", "-m", "operator merged it", &done],
+    );
+
+    // `fresh` is genuinely unmerged and must survive.
+    let fresh = branch(&root, "fresh", "new.txt", "not yet landed\n");
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(tree, ProfileLegRunner::new("lane"), ReportOnlyLander);
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+
+    let _ = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("done", &done).with_changed_files(["shipped.txt"])),
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("fresh", &fresh).with_changed_files(["new.txt"])),
+    );
+
+    // 1. The landed member is ejected BY NAME — not silently skipped. A green
+    //    candidate that never contained the member must not look like one
+    //    that did.
+    let ejected: Vec<&str> = lane.ejections().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        ejected,
+        vec!["done"],
+        "a member already contained in the base must leave the queue, and only \
+         that member. actions: {actions:?}"
+    );
+
+    // 2. Never infrastructure. Infra ejects nobody and backs off, so a landed
+    //    member would ride every future candidate forever.
+    let (_, ejection) = lane.ejections().next().expect("`done` is ejected");
+    assert!(
+        !matches!(
+            ejection.reason,
+            cargoless_core::lane::EjectReason::Infrastructure { .. }
+        ),
+        "an already-landed member is attributable, not an infra failure: {:?}",
+        ejection.reason
+    );
+
+    // 3. The co-rider is untouched — someone else landing is not its problem.
+    assert!(
+        !ejected.contains(&"fresh"),
+        "the unmerged member must not be ejected because a co-rider landed: \
+         ejected={ejected:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A failing lander must not retry as fast as the driver can loop.
 ///
 /// The realistic cause of a failed land is the base moving and the forge's
