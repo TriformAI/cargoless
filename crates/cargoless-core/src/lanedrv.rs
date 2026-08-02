@@ -72,6 +72,21 @@ pub trait LegRunner {
     fn run(&self, root: &Path, changed_files: &[String]) -> io::Result<LegOutcome>;
 }
 
+/// So a caller can pick the runner at runtime without monomorphising a branch
+/// per combination.
+///
+/// `LaneHost::spawn` is generic over the runner AND the lander, so choosing
+/// between in-process and dispatched legs at boot would otherwise need one
+/// `spawn` call per (runner × lander) pair — four for two of each, and eight
+/// the next time either grows. The trait is object-safe (`&self`, concrete
+/// argument types), so boxing costs one vtable hop per BUILD — measured in
+/// tens of minutes — and buys back the combinatorics.
+impl LegRunner for Box<dyn LegRunner + Send> {
+    fn run(&self, root: &Path, changed_files: &[String]) -> io::Result<LegOutcome> {
+        (**self).run(root, changed_files)
+    }
+}
+
 /// What a leg run reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegOutcome {

@@ -1486,6 +1486,18 @@ impl ServeVerdictState {
     /// publishes on green. `None` is a check-only lane: it proves the merged
     /// tree compiles and deliberately leaves the pointer alone rather than
     /// advancing it to nothing.
+    ///
+    /// `dispatch` selects WHERE the legs run. `None` compiles them in this
+    /// process; `Some((argv, remote, ref_prefix))` publishes the candidate and
+    /// hands it to an external builder.
+    ///
+    /// In-process is the default because it is the zero-config one — a single
+    /// developer's laptop has no builder to dispatch to. It is NOT the safe one
+    /// for a multi-tenant daemon: `cargo` executes `build.rs` and proc-macros
+    /// from the candidate, which is unreviewed code, so a daemon whose
+    /// container can reach a credential (tf-multiverse's can reach a
+    /// push-capable forge token via `.git/config` on its shared volume, checked
+    /// 2026-07-31) must dispatch instead. See `DispatchLegRunner`.
     #[must_use]
     pub fn with_lane(
         mut self,
@@ -1494,15 +1506,47 @@ impl ServeVerdictState {
         base_ref: &str,
         profile: &str,
         artifact_path: Option<PathBuf>,
+        dispatch: Option<(Vec<String>, String, String)>,
     ) -> Self {
         let tree = cargoless_core::lanetree::GitCandidateTree::new(
             repo,
             state_dir.join("lane-candidates"),
             base_ref,
         );
-        let publishing = artifact_path.is_some();
-        let mut legs = cargoless_core::lanedrv::ProfileLegRunner::new(profile);
-        legs.artifact_path = artifact_path;
+        // Captured BEFORE the match consumes `artifact_path`.
+        let publishes_locally = artifact_path.is_some();
+        let dispatching = dispatch.is_some();
+        let legs: Box<dyn cargoless_core::lanedrv::LegRunner + Send> = match dispatch {
+            Some((command, remote, ref_prefix)) => {
+                // REFUSE the combination rather than quietly ignore half of it.
+                // `DispatchLegRunner` always reports `artifact: None` — the
+                // build happened elsewhere, so there is no local file to hand a
+                // lander. Accepting an artifact path here would leave
+                // `PointerLander` taking its "green with nothing to publish"
+                // branch on every build: no error, no pointer movement, and an
+                // operator who configured a publishing lane watching it publish
+                // nothing forever. That is precisely the
+                // exits-0-while-doing-nothing shape, so it fails loudly at boot
+                // instead.
+                assert!(
+                    artifact_path.is_none(),
+                    "CARGOLESS_LANE_ARTIFACT cannot be combined with a dispatched \
+                     lane: the build runs elsewhere, so there is no local artifact \
+                     to publish. The dispatcher's own builder owns promotion."
+                );
+                Box::new(cargoless_core::lanedrv::DispatchLegRunner::new(
+                    command, remote, ref_prefix,
+                ))
+            }
+            None => {
+                let mut legs = cargoless_core::lanedrv::ProfileLegRunner::new(profile);
+                legs.artifact_path = artifact_path;
+                Box::new(legs)
+            }
+        };
+        // A dispatched lane is never "publishing" locally, whatever the artifact
+        // setting was — the assert above guarantees it was unset.
+        let publishing = !dispatching && publishes_locally;
         // The lander follows the artifact setting so the two cannot disagree.
         //
         // No artifact ⇒ report-only: the lane proves the merged tree builds and
@@ -1517,9 +1561,10 @@ impl ServeVerdictState {
         // is harmless today but is one refactor away from advancing a pointer
         // to nothing.
         //
-        // Two spawn calls rather than one over a boxed lander: `LaneHost::spawn`
-        // is generic, so each branch monomorphises its own driver and neither
-        // needs dynamic dispatch on a path that runs once at boot.
+        // Two spawn calls, one per LANDER. The runner is boxed above (see the
+        // `Box<dyn LegRunner>` impl) because it has two variants of its own, and
+        // monomorphising both dimensions would mean four `spawn` bodies here.
+        //
         // The verdict trail, beside the witness's own `witness-legs.log` in the
         // same state dir. A lane build is tens of minutes and the candidate
         // worktree (with its target dir) is destroyed the moment it ends, so

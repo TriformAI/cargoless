@@ -530,6 +530,43 @@ fn dispatching_never_executes_code_from_the_candidate_tree() {
     }
 }
 
+/// The runner must be selectable at RUNTIME, or the daemon cannot offer the
+/// choice without monomorphising a branch per (runner × lander) pair.
+///
+/// This is a compile-shaped property — it passes trivially once the boxed impl
+/// exists and fails to build without it — so the assertion is that a boxed
+/// runner still produces a real verdict through the real driver, not merely
+/// that the types line up.
+#[test]
+fn a_boxed_runner_drives_a_real_build() {
+    let root = repo_with_legs("boxed", &leg("build", "true"));
+    let a = branch(&root, "a", "a.txt", "a\n");
+
+    let legs: Box<dyn LegRunner + Send> = Box::new(ProfileLegRunner::new("lane"));
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander);
+
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+
+    assert!(
+        actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::LandAndPublish { .. })),
+        "a boxed runner must reach a landing exactly as a concrete one does: {actions:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A dispatcher that fails is a RED with real diagnostics, not an infra error —
 /// the whole point of moving the build out is that its verdict still attributes.
 #[test]

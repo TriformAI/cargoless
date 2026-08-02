@@ -491,17 +491,78 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             .ok()
             .filter(|p| !p.trim().is_empty())
             .map(std::path::PathBuf::from);
+        // WHERE the legs run. Unset = in this process, which is right for a
+        // single-developer repo and WRONG for a daemon whose container can
+        // reach a credential: `cargo` executes `build.rs` and proc-macros from
+        // the candidate, and a candidate is unreviewed code. On tf-multiverse
+        // the `serve` container can read a push-capable forge token out of
+        // `.git/config` on its shared volume (verified 2026-07-31), so that
+        // deployment MUST set this.
+        //
+        // Split on whitespace: an argv, not a shell string. Handing this to a
+        // shell would make the dispatcher command itself an injection surface,
+        // which is a strange thing to add to a feature whose entire purpose is
+        // to stop executing untrusted input.
+        let dispatch_cmd: Vec<String> = std::env::var("CARGOLESS_LANE_DISPATCH")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let dispatch = if dispatch_cmd.is_empty() {
+            None
+        } else {
+            // Refuse the contradictory pair HERE, with the same fail-closed
+            // shape as the unknown-profile check above, rather than letting
+            // `with_lane`'s assert panic. An operator reading a panic has to
+            // guess; an operator reading this sentence has the fix.
+            if artifact.is_some() {
+                eprintln!(
+                    "[cargoless] FATAL: CARGOLESS_LANE_ARTIFACT and \
+                     CARGOLESS_LANE_DISPATCH are mutually exclusive. A dispatched \
+                     lane builds elsewhere, so there is no local artifact for the \
+                     lander to publish — the pointer would silently never move."
+                );
+                eprintln!(
+                    "[cargoless] Unset one: drop CARGOLESS_LANE_ARTIFACT to let the \
+                     dispatcher's builder own promotion, or drop \
+                     CARGOLESS_LANE_DISPATCH to compile in this process."
+                );
+                std::process::exit(2);
+            }
+            let remote = std::env::var("CARGOLESS_LANE_DISPATCH_REMOTE")
+                .unwrap_or_else(|_| "origin".to_string());
+            let prefix = std::env::var("CARGOLESS_LANE_DISPATCH_REF_PREFIX")
+                .unwrap_or_else(|_| "refs/heads/lane-candidate".to_string());
+            Some((dispatch_cmd, remote, prefix))
+        };
         // Announce it. A lane that can move the trunk must be visible in the
         // boot log, not inferred from behaviour — the same reasoning as the
-        // resolved-caps lines below.
+        // resolved-caps lines below. `where=` is the load-bearing field: it is
+        // the difference between compiling unreviewed code in this pod and
+        // compiling it in a sandbox, and an operator must be able to read which
+        // one they got without inspecting behaviour.
         eprintln!(
-            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={}",
+            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={} where={}",
             artifact
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<none: check-only>".to_string())
+                .unwrap_or_else(|| "<none: check-only>".to_string()),
+            match dispatch.as_ref() {
+                Some((cmd, remote, prefix)) => format!(
+                    "dispatched:{} remote={remote} ref_prefix={prefix}",
+                    cmd.join(" ")
+                ),
+                None => "in-process (compiles candidate code in THIS pod)".to_string(),
+            }
         );
-        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, &profile, artifact);
+        api_state = api_state.with_lane(
+            &scope.repo_root,
+            &state_dir,
+            &base,
+            &profile,
+            artifact,
+            dispatch,
+        );
     }
     let api = Arc::new(api_state);
     // Path D + R3 — publish the resolved caps at startup so an operator
