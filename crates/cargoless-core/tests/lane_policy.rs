@@ -915,6 +915,45 @@ fn ttl_expiry_readmits_as_a_backstop() {
             .any(|a| matches!(a, LaneAction::Readmit { .. })),
         "expiry is reported, never silent"
     );
+
+    // AND THE MEMBER IS ACTUALLY BACK. Leaving `ejected` is not the same as
+    // rejoining the queue, and this test used to assert only the former —
+    // so a TTL expiry that dropped the member entirely passed it.
+    //
+    // That shipped. On 2026-08-02 three members ejected `infrastructure` by a
+    // preview outage hit their TTL and vanished: `queue_depth: 0`, nothing
+    // building, and `GET /lane` showing no trace that anything had been lost.
+    // A backstop that discards the member it was protecting is worse than no
+    // backstop, because the log says "re-admitted" either way.
+    assert_eq!(
+        st.queue_depth() + st.in_flight().len(),
+        1,
+        "a lapsed ejection must put the member BACK IN THE LANE, not merely \
+         out of `ejected`: {actions:?}"
+    );
+    // Intact, not a husk. Ticking past the capture window starts the build,
+    // which is what puts the member in `in_flight` where its fields are
+    // readable — `LaneState` deliberately exposes no `queue()`, and widening
+    // that surface for a test would be the wrong trade.
+    //
+    // This matters: without `head` the candidate cannot be built, and without
+    // `changed_files` every future red it rides is unattributable and holds
+    // the whole queue instead of ejecting one member.
+    st.step(LaneEvent::Tick {
+        now: WINDOW + 11 + WINDOW,
+    });
+    let back = st
+        .in_flight()
+        .iter()
+        .find(|m| m.id == "A")
+        .expect("the readmitted member rebuilds");
+    assert_eq!(back.head, "a1", "the readmitted member keeps its head");
+    assert_eq!(
+        back.changed_files,
+        vec!["src/a.rs".to_string()],
+        "the readmitted member keeps its changed set — losing it makes every \
+         later red it rides unattributable"
+    );
 }
 
 #[test]

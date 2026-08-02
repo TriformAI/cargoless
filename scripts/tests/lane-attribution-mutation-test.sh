@@ -129,6 +129,21 @@ mutate "infra retry has no backoff (the hot loop)" \
   's = s.replace("self.infra_failures = self.infra_failures.saturating_add(1);\n\n                // GIVE UP eventually.", "self.infra_failures = self.infra_failures.saturating_add(1);\n                self.infra_retry_after = None;\n\n                // GIVE UP eventually.", 1)' \
   "retries an infrastructure failure instantly and forever, burning the machine while reporting a phase indistinguishable from a long build"
 
+# 5b. A lapsed TTL drops the member instead of requeueing it. THIS ALSO
+#    SHIPPED: `expire_ejections` removed the ejection and announced `Readmit`
+#    without ever calling `admit`, so the member left `ejected`, never reached
+#    `queue`, and was simply gone. Observed 2026-08-02 — three members ejected
+#    by a preview outage hit their TTL and vanished, leaving `queue_depth: 0`
+#    with nothing building and a log that said "re-admitted".
+#
+#    The TTL is the backstop for a member the attribution stranded. A backstop
+#    that discards what it was protecting is worse than none, because the
+#    reported outcome is identical either way. No test caught it: the TTL test
+#    asserted only that the ejection was gone, never that the member was back.
+mutate "TTL expiry drops the member instead of requeueing it" \
+  's = s.replace("            self.admit(\n                LaneMember {\n                    id,\n                    head: ejection.head,\n                    changed_files: ejection.changed_files,\n                },\n                actions,\n            );", "            let _ = ejection;", 1)' \
+  "silently loses a member whose ejection lapsed — it leaves \`ejected\`, never reaches \`queue\`, and the log still says re-admitted"
+
 # 6. The attempt cap never trips, so a PERMANENT infra failure retries forever.
 #    A member whose head commit the daemon cannot reach never becomes buildable
 #    by waiting; retrying it blocks every later submission behind it.

@@ -787,11 +787,39 @@ impl LaneState {
             .map(|(id, _)| id.clone())
             .collect();
         for id in lapsed {
-            self.ejected.remove(&id);
+            // Put the member BACK IN THE QUEUE, not merely out of `ejected`.
+            //
+            // This used to remove the ejection and announce `Readmit` without
+            // ever calling `admit`, so a member whose TTL lapsed was silently
+            // dropped: gone from `ejected`, absent from `queue`, and reported
+            // as re-admitted. Observed in production 2026-08-02 — three members
+            // ejected `infrastructure` by a preview outage hit their TTL and
+            // vanished, leaving `queue_depth: 0` with nothing building and no
+            // way to tell from `GET /lane` that anything had been lost.
+            //
+            // That is the exact failure the TTL exists to PREVENT. It is the
+            // backstop for a member the attribution stranded; a backstop that
+            // discards the thing it was protecting is worse than none, because
+            // the log says "re-admitted" either way.
+            //
+            // `Ejection` retains `head` and `changed_files` precisely so the
+            // member can be rebuilt intact — the same reconstruction
+            // `on_force_readmit` does.
+            let Some(ejection) = self.ejected.remove(&id) else {
+                continue;
+            };
             actions.push(LaneAction::Readmit {
-                id,
+                id: id.clone(),
                 why: "ejection expired (TTL backstop)".to_string(),
             });
+            self.admit(
+                LaneMember {
+                    id,
+                    head: ejection.head,
+                    changed_files: ejection.changed_files,
+                },
+                actions,
+            );
         }
     }
 
