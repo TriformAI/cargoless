@@ -543,18 +543,25 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             // watch/push path treats this cluster as already-spawned, then
             // spawn its RA and drain the spawn control messages).
             if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&root), h.clone()) {
-                spawn_cluster(
+                if let Err(error) = spawn_cluster(
                     &mut clusters,
                     &h,
                     root.clone(),
                     lsp_tx.clone(),
                     ctrl_tx.clone(),
-                );
-                drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
-                eprintln!(
-                    "[cargoless:obs] eager-boot-warm — spawned base cluster RA at {} (push-only; /readyz no longer traffic-dependent)",
-                    root.display()
-                );
+                ) {
+                    let _ = lifecycle.deactivate(path_key(&root));
+                    eprintln!(
+                        "[cargoless:obs] ra-spawn-failed phase=eager-boot root={} error={error}",
+                        root.display()
+                    );
+                } else {
+                    drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
+                    eprintln!(
+                        "[cargoless:obs] eager-boot-warm — spawned base cluster RA at {} (push-only; /readyz no longer traffic-dependent)",
+                        root.display()
+                    );
+                }
             }
         }
     }
@@ -658,13 +665,22 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             // Ensure the cluster's RA exists (proven 0→1 SpawnRa) — same
             // as the FS path's gate.
             if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
-                spawn_cluster(
+                if let Err(error) = spawn_cluster(
                     &mut clusters,
                     &h,
                     cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
                     lsp_tx.clone(),
                     ctrl_tx.clone(),
-                );
+                ) {
+                    let wt_key = path_key(&wt);
+                    let _ = lifecycle.deactivate(wt_key.clone());
+                    eprintln!(
+                        "[cargoless:obs] ra-spawn-failed phase=pushed-overlay wt={} error={error}",
+                        wt.display()
+                    );
+                    api.fail_next_pushed_overlay(&wt_key, &format!("ra_spawn_failed: {error}"));
+                    continue;
+                }
                 // `spawn_cluster` runs the initial LSP handshake inside
                 // the Supervisor hook and queues `Ctrl::Spawned` before
                 // returning. Drain it now so the first pushed batch does
@@ -766,13 +782,20 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 pending_batch.insert(wt.clone(), batch);
                 // Ensure the cluster's RA exists (proven 0→1 SpawnRa).
                 if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
-                    spawn_cluster(
+                    if let Err(error) = spawn_cluster(
                         &mut clusters,
                         &h,
                         cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
                         lsp_tx.clone(),
                         ctrl_tx.clone(),
-                    );
+                    ) {
+                        let _ = lifecycle.deactivate(path_key(&wt));
+                        eprintln!(
+                            "[cargoless:obs] ra-spawn-failed phase=fs-watch wt={} error={error}",
+                            wt.display()
+                        );
+                        continue;
+                    }
                     drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
                 }
                 route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
@@ -928,9 +951,9 @@ fn spawn_cluster(
     root: PathBuf,
     lsp_tx: Sender<(WorkspaceConfigHash, LspEvent)>,
     ctrl_tx: Sender<Ctrl>,
-) {
+) -> Result<(), String> {
     if clusters.contains_key(h) {
-        return; // ClusterLifecycle proves SpawnRa is 0→1 only; defensive.
+        return Ok(()); // ClusterLifecycle proves SpawnRa is 0→1 only; defensive.
     }
     let spawn_root = root.clone();
     let spawn = move || -> std::io::Result<Child> {
@@ -986,10 +1009,12 @@ fn spawn_cluster(
                 }
             });
     };
-    let Ok(supervisor) = Supervisor::start_with_hook(spawn, on_spawn) else {
-        crate::ui::warn("rust-analyzer spawn failed for a cluster — skipping");
-        return;
-    };
+    let supervisor = Supervisor::start_with_hook(spawn, on_spawn).map_err(|error| {
+        format!(
+            "could not spawn rust-analyzer in `{}`: {error}",
+            root.display()
+        )
+    })?;
     clusters.insert(
         h.clone(),
         ClusterState {
@@ -1008,6 +1033,7 @@ fn spawn_cluster(
             deferred: VecDeque::new(),
         },
     );
+    Ok(())
 }
 
 /// CGLS-27 — the worktree keys belonging to cluster `h`, in the

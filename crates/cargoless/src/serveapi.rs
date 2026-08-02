@@ -2040,6 +2040,18 @@ impl ServeVerdictState {
                             after_ms: context.retry_after_ms,
                         },
                     )
+                } else if reason.starts_with("ra_spawn_failed") {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::ProcessLost {
+                            component: OutcomeComponent::RustAnalyzer,
+                            respawned: false,
+                        },
+                        RetryDirective::Automatic {
+                            attempt: context.attempt_number,
+                            maximum_attempts: context.maximum_attempts,
+                            after_ms: context.retry_after_ms,
+                        },
+                    )
                 } else if reason.contains("timeout") {
                     (
                         cargoless_core::outcome::IndeterminateCause::BudgetExhausted {
@@ -2368,6 +2380,30 @@ impl ServeVerdictState {
             }
         }
         popped.0
+    }
+
+    /// Terminalize the next accepted overlay when its rust-analyzer cluster
+    /// cannot be created. Accepted exact attempts must never remain queued
+    /// after the adapter has already abandoned their execution.
+    pub(crate) fn fail_next_pushed_overlay(&self, wt_key: &str, reason: &str) -> bool {
+        let Some(pushed) = self.take_overlay_for(wt_key) else {
+            return false;
+        };
+        let macro_blind_hit = compute_macro_blind_hit(
+            pushed.changed_files.as_deref(),
+            &macro_blind_globs(),
+            &pushed.files,
+            &macro_blind_macros(),
+        );
+        self.publish_attributed_with_checks(
+            Path::new(wt_key),
+            crate::statusfile::VerdictPayload::unknown(reason),
+            pushed.base_sha,
+            macro_blind_hit,
+            Vec::new(),
+            pushed.semantic,
+        );
+        true
     }
 
     /// #240/2b — non-consuming peek. Used by the serve loop's first-push
@@ -4053,10 +4089,10 @@ impl VerdictService for ServeVerdictState {
                 }
             }
         }
-        // Wake the serve loop (best-effort — see attach_push_signal doc).
-        if let Some(tx) = poisoned(&self.push_signal).as_ref() {
-            let _ = tx.send(worktree.to_string());
-        }
+        // Publish the pending identity before waking the serve loop. The loop
+        // can fail an initial rust-analyzer spawn immediately; waking first
+        // lets that failure race ahead of the accepted outcome and strand the
+        // later pending record forever.
         if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
             self.begin_outcome_v3(
                 context,
@@ -4065,6 +4101,10 @@ impl VerdictService for ServeVerdictState {
                 Phase::Queued,
                 "overlay accepted and queued for analysis",
             );
+        }
+        // Wake the serve loop (best-effort — see attach_push_signal doc).
+        if let Some(tx) = poisoned(&self.push_signal).as_ref() {
+            let _ = tx.send(worktree.to_string());
         }
         PushOverlayAck {
             worktree: worktree.to_string(),
@@ -4692,14 +4732,7 @@ fn prepare_project_check_scratch(
     scratch_root: &Path,
     base_ref: &str,
 ) -> Result<(), String> {
-    if scratch_root.exists() {
-        std::fs::remove_dir_all(scratch_root).map_err(|e| {
-            format!(
-                "could not remove stale project-check scratch `{}`: {e}",
-                scratch_root.display()
-            )
-        })?;
-    }
+    cleanup_project_check_scratch(root, scratch_root)?;
     if let Some(parent) = scratch_root.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -4713,20 +4746,23 @@ fn prepare_project_check_scratch(
 }
 
 fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(), String> {
-    if !scratch_root.exists() {
-        return Ok(());
-    }
     let scratch = scratch_root.to_string_lossy().into_owned();
     match run_git(root, &["worktree", "remove", "--force", &scratch]) {
         Ok(()) => Ok(()),
         Err(git_err) => {
-            let fallback = std::fs::remove_dir_all(scratch_root).map_err(|e| {
-                format!(
-                    "{git_err}; fallback remove_dir_all `{}` failed: {e}",
-                    scratch_root.display()
-                )
-            });
-            fallback.and(Err(git_err))
+            if scratch_root.exists() {
+                std::fs::remove_dir_all(scratch_root).map_err(|e| {
+                    format!(
+                        "{git_err}; fallback remove_dir_all `{}` failed: {e}",
+                        scratch_root.display()
+                    )
+                })?;
+            }
+            // If the directory was unregistered, the remove above fails even
+            // though there is nothing else to do. If registration metadata is
+            // damaged or stale, pruning after filesystem cleanup removes the
+            // prunable entry from the persistent repository volume.
+            run_git(root, &["worktree", "prune", "--expire", "now"])
         }
     }
 }
@@ -8543,6 +8579,43 @@ checks:
     }
 
     #[test]
+    fn project_check_scratch_recovers_registration_left_by_prior_process() {
+        let project = setup_batch_project("project-overlay-stale-registration");
+        let state_dir = temp_root("project-overlay-stale-registration-state");
+        let scratch = state_dir.join("project-check-runs/run-1-8");
+
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
+        assert!(
+            scratch.exists(),
+            "the prior process created its scratch tree"
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(
+            !scratch.exists(),
+            "simulate pod replacement after the directory disappeared but Git metadata survived"
+        );
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main")
+            .expect("a restarted process may safely reclaim the same scratch path");
+        assert!(scratch.exists(), "the replacement scratch tree exists");
+
+        cleanup_project_check_scratch(&project.root, &scratch).unwrap();
+        assert!(!scratch.exists(), "cleanup removes the scratch directory");
+        let registrations = Command::new("git")
+            .arg("-C")
+            .arg(&project.root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("worktree list remains readable");
+        assert!(registrations.status.success());
+        let registrations = String::from_utf8_lossy(&registrations.stdout);
+        assert!(
+            !registrations.contains(scratch.to_string_lossy().as_ref()),
+            "cleanup removes the Git worktree registration as well"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn push_overlay_with_options_rejects_escaping_repo_relative_paths() {
         let api = ServeVerdictState::new();
         let files = vec![("../outside.rs".to_string(), "bad".to_string())];
@@ -8584,6 +8657,52 @@ checks:
         );
         // peek also None.
         assert!(api.peek_overlay_for("/wt").is_none());
+    }
+
+    #[test]
+    fn ra_spawn_failure_terminalizes_the_exact_queued_attempt() {
+        let state_dir = temp_root("ra-spawn-failure-outcome");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = attempt_context("attempt-ra-spawn-failure", 1);
+        let files = vec![("src/lib.rs".to_string(), "pub fn changed() {}".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..PushOverlayOptions::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/client/ra-spawn-failure",
+                "0123456789abcdef0123456789abcdef01234567",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        assert!(api.fail_next_pushed_overlay(
+            "/client/ra-spawn-failure",
+            "ra_spawn_failed: Resource temporarily unavailable (os error 11)",
+        ));
+
+        assert!(api.peek_overlay_for("/client/ra-spawn-failure").is_none());
+        assert_eq!(api.daemon_activity().active_worktrees, 0);
+        let outcome = api
+            .get_outcome_v3(&context.attempt_id)
+            .expect("accepted attempt remains queryable");
+        assert_eq!(
+            outcome.conclusion.semantic_code(),
+            "indeterminate.process_lost"
+        );
+        assert!(
+            outcome.timeline.last().is_some_and(|phase| {
+                phase.phase == Phase::Terminal && phase.finished_at_unix_ms.is_some()
+            }),
+            "spawn failure must become terminal instead of remaining queued forever"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     /// **THE load-bearing composing-equivalence assertion (2b spec §5.3).**
