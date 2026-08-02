@@ -115,18 +115,24 @@ mutate "line-sensitive ejection identity" \
 #    indistinguishable from a slow compile. No test failed, because no test
 #    asserted that a retry WAITS.
 #
-#    ANCHORED on the line above the assignment, not the assignment alone.
-#    `LandFailed` sets `infra_retry_after` with a byte-identical two-line
-#    statement, and it appears EARLIER in the file — so a bare `replace(..., 1)`
-#    silently mutated that one instead and left this rung untouched. The mutation
-#    then "survived" while reporting the wrong cause: the suite looked blind to
-#    the hot loop when it was actually being handed a different edit.
+#    ANCHORED on the comment directly above the assignment, which is unique to
+#    this rung. Two earlier attempts got this wrong and are worth recording,
+#    because both LOOKED right:
 #
-#    A mutation that can drift onto a lookalike is worse than no mutation: it
-#    reports on code nobody meant to test. The `infra_failures.saturating_add`
-#    line is unique to the infra arm, so anchoring on it pins the target.
+#    1. A bare `replace("self.infra_retry_after =\n ... backoff_ticks));", ...)`
+#       drifted. `LandFailed` sets the same field with a byte-identical two-line
+#       statement and appears EARLIER in the file, so `replace(..., 1)` mutated
+#       that one and left this rung intact.
+#    2. Injecting `infra_retry_after = None` at the TOP of the infra arm was a
+#       no-op: the real assignment happens later in the same arm and simply
+#       overwrote it. The mutation applied cleanly and changed nothing.
+#
+#    Both reported "SURVIVED" and both blamed the tests. A mutation that edits
+#    the wrong line, or the right line at the wrong point, is worse than no
+#    mutation — it accuses the suite of a blindness it does not have. Verify a
+#    new mutation actually breaks the behaviour before trusting its verdict.
 mutate "infra retry has no backoff (the hot loop)" \
-  's = s.replace("self.infra_failures = self.infra_failures.saturating_add(1);\n\n                // GIVE UP eventually.", "self.infra_failures = self.infra_failures.saturating_add(1);\n                self.infra_retry_after = None;\n\n                // GIVE UP eventually.", 1)' \
+  's = s.replace("            // failure returns.\n                self.infra_retry_after =\n                    Some(self.now.saturating_add(self.cfg.infra_backoff_ticks));", "            // failure returns.\n                self.infra_retry_after = None;", 1)' \
   "retries an infrastructure failure instantly and forever, burning the machine while reporting a phase indistinguishable from a long build"
 
 # 5b. A lapsed TTL drops the member instead of requeueing it. THIS ALSO
