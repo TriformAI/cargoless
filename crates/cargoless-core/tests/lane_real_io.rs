@@ -561,10 +561,22 @@ fn a_green_candidate_is_handed_to_the_lander_with_its_roster() {
         ProfileLegRunner::new("lane"),
         CommandLander::new(vec![script.to_string_lossy().into_owned()]),
     );
+    // A NON-ZERO capture window, closed by an explicit tick.
+    //
+    // This test is about a roster carrying BOTH members, so both have to ride
+    // the same candidate. With `capture_window_ticks: 0` the window is already
+    // expired when the first enqueue is pumped, so `a` builds alone, `b`
+    // arrives while the lane is Building and rides a second candidate, and the
+    // lander — invoked once per build, writing the same file each time — ends
+    // up holding only `b`. The assertion then fails on `a` for a reason that
+    // has nothing to do with rosters.
+    //
+    // Ticking to exactly the window edge is what makes the coalescing
+    // deterministic rather than a race.
     let mut lane = LaneState::with_config(
         &root,
         cargoless_core::lane::LaneConfig {
-            capture_window_ticks: 0,
+            capture_window_ticks: 5,
             ..Default::default()
         },
     );
@@ -576,6 +588,8 @@ fn a_green_candidate_is_handed_to_the_lander_with_its_roster() {
         &mut lane,
         LaneEvent::Enqueue(LaneMember::new("b", &b).with_changed_files(["b.txt"])),
     );
+    // Both are queued; closing the window is what starts the single candidate.
+    drv.pump(&mut lane, LaneEvent::Tick { now: 5 });
 
     let roster = fs::read_to_string(&seen).expect("the lander must have been invoked");
     // id AND head for every member: a lander that only knows the ids cannot
@@ -621,17 +635,32 @@ fn a_failed_land_requeues_the_members_instead_of_losing_them() {
         ProfileLegRunner::new("lane"),
         CommandLander::new(vec![script.to_string_lossy().into_owned()]),
     );
+    // A NON-ZERO capture window, so the re-enqueue lands in the QUEUE and stops
+    // there instead of immediately starting another build.
+    //
+    // With `capture_window_ticks: 0` the driver spins: Enqueue → StartBuild →
+    // BuildFinished → LandAndPublish → lander Err → Enqueue → … Each turn is
+    // several lane events, so `pump`'s MAX_STEPS backstop (64) cuts the loop at
+    // an arbitrary point. `on_build_finished` does `mem::take(&mut in_flight)`,
+    // so a cut between that take and the re-enqueue being applied leaves BOTH
+    // `queue_depth()` and `in_flight()` at zero — and the member looks lost
+    // when it is not. That is what this assertion was reading.
+    //
+    // The window is the thing that makes "requeued" observable: the member
+    // comes to rest in the queue, and only a tick would start the next attempt.
     let mut lane = LaneState::with_config(
         &root,
         cargoless_core::lane::LaneConfig {
-            capture_window_ticks: 0,
+            capture_window_ticks: 5,
             ..Default::default()
         },
     );
-    let actions = drv.pump(
+    let mut actions = drv.pump(
         &mut lane,
         LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
     );
+    // Close the window: this is the pump that builds, lands, fails, requeues.
+    actions.extend(drv.pump(&mut lane, LaneEvent::Tick { now: 5 }));
 
     assert!(
         !actions
