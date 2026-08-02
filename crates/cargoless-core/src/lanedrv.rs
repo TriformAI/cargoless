@@ -728,6 +728,39 @@ const POINT_ATTEMPTS: u32 = 5;
 /// answering, without meaningfully delaying a real failure.
 const POINT_RETRY_DELAY: Duration = Duration::from_secs(6);
 
+/// How long to wait for a busy slot before pointing anyway.
+///
+/// Generous, because the thing we are waiting on is a real tf-multiverse
+/// compile (20-45 min observed). Bounded all the same: a slot wedged
+/// `building` forever must eventually surface as Infra rather than hold the
+/// lane open indefinitely.
+const SLOT_FREE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+/// Poll gap while waiting for the slot. Slow on purpose — this is a
+/// tens-of-minutes wait, so a tight loop would only add noise.
+const SLOT_FREE_POLL: Duration = Duration::from_secs(20);
+
+/// Is this slot mid-build in the `/app` snapshot?
+///
+/// Best-effort by design: unparseable JSON, an absent slot, or a missing
+/// `phase` all read as NOT busy, so a bad snapshot can never wedge the lane
+/// waiting for a slot it cannot see. The phases that mean "work in flight" are
+/// the same set `disk-gc` treats as busy, kept in sync deliberately.
+fn slot_is_building(snapshot: &str, slot: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(snapshot) else {
+        return false;
+    };
+    v.get("instances")
+        .and_then(|i| i.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(slot))
+        })
+        .and_then(|inst| inst.get("phase"))
+        .and_then(|p| p.as_str())
+        .is_some_and(|p| matches!(p, "building" | "queued" | "probing" | "probing+serving"))
+}
+
 pub struct PreviewLegRunner {
     /// Base URL of the daemon that owns the preview slot, e.g.
     /// `http://cargoless-preview.triform-staging.svc.cluster.local:8787`.
@@ -817,6 +850,37 @@ impl LegRunner for PreviewLegRunner {
             "ref": local_ref,
         })
         .to_string();
+        // WAIT for the slot to be free before pointing it.
+        //
+        // Nothing coordinates the lane with the slot it builds on: this runner
+        // used to POST /instances without ever reading the slot's phase, and
+        // the daemon accepts a re-point while a build is in flight. Meanwhile
+        // an infra-ejected member is auto-requeued the moment its TTL lapses,
+        // on a timer that knows nothing about the slot.
+        //
+        // Observed 2026-08-02 20:07Z: an ejection due to expire in ~3 minutes
+        // while the slot had 10-20 minutes of `triform_physics` left, so the
+        // readmit was guaranteed to land mid-build. That is not dangerous — it
+        // fails infra and backs off — but it burns a generation every time, and
+        // it is why the generation counter climbed past 11 with no progress.
+        //
+        // Waiting is honest here: a busy slot is not an infrastructure FAILURE,
+        // it is a queue. Bounded, so a slot wedged `building` forever still
+        // surfaces as Infra rather than hanging the lane.
+        let free_by = Instant::now() + SLOT_FREE_TIMEOUT;
+        loop {
+            let busy = match self.app_snapshot() {
+                Ok(snap) => slot_is_building(&snap, &self.slot),
+                // Cannot read it ⇒ do not block on a guess; the point attempt
+                // below has its own retry and will report the real error.
+                Err(_) => false,
+            };
+            if !busy || Instant::now() >= free_by {
+                break;
+            }
+            std::thread::sleep(SLOT_FREE_POLL);
+        }
+
         // RETRY, because the daemon we are pointing at restarts.
         //
         // This one POST decides whether a 20-45 minute candidate build happens
@@ -1496,5 +1560,75 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             all.extend(actions);
         }
         all
+    }
+}
+
+#[cfg(test)]
+mod slot_free_tests {
+    use super::slot_is_building;
+
+    /// The whole point: a slot mid-build must read BUSY so the lane waits
+    /// instead of pointing into it and burning a generation.
+    #[test]
+    fn a_building_slot_reads_busy() {
+        let snap = r#"{"instances":[{"name":"lane","phase":"building"}]}"#;
+        assert!(
+            slot_is_building(snap, "lane"),
+            "a slot compiling a candidate must read busy"
+        );
+        for phase in ["queued", "probing", "probing+serving"] {
+            let s = format!(r#"{{"instances":[{{"name":"lane","phase":"{phase}"}}]}}"#);
+            assert!(
+                slot_is_building(&s, "lane"),
+                "`{phase}` means work is in flight and must read busy"
+            );
+        }
+    }
+
+    /// A free slot must NOT read busy, or the lane waits out the full timeout
+    /// on every single candidate — worse than the churn this replaces.
+    #[test]
+    fn an_idle_or_serving_slot_is_free() {
+        for phase in ["idle", "serving"] {
+            let s = format!(r#"{{"instances":[{{"name":"lane","phase":"{phase}"}}]}}"#);
+            assert!(
+                !slot_is_building(&s, "lane"),
+                "`{phase}` is not work in flight; the lane must proceed"
+            );
+        }
+    }
+
+    /// FAILS OPEN. An unreadable snapshot must never wedge the lane waiting for
+    /// a slot it cannot see — the point attempt has its own retry and reports
+    /// the real error.
+    #[test]
+    fn an_unreadable_snapshot_never_blocks() {
+        for snap in [
+            "",
+            "not json",
+            "{}",
+            r#"{"instances":[]}"#,
+            r#"{"instances":[{"name":"other","phase":"building"}]}"#,
+            r#"{"instances":[{"name":"lane"}]}"#,
+        ] {
+            assert!(
+                !slot_is_building(snap, "lane"),
+                "a snapshot we cannot read must not block: {snap:?}"
+            );
+        }
+    }
+
+    /// Only OUR slot's phase counts. Another slot compiling is none of our
+    /// business, and treating it as busy would serialise unrelated lanes.
+    #[test]
+    fn another_slots_build_does_not_block_us() {
+        let snap = r#"{"instances":[
+            {"name":"dev","phase":"building"},
+            {"name":"lane","phase":"idle"}
+        ]}"#;
+        assert!(
+            !slot_is_building(snap, "lane"),
+            "dev building must not make the lane wait"
+        );
     }
 }
