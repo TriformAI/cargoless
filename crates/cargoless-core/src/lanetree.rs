@@ -13,14 +13,24 @@
 //! asked for if the process died. `git worktree add --detach` gives a throwaway
 //! tree that shares the object store — cheap to make, cheap to abandon.
 //!
-//! ## Conflicts are infrastructure, not a code red
+//! ## A conflict is the member's, an I/O failure is ours
 //!
 //! A member that cannot merge has not *failed a build*; it has failed to
-//! produce a candidate. Those are different facts and the lane treats them
-//! differently — a red ejects someone, an `Err` keeps everyone queued. Blaming
-//! a member for a conflict it may not own (the other side of a conflict is
-//! equally "responsible") is exactly the kind of wrong attribution that teaches
-//! a team to route around its own gate.
+//! produce a candidate. But it is still **its** failure, and git says so by
+//! name before we infer anything — so it is reported as
+//! [`MaterializeError::Conflict`] and the lane ejects that member alone.
+//! Everything else (fetch failed, worktree could not be created, disk full) is
+//! [`MaterializeError::Infra`]: nobody's fault, everyone stays queued.
+//!
+//! This distinction was originally collapsed — both were an `io::Error`, and
+//! the driver called the lot infrastructure. Because infra ejects nobody, an
+//! unmergeable member never left the queue and was re-included in every
+//! subsequent candidate. Observed in production 2026-08-02: generations 2
+//! through 5 each died on the same unmergeable member while the rest of the
+//! queue waited behind it. The old reasoning was that the other side of a
+//! conflict is equally "responsible" — true of the *content*, but not of the
+//! decision: the base is what everyone else already agreed on, so the member
+//! that cannot apply to it is the one that has to move.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,7 +38,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::lane::LaneMember;
-use crate::lanedrv::CandidateTree;
+use crate::lanedrv::{CandidateTree, MaterializeError};
 
 /// Monotonic suffix so two candidates never collide on a path, even within one
 /// process and even if a previous cleanup failed.
@@ -68,7 +78,7 @@ impl GitCandidateTree {
 }
 
 impl CandidateTree for GitCandidateTree {
-    fn materialize(&self, members: &[LaneMember]) -> io::Result<PathBuf> {
+    fn materialize(&self, members: &[LaneMember]) -> Result<PathBuf, MaterializeError> {
         let seq = CANDIDATE_SEQ.fetch_add(1, Ordering::Relaxed);
         let root = self
             .scratch_parent
@@ -94,13 +104,22 @@ impl CandidateTree for GitCandidateTree {
         // reported, which matters when a merge conflicts: "B conflicts when
         // applied after A" is actionable; "the candidate conflicted" is not.
         for member in members {
-            let merged = merge_one(&root, member, &self.author_name, &self.author_email);
-            if let Err(e) = merged {
-                // Leave nothing half-merged behind. The caller sees Err and
-                // keeps everyone queued; a leaked conflicted worktree would
-                // poison the next candidate that reused the path.
+            // Read the conflicting paths BEFORE aborting — `merge --abort`
+            // clears the index, and with it the only record of which files
+            // collided. Those paths are what makes the ejection attributable
+            // instead of a bare "it conflicted".
+            if let Err(reason) = merge_one_raw(&root, member, &self.author_name, &self.author_email)
+            {
+                let files = unmerged_paths(&root);
+                let _ = git(&root, &["merge", "--abort"]);
+                // Leave nothing half-merged behind: a leaked conflicted
+                // worktree would poison the next candidate that reused the path.
                 self.release(&root);
-                return Err(e);
+                return Err(MaterializeError::Conflict {
+                    id: member.id.clone(),
+                    files,
+                    reason,
+                });
             }
         }
 
@@ -120,7 +139,7 @@ impl CandidateTree for GitCandidateTree {
     }
 }
 
-fn merge_one(root: &Path, member: &LaneMember, name: &str, email: &str) -> io::Result<()> {
+fn merge_one_raw(root: &Path, member: &LaneMember, name: &str, email: &str) -> Result<(), String> {
     // `--no-ff` so every member is a distinguishable commit in the candidate,
     // even when it happens to fast-forward. The lane's premise is that the
     // combination was built; a fast-forward would erase the evidence that this
@@ -140,17 +159,39 @@ fn merge_one(root: &Path, member: &LaneMember, name: &str, email: &str) -> io::R
     ];
     match git(root, &args) {
         Ok(()) => Ok(()),
-        Err(e) => {
-            // Abort so the worktree is not left mid-merge. If the abort itself
-            // fails the tree is unusable anyway and the caller is about to
-            // discard it.
-            let _ = git(root, &["merge", "--abort"]);
-            Err(io::Error::other(format!(
-                "member `{}` ({}) could not be merged onto the candidate: {e}",
-                member.id, member.head
-            )))
-        }
+        // The caller aborts, so that it can read the unmerged paths first.
+        Err(e) => Err(format!(
+            "member `{}` ({}) could not be merged onto the candidate: {e}",
+            member.id, member.head
+        )),
     }
+}
+
+/// Paths git left unmerged, i.e. the files that actually collided.
+///
+/// Best-effort by design: this runs on a failure path, and a member that
+/// conflicts must be ejected whether or not we can name the files. An empty
+/// result only costs a coarser readmission rule (any new head, rather than one
+/// touching a conflicting file).
+///
+/// Must be called BEFORE `merge --abort` — the abort clears the index.
+fn unmerged_paths(root: &Path) -> Vec<PathBuf> {
+    let Ok(out) = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {

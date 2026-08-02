@@ -242,7 +242,7 @@ impl LaneHost {
 mod tests {
     use super::*;
     use crate::lane::{LaneBuildOutcome, LaneConfig};
-    use crate::lanedrv::{LandOutcome, LegOutcome};
+    use crate::lanedrv::{LandOutcome, LegOutcome, MaterializeError};
     use cargoless_proto::TreeState;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -251,7 +251,7 @@ mod tests {
 
     struct NoTree;
     impl CandidateTree for NoTree {
-        fn materialize(&self, _members: &[LaneMember]) -> io::Result<PathBuf> {
+        fn materialize(&self, _members: &[LaneMember]) -> Result<PathBuf, MaterializeError> {
             Ok(PathBuf::from("/tmp/lanehost-test-candidate"))
         }
     }

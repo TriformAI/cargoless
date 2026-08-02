@@ -864,3 +864,90 @@ fn an_unwritable_trail_never_fails_a_build() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+/// A member that cannot be merged onto the base is EJECTED — and the queue
+/// keeps moving without it.
+///
+/// This is the livelock regression guard. Until 2026-08-02 every
+/// `materialize()` failure was reported as `Infra`, and `Infra` ejects nobody
+/// by design ("nothing was compiled, so nothing was judged"). A conflicting
+/// member therefore never left the queue and was re-included in every
+/// subsequent candidate. Observed in production against tf-multiverse:
+/// generations 2, 3, 4 and 5 each died on the same unmergeable member while
+/// three real PRs waited behind it.
+///
+/// The third assertion is the one that would have caught it: after the
+/// ejection, a fresh tick must NOT put the conflicting member back in flight.
+#[test]
+fn an_unmergeable_member_is_ejected_and_the_queue_keeps_moving() {
+    let root = repo_with_legs("conflict", &leg("build", "true"));
+
+    // `bad` and main both change the same line of the same file, so merging
+    // `bad` onto main after main moved is a genuine conflict — not a fetch
+    // failure, not a disk error.
+    let bad = branch(&root, "bad", "contested.txt", "from the branch\n");
+    fs::write(root.join("contested.txt"), "from main\n").unwrap();
+    sh(&root, &["add", "contested.txt"]);
+    sh(&root, &["commit", "-q", "-m", "main moves contested.txt"]);
+
+    // `good` touches a different file and merges cleanly.
+    let good = branch(&root, "good", "fine.txt", "no conflict here\n");
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(tree, ProfileLegRunner::new("lane"), ReportOnlyLander);
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+
+    // Both members ride the same candidate. `bad` is submitted first so it is
+    // merged first and is unambiguously the one that fails.
+    let _ = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("bad", &bad).with_changed_files(["contested.txt"])),
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("good", &good).with_changed_files(["fine.txt"])),
+    );
+
+    // 1. The conflicting member is ejected BY NAME.
+    let ejected: Vec<&str> = lane.ejections().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        ejected,
+        vec!["bad"],
+        "the member that could not be merged must be ejected, and only that \
+         member — a co-rider is not responsible for someone else's conflict. \
+         actions: {actions:?}"
+    );
+
+    // 2. It is ejected as a VERDICT about that member, never as infrastructure.
+    //    Infra ejects nobody, which is exactly how the livelock happened.
+    let (_, ejection) = lane.ejections().next().expect("`bad` is ejected");
+    assert!(
+        !matches!(
+            ejection.reason,
+            cargoless_core::lane::EjectReason::Infrastructure { .. }
+        ),
+        "a conflict is attributable to the member git named; classifying it as \
+         infrastructure is what let it re-enter every candidate forever: {:?}",
+        ejection.reason
+    );
+
+    // 3. THE LIVELOCK GUARD. A fresh tick must not resurrect the ejected
+    //    member. If this fails, every future candidate re-includes it and the
+    //    queue never drains.
+    let after = drv.pump(&mut lane, LaneEvent::Tick { now: 1 });
+    let in_flight: Vec<&str> = lane.in_flight().iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        !in_flight.contains(&"bad"),
+        "the ejected member must stay out until its head moves — putting it \
+         back is the livelock this test exists to prevent: in_flight={in_flight:?} \
+         actions={after:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

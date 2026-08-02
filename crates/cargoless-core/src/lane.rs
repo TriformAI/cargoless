@@ -277,6 +277,30 @@ pub enum LaneBuildOutcome {
     Green { artifact: Option<String> },
     /// Compiled red. Diagnostics drive attribution.
     Red { diagnostics: Vec<Diagnostic> },
+    /// A named member could not be merged onto the candidate. Nothing was
+    /// compiled, but unlike [`Self::Infra`] we know exactly whose fault it is —
+    /// git told us, by name, before any inference.
+    ///
+    /// This is its own outcome rather than a `Red` because attribution for a
+    /// red runs *backwards*, from erroring files to the members that touched
+    /// them, and needs `changed_files` to do it. A caller that submits members
+    /// without a diff would get `Unattributed`, which readmits on any new head
+    /// — and a member that cannot merge would then be re-included in every
+    /// subsequent candidate, forever. That livelock was observed in production
+    /// on 2026-08-02: generations 2 through 5 each died on the same
+    /// unmergeable member while the rest of the queue waited behind it.
+    ///
+    /// `files` is best-effort (git's unmerged paths); empty means the conflict
+    /// was real but the paths could not be read, which must not stop the
+    /// ejection.
+    Conflict {
+        /// The member that failed to merge.
+        id: String,
+        /// Conflicting paths, when git could report them.
+        files: Vec<PathBuf>,
+        /// git's own explanation, for the trail.
+        reason: String,
+    },
     /// Neither — the build could not be trusted to have run (runner died,
     /// timeout, cancelled). NOT a code red: members stay queued and ride the
     /// next build. Treating a transient as a red is how a fleet learns to
@@ -831,6 +855,77 @@ impl LaneState {
             }
             LaneBuildOutcome::Red { diagnostics } => {
                 self.attribute_red(&members, &diagnostics, actions);
+            }
+            LaneBuildOutcome::Conflict { id, files, reason } => {
+                // The infrastructure worked — git ran and answered. Reset the
+                // consecutive-failure count so a conflict cannot creep the lane
+                // toward its infra give-up threshold.
+                self.infra_failures = 0;
+
+                let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
+                for m in members {
+                    if m.id == id {
+                        // Attributed, with the conflicting paths as the files
+                        // that carried the failure. `readmission_decision`'s
+                        // existing gate then does the right thing without
+                        // knowing a conflict happened: a new head touching one
+                        // of those paths is a plausible fix and readmits;
+                        // anything else stays out. That is what stops the
+                        // member re-entering every candidate forever.
+                        //
+                        // When git could not report the paths, fall back to
+                        // `Unattributed`: it still ejects, and it readmits on
+                        // any new head — which is the honest answer when we
+                        // cannot say which files to watch. It does NOT reopen
+                        // the livelock, because the member is out until its
+                        // head actually moves.
+                        let eject_reason = if files.is_empty() {
+                            EjectReason::Unattributed {
+                                fingerprints: FingerprintCounts::default(),
+                                shared_with: Vec::new(),
+                            }
+                        } else {
+                            EjectReason::Attributed {
+                                files: files.clone(),
+                                fingerprints: FingerprintCounts::default(),
+                                // Nobody else is implicated: a conflict is
+                                // between this member and the base, and blaming
+                                // a co-rider for it would be the false
+                                // accusation the lane exists to avoid.
+                                shared_with: Vec::new(),
+                            }
+                        };
+                        actions.push(LaneAction::Eject {
+                            id: m.id.clone(),
+                            reason: eject_reason.clone(),
+                        });
+                        self.ejected.insert(
+                            m.id.clone(),
+                            Ejection {
+                                reason: eject_reason,
+                                head: m.head.clone(),
+                                changed_files: m.changed_files.clone(),
+                                expires_at_tick: expires,
+                            },
+                        );
+                    } else {
+                        // Everyone else was never judged — they rode a
+                        // candidate that was never built. Requeue at the front
+                        // so they rebuild immediately, WITHOUT the infra
+                        // backoff: the next attempt has the conflicting member
+                        // removed, so it is a genuinely different candidate
+                        // rather than a retry of the same broken one.
+                        actions.push(LaneAction::Report {
+                            id: m.id.clone(),
+                            state: format!(
+                                "requeued — `{id}` could not be merged onto the base \
+                                 ({reason}) and was ejected; the next candidate is built \
+                                 without it"
+                            ),
+                        });
+                        self.queue.push(m);
+                    }
+                }
             }
         }
     }

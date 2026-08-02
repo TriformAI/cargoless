@@ -25,14 +25,23 @@
 //! [`PointerLander`] and lets anyone supply the second, which is what keeps the
 //! lane useful outside this fleet.
 //!
-//! ## Fail closed
+//! ## Fail closed — but do not fail *blind*
 //!
-//! Every failure that is not a compiler verdict —  the tree could not be
-//! built, the legs could not be launched, the lander errored — reports
+//! Every failure that is not a compiler verdict — the legs could not be
+//! launched, the lander errored, the tree could not be created — reports
 //! [`LaneBuildOutcome::Infra`], never `Red`. An infra failure keeps members
 //! queued; a `Red` ejects someone. Misclassifying the first as the second
 //! blames people for a runner dying, which is how a fleet learns to distrust
 //! its own gate.
+//!
+//! The one failure that is *not* infrastructure, despite producing no compiler
+//! verdict, is a member that cannot be merged onto the base. Git names the
+//! member before we infer anything, so it reports
+//! [`LaneBuildOutcome::Conflict`] and that member alone is ejected. Folding it
+//! into `Infra` is the mirror-image mistake — it exonerates a member the lane
+//! can prove is at fault, and because infra ejects nobody, the member is
+//! re-included in every subsequent candidate and the queue never drains. See
+//! [`MaterializeError`].
 
 use std::fs;
 use std::io;
@@ -47,6 +56,51 @@ use cargoless_proto::TreeState;
 use crate::lane::{LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LaneState};
 use crate::project_checks;
 
+/// Why a candidate tree could not be produced.
+///
+/// The distinction is load-bearing. `Infra` is nobody's fault and everyone
+/// stays queued; `Conflict` names a member and gets it ejected. Collapsing the
+/// two — which is what `io::Result` did until 2026-08-02 — means an unmergeable
+/// member is treated as a transient, never leaves the queue, and is re-included
+/// in every subsequent candidate. Observed in production: generations 2 through
+/// 5 each died on the same unmergeable member while the rest of the queue
+/// waited behind it.
+#[derive(Debug)]
+pub enum MaterializeError {
+    /// A named member could not be merged onto the base. `files` is
+    /// best-effort: git's unmerged paths when they can be read, empty
+    /// otherwise. An empty list still ejects — it only costs a coarser
+    /// readmission rule.
+    Conflict {
+        id: String,
+        files: Vec<PathBuf>,
+        reason: String,
+    },
+    /// Anything else: fetch failed, worktree could not be created, disk full.
+    /// Not attributable to any member.
+    Infra(io::Error),
+}
+
+impl std::fmt::Display for MaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { id, reason, .. } => {
+                write!(
+                    f,
+                    "member `{id}` could not be merged onto the base: {reason}"
+                )
+            }
+            Self::Infra(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<io::Error> for MaterializeError {
+    fn from(e: io::Error) -> Self {
+        Self::Infra(e)
+    }
+}
+
 /// Materialises `base + members` somewhere the build legs can run.
 ///
 /// Implementations must produce a tree that is **disposable** — the lane may
@@ -55,12 +109,11 @@ use crate::project_checks;
 pub trait CandidateTree {
     /// Build the candidate and return its root.
     ///
-    /// `Err` means the candidate could not be produced (conflict, fetch
-    /// failure, disk). That is infrastructure, not a code red: the lane keeps
-    /// the members queued rather than blaming one of them. A member that
-    /// genuinely cannot merge is excluded by the caller *before* it reaches the
-    /// lane, where the conflict is unambiguous.
-    fn materialize(&self, members: &[LaneMember]) -> io::Result<PathBuf>;
+    /// A [`MaterializeError::Conflict`] names the member that could not be
+    /// merged and the lane ejects exactly that member, so the rest of the queue
+    /// builds without it. [`MaterializeError::Infra`] is nobody's fault and
+    /// everyone stays queued.
+    fn materialize(&self, members: &[LaneMember]) -> Result<PathBuf, MaterializeError>;
 
     /// Release the tree. Best-effort: a leaked scratch dir is a disk problem,
     /// never a reason to fail a build that already produced a verdict.
@@ -1205,7 +1258,22 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
 
         let root = match self.tree.materialize(members) {
             Ok(r) => r,
-            Err(e) => {
+            // A member that cannot be merged is ejected by name. Nothing was
+            // compiled, but git already told us whose fault it is — no
+            // inference, no ambiguity — and the rest of the queue must not wait
+            // behind it.
+            Err(MaterializeError::Conflict { id, files, reason }) => {
+                self.trail_line(&format!(
+                    "[cargoless:obs] lane-build generation={generation} outcome=conflict \
+                     member={id} files={} reason={reason}",
+                    files.len()
+                ));
+                return LaneEvent::BuildFinished {
+                    generation,
+                    outcome: LaneBuildOutcome::Conflict { id, files, reason },
+                };
+            }
+            Err(MaterializeError::Infra(e)) => {
                 let reason = format!("candidate tree could not be materialized: {e}");
                 self.trail_line(&format!(
                     "[cargoless:obs] lane-build generation={generation} outcome=infra \

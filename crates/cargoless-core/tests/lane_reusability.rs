@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use cargoless_core::lane::{LaneAction, LaneEvent, LaneMember, LaneState};
 use cargoless_core::lanedrv::{
-    CandidateTree, LandOutcome, LaneDriver, LaneLander, LegOutcome, LegRunner,
+    CandidateTree, LandOutcome, LaneDriver, LaneLander, LegOutcome, LegRunner, MaterializeError,
 };
 use cargoless_proto::{Diagnostic, Severity, TreeState};
 
@@ -37,7 +37,7 @@ struct FakeTree {
 }
 
 impl CandidateTree for FakeTree {
-    fn materialize(&self, members: &[LaneMember]) -> io::Result<PathBuf> {
+    fn materialize(&self, members: &[LaneMember]) -> Result<PathBuf, MaterializeError> {
         self.materialized
             .borrow_mut()
             .push(members.iter().map(|m| m.id.clone()).collect());
