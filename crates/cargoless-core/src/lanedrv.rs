@@ -1227,7 +1227,22 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                     // against the new base. Silently dropping them here would
                     // lose green work to a push race — the worst outcome
                     // available, because it looks like nothing happened.
-                    Err(_) => members.iter().cloned().map(LaneEvent::Enqueue).collect(),
+                    //
+                    // `LandFailed` goes FIRST so the backoff is already pending
+                    // when the members arrive. Every `Enqueue` ends in
+                    // `maybe_start_build`, and with a zero capture window the
+                    // very first one would otherwise start the next build
+                    // before any backoff existed — the hot loop this exists to
+                    // stop. Setting the timer first means `maybe_start_build`
+                    // returns early on every one of them.
+                    Err(e) => {
+                        let mut evs = vec![LaneEvent::LandFailed {
+                            reason: e.to_string(),
+                            members: members.iter().map(|m| m.id.clone()).collect(),
+                        }];
+                        evs.extend(members.iter().cloned().map(LaneEvent::Enqueue));
+                        evs
+                    }
                 }
             }
             LaneAction::Eject { .. } | LaneAction::Readmit { .. } | LaneAction::Report { .. } => {

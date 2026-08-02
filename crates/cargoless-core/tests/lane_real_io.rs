@@ -980,3 +980,75 @@ fn an_unmergeable_member_is_ejected_and_the_queue_keeps_moving() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// A failing lander must not retry as fast as the driver can loop.
+///
+/// The realistic cause of a failed land is the base moving and the forge's
+/// compare-and-swap rejecting the push — which on a busy trunk persists for
+/// many minutes. Without pacing, every rejection re-enqueues and
+/// `maybe_start_build` starts the next candidate at once, so the lane rebuilds
+/// the same tree continuously, each turn a real multi-minute build holding the
+/// slot. The infra path has carried `infra_backoff_ticks` for exactly this
+/// reason since the first deployment; the land path had nothing.
+#[test]
+fn a_failing_lander_backs_off_instead_of_spinning() {
+    let root = repo_with_legs("landbackoff", &leg("build", "true"));
+    let a = branch(&root, "a", "a.txt", "a\n");
+
+    // A lander that always fails.
+    let script = root.join("fail-land.sh");
+    fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(
+        tree,
+        ProfileLegRunner::new("lane"),
+        CommandLander::new(vec![script.to_string_lossy().into_owned()]),
+    );
+    // Zero capture window on purpose: it is the WORST case for this property.
+    // Nothing else would stop the requeued member building again immediately,
+    // so if a backoff holds here it holds anywhere.
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+
+    // The member survived — a failed land must never lose green work.
+    assert_eq!(
+        lane.queue_depth() + lane.in_flight().len(),
+        1,
+        "the member must survive a failed land: {actions:?}"
+    );
+    // And it is WAITING, not building. Before the backoff existed this was
+    // `Building`, over and over, until `pump`'s MAX_STEPS cut the loop.
+    assert!(
+        lane.in_flight().is_empty(),
+        "a failed land must not immediately restart the build — that is the hot \
+         loop the backoff exists to prevent: in_flight={:?}",
+        lane.in_flight()
+    );
+    // The operator is told why, with the retry budget. A member that stops
+    // moving and says nothing is the failure mode `GET /lane` exists to avoid.
+    assert!(
+        actions.iter().any(|x| matches!(
+            x,
+            cargoless_core::lane::LaneAction::Report { state, .. } if state.contains("land failed")
+        )),
+        "the failed land must be reported, not silent: {actions:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

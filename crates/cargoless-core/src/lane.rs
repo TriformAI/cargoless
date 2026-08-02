@@ -340,6 +340,29 @@ pub enum LaneEvent {
         generation: u64,
         outcome: LaneBuildOutcome,
     },
+    /// The lander refused a GREEN build's members.
+    ///
+    /// Distinct from re-enqueueing them directly, which is what this used to
+    /// do. A land failure is infrastructure by construction — the build was
+    /// green, so nobody's code is at fault — and it therefore needs the same
+    /// pacing every other infra failure gets: a backoff before the retry, and
+    /// a cap so a permanently-refusing lander eventually stops.
+    ///
+    /// Without that, a failed land re-enqueues, `maybe_start_build` starts the
+    /// next candidate at once, the lander refuses again, and the lane rebuilds
+    /// the same tree as fast as it can loop — each turn a real multi-minute
+    /// build occupying the slot. The realistic trigger is the base moving and
+    /// the forge's compare-and-swap rejecting the push, which on a busy trunk
+    /// persists for many minutes.
+    ///
+    /// Carries the member ids rather than reading the queue, because this is
+    /// sent BEFORE the re-enqueues — the backoff has to exist before the first
+    /// `Enqueue` reaches `maybe_start_build`, or with a zero capture window
+    /// that enqueue starts the next build and the timer arrives too late.
+    LandFailed {
+        reason: String,
+        members: Vec<String>,
+    },
     /// Time passes. Drives TTL expiry and lets an idle lane with a ready queue
     /// start a build.
     Tick { now: u64 },
@@ -541,6 +564,26 @@ impl LaneState {
                 self.ejected.remove(&id);
             }
             LaneEvent::ForceReadmit { id } => self.on_force_readmit(&id, &mut actions),
+            // Members are already back in the queue — the driver re-enqueues
+            // them before sending this, because losing green work to a push
+            // race is the worst outcome available. What is missing is the
+            // pacing, and that is all this arm adds.
+            LaneEvent::LandFailed { reason, members } => {
+                self.infra_failures = self.infra_failures.saturating_add(1);
+                self.infra_retry_after =
+                    Some(self.now.saturating_add(self.cfg.infra_backoff_ticks));
+                let attempt = self.infra_failures;
+                for id in members {
+                    actions.push(LaneAction::Report {
+                        id,
+                        state: format!(
+                            "green, but the land failed ({reason}) — requeued, retry {attempt} \
+                             of {} in {} ticks",
+                            self.cfg.infra_max_attempts, self.cfg.infra_backoff_ticks
+                        ),
+                    });
+                }
+            }
             LaneEvent::BuildFinished {
                 generation,
                 outcome,
