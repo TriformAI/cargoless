@@ -22,8 +22,8 @@ use std::process::Command;
 
 use cargoless_core::lane::{LaneEvent, LaneMember, LaneState};
 use cargoless_core::lanedrv::{
-    DispatchLegRunner, LaneDriver, LaneLander, LegRunner, PointerLander, ProfileLegRunner,
-    ReportOnlyLander,
+    CommandLander, DispatchLegRunner, LaneDriver, LaneLander, LegRunner, PointerLander,
+    ProfileLegRunner, ReportOnlyLander,
 };
 use cargoless_core::lanetree::GitCandidateTree;
 use cargoless_proto::{Severity, TreeState};
@@ -528,6 +528,125 @@ fn dispatching_never_executes_code_from_the_candidate_tree() {
     for d in [root, remote] {
         let _ = fs::remove_dir_all(d);
     }
+}
+
+/// THE AUTO-MERGE STEP: a green candidate is handed to the lander command,
+/// with every member's id and head.
+#[test]
+fn a_green_candidate_is_handed_to_the_lander_with_its_roster() {
+    let root = repo_with_legs("land-ok", &leg("build", "true"));
+    let a = branch(&root, "a", "a.txt", "a\n");
+    let b = branch(&root, "b", "b.txt", "b\n");
+
+    let seen = scratch("land-ok-seen").join("roster");
+    let script = scratch("land-ok-bin").join("land.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$CARGOLESS_LANE_MEMBERS\" > {}\nexit 0\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(
+        tree,
+        ProfileLegRunner::new("lane"),
+        CommandLander::new(vec![script.to_string_lossy().into_owned()]),
+    );
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("b", &b).with_changed_files(["b.txt"])),
+    );
+
+    let roster = fs::read_to_string(&seen).expect("the lander must have been invoked");
+    // id AND head for every member: a lander that only knows the ids cannot
+    // reconcile PR state, and one that only knows the heads cannot name who.
+    for (id, head) in [("a", &a), ("b", &b)] {
+        assert!(
+            roster.lines().any(|l| l == format!("{id}\t{head}")),
+            "roster must carry `<id>\\t<head>` for {id}: {roster:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A FAILED land must re-enqueue, never silently drop green work.
+///
+/// These members compiled. If a lost CAS race or a forge hiccup made them
+/// vanish, the lane would look like it did nothing at all — the worst available
+/// outcome, because nobody is told and the work is gone. The driver re-enqueues
+/// on `Err`, so the lander must report failure as `Err` rather than an
+/// `Ok(LandOutcome)` carrying a sad sentence.
+#[test]
+fn a_failed_land_requeues_the_members_instead_of_losing_them() {
+    let root = repo_with_legs("land-fail", &leg("build", "true"));
+    let a = branch(&root, "a", "a.txt", "a\n");
+
+    let script = scratch("land-fail-bin").join("land.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    // What a lost compare-and-swap looks like: the base moved under us.
+    fs::write(
+        &script,
+        "#!/bin/sh\necho '! [rejected] dev -> dev (stale info)' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let drv = LaneDriver::new(
+        tree,
+        ProfileLegRunner::new("lane"),
+        CommandLander::new(vec![script.to_string_lossy().into_owned()]),
+    );
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+
+    assert!(
+        !actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::Eject { .. })),
+        "a failed LAND is not the member's fault — nobody may be ejected: {actions:?}"
+    );
+    // The member is back in the lane rather than gone. `queue_depth` counts
+    // what will be built next; anything else means green work evaporated.
+    assert_eq!(
+        lane.queue_depth() + lane.in_flight().len(),
+        1,
+        "the member must survive a failed land, not vanish"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 /// A dispatcher that could not GET a verdict must never eject anyone.

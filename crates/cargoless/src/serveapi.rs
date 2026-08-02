@@ -1505,6 +1505,7 @@ impl ServeVerdictState {
         state_dir: &Path,
         base_ref: &str,
         plan: cargoless_core::lanedrv::LegPlan,
+        land_command: Option<Vec<String>>,
     ) -> Self {
         let tree = cargoless_core::lanetree::GitCandidateTree::new(
             repo,
@@ -1548,27 +1549,21 @@ impl ServeVerdictState {
         // the first shadow run, which compiled for 76 minutes and left no
         // recoverable verdict.
         let trail = state_dir.join("lane-runs.log");
-        self.lane = Some(if publishing {
-            LaneHost::spawn(
-                LaneState::new(repo),
-                cargoless_core::lanedrv::LaneDriver::new(
-                    tree,
-                    legs,
-                    cargoless_core::lanedrv::PointerLander::new(repo),
-                )
-                .with_trail(trail),
-            )
-        } else {
-            LaneHost::spawn(
-                LaneState::new(repo),
-                cargoless_core::lanedrv::LaneDriver::new(
-                    tree,
-                    legs,
-                    cargoless_core::lanedrv::ReportOnlyLander,
-                )
-                .with_trail(trail),
-            )
-        });
+        // Boxed, one `spawn` body. Three landers × three runners would be nine
+        // monomorphised branches here; landing runs once per green build, so
+        // the vtable hop costs nothing measurable.
+        let lander: Box<dyn cargoless_core::lanedrv::LaneLander + Send> = match land_command {
+            // AUTO-MERGE. Deliberately last-resort in this match order so the
+            // safe shapes win by default: an operator gets report-only unless
+            // they explicitly name a lander command.
+            Some(cmd) => Box::new(cargoless_core::lanedrv::CommandLander::new(cmd)),
+            None if publishing => Box::new(cargoless_core::lanedrv::PointerLander::new(repo)),
+            None => Box::new(cargoless_core::lanedrv::ReportOnlyLander),
+        };
+        self.lane = Some(LaneHost::spawn(
+            LaneState::new(repo),
+            cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander).with_trail(trail),
+        ));
         self
     }
 

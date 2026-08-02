@@ -582,21 +582,45 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             }
         };
 
+        // AUTO-MERGE. Unset = the lane reports and lands nothing, which is the
+        // right default: a lane that can move the trunk should require someone
+        // to say so out loud. Set it and a GREEN candidate is handed to this
+        // command, which owns the forge semantics (lock, CAS push, PR
+        // reconcile) — cargoless does not reimplement them.
+        //
+        // argv, not a shell string, for the same reason as the dispatcher.
+        let land_cmd: Vec<String> = std::env::var("CARGOLESS_LANE_LAND")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let land_command = if land_cmd.is_empty() {
+            None
+        } else {
+            Some(land_cmd)
+        };
+
         // Announce it. A lane that can move the trunk must be visible in the
         // boot log, not inferred from behaviour — the same reasoning as the
-        // resolved-caps lines below. `where=` is the load-bearing field: it is
-        // the difference between compiling unreviewed code in this pod and
-        // compiling it in a sandbox, and an operator must be able to read which
-        // one they got without inspecting behaviour.
+        // resolved-caps lines below. `where=` and `land=` are the load-bearing
+        // fields: the first is the difference between compiling unreviewed code
+        // in this pod and compiling it in a sandbox, the second between a lane
+        // that observes and one that MERGES. An operator must read both without
+        // inspecting behaviour.
         eprintln!(
-            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={} where={}",
+            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={} \
+             where={} land={}",
             artifact
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<none: check-only>".to_string()),
-            plan.describe()
+            plan.describe(),
+            match land_command.as_ref() {
+                Some(c) => format!("AUTO-MERGE via `{}`", c.join(" ")),
+                None => "<none: reports only, lands nothing>".to_string(),
+            }
         );
-        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, plan);
+        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, plan, land_command);
     }
     let api = Arc::new(api_state);
     // Path D + R3 — publish the resolved caps at startup so an operator

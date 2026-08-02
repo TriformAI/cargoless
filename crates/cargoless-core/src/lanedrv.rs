@@ -857,6 +857,17 @@ pub trait LaneLander {
     fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome>;
 }
 
+/// Same reason as the boxed [`LegRunner`]: `LaneHost::spawn` is generic over
+/// BOTH, so choosing each at boot would otherwise mean one `spawn` body per
+/// (runner × lander) pair. Three landers and three runners is nine.
+///
+/// Landing happens once per green build, so a vtable hop is free.
+impl LaneLander for Box<dyn LaneLander + Send> {
+    fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome> {
+        (**self).land(members, artifact)
+    }
+}
+
 /// The default lander: advance `.cargoless/latest-green`.
 ///
 /// For a single-app project this *is* "merge and publish together" — the
@@ -936,6 +947,104 @@ impl LaneLander for PointerLander {
 /// the choice is between doing nothing and *saying so*, or doing nothing and
 /// implying something shipped. This says so.
 pub struct ReportOnlyLander;
+
+/// Hands a green candidate to an external lander command — the auto-merge step.
+///
+/// # Why a command and not an implementation
+///
+/// Landing on a forge is not one API call. tf-multiverse's
+/// `scripts/merge-train-controller` already does it, and every part was earned:
+///
+/// * a **k8s Lease** for mutual exclusion (`replicas: 1` is not a lock — a
+///   rolling update starts the new pod before the old one exits)
+/// * **ONE** `EXIT` trap doing worktree removal, scratch cleanup and lease
+///   release, because traps REPLACE rather than append and a second one would
+///   silently drop the release, wedging the lane for a full TTL
+/// * `git push --force-with-lease=<branch>:<base>` — git's own ref comparison
+///   IS the compare-and-swap that makes concurrent landing safe
+/// * per-member `POST /pulls/N/merge {Do:"manually-merged"}`, with the queue
+///   retraction ordered BEFORE it
+///
+/// Re-implementing that here would be a second copy of a security- and
+/// correctness-critical path to keep in sync, and this lane has already learned
+/// what re-deriving solved problems costs. So cargoless stays forge-agnostic:
+/// it runs a command, exactly as [`DispatchLegRunner`] does for building.
+///
+/// # Contract
+///
+/// The command receives `CARGOLESS_LANE_MEMBERS` (newline-separated
+/// `<id>\t<head>`) and `CARGOLESS_LANE_ARTIFACT` when there is one. Exit 0 means
+/// landed. **Non-zero is an error, not a silent failure** — the driver
+/// re-enqueues every member so a lost race is retried rather than dropped,
+/// which matters because these members are GREEN and their work would otherwise
+/// vanish looking like nothing happened.
+pub struct CommandLander {
+    pub command: Vec<String>,
+    pub timeout: Duration,
+}
+
+impl CommandLander {
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            // Landing is a push plus N PR reconciles — seconds, not minutes.
+            // A long budget here would hide a hung forge behind a lane that
+            // looks busy.
+            timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+impl LaneLander for CommandLander {
+    fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome> {
+        let Some(program) = self.command.first() else {
+            return Err(io::Error::other(
+                "command lander configured with an empty command",
+            ));
+        };
+        let roster = members
+            .iter()
+            .map(|m| format!("{}\t{}", m.id, m.head))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut cmd = Command::new(program);
+        cmd.args(&self.command[1..])
+            .env("CARGOLESS_LANE_MEMBERS", &roster)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(a) = artifact {
+            cmd.env("CARGOLESS_LANE_ARTIFACT", a);
+        }
+
+        let (success, _code, text, _ms) = DispatchLegRunner::run_to_completion(cmd, self.timeout)?;
+        if !success {
+            // Err, never Ok-with-a-sad-message: the driver's LandAndPublish arm
+            // re-enqueues on Err, and these members are green. Reporting a
+            // failed land as success would drop verified work silently.
+            return Err(io::Error::other(format!(
+                "lander command failed: {}",
+                tail_lines(&text, 12)
+            )));
+        }
+        let ids: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
+        Ok(LandOutcome {
+            detail: format!(
+                "landed {} member(s) via `{}`: {}",
+                ids.len(),
+                program,
+                ids.join(", ")
+            ),
+        })
+    }
+}
+
+/// Last `n` non-blank lines — enough context to diagnose without pasting a
+/// whole build log into a per-member report.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
 
 impl LaneLander for ReportOnlyLander {
     fn land(&self, members: &[LaneMember], artifact: Option<&str>) -> io::Result<LandOutcome> {
