@@ -740,6 +740,35 @@ const SLOT_FREE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 /// tens-of-minutes wait, so a tight loop would only add noise.
 const SLOT_FREE_POLL: Duration = Duration::from_secs(20);
 
+/// Does this slot's red reason describe OUR failure rather than the code's?
+///
+/// Fails toward RED by design. A false "infrastructure" verdict would let a
+/// genuinely broken candidate stay queued and eventually land, which is far
+/// worse than a false accusation — so this matches only phrases that cannot
+/// plausibly come from a compiler or a failing test.
+///
+/// The patterns are anchored on what the preview slot actually emits when its
+/// own setup fails: `git checkout <sha> failed: fatal: cannot change to
+/// '<path>': No such file or directory` (observed 2026-08-02, after a PVC fault
+/// removed the slot's worktree).
+fn reason_is_infrastructure(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    // Each phrase names a step BEFORE compilation: preparing the tree, reaching
+    // the repo, or having somewhere to put it. A compiler error never says any
+    // of these about its own run.
+    const SETUP_FAILURES: &[&str] = &[
+        "git checkout",
+        "cannot change to",
+        "no such file or directory",
+        "could not create worktree",
+        "worktree add failed",
+        "no space left on device",
+        "could not fetch",
+        "repository not found",
+    ];
+    SETUP_FAILURES.iter().any(|p| r.contains(p))
+}
+
 /// Is this slot mid-build in the `/app` snapshot?
 ///
 /// Best-effort by design: unparseable JSON, an absent slot, or a missing
@@ -987,6 +1016,33 @@ impl LegRunner for PreviewLegRunner {
                 // decline to attribute it. That is honest: a boot failure is
                 // frequently an interaction, not one member's line.
                 let reason = field("last_red_reason");
+
+                // NOT EVERY SLOT RED IS A CODE RED.
+                //
+                // The slot reports setup failures through the same field as
+                // compile failures. On 2026-08-02 the lane slot's worktree
+                // directory did not survive a PVC fault, and the next candidate
+                // produced:
+                //
+                //   last_red_reason=git checkout <sha> failed: fatal: cannot
+                //   change to '.../app/lane/worktree': No such file or directory
+                //
+                // The lane called that Red and ejected pr-10394 — a member whose
+                // code compiles fine — in TWELVE SECONDS. No tf-multiverse build
+                // can go red that fast; the elapsed time alone said it was not a
+                // verdict.
+                //
+                // A checkout/setup failure is OUR problem, not the member's, so
+                // it must report Infra: everyone stays queued and the lane
+                // retries, instead of a false accusation that also lets the real
+                // fault go unnoticed. Same rule as
+                // `a_missing_artifact_on_green_is_infrastructure_not_a_red`.
+                if reason_is_infrastructure(&reason) {
+                    return Err(io::Error::other(format!(
+                        "preview slot {:?} could not set up the candidate (not a code verdict): {reason}",
+                        self.slot
+                    )));
+                }
                 return Ok(LegOutcome {
                     tree: TreeState::Red,
                     diagnostics: vec![cargoless_proto::Diagnostic {
@@ -1565,7 +1621,49 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
 
 #[cfg(test)]
 mod slot_free_tests {
-    use super::slot_is_building;
+    use super::{reason_is_infrastructure, slot_is_building};
+
+    /// The 2026-08-02 incident: the slot's worktree vanished after a PVC fault
+    /// and the lane blamed the PR. A setup failure is OURS.
+    #[test]
+    fn a_missing_worktree_is_infrastructure_not_a_code_red() {
+        let real = "git checkout 8b6af9d3fa0dfb6acb61fc98358c46ab6e3eb3f7 failed: \
+                    fatal: cannot change to '/workspace/cargoless-state/app/lane/worktree': \
+                    No such file or directory";
+        assert!(
+            reason_is_infrastructure(real),
+            "the exact reason that ejected an innocent PR must read as infrastructure"
+        );
+        for r in [
+            "could not create worktree",
+            "git worktree add failed: already exists",
+            "No space left on device",
+            "could not fetch origin",
+        ] {
+            assert!(reason_is_infrastructure(r), "setup failure: {r:?}");
+        }
+    }
+
+    /// FAILS TOWARD RED. Calling a real compile failure "infrastructure" would
+    /// keep a broken candidate queued until it landed — worse than a false
+    /// accusation, which at least stops the merge.
+    #[test]
+    fn a_real_build_failure_stays_red() {
+        for r in [
+            "build step `server` exited 101",
+            "error[E0308]: mismatched types",
+            "cannot find function `foo` in this scope",
+            "test failed: assertion left == right",
+            "health probe returned 500",
+            "respawn of previously-green bundle failed health probe: no 200 on /health within 120000ms",
+            "",
+        ] {
+            assert!(
+                !reason_is_infrastructure(r),
+                "must stay RED so a broken candidate cannot ride through: {r:?}"
+            );
+        }
+    }
 
     /// The whole point: a slot mid-build must read BUSY so the lane waits
     /// instead of pointing into it and burning a generation.
