@@ -1221,16 +1221,67 @@ pub struct CommandLander {
     pub timeout: Duration,
 }
 
+/// Default land budget. Deliberately large, and that needs justifying because
+/// the number it replaces was chosen for a good reason that turned out to
+/// describe a different lander than the one we run.
+///
+/// "Landing is a push plus N PR reconciles — seconds, not minutes" is true of a
+/// lander that lands *itself*. The lander actually configured on tf-multiverse
+/// is `scripts/ci/lane-land.sh`, which delegates to
+/// `scripts/merge-train-controller --land` — and the controller does not just
+/// push. It re-derives the candidate, publishes a merge-train ref, DISPATCHES A
+/// CANDIDATE BUILD and waits for the verdict, under its own
+/// `TRAIN_BUILD_MAX_WAIT_SECS` (default 5400).
+///
+/// A parent budget below the delegate's own ceiling cannot ever observe an
+/// outcome: it SIGKILLs a healthy land mid-wait and reports infrastructure
+/// failure. Measured 2026-08-02 — five green candidates in a row, each killed
+/// at exactly 600s and re-enqueued, so the trunk never moved and the trail read
+/// `outcome=green` followed by a fresh build with no reason in between.
+///
+/// So: 7200s, above the delegate's 5400 with room for the forge round-trips
+/// that bracket it. This still bounds a hung forge — it does not remove the
+/// timeout, it makes it mean what it says. Override with
+/// `CARGOLESS_LANE_LAND_TIMEOUT_SECS` when the delegate's budget differs; the
+/// rule to preserve is **parent > delegate**, never the reverse.
+const LAND_TIMEOUT_DEFAULT_SECS: u64 = 7200;
+
 impl CommandLander {
     pub fn new(command: Vec<String>) -> Self {
         Self {
             command,
-            // Landing is a push plus N PR reconciles — seconds, not minutes.
-            // A long budget here would hide a hung forge behind a lane that
-            // looks busy.
-            timeout: Duration::from_secs(600),
+            timeout: Duration::from_secs(land_timeout_secs()),
         }
     }
+}
+
+/// Resolve the land budget from the environment, falling back to
+/// [`LAND_TIMEOUT_DEFAULT_SECS`].
+fn land_timeout_secs() -> u64 {
+    parse_land_timeout(
+        std::env::var("CARGOLESS_LANE_LAND_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parsing half of [`land_timeout_secs`], split out so it can be tested
+/// without touching the process environment.
+///
+/// Not fastidiousness: `set_var` is `unsafe` in Edition 2024, and a test that
+/// mutates a global does it for every other test running in parallel. This
+/// crate already carries a known env-lock flake from exactly that
+/// (`CGLS-26` warm-target, two tests failing together through a poisoned
+/// mutex). A pure function takes the whole class off the table.
+///
+/// Unparseable or zero reads as "unset". Zero especially: it would mean a
+/// deadline already in the past, so every land would be killed before its first
+/// poll — a typo silently disabling landing, which is precisely the class of
+/// failure this constant exists to end.
+fn parse_land_timeout(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(LAND_TIMEOUT_DEFAULT_SECS)
 }
 
 impl LaneLander for CommandLander {
@@ -1388,7 +1439,18 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             } => vec![self.run_build(*generation, members)],
             LaneAction::LandAndPublish { members, artifact } => {
                 match self.lander.land(members, artifact.as_deref()) {
-                    Ok(_) => Vec::new(),
+                    Ok(o) => {
+                        // A land is the only step that moves the trunk, so it
+                        // belongs in the durable trail beside the verdict that
+                        // authorised it — not only in the process log, which
+                        // dies with the pod.
+                        self.trail_line(&format!(
+                            "[cargoless:obs] lane-land outcome=landed members={} detail={}",
+                            members.len(),
+                            o.detail
+                        ));
+                        Vec::new()
+                    }
                     // A lander failure is infrastructure by construction: the
                     // build was GREEN, so nobody's code is at fault. The usual
                     // cause is the base moving under us and the forge's
@@ -1407,8 +1469,27 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                     // stop. Setting the timer first means `maybe_start_build`
                     // returns early on every one of them.
                     Err(e) => {
+                        // Write the reason to the TRAIL, not just the log.
+                        //
+                        // Without this line the trail reads `outcome=green`
+                        // immediately followed by `lane-build-start` for the
+                        // same members, with nothing in between — a green
+                        // candidate silently rebuilding forever, which is
+                        // indistinguishable from a lane that never tried to
+                        // land at all. That gap hid a 600s lander timeout for a
+                        // full day on 2026-08-02: five greens, five kills, and
+                        // the only evidence was Forgejo status timestamps.
+                        //
+                        // The trail exists so a verdict outlives the tree; a
+                        // failed land is a verdict about the trunk and has the
+                        // same claim on it.
+                        let reason = e.to_string();
+                        self.trail_line(&format!(
+                            "[cargoless:obs] lane-land outcome=failed members={} reason={reason}",
+                            members.len()
+                        ));
                         let mut evs = vec![LaneEvent::LandFailed {
-                            reason: e.to_string(),
+                            reason,
                             members: members.iter().map(|m| m.id.clone()).collect(),
                         }];
                         evs.extend(members.iter().cloned().map(LaneEvent::Enqueue));
@@ -1728,5 +1809,66 @@ mod slot_free_tests {
             !slot_is_building(snap, "lane"),
             "dev building must not make the lane wait"
         );
+    }
+}
+
+#[cfg(test)]
+mod land_timeout_tests {
+    use super::{LAND_TIMEOUT_DEFAULT_SECS, parse_land_timeout};
+
+    /// The regression that cost a day. The configured lander delegates to
+    /// `merge-train-controller --land`, whose own `TRAIN_BUILD_MAX_WAIT_SECS`
+    /// defaults to 5400. A parent budget at or below that can never observe an
+    /// outcome — it SIGKILLs a healthy land mid-wait and calls it infra.
+    ///
+    /// Asserted against the delegate's real number, not a copy of our own, so
+    /// this fails if someone lowers the default back toward it.
+    #[test]
+    fn the_default_outlives_the_delegates_own_budget() {
+        const CONTROLLER_BUILD_MAX_WAIT_SECS: u64 = 5400;
+        assert!(
+            LAND_TIMEOUT_DEFAULT_SECS > CONTROLLER_BUILD_MAX_WAIT_SECS,
+            "the land budget ({LAND_TIMEOUT_DEFAULT_SECS}s) must exceed the delegate's \
+             ({CONTROLLER_BUILD_MAX_WAIT_SECS}s) or every land is killed before it can answer"
+        );
+    }
+
+    /// Specifically 600s, the value that was there. Named because a comment
+    /// explaining why it was wrong is not a test.
+    #[test]
+    fn the_old_600s_budget_would_still_be_wrong() {
+        assert!(
+            LAND_TIMEOUT_DEFAULT_SECS > 600,
+            "600s killed five consecutive green candidates on 2026-08-02"
+        );
+    }
+
+    #[test]
+    fn an_explicit_override_wins() {
+        assert_eq!(parse_land_timeout(Some("120")), 120);
+        assert_eq!(parse_land_timeout(Some("  9000  ")), 9000);
+    }
+
+    /// Every unusable value falls back rather than producing a budget that
+    /// cannot work. Zero is the dangerous one: a deadline already in the past
+    /// kills the land before its first poll, so a typo would silently disable
+    /// landing while looking configured.
+    #[test]
+    fn unusable_values_fall_back_to_the_default() {
+        for raw in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0"),
+            Some("-1"),
+            Some("abc"),
+            Some("60s"),
+        ] {
+            assert_eq!(
+                parse_land_timeout(raw),
+                LAND_TIMEOUT_DEFAULT_SECS,
+                "{raw:?} is not a usable budget and must fall back"
+            );
+        }
     }
 }
