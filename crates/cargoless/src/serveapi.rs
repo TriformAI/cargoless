@@ -1504,49 +1504,25 @@ impl ServeVerdictState {
         repo: &Path,
         state_dir: &Path,
         base_ref: &str,
-        profile: &str,
-        artifact_path: Option<PathBuf>,
-        dispatch: Option<(Vec<String>, String, String)>,
+        plan: cargoless_core::lanedrv::LegPlan,
     ) -> Self {
         let tree = cargoless_core::lanetree::GitCandidateTree::new(
             repo,
             state_dir.join("lane-candidates"),
             base_ref,
         );
-        // Captured BEFORE the match consumes `artifact_path`.
-        let publishes_locally = artifact_path.is_some();
-        let dispatching = dispatch.is_some();
-        let legs: Box<dyn cargoless_core::lanedrv::LegRunner + Send> = match dispatch {
-            Some((command, remote, ref_prefix)) => {
-                // REFUSE the combination rather than quietly ignore half of it.
-                // `DispatchLegRunner` always reports `artifact: None` — the
-                // build happened elsewhere, so there is no local file to hand a
-                // lander. Accepting an artifact path here would leave
-                // `PointerLander` taking its "green with nothing to publish"
-                // branch on every build: no error, no pointer movement, and an
-                // operator who configured a publishing lane watching it publish
-                // nothing forever. That is precisely the
-                // exits-0-while-doing-nothing shape, so it fails loudly at boot
-                // instead.
-                assert!(
-                    artifact_path.is_none(),
-                    "CARGOLESS_LANE_ARTIFACT cannot be combined with a dispatched \
-                     lane: the build runs elsewhere, so there is no local artifact \
-                     to publish. The dispatcher's own builder owns promotion."
-                );
-                Box::new(cargoless_core::lanedrv::DispatchLegRunner::new(
-                    command, remote, ref_prefix,
-                ))
-            }
-            None => {
-                let mut legs = cargoless_core::lanedrv::ProfileLegRunner::new(profile);
-                legs.artifact_path = artifact_path;
-                Box::new(legs)
-            }
-        };
-        // A dispatched lane is never "publishing" locally, whatever the artifact
-        // setting was — the assert above guarantees it was unset.
-        let publishing = !dispatching && publishes_locally;
+        // The lander follows the PLAN, so the two cannot disagree. Only an
+        // in-process plan with an artifact path produces a local file to
+        // publish; both remote plans build elsewhere and report `artifact:
+        // None`, so pairing either with `PointerLander` would leave it taking
+        // its "green with nothing to publish" branch forever — no error, no
+        // pointer movement, and an operator watching a publishing lane publish
+        // nothing. The caller refuses that combination at boot; this makes it
+        // unrepresentable here.
+        let publishing = plan.publishes_locally();
+        // The description is the caller's to log — `servedrv` announces it in
+        // the boot line beside the profile and base, where an operator reads it.
+        let (legs, _where) = plan.into_runner();
         // The lander follows the artifact setting so the two cannot disagree.
         //
         // No artifact ⇒ report-only: the lane proves the merged tree builds and

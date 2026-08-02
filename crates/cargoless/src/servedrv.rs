@@ -508,33 +508,80 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             .split_whitespace()
             .map(str::to_string)
             .collect();
-        let dispatch = if dispatch_cmd.is_empty() {
-            None
-        } else {
-            // Refuse the contradictory pair HERE, with the same fail-closed
-            // shape as the unknown-profile check above, rather than letting
-            // `with_lane`'s assert panic. An operator reading a panic has to
-            // guess; an operator reading this sentence has the fix.
-            if artifact.is_some() {
+        // The PREVIEW slot: the strongest of the three destinations, because it
+        // proves the candidate boots and SERVES rather than merely compiles.
+        let preview_slot = std::env::var("CARGOLESS_LANE_PREVIEW_SLOT")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let remote = std::env::var("CARGOLESS_LANE_DISPATCH_REMOTE")
+            .unwrap_or_else(|_| "origin".to_string());
+        let ref_prefix = std::env::var("CARGOLESS_LANE_DISPATCH_REF_PREFIX")
+            .unwrap_or_else(|_| "refs/heads/lane-candidate".to_string());
+
+        // Exactly one destination. Refuse an ambiguous pair rather than pick
+        // for the operator: which one won would be invisible, and the two have
+        // very different security properties.
+        if !dispatch_cmd.is_empty() && !preview_slot.is_empty() {
+            eprintln!(
+                "[cargoless] FATAL: CARGOLESS_LANE_DISPATCH and \
+                 CARGOLESS_LANE_PREVIEW_SLOT are mutually exclusive — a lane has \
+                 one destination for its legs. Unset whichever you did not mean."
+            );
+            std::process::exit(2);
+        }
+        // Both remote destinations build elsewhere and report `artifact: None`,
+        // so an artifact path would leave the lander silently publishing
+        // nothing forever. Refuse with the same fail-closed shape as the
+        // unknown-profile check above: a panic makes an operator guess, this
+        // sentence hands them the fix.
+        if artifact.is_some() && (!dispatch_cmd.is_empty() || !preview_slot.is_empty()) {
+            eprintln!(
+                "[cargoless] FATAL: CARGOLESS_LANE_ARTIFACT cannot be combined \
+                 with a remote lane destination. The build runs elsewhere, so \
+                 there is no local artifact for the lander to publish — the \
+                 pointer would silently never move."
+            );
+            eprintln!(
+                "[cargoless] Unset one: drop CARGOLESS_LANE_ARTIFACT to let the \
+                 remote builder own promotion, or drop the destination to \
+                 compile in this process."
+            );
+            std::process::exit(2);
+        }
+
+        let plan = if !preview_slot.is_empty() {
+            let daemon = std::env::var("CARGOLESS_LANE_PREVIEW_DAEMON").unwrap_or_default();
+            if daemon.trim().is_empty() {
                 eprintln!(
-                    "[cargoless] FATAL: CARGOLESS_LANE_ARTIFACT and \
-                     CARGOLESS_LANE_DISPATCH are mutually exclusive. A dispatched \
-                     lane builds elsewhere, so there is no local artifact for the \
-                     lander to publish — the pointer would silently never move."
-                );
-                eprintln!(
-                    "[cargoless] Unset one: drop CARGOLESS_LANE_ARTIFACT to let the \
-                     dispatcher's builder own promotion, or drop \
-                     CARGOLESS_LANE_DISPATCH to compile in this process."
+                    "[cargoless] FATAL: CARGOLESS_LANE_PREVIEW_SLOT is set but \
+                     CARGOLESS_LANE_PREVIEW_DAEMON is not — there is nowhere to \
+                     roll the candidate."
                 );
                 std::process::exit(2);
             }
-            let remote = std::env::var("CARGOLESS_LANE_DISPATCH_REMOTE")
-                .unwrap_or_else(|_| "origin".to_string());
-            let prefix = std::env::var("CARGOLESS_LANE_DISPATCH_REF_PREFIX")
-                .unwrap_or_else(|_| "refs/heads/lane-candidate".to_string());
-            Some((dispatch_cmd, remote, prefix))
+            cargoless_core::lanedrv::LegPlan::Preview {
+                daemon,
+                token: std::env::var("CARGOLESS_LANE_PREVIEW_TOKEN")
+                    .or_else(|_| std::env::var("CARGOLESS_AUTH_TOKEN"))
+                    .unwrap_or_default(),
+                slot: preview_slot,
+                remote,
+                ref_prefix,
+            }
+        } else if !dispatch_cmd.is_empty() {
+            cargoless_core::lanedrv::LegPlan::Dispatch {
+                command: dispatch_cmd,
+                remote,
+                ref_prefix,
+            }
+        } else {
+            cargoless_core::lanedrv::LegPlan::InProcess {
+                profile: profile.clone(),
+                artifact_path: artifact.clone(),
+            }
         };
+
         // Announce it. A lane that can move the trunk must be visible in the
         // boot log, not inferred from behaviour — the same reasoning as the
         // resolved-caps lines below. `where=` is the load-bearing field: it is
@@ -547,22 +594,9 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<none: check-only>".to_string()),
-            match dispatch.as_ref() {
-                Some((cmd, remote, prefix)) => format!(
-                    "dispatched:{} remote={remote} ref_prefix={prefix}",
-                    cmd.join(" ")
-                ),
-                None => "in-process (compiles candidate code in THIS pod)".to_string(),
-            }
+            plan.describe()
         );
-        api_state = api_state.with_lane(
-            &scope.repo_root,
-            &state_dir,
-            &base,
-            &profile,
-            artifact,
-            dispatch,
-        );
+        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, plan);
     }
     let api = Arc::new(api_state);
     // Path D + R3 — publish the resolved caps at startup so an operator

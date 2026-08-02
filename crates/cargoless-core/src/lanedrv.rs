@@ -72,6 +72,137 @@ pub trait LegRunner {
     fn run(&self, root: &Path, changed_files: &[String]) -> io::Result<LegOutcome>;
 }
 
+/// WHERE a lane runs its legs, as one value.
+///
+/// A daemon selects this at boot. It exists so the choice is a single
+/// exhaustively-matched value rather than a widening tuple of options — the
+/// previous shape passed `Option<(Vec<String>, String, String)>` and adding a
+/// third destination would have made the call site unreadable and the illegal
+/// combinations invisible.
+pub enum LegPlan {
+    /// Compile in the daemon process.
+    ///
+    /// Zero-config, and the right answer for a single developer. NOT the right
+    /// answer for a daemon that can reach a credential: `cargo` executes
+    /// `build.rs` and proc-macros from the candidate, which is unreviewed code.
+    InProcess {
+        profile: String,
+        artifact_path: Option<PathBuf>,
+    },
+    /// Publish the candidate and hand it to an external builder.
+    Dispatch {
+        command: Vec<String>,
+        remote: String,
+        ref_prefix: String,
+    },
+    /// Publish the candidate, roll it onto a preview slot, and wait for the
+    /// slot to actually SERVE it. The strongest of the three: it proves the
+    /// tree boots and answers, not merely that it compiles.
+    Preview {
+        daemon: String,
+        token: String,
+        slot: String,
+        remote: String,
+        ref_prefix: String,
+    },
+}
+
+impl LegPlan {
+    /// One line naming where the legs will run.
+    ///
+    /// Borrows rather than consuming so a caller can log it BEFORE building the
+    /// runner — a boot line that only appears after construction is missing
+    /// exactly when construction is what failed.
+    ///
+    /// This is not decoration: a lane that can move the trunk must announce
+    /// where it compiles unreviewed code, because that is the difference
+    /// between a sandbox and this pod.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            LegPlan::InProcess { .. } => {
+                "in-process (compiles candidate code in THIS pod)".to_string()
+            }
+            LegPlan::Dispatch {
+                command,
+                remote,
+                ref_prefix,
+            } => format!(
+                "dispatched:{} remote={remote} ref_prefix={ref_prefix}",
+                command.join(" ")
+            ),
+            LegPlan::Preview {
+                daemon,
+                slot,
+                remote,
+                ..
+            } => format!("preview:{slot} daemon={daemon} remote={remote}"),
+        }
+    }
+
+    /// Build the runner. Pair with [`Self::describe`] for the boot line.
+    #[must_use]
+    pub fn into_runner(self) -> (Box<dyn LegRunner + Send>, String) {
+        match self {
+            LegPlan::InProcess {
+                profile,
+                artifact_path,
+            } => {
+                let mut legs = ProfileLegRunner::new(profile);
+                legs.artifact_path = artifact_path;
+                (
+                    Box::new(legs),
+                    "in-process (compiles candidate code in THIS pod)".to_string(),
+                )
+            }
+            LegPlan::Dispatch {
+                command,
+                remote,
+                ref_prefix,
+            } => {
+                let what = format!(
+                    "dispatched:{} remote={remote} ref_prefix={ref_prefix}",
+                    command.join(" ")
+                );
+                (
+                    Box::new(DispatchLegRunner::new(command, remote, ref_prefix)),
+                    what,
+                )
+            }
+            LegPlan::Preview {
+                daemon,
+                token,
+                slot,
+                remote,
+                ref_prefix,
+            } => {
+                let what = format!("preview:{slot} daemon={daemon} remote={remote}");
+                let mut r = PreviewLegRunner::new(daemon, token, slot, remote);
+                r.ref_prefix = ref_prefix;
+                (Box::new(r), what)
+            }
+        }
+    }
+
+    /// Does this plan produce a LOCAL artifact for a lander to publish?
+    ///
+    /// Only in-process does. Both remote plans build elsewhere and report
+    /// `artifact: None`, so pairing either with a publishing lander would leave
+    /// it taking its "green with nothing to publish" branch forever: no error,
+    /// no pointer movement, and an operator watching a publishing lane publish
+    /// nothing.
+    #[must_use]
+    pub fn publishes_locally(&self) -> bool {
+        matches!(
+            self,
+            LegPlan::InProcess {
+                artifact_path: Some(_),
+                ..
+            }
+        )
+    }
+}
+
 /// So a caller can pick the runner at runtime without monomorphising a branch
 /// per combination.
 ///
@@ -373,6 +504,42 @@ impl DispatchLegRunner {
         }
     }
 
+    /// Publish the candidate at `root` as `<ref_prefix>/<sha>` on `remote`,
+    /// returning `(sha, refname)`.
+    ///
+    /// Shared with [`PreviewLegRunner`]: both need the candidate reachable by
+    /// something that is not this process, and both address it by its own sha.
+    ///
+    /// `--force` is correct AND safe here precisely because the ref name
+    /// contains the sha: the only thing it can overwrite is a byte-identical
+    /// rebuild of itself. Publishing under a name that did NOT carry the sha
+    /// would make force a real hazard and two concurrent candidates a race.
+    ///
+    /// The prefix must live under `refs/heads/` for anything that mirrors with
+    /// the usual `+refs/heads/*:refs/remotes/origin/*` refspec to see it —
+    /// tf-multiverse's preview daemon does exactly that, so a candidate
+    /// published outside `refs/heads/` is invisible to it and the instance
+    /// silently never binds.
+    pub(crate) fn publish_candidate(
+        root: &Path,
+        remote: &str,
+        ref_prefix: &str,
+    ) -> io::Result<(String, String)> {
+        let sha = Self::head_sha(root)?;
+        let refname = format!("{}/{sha}", ref_prefix.trim_end_matches('/'));
+        let push = Command::new("git")
+            .current_dir(root)
+            .args(["push", "--force", remote, &format!("HEAD:{refname}")])
+            .output()?;
+        if !push.status.success() {
+            return Err(io::Error::other(format!(
+                "could not publish the candidate as {refname}: {}",
+                String::from_utf8_lossy(&push.stderr).trim()
+            )));
+        }
+        Ok((sha, refname))
+    }
+
     fn head_sha(root: &Path) -> io::Result<String> {
         let out = Command::new("git")
             .current_dir(root)
@@ -395,22 +562,8 @@ impl LegRunner for DispatchLegRunner {
                 "dispatch leg runner configured with an empty command",
             ));
         };
-        let sha = Self::head_sha(root)?;
-        let refname = format!("{}/{sha}", self.ref_prefix.trim_end_matches('/'));
-
-        // Publish the candidate so an external builder can fetch it. Force is
-        // correct and safe here: the ref name CONTAINS the sha, so the only
-        // thing it can overwrite is a byte-identical rebuild of itself.
-        let push = Command::new("git")
-            .current_dir(root)
-            .args(["push", "--force", &self.remote, &format!("HEAD:{refname}")])
-            .output()?;
-        if !push.status.success() {
-            return Err(io::Error::other(format!(
-                "could not publish the candidate as {refname}: {}",
-                String::from_utf8_lossy(&push.stderr).trim()
-            )));
-        }
+        // Publish the candidate so an external builder can fetch it.
+        let (sha, refname) = Self::publish_candidate(root, &self.remote, &self.ref_prefix)?;
 
         // NOTE: no `current_dir(root)`. The dispatcher must not run inside the
         // candidate tree — that tree is the unreviewed code, and a dispatcher
@@ -463,6 +616,224 @@ impl LegRunner for DispatchLegRunner {
                 duration_ms,
             }],
         })
+    }
+}
+
+/// Rolls the candidate onto a PREVIEW SLOT and waits for it to be live.
+///
+/// # Why a preview slot is a better gate than a build
+///
+/// A build proves the tree compiles. A preview proves it *boots and serves* —
+/// the app came up, its health endpoint answered, and the never-serve-red
+/// promote actually flipped to this candidate. Those are different claims, and
+/// only the second is what "ready to merge" means for a deployed service.
+///
+/// This adds no second build path. It reuses the app-serve tier wholesale:
+/// worktree-per-instance, exact-sha checkout, mid-build HEAD-move detection,
+/// warm per-lane target dir, ENOSPC classification and self-heal, bundle
+/// pruning, health-gated promote at a single site, TTL reaping. All of that
+/// already exists and is in production; re-deriving it is how the lane ended up
+/// re-solving four problems this repo had already solved.
+///
+/// # The gate
+///
+/// One FIXED slot name — the serial queue has exactly one staging area, so the
+/// slot is a position, not a per-candidate resource. `POST /instances` re-points
+/// a live preview at a new ref and renews its TTL rather than churning it, which
+/// is precisely the behaviour a queue wants.
+///
+/// Verdict comes from `GET /app`:
+/// * `serving_sha == <candidate>` ⇒ **green and live**
+/// * `last_red_sha == <candidate>` ⇒ **red**, with `last_red_reason`
+///
+/// Anything else is "not yet"; the deadline decides when to stop waiting, and a
+/// timeout is `Err` (infrastructure) rather than a red, because "we stopped
+/// looking" is not a verdict about anyone's code.
+pub struct PreviewLegRunner {
+    /// Base URL of the daemon that owns the preview slot, e.g.
+    /// `http://cargoless-preview.triform-staging.svc.cluster.local:8787`.
+    pub daemon: String,
+    /// Bearer token for `POST /instances`. `GET /app` is auth-exempt, so this
+    /// is only needed to create or re-point the slot.
+    pub token: String,
+    /// The slot name. One per lane — see above.
+    pub slot: String,
+    /// Where to publish the candidate, and under what prefix. The prefix must
+    /// live under `refs/heads/` or the preview daemon's mirror will not see it.
+    pub remote: String,
+    pub ref_prefix: String,
+    /// How long to wait for the slot to go live before calling it infra.
+    pub timeout: Duration,
+    /// Gap between `GET /app` polls.
+    pub poll: Duration,
+}
+
+impl PreviewLegRunner {
+    pub fn new(
+        daemon: impl Into<String>,
+        token: impl Into<String>,
+        slot: impl Into<String>,
+        remote: impl Into<String>,
+    ) -> Self {
+        Self {
+            daemon: daemon.into(),
+            token: token.into(),
+            slot: slot.into(),
+            remote: remote.into(),
+            ref_prefix: "refs/heads/lane-candidate".to_string(),
+            // A cold preview build of a real app is minutes; tf-multiverse's
+            // own manifest allows 600s just for the health probe after a build
+            // that can take 45. 2h leaves room without waiting on a dead slot.
+            timeout: Duration::from_secs(7200),
+            poll: Duration::from_secs(10),
+        }
+    }
+
+    /// One `GET /app`, returning the raw body. Auth-exempt by design, so a
+    /// poller never needs the bearer token.
+    fn app_snapshot(&self) -> io::Result<String> {
+        let out = Command::new("curl")
+            .args([
+                "-sS",
+                "--max-time",
+                "20",
+                &format!("{}/app", self.daemon.trim_end_matches('/')),
+            ])
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "GET /app failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+impl LegRunner for PreviewLegRunner {
+    fn run(&self, root: &Path, _changed_files: &[String]) -> io::Result<LegOutcome> {
+        let started = Instant::now();
+        let (sha, refname) =
+            DispatchLegRunner::publish_candidate(root, &self.remote, &self.ref_prefix)?;
+
+        // Point the slot at this candidate. Re-`Add`ing a live preview
+        // re-points its ref and renews the TTL — no re-bind, no port churn —
+        // which is exactly what a serial queue wants from a reusable slot.
+        let body = serde_json::json!({
+            "name": self.slot,
+            "ref": refname,
+        })
+        .to_string();
+        let post = Command::new("curl")
+            .args([
+                "-sS",
+                "-X",
+                "POST",
+                "--max-time",
+                "30",
+                "-H",
+                &format!("Authorization: Bearer {}", self.token),
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                &body,
+                &format!("{}/instances", self.daemon.trim_end_matches('/')),
+            ])
+            .output()?;
+        if !post.status.success() {
+            return Err(io::Error::other(format!(
+                "could not point preview slot {:?} at {refname}: {}",
+                self.slot,
+                String::from_utf8_lossy(&post.stderr).trim()
+            )));
+        }
+
+        // Poll until the slot SERVES this sha, or reds on it.
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            if Instant::now() >= deadline {
+                // Not a red. We stopped looking; that says nothing about the
+                // code, and blaming a member for our deadline would be the
+                // false accusation the lane exists to avoid.
+                return Err(io::Error::other(format!(
+                    "preview slot {:?} did not serve {sha} within {}s",
+                    self.slot,
+                    self.timeout.as_secs()
+                )));
+            }
+            let snap = self.app_snapshot()?;
+            let v: serde_json::Value =
+                serde_json::from_str(&snap).unwrap_or(serde_json::Value::Null);
+            let inst = v
+                .get("instances")
+                .and_then(|i| i.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(&self.slot))
+                })
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            let field = |k: &str| {
+                inst.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+
+            if field("serving_sha") == sha {
+                let host = field("public_host");
+                return Ok(LegOutcome {
+                    tree: TreeState::Green,
+                    diagnostics: Vec::new(),
+                    artifact: None,
+                    legs: vec![LegReport {
+                        id: format!(
+                            "preview:{} live at {}",
+                            self.slot,
+                            if host.is_empty() { "<no route>" } else { &host }
+                        ),
+                        tree: TreeState::Green,
+                        required: true,
+                        duration_ms: started.elapsed().as_millis(),
+                    }],
+                });
+            }
+            if field("last_red_sha") == sha {
+                // The preview reports a free-text reason, not cargo JSON, so
+                // this red carries no file paths and the lane will correctly
+                // decline to attribute it. That is honest: a boot failure is
+                // frequently an interaction, not one member's line.
+                let reason = field("last_red_reason");
+                return Ok(LegOutcome {
+                    tree: TreeState::Red,
+                    diagnostics: vec![cargoless_proto::Diagnostic {
+                        // Anchored at the manifest, like every other
+                        // build-level failure with no source span. Attribution
+                        // treats a file nobody touched as unattributable, which
+                        // is the correct outcome here.
+                        file_path: root.join("cargoless.checks.yaml"),
+                        line: 1,
+                        col: 1,
+                        severity: cargoless_proto::Severity::Error,
+                        code: Some("preview.red".to_string()),
+                        message: format!(
+                            "preview slot {:?} rejected the candidate: {reason}",
+                            self.slot
+                        ),
+                        source: Some("cargoless-preview".to_string()),
+                    }],
+                    artifact: None,
+                    legs: vec![LegReport {
+                        id: format!("preview:{}", self.slot),
+                        tree: TreeState::Red,
+                        required: true,
+                        duration_ms: started.elapsed().as_millis(),
+                    }],
+                });
+            }
+            thread::sleep(self.poll);
+        }
     }
 }
 
