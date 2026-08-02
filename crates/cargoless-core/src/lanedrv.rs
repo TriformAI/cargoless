@@ -716,6 +716,18 @@ impl LegRunner for DispatchLegRunner {
 /// Anything else is "not yet"; the deadline decides when to stop waiting, and a
 /// timeout is `Err` (infrastructure) rather than a red, because "we stopped
 /// looking" is not a verdict about anyone's code.
+/// How many times to try pointing the slot before calling it infrastructure.
+///
+/// Small on purpose: this covers a daemon that is RESTARTING (seconds), not one
+/// that is gone. A genuinely absent daemon must still surface as Infra quickly
+/// rather than hold the lane.
+const POINT_ATTEMPTS: u32 = 5;
+
+/// Gap between point attempts. 5 × 6s ≈ 30s of tolerance, which covers the
+/// observed gap between a preview pod being killed and its replacement
+/// answering, without meaningfully delaying a real failure.
+const POINT_RETRY_DELAY: Duration = Duration::from_secs(6);
+
 pub struct PreviewLegRunner {
     /// Base URL of the daemon that owns the preview slot, e.g.
     /// `http://cargoless-preview.triform-staging.svc.cluster.local:8787`.
@@ -805,27 +817,52 @@ impl LegRunner for PreviewLegRunner {
             "ref": local_ref,
         })
         .to_string();
-        let post = Command::new("curl")
-            .args([
-                "-sS",
-                "-X",
-                "POST",
-                "--max-time",
-                "30",
-                "-H",
-                &format!("Authorization: Bearer {}", self.token),
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body,
-                &format!("{}/instances", self.daemon.trim_end_matches('/')),
-            ])
-            .output()?;
-        if !post.status.success() {
+        // RETRY, because the daemon we are pointing at restarts.
+        //
+        // This one POST decides whether a 20-45 minute candidate build happens
+        // at all, and `post.status` is CURL's exit code — a connection refused
+        // during a rolling update looks identical to a permanent failure. On
+        // 2026-08-02 the preview rolled twice in 90 minutes (a Flux apply, then
+        // a second kill) and every candidate that raced it died instantly:
+        // generations 8-11 all `could not point preview slot`, each one a
+        // fresh ejection and backoff for a member whose code was never at
+        // fault.
+        //
+        // A few seconds of retry converts "the daemon was restarting" from a
+        // lost build into a pause. Still bounded: a daemon that is genuinely
+        // gone must still surface as Infra rather than hanging the lane.
+        let mut last_err = String::new();
+        let mut pointed = false;
+        for attempt in 1..=POINT_ATTEMPTS {
+            let post = Command::new("curl")
+                .args([
+                    "-sS",
+                    "-X",
+                    "POST",
+                    "--max-time",
+                    "30",
+                    "-H",
+                    &format!("Authorization: Bearer {}", self.token),
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    &body,
+                    &format!("{}/instances", self.daemon.trim_end_matches('/')),
+                ])
+                .output()?;
+            if post.status.success() {
+                pointed = true;
+                break;
+            }
+            last_err = String::from_utf8_lossy(&post.stderr).trim().to_string();
+            if attempt < POINT_ATTEMPTS {
+                std::thread::sleep(POINT_RETRY_DELAY);
+            }
+        }
+        if !pointed {
             return Err(io::Error::other(format!(
-                "could not point preview slot {:?} at {refname}: {}",
-                self.slot,
-                String::from_utf8_lossy(&post.stderr).trim()
+                "could not point preview slot {:?} at {refname} after {} attempts: {}",
+                self.slot, POINT_ATTEMPTS, last_err
             )));
         }
 
