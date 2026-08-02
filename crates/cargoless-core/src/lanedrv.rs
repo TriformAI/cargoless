@@ -719,9 +719,23 @@ impl LegRunner for PreviewLegRunner {
         // Point the slot at this candidate. Re-`Add`ing a live preview
         // re-points its ref and renews the TTL — no re-bind, no port churn —
         // which is exactly what a serial queue wants from a reusable slot.
+        //
+        // Send the REMOTE-TRACKING name, not the name we pushed to. We publish
+        // `refs/heads/lane-candidate/<sha>` on the forge, but the preview daemon
+        // resolves refs in ITS OWN clone, where a mirror of
+        // `+refs/heads/*:refs/remotes/origin/*` lands that ref at
+        // `refs/remotes/origin/lane-candidate/<sha>`. Asking it for the
+        // `refs/heads/` name gets `fatal: Needed a single revision`, the poller
+        // silently skips, and the slot sits `phase=idle` forever with no error
+        // anywhere — verified in production 2026-08-02, where the refs WERE
+        // mirrored (6 of them) and the slot still never built.
+        let local_ref = format!(
+            "refs/remotes/origin/{}",
+            refname.trim_start_matches("refs/heads/")
+        );
         let body = serde_json::json!({
             "name": self.slot,
-            "ref": refname,
+            "ref": local_ref,
         })
         .to_string();
         let post = Command::new("curl")
