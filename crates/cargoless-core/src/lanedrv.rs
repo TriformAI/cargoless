@@ -1341,6 +1341,17 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             LaneBuildOutcome::Infra { reason } => self.trail_line(&format!(
                 "[cargoless:obs] lane-build generation={generation} outcome=infra reason={reason}"
             )),
+            // Not reachable here: a conflict is detected while materialising,
+            // which returns early and writes its own `outcome=conflict` line
+            // above. Written as a real arm rather than a wildcard so that if a
+            // future path ever produces a conflict *after* materialisation, it
+            // still reaches the trail instead of being silently swallowed by a
+            // `_ => {}`. The verdict outliving the tree is the point.
+            LaneBuildOutcome::Conflict { id, files, reason } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} outcome=conflict \
+                 member={id} files={} reason={reason}",
+                files.len()
+            )),
         }
 
         self.tree.release(&root);
