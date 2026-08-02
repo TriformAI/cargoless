@@ -530,6 +530,76 @@ fn dispatching_never_executes_code_from_the_candidate_tree() {
     }
 }
 
+/// A dispatcher that could not GET a verdict must never eject anyone.
+///
+/// Remote builds get cancelled, runners vanish, queues time out. If any of
+/// those read as "your code is broken", the lane ejects whichever member
+/// happened to be aboard for an infrastructure fault — the fastest way to teach
+/// a fleet to distrust its own gate. EX_TEMPFAIL (75) is the dispatcher's way
+/// to say "no verdict", and it must reach the lane as infra, not red.
+#[test]
+fn a_dispatcher_that_cannot_get_a_verdict_ejects_nobody() {
+    let root = repo_with_legs("dispatch-tempfail", &leg("unused", "true"));
+    let remote = scratch("dispatch-tempfail-remote");
+    sh(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    sh(
+        &root,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    sh(&root, &["push", "-q", "origin", "main"]);
+    let a = branch(&root, "a", "src/x.rs", "fn x() {}\n");
+
+    let script = scratch("dispatch-tempfail-bin").join("d.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    // Exactly what scripts/ci/lane-dispatch.sh does on cancelled/timeout.
+    fs::write(
+        &script,
+        "#!/bin/sh\necho 'remote build cancelled' >&2\nexit 75\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let legs = DispatchLegRunner::new(
+        vec![script.to_string_lossy().into_owned()],
+        remote.to_string_lossy().into_owned(),
+        "refs/heads/lane-candidate",
+    );
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander);
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["src/x.rs"])),
+    );
+
+    assert!(
+        !actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::Eject { .. })),
+        "a transient dispatcher failure must not eject a member: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::LandAndPublish { .. })),
+        "and it must certainly not LAND — no verdict was produced: {actions:?}"
+    );
+
+    for d in [root, remote] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
 /// The runner must be selectable at RUNTIME, or the daemon cannot offer the
 /// choice without monomorphising a branch per (runner × lander) pair.
 ///

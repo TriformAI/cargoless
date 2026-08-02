@@ -292,7 +292,11 @@ impl DispatchLegRunner {
     /// than shared because that function's loop is entangled with the check
     /// cancellation flag, and lifting it out to serve two callers is a bigger
     /// change than this one earns.
-    fn run_to_completion(mut cmd: Command, timeout: Duration) -> io::Result<(bool, String, u128)> {
+    #[allow(clippy::type_complexity)]
+    fn run_to_completion(
+        mut cmd: Command,
+        timeout: Duration,
+    ) -> io::Result<(bool, Option<i32>, String, u128)> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -361,7 +365,10 @@ impl DispatchLegRunner {
         );
         let elapsed = started.elapsed().as_millis();
         match status {
-            Ok(s) => Ok((s.success(), combined, elapsed)),
+            // `code()` is None when the child died on a SIGNAL. That is not a
+            // verdict either, but it is already not-success, and the caller
+            // only special-cases an explicit EX_TEMPFAIL.
+            Ok(s) => Ok((s.success(), s.code(), combined, elapsed)),
             Err(e) => Err(e),
         }
     }
@@ -416,7 +423,24 @@ impl LegRunner for DispatchLegRunner {
             .env("CARGOLESS_LANE_CHANGED_FILES", changed_files.join("\n"))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let (success, text, duration_ms) = Self::run_to_completion(cmd, self.timeout)?;
+        let (success, code, text, duration_ms) = Self::run_to_completion(cmd, self.timeout)?;
+
+        // EX_TEMPFAIL. A dispatcher that could not get a verdict — the remote
+        // build was cancelled, the runner vanished, the queue timed out — must
+        // say so in a way the lane can tell apart from "your code is broken".
+        // Without this the only signal is "non-zero", and an infrastructure
+        // fault would eject whichever member happened to be aboard: the fastest
+        // way to teach a fleet to distrust its own gate.
+        //
+        // 75 rather than a bespoke number because sysexits.h already means this
+        // and shell authors reach for it without being told.
+        const EX_TEMPFAIL: i32 = 75;
+        if code == Some(EX_TEMPFAIL) {
+            return Err(io::Error::other(format!(
+                "dispatcher reported a transient failure (exit {EX_TEMPFAIL}); \
+                 no verdict was produced"
+            )));
+        }
 
         let diagnostics = crate::cargodiag::parse_cargo_json(root, &text);
         let tree = if success {
