@@ -1128,3 +1128,179 @@ fn absolute_scratch_paths_attribute_to_repo_relative_changed_files() {
     // A suffix that is not a path-component boundary must NOT match.
     assert!(!m.touches(&PathBuf::from("/scratch/x/notportal/src/page.rs")));
 }
+
+// ── lane honesty: what `GET /lane` and the trail say is happening ─────────
+//
+// Four defects that share one property: the lane did the right thing and
+// REPORTED the wrong thing. A gate whose status surface lies is worse than one
+// with no surface, because the lie gets acted on — an author re-submits, an
+// operator rolls the daemon mid-merge, a retry storm reads as progress.
+
+/// DEFECT 4 — the infra backoff must be measured from when the failure
+/// HAPPENED, not from when the attempt started.
+///
+/// `LaneState::now` moves only on `LaneEvent::Tick`, and the host's ticks sit
+/// unread in a channel for the whole of a blocking action — the worker is
+/// inside `LaneDriver::execute`. So a failing attempt that takes LONGER than
+/// `infra_backoff_ticks` records `infra_retry_after = started + backoff`, which
+/// is already in the past, and the first tick after it clears the backoff
+/// without waiting at all.
+///
+/// That is the observed ~30-second generation loop against an unreachable
+/// preview daemon: pointing the slot takes ~24-35s (5 attempts, 6s apart)
+/// against a 30-tick backoff, so it expired before it was written. 51 wasted
+/// generations in one night, each writing an `outcome=infra` trail line.
+///
+/// `LaneState::advance_clock` is what the driver calls to close that gap, and
+/// this pins the property it exists for.
+#[test]
+fn an_infra_backoff_is_measured_from_the_failure_not_the_attempt() {
+    let mut st = LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let build_gen = start_build_now(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+
+    // The attempt takes LONGER than the backoff — the real preview-point case.
+    // This is what the driver's clock re-sync does after a blocking action.
+    let attempt_took = INFRA_BACKOFF + 5;
+    st.advance_clock(attempt_took);
+    assert_eq!(
+        st.now(),
+        attempt_took,
+        "the re-sync must actually move the lane's clock, or the rest of this \
+         test proves nothing"
+    );
+
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Infra {
+            reason: "could not point preview slot \"lane\": curl: (7) Failed to connect"
+                .to_string(),
+        },
+    });
+
+    // The next tick carries the CURRENT wall clock, which is where the daemon's
+    // tick loop actually is. Without the re-sync that tick found a backoff
+    // anchored at `0 + 30` — already elapsed — and started the next candidate
+    // immediately.
+    let actions = st.step(LaneEvent::Tick {
+        now: attempt_took + 1,
+    });
+    assert!(
+        started(&actions).is_none(),
+        "the retry must wait out the backoff FROM THE FAILURE. Anchoring it at \
+         the moment the attempt started makes it expire before it is written, \
+         and the lane then spins one generation per attempt."
+    );
+
+    // Still nothing one tick before it lapses, so a backoff that is present but
+    // effectively zero cannot pass.
+    let actions = st.step(LaneEvent::Tick {
+        now: attempt_took + INFRA_BACKOFF - 1,
+    });
+    assert!(started(&actions).is_none(), "no rebuild before the backoff");
+
+    // And it is a BACKOFF, not a give-up: the same member does retry.
+    let actions = st.step(LaneEvent::Tick {
+        now: attempt_took + INFRA_BACKOFF + 1,
+    });
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string()][..]),
+        "the member must still be retried — the fix paces the retry, it does \
+         not remove it"
+    );
+}
+
+/// DEFECT 4, the other half: `advance_clock` must NOT be a `Tick`.
+///
+/// A `Tick` does two things — moves the clock AND runs the expiry +
+/// `maybe_start_build` pipeline. The driver needs only the first, and using a
+/// Tick would break the land path specifically: after a failed land the phase
+/// is already `Idle` with the members re-enqueued, so a Tick there would start
+/// the next build BEFORE `LandFailed` installs the backoff — reintroducing the
+/// exact hot loop that event was added to prevent.
+#[test]
+fn advancing_the_clock_does_not_itself_start_a_build() {
+    // A lane with a member waiting and a lapsed backoff: any Tick builds it.
+    let mut st = LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let build_gen = start_build_now(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Infra {
+            reason: "transient".to_string(),
+        },
+    });
+    let held = st.generation();
+    let mut with_tick = st.clone();
+
+    // advance_clock moves the clock past the backoff and starts nothing.
+    st.advance_clock(INFRA_BACKOFF + 1);
+    assert_eq!(
+        st.generation(),
+        held,
+        "advance_clock must move the clock and NOTHING else — a build started \
+         here would run before `LandFailed` could install its backoff"
+    );
+    assert_eq!(st.now(), INFRA_BACKOFF + 1, "but it must move the clock");
+
+    // The contrast that makes the assertion mean something: the SAME state
+    // stepped with a Tick to the SAME instant does start a build. Asserted by
+    // stepping the machine, never by comparing two constants — that folds to
+    // `assert!(true)` under `clippy::assertions_on_constants`.
+    let actions = with_tick.step(LaneEvent::Tick {
+        now: INFRA_BACKOFF + 1,
+    });
+    assert!(
+        started(&actions).is_some() && with_tick.generation() > held,
+        "a Tick to the same instant DOES start a build, which is precisely why \
+         the driver must not use one to re-sync the clock"
+    );
+}
+
+/// DEFECT 1 — the lane must be able to say WHO is waiting, not only how many.
+///
+/// `queue_depth` alone cannot be reconciled against a member's own submission:
+/// an author who POSTed `pr-6956` and reads `queue_depth: 3` still cannot tell
+/// whether one of those three is theirs. The host also folds its
+/// accepted-but-not-yet-stepped ids into the reported list, and de-duplicating
+/// against the lane is only possible because the queue is exposed by name.
+#[test]
+fn the_lane_reports_who_is_queued_not_just_how_many() {
+    let mut st = lane();
+    st.step(LaneEvent::Enqueue(member("A", "a1", &["src/a.rs"])));
+    st.step(LaneEvent::Enqueue(member("B", "b1", &["src/b.rs"])));
+
+    let queued: Vec<&str> = st.queued().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        queued,
+        vec!["A", "B"],
+        "the queue must be reportable BY NAME and in arrival order"
+    );
+    assert_eq!(
+        st.queued().len(),
+        st.queue_depth(),
+        "`queued` and `queue_depth` must describe the same set, or the snapshot \
+         can report a count that contradicts its own list"
+    );
+
+    // Once they build they are no longer queued. The host de-duplicates its
+    // accepted set against exactly this, so a member that stayed in both would
+    // be counted as building AND waiting.
+    st.step(LaneEvent::Tick { now: WINDOW });
+    assert!(
+        st.queued().is_empty(),
+        "members in flight must leave the queue"
+    );
+    assert_eq!(st.in_flight().len(), 2);
+}

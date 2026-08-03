@@ -382,6 +382,36 @@ fn the_verdict_and_per_leg_timings_outlive_the_candidate_worktree() {
         "each leg must carry its own duration: {log}"
     );
 
+    // DEFECT 2, in the DURABLE channel. `GET /lane` now reports `activity:
+    // landing` while the lander runs, but a snapshot dies with the pod and the
+    // trail is what is left afterwards. Without a start line the trail reads
+    // `outcome=green` and then nothing for up to two hours, so a daemon killed
+    // mid-land leaves a record indistinguishable from one that never tried to
+    // land at all — the same gap that hid a 600s lander timeout for a full day.
+    assert!(
+        log.contains("lane-land-start"),
+        "the trail must record that a land STARTED, not only that one finished: \
+         a land is the only step that moves the trunk and it can run for hours, \
+         so `outcome=green` followed by silence must be distinguishable from a \
+         lane that never tried to land: {log}"
+    );
+    assert!(
+        log.contains(&format!("lane-land-start members=a@{a}")),
+        "and it must name who is being landed, by id@head — `in_flight` is \
+         already empty by this point, so nothing else can answer that: {log}"
+    );
+    // Ordering is the whole point: a start line written after the land would
+    // prove nothing about the window it exists to cover.
+    let start = log.find("lane-land-start").expect("start line present");
+    let outcome = log
+        .find("lane-land outcome=")
+        .expect("outcome line present");
+    assert!(
+        start < outcome,
+        "the start line must precede the outcome, or it does not cover the \
+         window a killed daemon falls into: {log}"
+    );
+
     let _ = fs::remove_file(&trail);
 }
 

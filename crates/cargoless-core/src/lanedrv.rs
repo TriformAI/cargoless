@@ -89,6 +89,37 @@ pub enum MaterializeError {
     Infra(io::Error),
 }
 
+impl MaterializeError {
+    /// An infrastructure failure that NAMES the operation and the path.
+    ///
+    /// `Infra` wraps a bare `io::Error`, and the driver renders it as
+    /// `candidate tree could not be materialized: {e}`. For an error straight
+    /// off a syscall that whole message is the syscall's — observed in
+    /// production as:
+    ///
+    /// ```text
+    /// lane-build generation=13 outcome=infra reason=candidate tree could not
+    /// be materialized: No such file or directory (os error 2)
+    /// ```
+    ///
+    /// Which path? Which step? The candidate root, the scratch parent, the repo
+    /// and the `git` binary itself can all produce exactly those bytes, and the
+    /// operator has no way to tell them apart. A verdict nobody can act on is
+    /// the same as no verdict, which is the failure the trail exists to end.
+    ///
+    /// `e.kind()` is preserved rather than flattened to
+    /// [`io::Error::other`]: nothing switches on it today, and a caller that
+    /// starts to must not find the kind quietly destroyed by the code that was
+    /// meant to make the error *more* informative.
+    #[must_use]
+    pub fn infra_at(op: &str, path: &Path, e: &io::Error) -> Self {
+        Self::Infra(io::Error::new(
+            e.kind(),
+            format!("{op} {}: {e}", path.display()),
+        ))
+    }
+}
+
 impl std::fmt::Display for MaterializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1462,6 +1493,67 @@ impl LaneLander for ReportOnlyLander {
     }
 }
 
+/// What the driver is doing RIGHT NOW, between two state transitions.
+///
+/// The lane's own [`LanePhase`](crate::lane::LanePhase) answers "is a build in
+/// flight". It cannot answer "is the trunk being moved", because by the time
+/// [`LaneAction::LandAndPublish`] is executed the lane has already taken its
+/// members out of `in_flight` and returned to `Idle` — the green verdict is in,
+/// and as far as the state machine is concerned the build is over. The land
+/// itself then runs for up to the land budget (7200s by default) with the lane
+/// reporting `idle`.
+///
+/// That is the single most destructive moment to roll the daemon, and a
+/// snapshot that says `idle` actively invites it. So the driver announces what
+/// it is about to block on, and the host renders it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LaneActivity {
+    /// Nothing blocking is in flight; the lane's own phase is the whole truth.
+    #[default]
+    Settled,
+    /// Inside [`CandidateTree::materialize`] + [`LegRunner::run`]. Tens of
+    /// minutes for a real lane.
+    ///
+    /// Carries nothing: the lane's own `phase`, `generation` and `in_flight`
+    /// already describe a running build completely. This variant exists only so
+    /// the blocking window is *bracketed*, which is what the land case needs.
+    Building,
+    /// Inside [`LaneLander::land`] — the trunk is being moved. Carries the
+    /// roster because the lane's `in_flight` is already empty here, and "who is
+    /// landing" is exactly what an author polling `GET /lane` needs.
+    Landing { members: Vec<String> },
+}
+
+impl LaneActivity {
+    fn of(action: &LaneAction) -> Self {
+        match action {
+            LaneAction::StartBuild { .. } => Self::Building,
+            LaneAction::LandAndPublish { members, .. } => Self::Landing {
+                members: members.iter().map(|m| m.id.clone()).collect(),
+            },
+            // Pure notifications — they return immediately, so there is no
+            // window during which anyone could read a stale phase.
+            LaneAction::Eject { .. } | LaneAction::Readmit { .. } | LaneAction::Report { .. } => {
+                Self::Settled
+            }
+        }
+    }
+
+    /// Does executing this take real, observable time?
+    fn is_blocking(&self) -> bool {
+        !matches!(self, Self::Settled)
+    }
+}
+
+/// Reads the wall clock **in the same unit the caller ticks the lane with**.
+///
+/// Boxed rather than a bare `fn` pointer because the only correct
+/// implementation captures state: [`LaneHost`](crate::lanehost::LaneHost)
+/// derives it from the tick stream it is actually given, so the driver never
+/// has to assume the caller counts in Unix seconds. `Send` because the driver
+/// is moved onto the lane worker thread.
+pub type LaneClock = Box<dyn Fn() -> u64 + Send>;
+
 /// Drives one [`LaneAction`] to completion, feeding results back into the lane.
 ///
 /// Deliberately synchronous and one-action-at-a-time. The lane's whole
@@ -1472,6 +1564,33 @@ pub struct LaneDriver<T, R, L> {
     pub tree: T,
     pub legs: R,
     pub lander: L,
+    /// Reads the wall clock so the lane's own clock can be re-synced across a
+    /// blocking action. `None` = the lane's clock moves only on the host's
+    /// [`LaneEvent::Tick`]s, which is what every pure unit test wants.
+    ///
+    /// # Why this is not optional in production
+    ///
+    /// `LaneState::now` advances ONLY on `Tick`, and the host's ticks sit
+    /// unread in a channel for the whole of a blocking action — the worker is
+    /// inside `execute`. So every deadline an outcome computes is measured from
+    /// the moment the action STARTED, not the moment it failed.
+    ///
+    /// For the infra backoff that is fatal. A failing preview point takes ~35s
+    /// (5 attempts, 6s apart) and the backoff is 30 ticks, so
+    /// `infra_retry_after = started + 30` is already in the past when the
+    /// failure is recorded: the drained tick backlog clears it on the first
+    /// tick and the next candidate starts immediately. Observed as a generation
+    /// roughly every 30s against an unreachable preview daemon, 51 of them in
+    /// one night, each writing an `outcome=infra` trail line and none of them
+    /// waiting.
+    ///
+    /// The land path is starker still: `CommandLander`'s default budget is
+    /// 7200s, so a land that times out records a 30-tick backoff measured from
+    /// two hours ago. That backoff can never delay anything.
+    ///
+    /// Re-syncing before the outcome is applied is what makes
+    /// `infra_backoff_ticks` mean what it says.
+    pub clock: Option<LaneClock>,
     /// Append one line per leg and one per build outcome here. `None` = no
     /// trail (the default, and what every unit test wants).
     ///
@@ -1496,6 +1615,7 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             tree,
             legs,
             lander,
+            clock: None,
             trail: None,
         }
     }
@@ -1504,6 +1624,18 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     #[must_use]
     pub fn with_trail(mut self, path: impl Into<PathBuf>) -> Self {
         self.trail = Some(path.into());
+        self
+    }
+
+    /// Re-sync the lane's clock from `clock` across every blocking action. See
+    /// [`Self::clock`] — without it the infra backoff is measured from before
+    /// the failure and cannot pace anything.
+    ///
+    /// [`LaneHost`](crate::lanehost::LaneHost) installs one automatically from
+    /// its own tick stream, so this is for a caller driving the driver directly.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + 'static) -> Self {
+        self.clock = Some(Box::new(clock));
         self
     }
 
@@ -1543,6 +1675,23 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                 members,
             } => vec![self.run_build(*generation, members)],
             LaneAction::LandAndPublish { members, artifact } => {
+                // Announce the land BEFORE blocking on it, the same way
+                // `run_build` writes `lane-build-start` before compiling.
+                //
+                // Same defect as the `idle` snapshot, in the durable channel:
+                // without this the trail reads `outcome=green` and then nothing
+                // for up to two hours, so a daemon killed mid-land leaves a
+                // record indistinguishable from one that never tried to land.
+                // The live snapshot now says `landing`, but a snapshot dies
+                // with the pod and the trail is what is left afterwards.
+                self.trail_line(&format!(
+                    "[cargoless:obs] lane-land-start members={}",
+                    members
+                        .iter()
+                        .map(|m| format!("{}@{}", m.id, m.head))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
                 match self.lander.land(members, artifact.as_deref()) {
                     Ok(o) => {
                         // A land is the only step that moves the trunk, so it
@@ -1757,11 +1906,11 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     /// Drive the lane until it is quiet, collecting every action for the caller
     /// to report. Bounded so a policy bug cannot spin forever.
     pub fn pump(&self, lane: &mut LaneState, event: LaneEvent) -> Vec<LaneAction> {
-        self.pump_observed(lane, event, |_| {})
+        self.pump_observed(lane, event, |_, _| {})
     }
 
-    /// [`Self::pump`] with a callback fired after every state transition, before
-    /// the resulting actions are executed.
+    /// [`Self::pump`] with a callback fired after every state transition AND
+    /// around every blocking action, carrying what the driver is about to do.
     ///
     /// The reason this exists: `execute` runs the BUILD, which for a real lane
     /// is tens of minutes, and the transition that flips the phase to
@@ -1771,13 +1920,28 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     /// explain. An author whose change stopped moving would look, see "idle",
     /// and reasonably conclude the lane never received their submission.
     ///
+    /// # Why a per-STEP callback was not enough
+    ///
+    /// That reasoning was applied to the build and stopped there, and the LAND
+    /// has the identical shape with a worse consequence. By the time
+    /// [`LaneAction::LandAndPublish`] is executed the lane has already emptied
+    /// `in_flight` and returned to `Idle` — so the snapshot published for that
+    /// step says `idle`, and it stays published for however long the lander
+    /// takes (up to the 7200s land budget, and a real lander delegates to a
+    /// merge-train controller that waits on its own candidate build).
+    ///
+    /// A snapshot reading `idle` while the trunk is being moved is not merely
+    /// unhelpful: it is the single most destructive moment to roll the daemon,
+    /// and the snapshot actively invites it. So the activity is reported around
+    /// every blocking action, not only at transitions.
+    ///
     /// The callback runs on the pump thread and must not block; it is for
     /// publishing a snapshot, not for work.
     pub fn pump_observed(
         &self,
         lane: &mut LaneState,
         event: LaneEvent,
-        mut observe: impl FnMut(&LaneState),
+        mut observe: impl FnMut(&LaneState, &LaneActivity),
     ) -> Vec<LaneAction> {
         const MAX_STEPS: usize = 64;
         let mut all = Vec::new();
@@ -1795,14 +1959,65 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             // Observe the NEW state before running the actions it produced.
             // `lane.step` has already set phase/in_flight; `execute` is what
             // blocks.
-            observe(lane);
+            observe(lane, &LaneActivity::Settled);
             for a in &actions {
-                pending.extend(self.execute(a));
+                let activity = LaneActivity::of(a);
+                if activity.is_blocking() {
+                    observe(lane, &activity);
+                }
+                let followups = self.execute(a);
+                if activity.is_blocking() {
+                    // RE-SYNC THE CLOCK BEFORE THE OUTCOME IS APPLIED.
+                    //
+                    // `LaneState::now` only moves on `LaneEvent::Tick`, and the
+                    // host's ticks sat unread in a channel for the whole of the
+                    // action we just ran — the worker was in here. So without
+                    // this, the follow-up event below computes every deadline
+                    // from the clock as it stood when the action STARTED.
+                    //
+                    // For the infra backoff that is not a rounding error, it is
+                    // the whole quantity: a failing preview point takes ~24-35s
+                    // (5 attempts, 6s apart) against a 30-tick backoff, so
+                    // `infra_retry_after = started + 30` is already in the past
+                    // when the failure is recorded and the drained tick backlog
+                    // clears it on arrival. The lane then retried as fast as the
+                    // failure returned — a generation roughly every 30s against
+                    // an unreachable preview daemon, each one writing an
+                    // `outcome=infra` trail line, and none of them waiting.
+                    //
+                    // Advanced directly rather than by feeding a `Tick`: a Tick
+                    // also runs `maybe_start_build`, which after a failed LAND
+                    // (phase is already `Idle` there) could start the next build
+                    // BEFORE `LandFailed` installs the backoff — reintroducing
+                    // the very hot loop that event exists to prevent.
+                    if let Some(clock) = self.clock.as_ref() {
+                        lane.advance_clock(clock());
+                    }
+                    // And publish `Settled` again: for a successful land
+                    // `execute` returns NO follow-up event, so without this the
+                    // snapshot would stay `landing` until the next unrelated
+                    // event arrived.
+                    observe(lane, &LaneActivity::Settled);
+                }
+                pending.extend(followups);
             }
             all.extend(actions);
         }
         all
     }
+}
+
+/// Seconds since the Unix epoch — the unit the daemon ticks the lane with.
+///
+/// Monotonic enough for windows measured in tens of seconds, and `LaneState`
+/// clamps its clock forward, so a wall-clock step backwards cannot rewind the
+/// lane.
+#[must_use]
+pub fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1914,6 +2129,112 @@ mod slot_free_tests {
             !slot_is_building(snap, "lane"),
             "dev building must not make the lane wait"
         );
+    }
+}
+
+#[cfg(test)]
+mod materialize_context_tests {
+    use super::MaterializeError;
+    use std::io;
+    use std::path::Path;
+
+    /// DEFECT 3 — an infra materialize failure must NAME the path and the step.
+    ///
+    /// The trail line observed on generation 13 was, in full:
+    ///
+    /// ```text
+    /// lane-build generation=13 outcome=infra reason=candidate tree could not
+    /// be materialized: No such file or directory (os error 2)
+    /// ```
+    ///
+    /// Which path? Which step? The candidate root, the scratch parent, the repo
+    /// and the `git` binary all produce exactly those bytes, and the two
+    /// filesystem calls in `materialize` have OPPOSITE fixes — a failed remove
+    /// means something is holding the old candidate, a failed create means the
+    /// state dir is gone or unwritable. A verdict nobody can act on is the same
+    /// as no verdict.
+    #[test]
+    fn an_infra_materialize_error_names_the_path_and_the_operation() {
+        let bare = io::Error::new(
+            io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        let e = MaterializeError::infra_at(
+            "could not create the candidate scratch directory",
+            Path::new("/workspace/cargoless-state/lane-candidates"),
+            &bare,
+        );
+        // Rendered exactly as the driver renders it into the trail.
+        let rendered = format!("candidate tree could not be materialized: {e}");
+
+        assert!(
+            rendered.contains("/workspace/cargoless-state/lane-candidates"),
+            "the PATH must be in the message — without it an operator cannot \
+             tell the candidate root from the scratch parent from the repo: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("could not create the candidate scratch directory"),
+            "the OPERATION must be in the message — the two fallible steps have \
+             opposite fixes: {rendered}"
+        );
+        assert!(
+            rendered.contains("os error 2"),
+            "and the original errno text must survive, or the annotation has \
+             traded one missing fact for another: {rendered}"
+        );
+    }
+
+    /// The bare form is what shipped, and it is what this must never render as
+    /// again. Pinned against the real observed string so a future refactor that
+    /// drops the context fails here rather than in production.
+    #[test]
+    fn the_observed_bare_message_is_no_longer_producible_by_infra_at() {
+        let bare = io::Error::new(
+            io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        let observed = format!(
+            "candidate tree could not be materialized: {}",
+            MaterializeError::Infra(io::Error::new(bare.kind(), bare.to_string()))
+        );
+        // The exact production line — proof the test is describing the real bug.
+        assert_eq!(
+            observed,
+            "candidate tree could not be materialized: No such file or directory (os error 2)",
+            "this is the string that reached the trail on generation 13"
+        );
+
+        let annotated = format!(
+            "candidate tree could not be materialized: {}",
+            MaterializeError::infra_at(
+                "could not remove the stale candidate worktree",
+                Path::new("/s/c-1"),
+                &bare
+            )
+        );
+        assert_ne!(
+            annotated, observed,
+            "the annotated form must differ from the bare one"
+        );
+    }
+
+    /// The `io::ErrorKind` must survive the annotation. Nothing switches on it
+    /// today, and a caller that starts to must not find it quietly destroyed by
+    /// the code that exists to make the error MORE informative.
+    #[test]
+    fn annotating_preserves_the_error_kind() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+        ] {
+            let e = MaterializeError::infra_at("op", Path::new("/p"), &io::Error::new(kind, "x"));
+            let MaterializeError::Infra(inner) = e else {
+                panic!("infra_at must produce Infra");
+            };
+            assert_eq!(inner.kind(), kind, "the kind must survive annotation");
+        }
     }
 }
 

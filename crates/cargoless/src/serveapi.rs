@@ -3796,12 +3796,27 @@ impl VerdictService for ServeVerdictState {
     /// needs to see which errors hold it, who else is implicated, and what
     /// will clear it — so the ejections carry `kind` (attributed vs not,
     /// because the two are cleared by different things) and the failing files.
+    ///
+    /// `queue_depth` counts members accepted by `POST /lane` that the worker
+    /// has not stepped yet, as well as the lane's own queue. During a build the
+    /// worker is blocked inside the compile and the lane's queue cannot grow,
+    /// so without that a member submitted mid-build reads as `queue_depth: 0`
+    /// for the whole build after being told "queued" — observed in production,
+    /// and an author who sees it reasonably re-submits. `queued` names them.
+    ///
+    /// `activity` is what the driver is BLOCKED ON, which `phase` cannot say.
+    /// The lane is legitimately `idle` while a green candidate is landing — the
+    /// build is over and the roster is empty — and reporting only `idle` at
+    /// that moment invites an operator to roll the daemon mid-merge.
     fn lane_snapshot(&self) -> Option<serde_json::Value> {
         let lane = self.lane.as_ref()?;
         let s = lane.snapshot();
         Some(serde_json::json!({
             "phase": s.phase,
+            "activity": s.activity,
+            "landing": s.landing,
             "queue_depth": s.queue_depth,
+            "queued": s.queued,
             "generation": s.generation,
             "in_flight": s.in_flight,
             "ejections": s.ejections.iter().map(|e| serde_json::json!({
