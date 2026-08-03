@@ -32,7 +32,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -1132,10 +1132,82 @@ pub fn path_from_uri(uri: &str) -> Option<String> {
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type PendingResponses = Arc<Mutex<BTreeMap<i64, Sender<Value>>>>;
 
+/// Monotonic fence for `workspace/diagnostic/refresh` requests from RA.
+///
+/// rust-analyzer disables push diagnostics when the client advertises pull
+/// diagnostics. Its document-diagnostic `resultId` is the constant
+/// `rust-analyzer`, so neither an empty report nor the result id proves that a
+/// just-sent `didOpen`/`didChange` reached the analysis snapshot. RA does,
+/// however, request a diagnostic refresh after the changed snapshot becomes
+/// quiescent. Pull callers therefore capture this generation before mutating
+/// a document and wait for a strictly newer generation before accepting a
+/// report as evidence.
+#[derive(Default)]
+struct DiagnosticRefreshState {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl DiagnosticRefreshState {
+    fn generation(&self) -> u64 {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn mark(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn wait_after(&self, previous: u64, timeout: Duration) -> Result<(), DiagnosticPullError> {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (generation, _waited) = self
+            .changed
+            .wait_timeout_while(generation, timeout, |generation| *generation <= previous)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *generation > previous {
+            Ok(())
+        } else {
+            Err(DiagnosticPullError::FreshnessTimeout)
+        }
+    }
+}
+
+fn client_capabilities() -> Value {
+    json!({
+        "window": { "workDoneProgress": true },
+        "workspace": {
+            "configuration": true,
+            "diagnostics": { "refreshSupport": true }
+        },
+        "textDocument": {
+            "publishDiagnostics": { "relatedInformation": false },
+            "diagnostic": {
+                "dynamicRegistration": false,
+                "relatedDocumentSupport": true
+            }
+        }
+    })
+}
+
+fn is_diagnostic_refresh_request(message: &Value) -> bool {
+    message.get("method").and_then(Value::as_str) == Some("workspace/diagnostic/refresh")
+}
+
 pub struct LspClient {
     writer: SharedWriter,
     next_id: AtomicI64,
     pending_responses: PendingResponses,
+    diagnostic_refresh: Arc<DiagnosticRefreshState>,
 }
 
 impl LspClient {
@@ -1174,17 +1246,7 @@ impl LspClient {
                 // stays ON (load-bearing for the GREEN gate); everything
                 // else is tuned down.
                 "initializationOptions": init_options.clone(),
-                "capabilities": {
-                    "window": { "workDoneProgress": true },
-                    "workspace": { "configuration": true },
-                    "textDocument": {
-                        "publishDiagnostics": { "relatedInformation": false },
-                        "diagnostic": {
-                            "dynamicRegistration": false,
-                            "relatedDocumentSupport": true
-                        }
-                    }
-                }
+                "capabilities": client_capabilities()
             }
         });
         write_lsp_message(&writer, &init)?;
@@ -1227,13 +1289,22 @@ impl LspClient {
 
         let (tx, rx): (Sender<LspEvent>, Receiver<LspEvent>) = channel();
         let pending_responses: PendingResponses = Arc::new(Mutex::new(BTreeMap::new()));
+        let diagnostic_refresh = Arc::new(DiagnosticRefreshState::default());
         let reader_writer = Arc::clone(&writer);
         let reader_config = init_options.clone();
         let reader_pending = Arc::clone(&pending_responses);
+        let reader_refresh = Arc::clone(&diagnostic_refresh);
         let _reader: JoinHandle<()> = thread::Builder::new()
             .name("tf-lsp-reader".into())
             .spawn(move || {
-                reader_loop(br, tx, reader_writer, reader_config, reader_pending);
+                reader_loop(
+                    br,
+                    tx,
+                    reader_writer,
+                    reader_config,
+                    reader_pending,
+                    reader_refresh,
+                );
             })
             .expect("spawn tf-lsp-reader thread");
 
@@ -1242,6 +1313,7 @@ impl LspClient {
                 writer,
                 next_id: AtomicI64::new(2),
                 pending_responses,
+                diagnostic_refresh,
             },
             rx,
         ))
@@ -1317,6 +1389,21 @@ impl LspClient {
     /// Monotonic LSP id for any future request-style call.
     pub fn next_request_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Snapshot the latest RA diagnostic-refresh boundary. Capture this
+    /// immediately before applying an overlay transaction.
+    pub fn diagnostic_refresh_generation(&self) -> u64 {
+        self.diagnostic_refresh.generation()
+    }
+
+    /// Wait until RA announces a diagnostic snapshot newer than `previous`.
+    pub fn wait_for_diagnostic_refresh(
+        &self,
+        previous: u64,
+        timeout: Duration,
+    ) -> Result<(), DiagnosticPullError> {
+        self.diagnostic_refresh.wait_after(previous, timeout)
     }
 
     /// Pull rust-analyzer diagnostics for one open document. Unlike
@@ -1397,6 +1484,7 @@ impl LspClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagnosticPullError {
     Timeout,
+    FreshnessTimeout,
     Transport(String),
     ServerCancelled { retrigger: bool },
     Protocol(String),
@@ -1406,6 +1494,7 @@ impl std::fmt::Display for DiagnosticPullError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout => f.write_str("diagnostic pull timed out"),
+            Self::FreshnessTimeout => f.write_str("diagnostic refresh timed out"),
             Self::Transport(detail) => write!(f, "diagnostic pull transport error: {detail}"),
             Self::ServerCancelled { retrigger } => {
                 write!(f, "diagnostic pull cancelled (retrigger={retrigger})")
@@ -1559,6 +1648,7 @@ fn reader_loop<R: BufRead>(
     writer: SharedWriter,
     config: Value,
     pending_responses: PendingResponses,
+    diagnostic_refresh: Arc<DiagnosticRefreshState>,
 ) {
     loop {
         match read_message(&mut br) {
@@ -1568,7 +1658,11 @@ fn reader_loop<R: BufRead>(
                 let Ok(v) = serde_json::from_slice::<Value>(&body) else {
                     continue;
                 };
+                let refresh_boundary = is_diagnostic_refresh_request(&v);
                 if matches!(respond_to_server_request(&v, &writer, &config), Ok(true)) {
+                    if refresh_boundary {
+                        diagnostic_refresh.mark();
+                    }
                     continue;
                 }
                 if v.get("method").is_none() {
@@ -1716,6 +1810,7 @@ mod tests {
             writer,
             json!({}),
             Arc::clone(&pending),
+            Arc::new(DiagnosticRefreshState::default()),
         );
 
         assert_eq!(rx9.recv().unwrap()["id"], json!(9));
