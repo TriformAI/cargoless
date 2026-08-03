@@ -2291,6 +2291,213 @@ mod tests {
         p
     }
 
+    fn write_structured_check_fixture(root: &Path, payload: &str, on_degraded: &str) {
+        fs::write(
+            root.join("emit-result.sh"),
+            format!(
+                "#!/usr/bin/env bash\nset -eu\ncat > \"$CARGOLESS_CHECK_RESULT_PATH\" <<JSON\n{payload}\nJSON\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join(MANIFEST_NAME),
+            format!(
+                r#"
+version: 1
+checks:
+  - id: reuse-semantic
+    kind: command
+    read_only: true
+    command: ["bash", "emit-result.sh"]
+    cache: none
+    result_protocol: cargoless.check-result/v1
+    on_degraded:
+      provider_unavailable: {on_degraded}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn structured_identity() -> ProjectCheckRunIdentity {
+        ProjectCheckRunIdentity {
+            source_sha: "source-0123456789abcdef".to_string(),
+            base_sha: "base-0123456789abcdef".to_string(),
+        }
+    }
+
+    #[test]
+    fn structured_command_result_passes_with_exact_subject_and_exports_identity() {
+        let root = scratch("structured-pass");
+        write_structured_check_fixture(
+            &root,
+            r#"{
+  "schema": "cargoless.check-result/v1",
+  "check_id": "reuse-semantic",
+  "status": "passed",
+  "summary": "no new semantic reuse blockers",
+  "subject": {
+    "source_sha": "$CARGOLESS_SOURCE_SHA",
+    "base_sha": "$CARGOLESS_BASE_SHA",
+    "engine": "reuse-analyzer",
+    "engine_version": "1",
+    "policy_hash": "policy-1"
+  },
+  "findings": []
+}"#,
+            "warn",
+        );
+
+        let report =
+            run_profile_with_changes_at(&root, "dev", None, None, Some(&structured_identity()))
+                .unwrap();
+
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(report.results[0].outcome, ProjectCheckOutcome::Passed);
+        assert_eq!(
+            report.results[0]
+                .structured
+                .as_ref()
+                .unwrap()
+                .subject
+                .policy_hash,
+            "policy-1"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allowlisted_provider_degradation_is_warn_and_not_semantic_green() {
+        let root = scratch("structured-degraded-warn");
+        write_structured_check_fixture(
+            &root,
+            r#"{
+  "schema": "cargoless.check-result/v1",
+  "check_id": "reuse-semantic",
+  "status": "degraded",
+  "summary": "embedding provider unavailable; deterministic checks still ran",
+  "subject": {
+    "source_sha": "$CARGOLESS_SOURCE_SHA",
+    "base_sha": "$CARGOLESS_BASE_SHA",
+    "engine": "reuse-analyzer",
+    "engine_version": "1",
+    "policy_hash": "policy-1"
+  },
+  "findings": [],
+  "degradation": {
+    "reason": "provider_unavailable",
+    "dependency": "self-hosted-embeddings",
+    "retryable": true,
+    "detail": "connection refused"
+  }
+}"#,
+            "warn",
+        );
+
+        let report =
+            run_profile_with_changes_at(&root, "dev", None, None, Some(&structured_identity()))
+                .unwrap();
+
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(report.results[0].outcome, ProjectCheckOutcome::Degraded);
+        assert!(report.results[0].diagnostics.iter().any(|d| {
+            d.severity == Severity::Warning
+                && d.code.as_deref() == Some("structured.degraded.provider_unavailable")
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unlisted_degradation_reason_is_indeterminate_and_fail_closed() {
+        let root = scratch("structured-degraded-unknown");
+        write_structured_check_fixture(
+            &root,
+            r#"{
+  "schema": "cargoless.check-result/v1",
+  "check_id": "reuse-semantic",
+  "status": "degraded",
+  "summary": "analyzer emitted incomplete evidence",
+  "subject": {
+    "source_sha": "$CARGOLESS_SOURCE_SHA",
+    "base_sha": "$CARGOLESS_BASE_SHA",
+    "engine": "reuse-analyzer",
+    "engine_version": "1",
+    "policy_hash": "policy-1"
+  },
+  "findings": [],
+  "degradation": {
+    "reason": "partial_corpus",
+    "dependency": "parser",
+    "retryable": false,
+    "detail": "one source file was not classified"
+  }
+}"#,
+            "warn",
+        );
+
+        let report =
+            run_profile_with_changes_at(&root, "dev", None, None, Some(&structured_identity()))
+                .unwrap();
+
+        assert_eq!(report.tree, TreeState::Red);
+        assert_eq!(
+            report.results[0].outcome,
+            ProjectCheckOutcome::Indeterminate
+        );
+        assert!(
+            report.results[0]
+                .diagnostics
+                .iter()
+                .any(|d| { d.code.as_deref() == Some("structured.degraded.unapproved_reason") })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_or_subject_mismatched_structured_output_is_indeterminate() {
+        for (tag, payload, code) in [
+            ("malformed", "{not-json", "structured.result.malformed"),
+            (
+                "subject-mismatch",
+                r#"{
+  "schema": "cargoless.check-result/v1",
+  "check_id": "reuse-semantic",
+  "status": "passed",
+  "summary": "wrong tree",
+  "subject": {
+    "source_sha": "different-source",
+    "base_sha": "$CARGOLESS_BASE_SHA",
+    "engine": "reuse-analyzer",
+    "engine_version": "1",
+    "policy_hash": "policy-1"
+  },
+  "findings": []
+}"#,
+                "structured.subject.mismatch",
+            ),
+        ] {
+            let root = scratch(tag);
+            write_structured_check_fixture(&root, payload, "warn");
+            let report =
+                run_profile_with_changes_at(&root, "dev", None, None, Some(&structured_identity()))
+                    .unwrap();
+            assert_eq!(report.tree, TreeState::Red, "{tag}");
+            assert_eq!(
+                report.results[0].outcome,
+                ProjectCheckOutcome::Indeterminate,
+                "{tag}"
+            );
+            assert!(
+                report.results[0]
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code.as_deref() == Some(code)),
+                "{tag}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
     #[test]
     fn snapshot_ignores_local_execution_state() {
         assert!(ignored_rel(".claude/worktrees/agent-a/src/lib.rs"));
