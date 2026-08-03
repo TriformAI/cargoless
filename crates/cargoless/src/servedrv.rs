@@ -115,6 +115,18 @@ const DEFAULT_PROJECT_CHECKS_WARN_MAX_PARALLEL: usize = 2;
 
 static PROJECT_CHECKS_WARN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Provenance for events entering the cluster driver's LSP channel.
+///
+/// rust-analyzer emits unsolicited workspace diagnostics and progress-end
+/// notifications while an explicit `textDocument/diagnostic` transaction is
+/// still running. Those native events are useful for readiness while idle, but
+/// they must not settle an overlay verdict ahead of the correlated pull that
+/// owns the final overlay content.
+enum LspIngressEvent {
+    Native(LspEvent),
+    DiagnosticPull { generation: u64, event: LspEvent },
+}
+
 /// One cluster's live state. Constructed at exactly one site (the
 /// `SpawnRa` arm); the `ClusterDriver`/`OverlayMultiplexer` are mutated
 /// only from the single serve loop (Judgment A as composed).
@@ -124,7 +136,7 @@ struct ClusterState {
     /// This cluster's hash and event sink, retained so background cargo
     /// checks can feed their completion back through the same driver.
     cluster: WorkspaceConfigHash,
-    lsp_tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    lsp_tx: Sender<(WorkspaceConfigHash, LspIngressEvent)>,
     /// The currently-live RA's client; `None` until the first
     /// `Spawned` message lands, swapped on every (re)spawn.
     lsp: Option<Arc<LspClient>>,
@@ -141,6 +153,15 @@ struct ClusterState {
     /// Worktrees with a routed batch that arrived before the current RA
     /// instance reached project-ready.
     deferred: VecDeque<WtId>,
+    /// Identity of the pull from the latest overlay mutation until its
+    /// correlated terminal event. While set, unsolicited native verdict
+    /// events and late events from retired pulls are excluded from the
+    /// driver's transaction barrier.
+    active_diagnostic_pull_generation: Option<u64>,
+    /// Monotonic cluster-local identity for diagnostic pulls. A pull from a
+    /// retired RA instance can finish after respawn; its generation must never
+    /// be mistaken for the next live transaction.
+    next_diagnostic_pull_generation: u64,
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -362,7 +383,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     };
 
     // ---- per-cluster RA event + control channels ---------------------
-    let (lsp_tx, lsp_rx) = channel::<(WorkspaceConfigHash, LspEvent)>();
+    let (lsp_tx, lsp_rx) = channel::<(WorkspaceConfigHash, LspIngressEvent)>();
     let (ctrl_tx, ctrl_rx) = channel::<Ctrl>();
 
     let mut clusters: BTreeMap<WorkspaceConfigHash, ClusterState> = BTreeMap::new();
@@ -706,9 +727,21 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         }
 
         // Drain forwarded RA events → the owning cluster's ClusterDriver.
-        while let Ok((h, ev)) = lsp_rx.try_recv() {
+        while let Ok((h, ingress)) = lsp_rx.try_recv() {
             if clusters.contains_key(&h) {
-                let ev = early_red_event(ev);
+                let ev = {
+                    let Some(cluster) = clusters.get_mut(&h) else {
+                        continue;
+                    };
+                    correlate_lsp_event(&mut cluster.active_diagnostic_pull_generation, ingress)
+                };
+                let Some(ev) = ev else {
+                    eprintln!(
+                        "[cargoless:obs] lsp-event-suppressed cluster={} reason=diagnostic-pull-correlation",
+                        h.as_str()
+                    );
+                    continue;
+                };
                 let indexing_ended = matches!(ev, LspEvent::IndexingEnded);
                 step(
                     &mut clusters,
@@ -959,7 +992,7 @@ fn spawn_cluster(
     clusters: &mut BTreeMap<WorkspaceConfigHash, ClusterState>,
     h: &WorkspaceConfigHash,
     root: PathBuf,
-    lsp_tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    lsp_tx: Sender<(WorkspaceConfigHash, LspIngressEvent)>,
     ctrl_tx: Sender<Ctrl>,
 ) -> Result<(), String> {
     if clusters.contains_key(h) {
@@ -1013,7 +1046,10 @@ fn spawn_cluster(
                 // lifecycle: a dropped/dead channel just stops the
                 // forwarder; the next on_spawn starts a fresh one).
                 while let Ok(ev) = events.recv() {
-                    if fwd_tx.send((fwd_h.clone(), ev)).is_err() {
+                    if fwd_tx
+                        .send((fwd_h.clone(), LspIngressEvent::Native(ev)))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1041,6 +1077,8 @@ fn spawn_cluster(
             next_ver: 2,
             ready: false,
             deferred: VecDeque::new(),
+            active_diagnostic_pull_generation: None,
+            next_diagnostic_pull_generation: 1,
         },
     );
     Ok(())
@@ -1102,6 +1140,7 @@ fn drain_spawned(
                 publish_stranded_unknown(Path::new(&wt_key), attribution, api);
             }
             cs.mux.reset();
+            cs.active_diagnostic_pull_generation = None;
             cs.lsp = Some(client);
             // In pushed RA-native service mode, a request already carries the
             // concrete overlay to check and `spawn_ra_native_settle` provides
@@ -1169,6 +1208,44 @@ fn mark_ready_and_take_deferred(
     };
     cs.ready = true;
     cs.deferred.drain(..).collect()
+}
+
+/// Admit only events that belong to the active analysis boundary.
+///
+/// Before an overlay starts, native RA notifications keep their historical
+/// behavior. Once the exact diagnostic pull is armed, native diagnostics and
+/// terminal notifications are unsolicited observations of the shared base
+/// workspace and cannot prove the pushed overlay. Readiness remains admitted.
+/// The pull's own terminal event both reaches the driver and releases the
+/// fence for the next serialized transaction.
+fn correlate_lsp_event(
+    active_diagnostic_pull_generation: &mut Option<u64>,
+    ingress: LspIngressEvent,
+) -> Option<LspEvent> {
+    match ingress {
+        LspIngressEvent::DiagnosticPull { generation, event }
+            if *active_diagnostic_pull_generation == Some(generation) =>
+        {
+            if matches!(
+                event,
+                LspEvent::FlycheckEnded | LspEvent::FlycheckFailed { .. }
+            ) {
+                *active_diagnostic_pull_generation = None;
+            }
+            Some(event)
+        }
+        LspIngressEvent::DiagnosticPull { .. } => None,
+        LspIngressEvent::Native(LspEvent::IndexingEnded) => Some(LspEvent::IndexingEnded),
+        LspIngressEvent::Native(event) if active_diagnostic_pull_generation.is_some() => {
+            let _ = event;
+            None
+        }
+        // Preserve the historical fail-fast behavior for native diagnostics
+        // while idle. Correlated pull diagnostics deliberately bypass this
+        // conversion: the pull's terminal event is the only safe boundary
+        // for advancing the serialized overlay queue.
+        LspIngressEvent::Native(event) => Some(early_red_event(event)),
+    }
 }
 
 fn early_red_event(ev: LspEvent) -> LspEvent {
@@ -1417,6 +1494,12 @@ fn exec(
             }
             let diagnostic_paths: Vec<PathBuf> =
                 target.iter_rs().map(|(path, _)| path.to_owned()).collect();
+            let diagnostic_pull_generation = cs.next_diagnostic_pull_generation;
+            cs.next_diagnostic_pull_generation = cs
+                .next_diagnostic_pull_generation
+                .checked_add(1)
+                .expect("diagnostic pull generation overflow");
+            cs.active_diagnostic_pull_generation = Some(diagnostic_pull_generation);
             spawn_ra_diagnostic_pull(
                 &wt,
                 cs.cluster.clone(),
@@ -1424,6 +1507,7 @@ fn exec(
                 lsp,
                 diagnostic_paths,
                 diagnostic_refresh_fence,
+                diagnostic_pull_generation,
             );
         }
         ClusterAction::EmitVerdict {
@@ -1658,13 +1742,16 @@ fn overlay_path_for_wt(wt: &WtId, path: &str) -> PathBuf {
 fn spawn_ra_diagnostic_pull(
     wt: &WtId,
     h: WorkspaceConfigHash,
-    tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    tx: Sender<(WorkspaceConfigHash, LspIngressEvent)>,
     lsp: Arc<LspClient>,
     paths: Vec<PathBuf>,
     refresh_generation: Option<u64>,
+    generation: u64,
 ) {
     let wt = wt.clone();
-    let _ = std::thread::Builder::new()
+    let failure_h = h.clone();
+    let failure_tx = tx.clone();
+    if let Err(error) = std::thread::Builder::new()
         .name("tf-ra-diagnostic-pull".into())
         .spawn(move || {
             const CANCEL_RETRIES: usize = 3;
@@ -1678,8 +1765,12 @@ fn spawn_ra_diagnostic_pull(
             if paths.is_empty() {
                 let _ = tx.send((
                     h,
-                    LspEvent::FlycheckFailed {
-                        message: "ra_diagnostic_pull:no Rust documents in transaction".to_string(),
+                    LspIngressEvent::DiagnosticPull {
+                        generation,
+                        event: LspEvent::FlycheckFailed {
+                            message: "ra_diagnostic_pull:no Rust documents in transaction"
+                                .to_string(),
+                        },
                     },
                 ));
                 return;
@@ -1692,8 +1783,11 @@ fn spawn_ra_diagnostic_pull(
                 {
                     let _ = tx.send((
                         h,
-                        LspEvent::FlycheckFailed {
-                            message: format!("ra_diagnostic_pull:{error}"),
+                        LspIngressEvent::DiagnosticPull {
+                            generation,
+                            event: LspEvent::FlycheckFailed {
+                                message: format!("ra_diagnostic_pull:{error}"),
+                            },
                         },
                     ));
                     return;
@@ -1704,8 +1798,12 @@ fn spawn_ra_diagnostic_pull(
                 if remaining.is_zero() {
                     let _ = tx.send((
                         h,
-                        LspEvent::FlycheckFailed {
-                            message: "ra_diagnostic_pull:transaction deadline exceeded".to_string(),
+                        LspIngressEvent::DiagnosticPull {
+                            generation,
+                            event: LspEvent::FlycheckFailed {
+                                message: "ra_diagnostic_pull:transaction deadline exceeded"
+                                    .to_string(),
+                            },
                         },
                     ));
                     return;
@@ -1713,7 +1811,16 @@ fn spawn_ra_diagnostic_pull(
                 match lsp.pull_diagnostics(&path.to_string_lossy(), remaining, CANCEL_RETRIES) {
                     Ok(reports) => {
                         for report in reports {
-                            if tx.send((h.clone(), LspEvent::Diagnostics(report))).is_err() {
+                            if tx
+                                .send((
+                                    h.clone(),
+                                    LspIngressEvent::DiagnosticPull {
+                                        generation,
+                                        event: LspEvent::Diagnostics(report),
+                                    },
+                                ))
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -1721,8 +1828,11 @@ fn spawn_ra_diagnostic_pull(
                     Err(error) => {
                         let _ = tx.send((
                             h,
-                            LspEvent::FlycheckFailed {
-                                message: format!("ra_diagnostic_pull:{error}"),
+                            LspIngressEvent::DiagnosticPull {
+                                generation,
+                                event: LspEvent::FlycheckFailed {
+                                    message: format!("ra_diagnostic_pull:{error}"),
+                                },
                             },
                         ));
                         return;
@@ -1733,8 +1843,25 @@ fn spawn_ra_diagnostic_pull(
                 "[cargoless:obs] ra-diagnostic-pull-ended wt={} status=settled",
                 wt.display()
             );
-            let _ = tx.send((h, LspEvent::FlycheckEnded));
-        });
+            let _ = tx.send((
+                h,
+                LspIngressEvent::DiagnosticPull {
+                    generation,
+                    event: LspEvent::FlycheckEnded,
+                },
+            ));
+        })
+    {
+        let _ = failure_tx.send((
+            failure_h,
+            LspIngressEvent::DiagnosticPull {
+                generation,
+                event: LspEvent::FlycheckFailed {
+                    message: format!("ra_diagnostic_pull:thread spawn failed: {error}"),
+                },
+            },
+        ));
+    }
 }
 
 /// Write `wt`'s per-worktree verdict — the only place a verdict is
@@ -3674,6 +3801,166 @@ mod tests {
             early_red_event(ev),
             LspEvent::FlycheckFailed { message } if message.contains("file:///repo/wt/src/lib.rs")
         ));
+    }
+
+    #[test]
+    fn native_verdict_events_cannot_settle_an_active_diagnostic_pull() {
+        let mut pull_active = Some(7);
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::Diagnostics(diagnostic)),
+            )
+            .is_none(),
+            "unsolicited native diagnostics must not race the exact pull"
+        );
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "only the correlated pull may clear its fence"
+        );
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::FlycheckEnded),
+            )
+            .is_none(),
+            "a native progress end must not publish before the exact pull finishes"
+        );
+        assert_eq!(pull_active, Some(7));
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::IndexingEnded),
+            ),
+            Some(LspEvent::IndexingEnded)
+        ));
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "readiness remains observable without settling the check"
+        );
+    }
+
+    #[test]
+    fn correlated_pull_is_the_only_event_source_that_clears_its_fence() {
+        let mut pull_active = Some(7);
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 0,
+            total: 0,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::Diagnostics(diagnostic),
+                },
+            ),
+            Some(LspEvent::Diagnostics(_))
+        ));
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "diagnostic rows precede the pull's terminal boundary"
+        );
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::FlycheckEnded,
+                },
+            ),
+            Some(LspEvent::FlycheckEnded)
+        ));
+        assert_eq!(
+            pull_active, None,
+            "the correlated terminal event releases the fence"
+        );
+    }
+
+    #[test]
+    fn correlated_error_diagnostics_wait_for_the_pull_terminal_boundary() {
+        let mut pull_active = Some(7);
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::Diagnostics(diagnostic),
+                },
+            ),
+            Some(LspEvent::Diagnostics(_))
+        ));
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "an error row must remain in the barrier window until the pull ends"
+        );
+    }
+
+    #[test]
+    fn retired_pull_generation_cannot_touch_the_live_transaction() {
+        let mut pull_active = Some(8);
+
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::FlycheckEnded,
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(
+            pull_active,
+            Some(8),
+            "a late terminal from a retired pull must not release the live fence"
+        );
+    }
+
+    #[test]
+    fn correlated_pull_failure_releases_the_fence_and_fails_closed() {
+        let mut pull_active = Some(7);
+        let event = correlate_lsp_event(
+            &mut pull_active,
+            LspIngressEvent::DiagnosticPull {
+                generation: 7,
+                event: LspEvent::FlycheckFailed {
+                    message: "ra_diagnostic_pull:timeout".into(),
+                },
+            },
+        );
+
+        assert!(matches!(
+            event,
+            Some(LspEvent::FlycheckFailed { message }) if message.contains("timeout")
+        ));
+        assert_eq!(pull_active, None);
     }
 
     // ────────────────────────────────────────────────────────────────────
