@@ -10,7 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::ui;
-use cargoless_core::project_checks::{ProjectCheckReport, ProjectCheckResult};
+use cargoless_core::project_checks::{
+    ProjectCheckOutcome, ProjectCheckReport, ProjectCheckResult, ProjectCheckRunIdentity,
+};
 use cargoless_core::{Diagnostic, TreeState};
 
 pub fn run(
@@ -128,11 +130,30 @@ fn run_checks(
         None => None,
     };
     let changed_slice = changed_files.as_ref().map(|(_, files)| files.as_slice());
-    let current = match cargoless_core::project_checks::run_profile_with_changes(
+    let identity = match base {
+        Some(base_ref) => match (
+            resolve_commit_sha(&cfg.root, "HEAD"),
+            resolve_commit_sha(&cfg.root, base_ref),
+        ) {
+            (Ok(source_sha), Ok(base_sha)) => Some(ProjectCheckRunIdentity {
+                source_sha,
+                base_sha,
+            }),
+            (Err(error), _) | (_, Err(error)) => {
+                ui::error(format!(
+                    "could not resolve structured check identity: {error}"
+                ));
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let current = match cargoless_core::project_checks::run_profile_with_changes_at(
         &cfg.root,
         profile,
         id,
         changed_slice,
+        identity.as_ref(),
     ) {
         Ok(report) => report,
         Err(e) => {
@@ -181,7 +202,7 @@ fn run_checks(
         let failed = current
             .results
             .iter()
-            .filter(|r| r.required && r.tree == TreeState::Red)
+            .filter(|r| r.required && r.outcome == ProjectCheckOutcome::Failed)
             .count();
         let existing = classifications
             .iter()
@@ -194,7 +215,21 @@ fn run_checks(
         let cache_hits = current.results.iter().filter(|r| r.cache_hit).count();
         let ran = current.results.len();
         let scope = check_scope_summary(changed_files.as_ref(), current.skipped.len());
-        if current.tree == TreeState::Green {
+        if current.has_indeterminate() {
+            ui::error(format!(
+                "project checks indeterminate — one or more checks did not produce trustworthy evidence; {ran} evaluated in {}ms{scope}",
+                current.duration_ms,
+            ));
+            ExitCode::from(75)
+        } else if current.tree == TreeState::Green && current.has_degraded() {
+            ui::warn(format!(
+                "project checks WARN — allowed degraded evidence; {ran} check{} evaluated, {} skipped in {}ms{scope}",
+                if ran == 1 { "" } else { "s" },
+                current.skipped.len(),
+                current.duration_ms,
+            ));
+            ExitCode::SUCCESS
+        } else if current.tree == TreeState::Green {
             ui::ok(format!(
                 "project checks green — {ran} check{} evaluated, {} skipped ({cache_hits} cache hit{}) in {}ms{scope}",
                 if ran == 1 { "" } else { "s" },
@@ -230,6 +265,28 @@ fn run_checks(
             ExitCode::from(1)
         }
     }
+}
+
+fn resolve_commit_sha(root: &Path, reference: &str) -> std::io::Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{reference}^{{commit}}"))
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git rev-parse {reference:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "git rev-parse {reference:?} returned an empty SHA"
+        )));
+    }
+    Ok(sha)
 }
 
 fn check_scope_summary(changed_files: Option<&(String, Vec<String>)>, skipped: usize) -> String {
@@ -278,25 +335,31 @@ fn classify_required_reds_at_base(
     let reds: Vec<&ProjectCheckResult> = current
         .results
         .iter()
-        .filter(|r| r.required && r.tree == TreeState::Red)
+        .filter(|r| r.required && r.outcome == ProjectCheckOutcome::Failed)
         .collect();
     if reds.is_empty() {
         return Ok(Vec::new());
     }
 
     let worktree = BaseWorktree::create(root, base)?;
+    let base_sha = resolve_commit_sha(&worktree.path, "HEAD")?;
+    let base_identity = ProjectCheckRunIdentity {
+        source_sha: base_sha.clone(),
+        base_sha,
+    };
     let mut out = Vec::new();
     for red in reds {
-        let base_report = cargoless_core::project_checks::run_profile_with_changes(
+        let base_report = cargoless_core::project_checks::run_profile_with_changes_at(
             &worktree.path,
             profile,
             Some(red.id.as_str()),
             changed_files,
+            Some(&base_identity),
         )?;
         let base_result = base_report
             .results
             .iter()
-            .find(|r| r.id == red.id && r.required && r.tree == TreeState::Red);
+            .find(|r| r.id == red.id && r.required && r.outcome == ProjectCheckOutcome::Failed);
         let current_fingerprints =
             cargoless_core::attribution::fingerprint_counts(root, &red.diagnostics);
         let base_fingerprints = base_result
@@ -567,9 +630,13 @@ fn write_report_json(
     let required_reds = report
         .results
         .iter()
-        .filter(|r| r.required && r.tree == TreeState::Red)
+        .filter(|r| r.required && r.outcome == ProjectCheckOutcome::Failed)
         .count();
-    let decision = if report.tree == TreeState::Green {
+    let decision = if report.has_indeterminate() {
+        "indeterminate"
+    } else if report.tree == TreeState::Green && report.has_degraded() {
+        "green_with_degraded_warning"
+    } else if report.tree == TreeState::Green {
         "green"
     } else if allow_existing_red && new_required_reds == 0 {
         "green_with_existing_red"
@@ -600,9 +667,11 @@ fn write_report_json(
                 "title": r.title,
                 "required": r.required,
                 "tree": if r.tree == TreeState::Green { "green" } else { "red" },
+                "outcome": r.outcome.as_str(),
                 "duration_ms": r.duration_ms,
                 "cache_hit": r.cache_hit,
                 "diagnostics": diagnostics_json(&r.diagnostics),
+                "structured": r.structured.as_ref().map(structured_result_json),
             })
         })
         .collect();
@@ -627,6 +696,52 @@ fn write_report_json(
     let text =
         serde_json::to_string_pretty(&value).map_err(|e| std::io::Error::other(e.to_string()))?;
     fs::write(path, format!("{text}\n"))
+}
+
+fn structured_result_json(
+    details: &cargoless_core::project_checks::StructuredCheckDetails,
+) -> serde_json::Value {
+    let findings = details
+        .findings
+        .iter()
+        .map(|finding| {
+            serde_json::json!({
+                "fingerprint": finding.fingerprint,
+                "blocking": finding.blocking,
+                "severity": finding.severity.as_str(),
+                "code": finding.code,
+                "path": finding.path,
+                "line": finding.line,
+                "col": finding.col,
+                "end_line": finding.end_line,
+                "message": finding.message,
+                "data": finding.data,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "summary": details.summary,
+        "subject": {
+            "source_sha": details.subject.source_sha,
+            "base_sha": details.subject.base_sha,
+            "engine": details.subject.engine,
+            "engine_version": details.subject.engine_version,
+            "policy_hash": details.subject.policy_hash,
+            "provider": details.subject.provider,
+            "model": details.subject.model,
+            "model_revision": details.subject.model_revision,
+            "dimensions": details.subject.dimensions,
+        },
+        "findings": findings,
+        "degradation": details.degradation.as_ref().map(|degradation| serde_json::json!({
+            "reason": degradation.reason,
+            "dependency": degradation.dependency,
+            "retryable": degradation.retryable,
+            "detail": degradation.detail,
+        })),
+        "metrics": details.metrics,
+        "artifacts": details.artifacts,
+    })
 }
 
 fn diagnostics_json(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {

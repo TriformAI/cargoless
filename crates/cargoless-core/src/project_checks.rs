@@ -42,9 +42,112 @@ pub struct ProjectCheckResult {
     pub title: String,
     pub required: bool,
     pub tree: TreeState,
+    /// Rich outcome adjacent to the frozen green/red tree seam. Callers that
+    /// need to distinguish an honest code failure from degraded or missing
+    /// evidence must use this field rather than re-deriving from `tree`.
+    pub outcome: ProjectCheckOutcome,
     pub diagnostics: Vec<Diagnostic>,
+    /// Present only for `cargoless.check-result/v1` command checks.
+    pub structured: Option<StructuredCheckDetails>,
     pub duration_ms: u128,
     pub cache_hit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectCheckOutcome {
+    Passed,
+    Failed,
+    Degraded,
+    Skipped,
+    Indeterminate,
+}
+
+impl ProjectCheckOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Degraded => "degraded",
+            Self::Skipped => "skipped",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "passed" => Some(Self::Passed),
+            "failed" => Some(Self::Failed),
+            "degraded" => Some(Self::Degraded),
+            "skipped" => Some(Self::Skipped),
+            "indeterminate" => Some(Self::Indeterminate),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCheckRunIdentity {
+    pub source_sha: String,
+    pub base_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredCheckSubject {
+    pub source_sha: String,
+    pub base_sha: String,
+    pub engine: String,
+    pub engine_version: String,
+    pub policy_hash: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub model_revision: Option<String>,
+    pub dimensions: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredCheckFinding {
+    pub fingerprint: String,
+    pub blocking: bool,
+    pub severity: Severity,
+    pub code: String,
+    pub path: Option<String>,
+    pub line: u32,
+    pub col: u32,
+    pub end_line: Option<u32>,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredCheckDegradation {
+    pub reason: String,
+    pub dependency: Option<String>,
+    pub retryable: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredCheckDetails {
+    pub summary: String,
+    pub subject: StructuredCheckSubject,
+    pub findings: Vec<StructuredCheckFinding>,
+    pub degradation: Option<StructuredCheckDegradation>,
+    pub metrics: Option<serde_json::Value>,
+    pub artifacts: Vec<serde_json::Value>,
+}
+
+impl ProjectCheckReport {
+    pub fn has_indeterminate(&self) -> bool {
+        self.results
+            .iter()
+            .any(|result| result.outcome == ProjectCheckOutcome::Indeterminate)
+    }
+
+    pub fn has_degraded(&self) -> bool {
+        self.results
+            .iter()
+            .any(|result| result.outcome == ProjectCheckOutcome::Degraded)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +280,26 @@ struct CheckConfig {
     /// line and code discarded — and those are exactly what the build lane needs
     /// to decide whose change broke the build.
     output: CheckOutput,
+    result_protocol: Option<String>,
+    on_degraded: BTreeMap<String, DegradedPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedPolicy {
+    Warn,
+    Fail,
+    Indeterminate,
+}
+
+impl DegradedPolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "warn" => Some(Self::Warn),
+            "fail" => Some(Self::Fail),
+            "indeterminate" => Some(Self::Indeterminate),
+            _ => None,
+        }
+    }
 }
 
 /// Diagnostic format a `kind: command` check emits.
@@ -436,6 +559,7 @@ pub fn plan_profile_with_changes(
         .is_some_and(|changed| changed.iter().any(|p| p == MANIFEST_NAME));
     let (selected, skipped) =
         select_for_changes(&root, profile_selected, &ids_filter, changed_files);
+    let structured_selected = selected.iter().any(|check| check.result_protocol.is_some());
     let selected_summaries = selected.iter().map(check_summary).collect::<Vec<_>>();
     let fingerprint = project_check_plan_fingerprint(
         &manifest.manifest_hash,
@@ -449,9 +573,16 @@ pub fn plan_profile_with_changes(
         profile_name: profile_name.to_string(),
         selected: selected_summaries,
         skipped,
-        coalesceable: !manifest_changed,
-        non_coalesce_reason: manifest_changed
-            .then(|| format!("{MANIFEST_NAME} changed; plan must be evaluated after overlay")),
+        coalesceable: !manifest_changed && !structured_selected,
+        non_coalesce_reason: if manifest_changed {
+            Some(format!(
+                "{MANIFEST_NAME} changed; plan must be evaluated after overlay"
+            ))
+        } else if structured_selected {
+            Some("structured result checks require per-source exact attribution".to_string())
+        } else {
+            None
+        },
     })
 }
 
@@ -462,6 +593,26 @@ pub fn run_profile_with_changes(
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
     run_profile_with_changes_in(root, profile_name, only_id, changed_files, None)
+}
+
+/// Run a profile with an immutable source/base identity exported to
+/// structured command checks and verified against their result subject.
+pub fn run_profile_with_changes_at(
+    root: &Path,
+    profile_name: &str,
+    only_id: Option<&str>,
+    changed_files: Option<&[String]>,
+    identity: Option<&ProjectCheckRunIdentity>,
+) -> io::Result<ProjectCheckReport> {
+    let ids: Vec<String> = only_id.into_iter().map(str::to_string).collect();
+    run_profile_inner(
+        root,
+        profile_name,
+        &ids,
+        changed_files,
+        None,
+        identity.cloned(),
+    )
 }
 
 /// CGLS-26 — [`run_profile_with_changes`] with an optional WARM shared
@@ -475,7 +626,14 @@ pub fn run_profile_with_changes_in(
     witness_target_dir: Option<&Path>,
 ) -> io::Result<ProjectCheckReport> {
     let ids: Vec<String> = only_id.into_iter().map(str::to_string).collect();
-    run_profile_inner(root, profile_name, &ids, changed_files, witness_target_dir)
+    run_profile_inner(
+        root,
+        profile_name,
+        &ids,
+        changed_files,
+        witness_target_dir,
+        None,
+    )
 }
 
 /// Run a profile restricted to an explicit SET of check ids (the merge-gate
@@ -495,7 +653,7 @@ pub fn run_profile_with_ids(
     ids: &[String],
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
-    run_profile_inner(root, profile_name, ids, changed_files, None)
+    run_profile_inner(root, profile_name, ids, changed_files, None, None)
 }
 
 /// CGLS-26 — [`run_profile_with_ids`] with an optional WARM shared
@@ -508,7 +666,33 @@ pub fn run_profile_with_ids_in(
     changed_files: Option<&[String]>,
     witness_target_dir: Option<&Path>,
 ) -> io::Result<ProjectCheckReport> {
-    run_profile_inner(root, profile_name, ids, changed_files, witness_target_dir)
+    run_profile_inner(
+        root,
+        profile_name,
+        ids,
+        changed_files,
+        witness_target_dir,
+        None,
+    )
+}
+
+/// Base-aware form used by the exact-SHA push/witness path.
+pub fn run_profile_with_ids_in_at(
+    root: &Path,
+    profile_name: &str,
+    ids: &[String],
+    changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
+    identity: Option<&ProjectCheckRunIdentity>,
+) -> io::Result<ProjectCheckReport> {
+    run_profile_inner(
+        root,
+        profile_name,
+        ids,
+        changed_files,
+        witness_target_dir,
+        identity.cloned(),
+    )
 }
 
 /// Shared inner: `ids_filter` empty ⇒ no id filter (whole profile, change-
@@ -522,6 +706,7 @@ fn run_profile_inner(
     ids_filter: &[String],
     changed_files: Option<&[String]>,
     witness_target_dir: Option<&Path>,
+    identity: Option<ProjectCheckRunIdentity>,
 ) -> io::Result<ProjectCheckReport> {
     let started = Instant::now();
     let root = fs::canonicalize(root)?;
@@ -546,7 +731,9 @@ fn run_profile_inner(
                     title: "project check manifest".to_string(),
                     required: true,
                     tree: TreeState::Red,
+                    outcome: ProjectCheckOutcome::Indeterminate,
                     diagnostics: vec![diagnostic],
+                    structured: None,
                     duration_ms: 0,
                     cache_hit: false,
                 }],
@@ -566,6 +753,7 @@ fn run_profile_inner(
         manifest_hash: manifest.manifest_hash.clone(),
         profile_name: profile_name.to_string(),
         changed_files: changed_files.map(|files| normalize_changed_files(&root, files)),
+        identity,
         witness_target_dir: witness_target_dir.map(Path::to_path_buf),
     });
     let results = run_parallel(
@@ -763,6 +951,7 @@ struct RunContext {
     manifest_hash: String,
     profile_name: String,
     changed_files: Option<Vec<String>>,
+    identity: Option<ProjectCheckRunIdentity>,
     /// CGLS-26 — optional WARM, persistent, shared `CARGO_TARGET_DIR` for the
     /// witness compile. `None` (the default and every non-witness caller)
     /// keeps the historical per-run `ctx.root/.cargoless-target`, byte-for-
@@ -934,16 +1123,23 @@ fn result_from_diags(
     diagnostics: Vec<Diagnostic>,
     duration_ms: u128,
 ) -> ProjectCheckResult {
+    let tree = if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        TreeState::Red
+    } else {
+        TreeState::Green
+    };
     ProjectCheckResult {
         id: check.id.clone(),
         title: check.title.clone(),
         required: check.required,
-        tree: if diagnostics.iter().any(|d| d.severity == Severity::Error) {
-            TreeState::Red
+        tree,
+        outcome: if tree == TreeState::Red {
+            ProjectCheckOutcome::Failed
         } else {
-            TreeState::Green
+            ProjectCheckOutcome::Passed
         },
         diagnostics,
+        structured: None,
         duration_ms,
         cache_hit: false,
     }
@@ -968,6 +1164,9 @@ fn timeout_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectChe
             d.severity = Severity::Warning;
         }
         result.tree = TreeState::Green;
+    }
+    if check.result_protocol.is_some() {
+        result.outcome = ProjectCheckOutcome::Indeterminate;
     }
     result
 }
@@ -1290,6 +1489,41 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             0,
         );
     }
+    let structured_result_path = if check.result_protocol.is_some() {
+        let Some(identity) = ctx.identity.as_ref() else {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.identity.missing",
+                "structured result check requires exact source_sha and base_sha attribution",
+                None,
+            );
+        };
+        if identity.source_sha.trim().is_empty() || identity.base_sha.trim().is_empty() {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.identity.missing",
+                "structured result identity contains an empty source_sha or base_sha",
+                None,
+            );
+        }
+        let dir = ctx.root.join(".cargoless").join("check-results");
+        if let Err(error) = fs::create_dir_all(&dir) {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.result.path",
+                &format!("could not create structured result directory: {error}"),
+                None,
+            );
+        }
+        let path = dir.join(format!("{}-{}.json", check.id, std::process::id()));
+        let _ = fs::remove_file(&path);
+        Some(path)
+    } else {
+        None
+    };
     // Pin CARGO_TARGET_DIR. The DEFAULT (`witness_target_dir == None`) is a
     // path inside this run's scratch worktree so witness builds in DIFFERENT
     // runs cannot clobber each other's `incremental/`, `.fingerprint/`, or
@@ -1335,6 +1569,11 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let (Some(path), Some(identity)) = (&structured_result_path, &ctx.identity) {
+        cmd.env("CARGOLESS_CHECK_RESULT_PATH", path)
+            .env("CARGOLESS_SOURCE_SHA", &identity.source_sha)
+            .env("CARGOLESS_BASE_SHA", &identity.base_sha);
+    }
     // Run the command (e.g. `cargo check`) as the leader of its own process
     // GROUP + SESSION so a timeout can SIGKILL the WHOLE tree, not just the
     // immediate child. Without this, a timed-out `cargo` leaves its `rustc`
@@ -1361,6 +1600,15 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            if check.result_protocol.is_some() {
+                return structured_indeterminate(
+                    ctx,
+                    check,
+                    "command.spawn",
+                    &format!("could not spawn structured check command: {e}"),
+                    None,
+                );
+            }
             return result_from_diags(
                 check,
                 vec![diag(
@@ -1403,8 +1651,29 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
     let combined = format!("{stdout}\n{stderr}");
     let mut command_diagnostics = parse_command_diagnostics(&ctx.root, check, &combined);
     match status {
-        Ok(s) if s.success() => result_from_diags(check, command_diagnostics, 0),
+        Ok(s) if s.success() => {
+            if let Some(path) = structured_result_path.as_deref() {
+                let result = read_structured_result(ctx, check, path);
+                let _ = fs::remove_file(path);
+                result
+            } else {
+                result_from_diags(check, command_diagnostics, 0)
+            }
+        }
         Ok(s) => {
+            if check.result_protocol.is_some() {
+                let tail = tail_lines(&combined, 12);
+                let (code, message) = classify_exit(s, &tail);
+                return structured_indeterminate(
+                    ctx,
+                    check,
+                    code,
+                    &format!(
+                        "structured check process failed before producing an honest verdict: {message}"
+                    ),
+                    None,
+                );
+            }
             if !command_diagnostics
                 .iter()
                 .any(|d| d.severity == Severity::Error)
@@ -1423,19 +1692,416 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             }
             result_from_diags(check, command_diagnostics, 0)
         }
-        Err(message) => result_from_diags(
-            check,
-            vec![diag(
+        Err(message) => {
+            if check.result_protocol.is_some() {
+                structured_indeterminate(ctx, check, "command.timeout", &message, None)
+            } else {
+                result_from_diags(
+                    check,
+                    vec![diag(
+                        &ctx.root,
+                        check,
+                        MANIFEST_NAME,
+                        1,
+                        1,
+                        "command.timeout",
+                        &message,
+                    )],
+                    0,
+                )
+            }
+        }
+    }
+}
+
+fn structured_indeterminate(
+    ctx: &RunContext,
+    check: &CheckConfig,
+    code: &str,
+    message: &str,
+    structured: Option<StructuredCheckDetails>,
+) -> ProjectCheckResult {
+    ProjectCheckResult {
+        id: check.id.clone(),
+        title: check.title.clone(),
+        required: check.required,
+        tree: TreeState::Red,
+        outcome: ProjectCheckOutcome::Indeterminate,
+        diagnostics: vec![diag(&ctx.root, check, MANIFEST_NAME, 1, 1, code, message)],
+        structured,
+        duration_ms: 0,
+        cache_hit: false,
+    }
+}
+
+fn read_structured_result(
+    ctx: &RunContext,
+    check: &CheckConfig,
+    path: &Path,
+) -> ProjectCheckResult {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.result.missing",
+                "structured check exited successfully without writing CARGOLESS_CHECK_RESULT_PATH",
+                None,
+            );
+        }
+        Err(error) => {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.result.unreadable",
+                &format!("could not read structured result: {error}"),
+                None,
+            );
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.result.malformed",
+                &format!("structured result is not valid JSON: {error}"),
+                None,
+            );
+        }
+    };
+    match parse_structured_result(ctx, check, &value) {
+        Ok(result) => result,
+        Err((code, message)) => structured_indeterminate(ctx, check, code, &message, None),
+    }
+}
+
+fn parse_structured_result(
+    ctx: &RunContext,
+    check: &CheckConfig,
+    value: &serde_json::Value,
+) -> Result<ProjectCheckResult, (&'static str, String)> {
+    let object = value.as_object().ok_or((
+        "structured.result.invalid",
+        "structured result root must be an object".to_string(),
+    ))?;
+    let schema = required_json_string(object, "schema")?;
+    if schema != "cargoless.check-result/v1" {
+        return Err((
+            "structured.result.invalid",
+            format!("unsupported structured result schema {schema:?}"),
+        ));
+    }
+    let check_id = required_json_string(object, "check_id")?;
+    if check_id != check.id {
+        return Err((
+            "structured.result.check_mismatch",
+            format!(
+                "structured result check_id {check_id:?} does not match manifest id {:?}",
+                check.id
+            ),
+        ));
+    }
+    let status = ProjectCheckOutcome::parse(&required_json_string(object, "status")?).ok_or((
+        "structured.result.invalid",
+        "status must be passed, failed, degraded, skipped, or indeterminate".to_string(),
+    ))?;
+    let summary = required_json_string(object, "summary")?;
+    let subject_value = object
+        .get("subject")
+        .and_then(serde_json::Value::as_object)
+        .ok_or((
+            "structured.result.invalid",
+            "subject must be an object".to_string(),
+        ))?;
+    let subject = StructuredCheckSubject {
+        source_sha: required_json_string(subject_value, "source_sha")?,
+        base_sha: required_json_string(subject_value, "base_sha")?,
+        engine: required_json_string(subject_value, "engine")?,
+        engine_version: required_json_string(subject_value, "engine_version")?,
+        policy_hash: required_json_string(subject_value, "policy_hash")?,
+        provider: optional_json_string(subject_value, "provider")?,
+        model: optional_json_string(subject_value, "model")?,
+        model_revision: optional_json_string(subject_value, "model_revision")?,
+        dimensions: subject_value
+            .get("dimensions")
+            .and_then(serde_json::Value::as_u64),
+    };
+    let identity = ctx.identity.as_ref().ok_or((
+        "structured.identity.missing",
+        "structured result check ran without exact identity".to_string(),
+    ))?;
+    if subject.source_sha != identity.source_sha || subject.base_sha != identity.base_sha {
+        return Err((
+            "structured.subject.mismatch",
+            format!(
+                "structured subject source/base ({}/{}) does not match requested identity ({}/{})",
+                subject.source_sha, subject.base_sha, identity.source_sha, identity.base_sha
+            ),
+        ));
+    }
+
+    let findings = object
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or((
+            "structured.result.invalid",
+            "findings must be an array".to_string(),
+        ))?
+        .iter()
+        .map(parse_structured_finding)
+        .collect::<Result<Vec<_>, _>>()?;
+    let degradation = object
+        .get("degradation")
+        .filter(|value| !value.is_null())
+        .map(parse_structured_degradation)
+        .transpose()?;
+    let details = StructuredCheckDetails {
+        summary: summary.clone(),
+        subject,
+        findings,
+        degradation,
+        metrics: object.get("metrics").cloned(),
+        artifacts: object
+            .get("artifacts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let mut diagnostics = details
+        .findings
+        .iter()
+        .map(|finding| structured_finding_diagnostic(ctx, check, finding))
+        .collect::<Vec<_>>();
+
+    let (outcome, tree) = match status {
+        ProjectCheckOutcome::Passed => {
+            if details.findings.iter().any(|finding| finding.blocking) {
+                return Err((
+                    "structured.result.inconsistent",
+                    "status passed cannot contain a blocking finding".to_string(),
+                ));
+            }
+            (ProjectCheckOutcome::Passed, TreeState::Green)
+        }
+        ProjectCheckOutcome::Failed => {
+            if !details.findings.iter().any(|finding| finding.blocking) {
+                return Err((
+                    "structured.result.inconsistent",
+                    "status failed requires at least one blocking finding".to_string(),
+                ));
+            }
+            (ProjectCheckOutcome::Failed, TreeState::Red)
+        }
+        ProjectCheckOutcome::Degraded => {
+            let degradation = details.degradation.as_ref().ok_or((
+                "structured.result.inconsistent",
+                "status degraded requires a degradation object".to_string(),
+            ))?;
+            let policy = check
+                .on_degraded
+                .get(&degradation.reason)
+                .copied()
+                .unwrap_or(DegradedPolicy::Indeterminate);
+            match policy {
+                DegradedPolicy::Warn => {
+                    let mut warning = diag(
+                        &ctx.root,
+                        check,
+                        MANIFEST_NAME,
+                        1,
+                        1,
+                        &format!("structured.degraded.{}", degradation.reason),
+                        &summary,
+                    );
+                    warning.severity = Severity::Warning;
+                    diagnostics.push(warning);
+                    (ProjectCheckOutcome::Degraded, TreeState::Green)
+                }
+                DegradedPolicy::Fail => {
+                    diagnostics.push(diag(
+                        &ctx.root,
+                        check,
+                        MANIFEST_NAME,
+                        1,
+                        1,
+                        &format!("structured.degraded.{}", degradation.reason),
+                        &summary,
+                    ));
+                    (ProjectCheckOutcome::Failed, TreeState::Red)
+                }
+                DegradedPolicy::Indeterminate => {
+                    diagnostics.push(diag(
+                        &ctx.root,
+                        check,
+                        MANIFEST_NAME,
+                        1,
+                        1,
+                        "structured.degraded.unapproved_reason",
+                        &format!(
+                            "degradation reason {:?} is not explicitly allowed by on_degraded",
+                            degradation.reason
+                        ),
+                    ));
+                    (ProjectCheckOutcome::Indeterminate, TreeState::Red)
+                }
+            }
+        }
+        ProjectCheckOutcome::Skipped => {
+            let mut info = diag(
                 &ctx.root,
                 check,
                 MANIFEST_NAME,
                 1,
                 1,
-                "command.timeout",
-                &message,
-            )],
-            0,
-        ),
+                "structured.skipped",
+                &summary,
+            );
+            info.severity = Severity::Info;
+            diagnostics.push(info);
+            (ProjectCheckOutcome::Skipped, TreeState::Green)
+        }
+        ProjectCheckOutcome::Indeterminate => {
+            diagnostics.push(diag(
+                &ctx.root,
+                check,
+                MANIFEST_NAME,
+                1,
+                1,
+                "structured.result.indeterminate",
+                &summary,
+            ));
+            (ProjectCheckOutcome::Indeterminate, TreeState::Red)
+        }
+    };
+    Ok(ProjectCheckResult {
+        id: check.id.clone(),
+        title: check.title.clone(),
+        required: check.required,
+        tree,
+        outcome,
+        diagnostics,
+        structured: Some(details),
+        duration_ms: 0,
+        cache_hit: false,
+    })
+}
+
+fn required_json_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, (&'static str, String)> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or((
+            "structured.result.invalid",
+            format!("{field} must be a non-empty string"),
+        ))
+}
+
+fn optional_json_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<String>, (&'static str, String)> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_str().map(|value| Some(value.to_string())).ok_or((
+        "structured.result.invalid",
+        format!("{field} must be a string or null"),
+    ))
+}
+
+fn parse_structured_finding(
+    value: &serde_json::Value,
+) -> Result<StructuredCheckFinding, (&'static str, String)> {
+    let object = value.as_object().ok_or((
+        "structured.result.invalid",
+        "each finding must be an object".to_string(),
+    ))?;
+    let severity = match optional_json_string(object, "severity")?.as_deref() {
+        Some("error") => Severity::Error,
+        Some("warning") | None => Severity::Warning,
+        Some("info") => Severity::Info,
+        Some("hint") => Severity::Hint,
+        Some(other) => {
+            return Err((
+                "structured.result.invalid",
+                format!("unknown finding severity {other:?}"),
+            ));
+        }
+    };
+    Ok(StructuredCheckFinding {
+        fingerprint: required_json_string(object, "fingerprint")?,
+        blocking: object
+            .get("blocking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        severity,
+        code: required_json_string(object, "code")?,
+        path: optional_json_string(object, "path")?,
+        line: object
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32,
+        col: object
+            .get("col")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as u32,
+        end_line: object
+            .get("end_line")
+            .and_then(serde_json::Value::as_u64)
+            .map(|line| line as u32),
+        message: required_json_string(object, "message")?,
+        data: object.get("data").cloned(),
+    })
+}
+
+fn parse_structured_degradation(
+    value: &serde_json::Value,
+) -> Result<StructuredCheckDegradation, (&'static str, String)> {
+    let object = value.as_object().ok_or((
+        "structured.result.invalid",
+        "degradation must be an object".to_string(),
+    ))?;
+    Ok(StructuredCheckDegradation {
+        reason: required_json_string(object, "reason")?,
+        dependency: optional_json_string(object, "dependency")?,
+        retryable: object
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        detail: optional_json_string(object, "detail")?,
+    })
+}
+
+fn structured_finding_diagnostic(
+    ctx: &RunContext,
+    check: &CheckConfig,
+    finding: &StructuredCheckFinding,
+) -> Diagnostic {
+    Diagnostic {
+        file_path: ctx
+            .root
+            .join(finding.path.as_deref().unwrap_or(MANIFEST_NAME)),
+        line: finding.line,
+        col: finding.col,
+        severity: if finding.blocking {
+            Severity::Error
+        } else {
+            finding.severity
+        },
+        code: Some(finding.code.clone()),
+        message: finding.message.clone(),
+        source: Some(format!("cargoless-check:{}", check.id)),
     }
 }
 
@@ -1762,6 +2428,12 @@ fn cache_key(ctx: &RunContext, check: &CheckConfig) -> String {
     preimage.push('\n');
     preimage.push_str(&sha256_hex(format!("{check:?}").as_bytes()));
     preimage.push('\n');
+    if let Some(identity) = &ctx.identity {
+        preimage.push_str(&identity.source_sha);
+        preimage.push('\0');
+        preimage.push_str(&identity.base_sha);
+        preimage.push('\n');
+    }
     for (path, hash) in input_fingerprints(ctx, check) {
         preimage.push_str(&path);
         preimage.push('\0');
@@ -1801,7 +2473,7 @@ fn file_hash(path: &Path) -> String {
 }
 
 fn cache_get(ctx: &RunContext, check: &CheckConfig) -> Option<ProjectCheckResult> {
-    if check.cache == "none" {
+    if check.cache == "none" || check.result_protocol.is_some() {
         return None;
     }
     let path = cache_dir(&ctx.root).join(cache_key(ctx, check));
@@ -1830,17 +2502,24 @@ fn cache_get(ctx: &RunContext, check: &CheckConfig) -> Option<ProjectCheckResult
         title: check.title.clone(),
         required: check.required,
         tree,
+        outcome: ProjectCheckOutcome::parse(value.get("outcome")?.as_str()?)?,
         diagnostics,
+        structured: None,
         duration_ms: 0,
         cache_hit: true,
     })
 }
 
 fn cache_put(ctx: &RunContext, check: &CheckConfig, result: &ProjectCheckResult) {
-    if check.cache == "none" {
+    if check.cache == "none" || check.result_protocol.is_some() {
         return;
     }
-    if has_timeout_diagnostic(&result.diagnostics) {
+    if has_timeout_diagnostic(&result.diagnostics)
+        || matches!(
+            result.outcome,
+            ProjectCheckOutcome::Degraded | ProjectCheckOutcome::Indeterminate
+        )
+    {
         return;
     }
     let dir = cache_dir(&ctx.root);
@@ -1864,6 +2543,7 @@ fn cache_put(ctx: &RunContext, check: &CheckConfig, result: &ProjectCheckResult)
         .collect();
     let body = serde_json::json!({
         "tree": if result.tree == TreeState::Green { "green" } else { "red" },
+        "outcome": result.outcome.as_str(),
         "diagnostics": diagnostics,
     })
     .to_string();
@@ -2039,6 +2719,8 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
                 "command",
                 "read_only",
                 "output",
+                "result_protocol",
+                "on_degraded",
             ],
             item.line(),
         )?;
@@ -2048,6 +2730,25 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
             line: item.line(),
             message: format!("unknown check kind `{kind_text}`"),
         })?;
+        let result_protocol = get_string(map, "result_protocol")?;
+        if result_protocol
+            .as_deref()
+            .is_some_and(|value| value != "cargoless.check-result/v1")
+        {
+            return Err(ParseError {
+                line: item.line(),
+                message: format!(
+                    "unknown result_protocol {:?}; expected cargoless.check-result/v1",
+                    result_protocol.as_deref().unwrap_or_default()
+                ),
+            });
+        }
+        if result_protocol.is_some() && kind != CheckKind::Command {
+            return Err(ParseError {
+                line: item.line(),
+                message: "result_protocol is supported only for kind: command".to_string(),
+            });
+        }
         out.push(CheckConfig {
             title: get_string(map, "title")?.unwrap_or_else(|| id.clone()),
             tier: get_string(map, "tier")?.unwrap_or_else(|| "dev".to_string()),
@@ -2075,9 +2776,29 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
                     ),
                 })?
             },
+            result_protocol,
+            on_degraded: parse_degraded_policies(map.get("on_degraded"))?,
             id,
             kind,
         });
+    }
+    Ok(out)
+}
+
+fn parse_degraded_policies(
+    node: Option<&YamlNode>,
+) -> Result<BTreeMap<String, DegradedPolicy>, ParseError> {
+    let Some(node) = node else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    for (reason, value) in node.expect_map("on_degraded")? {
+        let raw = value.expect_string()?;
+        let policy = DegradedPolicy::parse(&raw).ok_or(ParseError {
+            line: value.line(),
+            message: format!("on_degraded.{reason} must be one of warn, fail, or indeterminate"),
+        })?;
+        out.insert(reason.clone(), policy);
     }
     Ok(out)
 }

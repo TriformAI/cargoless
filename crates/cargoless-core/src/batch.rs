@@ -207,6 +207,35 @@ pub fn run_batch(
     }
 
     match checker.check_combined(members) {
+        Ok(report) if report.has_indeterminate() => {
+            let executed_members = members.len() as u32;
+            let ran_check_ids = report
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>();
+            BatchReport {
+                batch_id: batch_id.clone(),
+                verdict: BatchVerdict::Indeterminate,
+                members: members
+                    .iter()
+                    .map(|member| BatchMemberResult {
+                        worktree: member.worktree.clone(),
+                        verdict: BatchVerdict::Indeterminate,
+                        provenance: BatchProvenance::Indeterminate,
+                        diagnostics: report.diagnostics.clone(),
+                        duration_ms: report.duration_ms,
+                        ran_check_ids: ran_check_ids.clone(),
+                    })
+                    .collect(),
+                combined_checks: 1,
+                solo_checks: 0,
+                duration_ms: started.elapsed().as_millis(),
+                queue_wait_ms: 0,
+                executed_members,
+                executed_batch_id: Some(batch_id),
+            }
+        }
         Ok(report) if report.tree == TreeState::Green => {
             let executed_members = members.len() as u32;
             // The single combined compile ran this exact check set; every
@@ -297,6 +326,17 @@ fn report_from_solos(
     let members: Vec<BatchMemberResult> = outcomes
         .into_iter()
         .map(|outcome| match outcome.result {
+            Ok(report) if report.has_indeterminate() => {
+                any_indeterminate = true;
+                BatchMemberResult {
+                    worktree: outcome.member.worktree,
+                    verdict: BatchVerdict::Indeterminate,
+                    provenance: BatchProvenance::Indeterminate,
+                    diagnostics: report.diagnostics,
+                    duration_ms: report.duration_ms,
+                    ran_check_ids: report.results.iter().map(|r| r.id.clone()).collect(),
+                }
+            }
             Ok(report) if report.tree == TreeState::Green => BatchMemberResult {
                 worktree: outcome.member.worktree,
                 verdict: BatchVerdict::Green,
