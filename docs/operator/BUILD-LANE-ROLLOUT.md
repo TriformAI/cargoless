@@ -144,14 +144,6 @@ like a stuck lane. `GET /lane` shows the reason.
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8787/lane | jq
 ```
 
-| you see | it means |
-|---|---|
-| `404` | no lane configured on this daemon (not "an empty lane") |
-| queue depth > 0, no build | the capture window is still open, or a build just finished |
-| a build with members | that set is compiling; arrivals queue, nothing preempts |
-| ejections with `Attributed` | those members own a file that carried an error |
-| ejections with `Unattributed` | the errors are in files nobody touched — **everyone** is held |
-
 For automation, read `members`, not the legacy id-only summaries. Every entry
 is an exact reconciliation identity:
 
@@ -164,6 +156,14 @@ with a different head is different work: re-read the forge before withdrawing
 or landing it, and refuse a mismatch. `queued`, `in_flight`, and `landing`
 remain useful for humans, but they intentionally contain ids only and cannot
 prove that a PR still names the enrolled tree.
+
+| you see | it means |
+|---|---|
+| `404` | no lane configured on this daemon (not "an empty lane") |
+| queue depth > 0, no build | the capture window is still open, or a build just finished |
+| a build with members | that set is compiling; arrivals queue, nothing preempts |
+| ejections with `Attributed` | those members own a file that carried an error |
+| ejections with `Unattributed` | the errors are in files nobody touched — **everyone** is held |
 
 ## "My change is stuck"
 
