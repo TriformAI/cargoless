@@ -263,5 +263,6 @@ the integration guard itself. Any guard failure is a hard STOP + surface to
 the lead, **never** a documented-override candidate (the override is only for
 a heuristic mis-flag of a *proven-safe* push; a triple-guard-ff failure means
 the push is *not* proven safe). `--dry-run` rehearses every check without
-pushing. After a successful ff, `mirror-verify` (GitHub == Forgejo == SHA)
-remains a separate non-skippable gate.
+pushing. After a successful ff, run `scripts/mirror-verify <gated-sha>` as the
+separate non-skippable gate. It resolves `main` from both configured remotes
+and proves GitHub == Forgejo == the exact gated SHA.

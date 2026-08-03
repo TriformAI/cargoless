@@ -141,6 +141,7 @@ jobs:
           fetch-depth: 1
       - run: python3 scripts/tests/workflow-container-image-policy-test.py
       - run: bash scripts/tests/lane-attribution-mutation-test.sh
+      - run: bash scripts/tests/mirror-verify-test.sh
 
   fmt:
     runs-on: docker
