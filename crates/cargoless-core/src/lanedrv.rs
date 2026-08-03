@@ -171,6 +171,9 @@ pub enum LegPlan {
         slot: String,
         remote: String,
         ref_prefix: String,
+        /// Slot that builds the BASE alone, for the base-health check. Empty
+        /// disables it — see [`PreviewLegRunner::base_slot`].
+        base_slot: String,
     },
 }
 
@@ -242,10 +245,12 @@ impl LegPlan {
                 slot,
                 remote,
                 ref_prefix,
+                base_slot,
             } => {
                 let what = format!("preview:{slot} daemon={daemon} remote={remote}");
                 let mut r = PreviewLegRunner::new(daemon, token, slot, remote);
                 r.ref_prefix = ref_prefix;
+                r.base_slot = base_slot;
                 (Box::new(r), what)
             }
         }
@@ -751,6 +756,56 @@ const SLOT_FREE_POLL: Duration = Duration::from_secs(20);
 /// own setup fails: `git checkout <sha> failed: fatal: cannot change to
 /// '<path>': No such file or directory` (observed 2026-08-02, after a PVC fault
 /// removed the slot's worktree).
+/// The base slot's own `last_red_reason` from an `/app` snapshot, or `""`.
+///
+/// Empty covers every "cannot tell" case — no such slot, no field, unparseable
+/// JSON — and [`same_failure`] treats empty as "not the same", so an unreadable
+/// snapshot can never suppress a genuine verdict. Failing that direction is
+/// deliberate: a missed base-red costs one false ejection, which the lane
+/// already survives; a wrongly-suppressed red would let a broken member land.
+fn base_red_reason(snapshot: &serde_json::Value, base_slot: &str) -> String {
+    snapshot
+        .get("instances")
+        .and_then(|i| i.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(base_slot))
+        })
+        .and_then(|inst| inst.get("last_red_reason"))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Do two build failures name the SAME underlying error?
+///
+/// Compared on the trailing window, not the whole string. The base and the
+/// candidate build different shas in different worktrees, so their reasons
+/// diverge in the leading path and step detail while ending identically in the
+/// compiler's own verdict — `error: could not compile X (lib) due to 1 previous
+/// error; N warnings emitted`. That tail is what identifies the failure.
+///
+/// Empty on either side is NEVER a match: no evidence must not read as
+/// agreement.
+fn same_failure(a: &str, b: &str) -> bool {
+    /// Long enough to carry `could not compile <crate> (lib) due to ...` — the
+    /// part that names the failing crate — and short enough not to reach back
+    /// into the per-build path noise.
+    const TAIL: usize = 60;
+    let tail = |s: &str| {
+        let t = s.trim_end();
+        t.char_indices()
+            .rev()
+            .nth(TAIL - 1)
+            .map(|(i, _)| t[i..].to_string())
+            .unwrap_or_else(|| t.to_string())
+    };
+    if a.trim().is_empty() || b.trim().is_empty() {
+        return false;
+    }
+    tail(a) == tail(b)
+}
+
 fn reason_is_infrastructure(reason: &str) -> bool {
     let r = reason.to_ascii_lowercase();
     // Each phrase names a step BEFORE compilation: preparing the tree, reaching
@@ -807,6 +862,11 @@ pub struct PreviewLegRunner {
     pub timeout: Duration,
     /// Gap between `GET /app` polls.
     pub poll: Duration,
+    /// The slot that builds the BASE alone, with no candidate merged into it —
+    /// `dev` on tf-multiverse. Used to tell "this member broke the build" from
+    /// "the trunk was already broken", which are indistinguishable from the
+    /// candidate's own red. Empty disables the check.
+    pub base_slot: String,
 }
 
 impl PreviewLegRunner {
@@ -827,7 +887,18 @@ impl PreviewLegRunner {
             // that can take 45. 2h leaves room without waiting on a dead slot.
             timeout: Duration::from_secs(7200),
             poll: Duration::from_secs(10),
+            // Empty = no base-health check. The host sets this to the slot that
+            // builds the base alone (`dev` on tf-multiverse); a project without
+            // such a slot keeps today's behaviour.
+            base_slot: String::new(),
         }
+    }
+
+    /// Name the slot that builds the BASE with no candidate merged in, enabling
+    /// the base-health check in [`Self::run`].
+    pub fn with_base_slot(mut self, slot: impl Into<String>) -> Self {
+        self.base_slot = slot.into();
+        self
     }
 
     /// One `GET /app`, returning the raw body. Auth-exempt by design, so a
@@ -1042,6 +1113,40 @@ impl LegRunner for PreviewLegRunner {
                         "preview slot {:?} could not set up the candidate (not a code verdict): {reason}",
                         self.slot
                     )));
+                }
+
+                // NOR IS EVERY COMPILE RED THE CANDIDATE'S FAULT.
+                //
+                // The candidate is base + members. If the BASE ALONE cannot
+                // compile, the candidate inherits that failure and the lane
+                // blames whichever member happens to be aboard.
+                //
+                // Observed 2026-08-03: a commit added a `debug!()` call without
+                // adding `debug` to the file's `use tracing::{...}`, so
+                // triform-physics stopped compiling on dev for ~90 minutes. The
+                // lane ejected FOUR members in that window — including pr-10572,
+                // which changes ONE YAML FILE and no Rust at all. A YAML change
+                // cannot break a Rust compile; the accusation was impossible on
+                // its face and the lane made it anyway.
+                //
+                // The base slot builds the base with NO candidate merged in, and
+                // it is in the SAME `/app` snapshot we already fetched — so this
+                // costs one extra map lookup, no request.
+                //
+                // Compared on the TAIL rather than the whole string: the two
+                // builds run at different shas and their reasons differ in the
+                // leading path/step detail while ending in the same compiler
+                // verdict (`error: could not compile X (lib) due to ...`). The
+                // tail is the part that identifies the failure.
+                if !self.base_slot.is_empty() {
+                    let base = base_red_reason(&v, &self.base_slot);
+                    if same_failure(&base, &reason) {
+                        return Err(io::Error::other(format!(
+                            "base slot {:?} is ALSO red with the same failure — the base does not \
+                             compile, so this is not a verdict on the candidate: {reason}",
+                            self.base_slot
+                        )));
+                    }
                 }
                 return Ok(LegOutcome {
                     tree: TreeState::Red,
@@ -1868,6 +1973,97 @@ mod land_timeout_tests {
                 parse_land_timeout(raw),
                 LAND_TIMEOUT_DEFAULT_SECS,
                 "{raw:?} is not a usable budget and must fall back"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod base_health_tests {
+    use super::{base_red_reason, same_failure};
+
+    /// The exact strings from 2026-08-03. The dev slot (base alone, no PR) and
+    /// the lane slot (base + pr-10572, a YAML-ONLY change) ended byte-identical
+    /// because the BASE could not compile. The lane ejected the member anyway.
+    const REAL_BASE: &str = "build step `server` exited 101: 1587 | ... warning: unused variable: `execution_id` --> physics/src/runtime/executors/app_ops.rs:630:13 error: could not compile `triform-physics` (lib) due to 1 previous error; 63 warnings emitted";
+    const REAL_CANDIDATE: &str = "build step `server` exited 101: 2104 | ... warning: value assigned is never read --> physics/src/runtime/executors/lifecycle.rs:533:56 error: could not compile `triform-physics` (lib) due to 1 previous error; 63 warnings emitted";
+
+    #[test]
+    fn the_2026_08_03_false_ejection_is_caught() {
+        assert!(
+            same_failure(REAL_BASE, REAL_CANDIDATE),
+            "base and candidate end in the same compiler verdict — this must NOT \
+             be attributed to the member"
+        );
+    }
+
+    /// The leading detail DIFFERS between the two (different line numbers,
+    /// different warning bodies) — which is exactly why the comparison is on
+    /// the tail and not the whole string.
+    #[test]
+    fn the_comparison_survives_differing_leading_detail() {
+        assert_ne!(REAL_BASE, REAL_CANDIDATE, "fixtures must differ up front");
+        assert!(same_failure(REAL_BASE, REAL_CANDIDATE));
+    }
+
+    /// A GENUINE member fault must still be attributed. If the base is green
+    /// (or fails differently), the candidate's red is its own.
+    #[test]
+    fn a_real_member_fault_is_still_attributed() {
+        let base_green = "";
+        assert!(
+            !same_failure(base_green, REAL_CANDIDATE),
+            "no base red => attribute"
+        );
+
+        let base_other = "build step `server` exited 101: error: could not compile `triform-portal` (lib) due to 1 previous error; 2 warnings emitted";
+        assert!(
+            !same_failure(base_other, REAL_CANDIDATE),
+            "a DIFFERENT crate failing on the base does not excuse this candidate"
+        );
+    }
+
+    /// Empty is never agreement — "I have no evidence" must not read as "they
+    /// match", or an unreadable snapshot would suppress every genuine red.
+    #[test]
+    fn empty_is_never_a_match() {
+        assert!(!same_failure("", ""));
+        assert!(!same_failure("   ", REAL_CANDIDATE));
+        assert!(!same_failure(REAL_CANDIDATE, ""));
+    }
+
+    /// Reading the base slot out of a real `/app` shape.
+    #[test]
+    fn base_red_reason_reads_the_named_slot() {
+        let snap: serde_json::Value = serde_json::from_str(
+            r#"{"instances":[
+                 {"name":"dev","last_red_reason":"boom on the base"},
+                 {"name":"lane","last_red_reason":"boom on the candidate"}
+               ]}"#,
+        )
+        .unwrap();
+        assert_eq!(base_red_reason(&snap, "dev"), "boom on the base");
+        assert_eq!(base_red_reason(&snap, "lane"), "boom on the candidate");
+    }
+
+    /// Every "cannot tell" shape yields empty, and empty never suppresses a
+    /// verdict. A missing slot, a missing field, or junk must all fail toward
+    /// ATTRIBUTING — one false ejection is survivable, letting a broken member
+    /// land is not.
+    #[test]
+    fn an_unreadable_snapshot_never_suppresses_a_red() {
+        for raw in [
+            r#"{"instances":[]}"#,
+            r#"{"instances":[{"name":"lane","last_red_reason":"x"}]}"#,
+            r#"{"instances":[{"name":"dev"}]}"#,
+            r#"{}"#,
+            r#"null"#,
+        ] {
+            let snap: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let base = base_red_reason(&snap, "dev");
+            assert!(
+                !same_failure(&base, REAL_CANDIDATE),
+                "unreadable base ({raw}) must not suppress the candidate's red"
             );
         }
     }

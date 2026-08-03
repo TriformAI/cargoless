@@ -514,6 +514,16 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             .unwrap_or_default()
             .trim()
             .to_string();
+        // The slot that builds the BASE alone, with nothing merged into it.
+        // Without it the lane cannot tell "this member broke the build" from
+        // "the trunk was already broken" — on 2026-08-03 a missing
+        // `use tracing::debug` on dev made the lane eject FOUR innocent members
+        // in 90 minutes, one of which changed only a YAML file. Unset keeps the
+        // previous behaviour, so a project with no such slot is unaffected.
+        let base_slot = std::env::var("CARGOLESS_LANE_BASE_SLOT")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let remote = std::env::var("CARGOLESS_LANE_DISPATCH_REMOTE")
             .unwrap_or_else(|_| "origin".to_string());
         let ref_prefix = std::env::var("CARGOLESS_LANE_DISPATCH_REF_PREFIX")
@@ -568,6 +578,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 slot: preview_slot,
                 remote,
                 ref_prefix,
+                base_slot,
             }
         } else if !dispatch_cmd.is_empty() {
             cargoless_core::lanedrv::LegPlan::Dispatch {
