@@ -5659,6 +5659,59 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_unattributed_error_requires_a_compiler_witness_by_typed_code() {
+        let state_dir = temp_root("outcome-v3-unattributed-error");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/view.rs".into()]),
+            semantic: Some(attempt_context("attempt-unattributed-error", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &[("src/view.rs".into(), "view! { <div/> }".into())],
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").unwrap();
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api.take_push_attribution("/client/wt").unwrap();
+        let context = attribution.semantic.clone().unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::unknown("ra_native_unattributed_error"),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let outcome = api.get_outcome_v3(&context.attempt_id).unwrap();
+        assert!(matches!(
+            outcome.conclusion,
+            Conclusion::Indeterminate {
+                cause: IndeterminateCause::CompilerWitnessRequired { .. },
+                retry: RetryDirective::NewInputRequired,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            outcome.reaction.code.as_str(),
+            "indeterminate.compiler_witness_required"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn batch_outcome_v3_is_typed_persisted_and_retry_bounded() {
         let state_dir = temp_root("batch-outcome-v3");
         let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
