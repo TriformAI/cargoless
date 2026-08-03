@@ -29,7 +29,10 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::process::{ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
@@ -38,6 +41,94 @@ use std::time::{Duration, Instant};
 
 use cargoless_proto::{Diagnostic, Severity};
 use serde_json::{Value, json};
+
+const DEFAULT_SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_BACKPRESSURE_POLL: Duration = Duration::from_millis(5);
+
+/// A total-deadline writer for non-blocking subprocess pipes.
+///
+/// rust-analyzer can remain alive while it stops reading stdin. A plain
+/// `ChildStdin::write_all` then parks the daemon's single serve loop in
+/// `pipe_write` forever even though HTTP continues accepting overlays. The
+/// server path sets the pipe non-blocking and wraps it here so every complete
+/// LSP frame either reaches RA within a bounded interval or returns a transport
+/// error. The caller can then restart RA and resolve the consumed attempt as
+/// indeterminate instead of silently accumulating `pending` outcomes.
+struct BoundedWriter<W> {
+    inner: W,
+    timeout: Duration,
+}
+
+impl<W> BoundedWriter<W> {
+    fn new(inner: W, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+impl<W: Write> Write for BoundedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
+        let deadline = Instant::now() + self.timeout;
+        while !buf.is_empty() {
+            match self.inner.write(buf) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => buf = &buf[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "rust-analyzer stdin stayed backpressured for {}ms",
+                                self.timeout.as_millis()
+                            ),
+                        ));
+                    }
+                    thread::sleep(WRITE_BACKPRESSURE_POLL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(unix)]
+fn make_child_stdin_nonblocking(stdin: &ChildStdin) -> io::Result<()> {
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const O_NONBLOCK: i32 = 0x0004;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    let fd = stdin.as_raw_fd();
+    // SAFETY: `fd` is the live ChildStdin descriptor. F_GETFL reads its
+    // current flags; F_SETFL preserves them and adds only O_NONBLOCK.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_child_stdin_nonblocking(_stdin: &ChildStdin) -> io::Result<()> {
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // RA weight-shedding initializationOptions (#74)
@@ -1211,6 +1302,27 @@ pub struct LspClient {
 }
 
 impl LspClient {
+    /// Initialize the long-lived daemon transport with bounded stdin writes.
+    ///
+    /// The generic [`Self::initialize`] remains available for in-memory tests
+    /// and one-shot callers. The serve daemon must use this child-specific
+    /// entrypoint so a live-but-unresponsive analyzer cannot block its sole
+    /// routing loop indefinitely.
+    pub fn initialize_server(
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        root_path: &str,
+        opts: &InitOpts,
+    ) -> io::Result<(Self, Receiver<LspEvent>)> {
+        make_child_stdin_nonblocking(&stdin)?;
+        Self::initialize(
+            BoundedWriter::new(stdin, DEFAULT_SERVER_WRITE_TIMEOUT),
+            stdout,
+            root_path,
+            opts,
+        )
+    }
+
     /// Handshake against an RA speaking LSP over (`w` = its stdin, `r` = its
     /// stdout). `root_path` is the absolute workspace root. flycheck
     /// (`cargo check` on save) is enabled — it is the authoritative tier.
@@ -1708,6 +1820,38 @@ fn reader_loop<R: BufRead>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    struct PermanentlyBackpressured;
+
+    impl Write for PermanentlyBackpressured {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_writer_turns_permanent_lsp_backpressure_into_a_timeout() {
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(BoundedWriter::new(
+            PermanentlyBackpressured,
+            Duration::from_millis(20),
+        ))));
+        let started = Instant::now();
+        let error = write_lsp_message(
+            &writer,
+            &json!({"jsonrpc": "2.0", "method": "textDocument/didOpen"}),
+        )
+        .expect_err("a permanently full rust-analyzer stdin must not block forever");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the LSP write deadline must be operational, not documentary"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // #180: env-test serialization (fleet-wide gate-reliability fix)

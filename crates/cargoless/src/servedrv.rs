@@ -426,7 +426,22 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     let (push_tx, push_rx) = channel::<String>();
     api.attach_push_signal(push_tx);
     let (direct_gate_tx, direct_gate_rx) = channel::<crate::serveapi::DirectGateRequest>();
-    api.attach_direct_gate_signal(direct_gate_tx);
+    let direct_api = Arc::downgrade(&api);
+    match std::thread::Builder::new()
+        .name("cargoless-direct-gate".to_string())
+        .spawn(move || {
+            run_dispatch_channel(direct_gate_rx, move |request| {
+                let Some(api) = direct_api.upgrade() else {
+                    return;
+                };
+                dispatch_direct_gate(request, api);
+            });
+        }) {
+        Ok(_dispatcher) => api.attach_direct_gate_signal(direct_gate_tx),
+        Err(error) => {
+            eprintln!("[cargoless:obs] direct-gate-dispatcher-spawn-failed error={error}")
+        }
+    }
 
     // C1 observability — record the resolved RA config for `GET /daemon`.
     // Resolved from the SAME env + repo root the per-cluster RA spawn uses
@@ -655,13 +670,6 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // next iteration from the new RA cannot interleave with the dead
         // state.
         drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
-
-        // Gated project checks are authoritative Cargo jobs over isolated
-        // scratch worktrees. Dispatch them directly from ingest; they do not
-        // enter the shared rust-analyzer transaction queue.
-        while let Ok(request) = direct_gate_rx.try_recv() {
-            dispatch_direct_gate(request, Arc::clone(&api));
-        }
 
         // #240/2b — overlay-push ingest drain. The PushOverlay write-plane
         // wakeup signal: every `api.push_overlay(...)` call sends the
@@ -1013,7 +1021,8 @@ fn spawn_cluster(
         };
         let root_str = hook_root.to_string_lossy().into_owned();
         let opts = InitOpts::from_env_and_project(&hook_root);
-        let Ok((client, events)) = LspClient::initialize(stdin, stdout, &root_str, &opts) else {
+        let Ok((client, events)) = LspClient::initialize_server(stdin, stdout, &root_str, &opts)
+        else {
             return; // RA broke mid-handshake; Supervisor retries
         };
         let client = Arc::new(client);
@@ -1461,9 +1470,9 @@ fn exec(
             let verbs = cs.mux.switch_to(&target);
             let zero_verbs = verbs.is_empty();
             for verb in verbs {
-                match verb {
+                let write_result = match verb {
                     LspVerb::DidOpen { path, content } => {
-                        let _ = lsp.did_open(&path.to_string_lossy(), &content, 1);
+                        lsp.did_open(&path.to_string_lossy(), &content, 1)
                     }
                     LspVerb::DidChange { path, content } => {
                         let v = cs.next_ver;
@@ -1473,11 +1482,18 @@ fn exec(
                         // A close+open pair can emit a refresh for the close
                         // before RA has analyzed the reopened content, which
                         // made a stale empty pull look authoritative.
-                        let _ = lsp.did_change(&p, &content, v);
+                        lsp.did_change(&p, &content, v)
                     }
-                    LspVerb::DidClose { path } => {
-                        let _ = lsp.did_close(&path.to_string_lossy());
-                    }
+                    LspVerb::DidClose { path } => lsp.did_close(&path.to_string_lossy()),
+                };
+                if let Err(error) = write_result {
+                    eprintln!(
+                        "[cargoless:obs] lsp-write-stalled wt={} error={} action=restart-ra",
+                        wt.display(),
+                        error
+                    );
+                    cs._supervisor.restart_now();
+                    return;
                 }
             }
             let diagnostic_refresh_fence =
@@ -2417,6 +2433,12 @@ fn dispatch_direct_gate(
     );
 }
 
+fn run_dispatch_channel<T>(rx: Receiver<T>, mut dispatch: impl FnMut(T)) {
+    while let Ok(request) = rx.recv() {
+        dispatch(request);
+    }
+}
+
 /// #A4.3 — Hard-mode witness, OFF the serve loop, watchdog included.
 ///
 /// Production entry: reads the timeout + require-checks knobs from env
@@ -3053,6 +3075,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn direct_dispatch_channel_progresses_without_a_serve_loop_poll() {
+        let (request_tx, request_rx) = channel();
+        let (observed_tx, observed_rx) = channel();
+        let dispatcher = std::thread::spawn(move || {
+            run_dispatch_channel(request_rx, move |request| {
+                observed_tx.send(request).unwrap();
+            });
+        });
+
+        request_tx.send("attempt-accepted").unwrap();
+        assert_eq!(
+            observed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "attempt-accepted",
+            "hard-gate dispatch must not wait behind rust-analyzer routing"
+        );
+        drop(request_tx);
+        dispatcher.join().unwrap();
     }
 
     // ────────── CGLS-27 — respawn-strand scoping + payload ──────────
