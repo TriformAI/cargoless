@@ -87,6 +87,11 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// generated overlay. Keep the overall deadline bounded while allowing slow
 /// ingress/TLS paths to drain without replaying already accepted bytes.
 const CLIENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// The overlay acknowledgement is not a cheap echo: the server reads,
+/// decompresses, decodes, and applies the complete overlay before replying.
+/// Large generated candidates can legitimately exceed the ordinary 10-second
+/// request timeout even after the upload itself has drained successfully.
+const CLIENT_OVERLAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const CLIENT_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// TCP connect only — read/write keep [`CLIENT_IO_TIMEOUT`]. Daemon-down
 /// detection drops 10s to 2s; the gate failover ladder relies on fast
@@ -1842,9 +1847,21 @@ impl HttpClient {
         req.extend_from_slice(&prepared.bytes);
 
         let mut stream = self.connect_with_read_timeout(read_timeout)?;
-        write_and_flush_with_deadline(&mut stream, &req, CLIENT_UPLOAD_TIMEOUT)?;
+        write_and_flush_with_deadline(&mut stream, &req, CLIENT_UPLOAD_TIMEOUT).map_err(
+            |error| {
+                TransportError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("POST {path} upload: {error}"),
+                ))
+            },
+        )?;
         let mut raw = String::new();
-        stream.read_to_string(&mut raw)?;
+        stream.read_to_string(&mut raw).map_err(|error| {
+            TransportError::Io(std::io::Error::new(
+                error.kind(),
+                format!("POST {path} response read: {error}"),
+            ))
+        })?;
         let (head, resp) = raw
             .split_once("\r\n\r\n")
             .ok_or_else(|| TransportError::Protocol("no header/body split".into()))?;
@@ -2214,7 +2231,12 @@ impl TransportClient for HttpClient {
             },
         }
         .to_json();
-        let (code, resp) = self.post_json("/overlay", &body, CLIENT_IO_TIMEOUT, "overlay")?;
+        let (code, resp) = self.post_json(
+            "/overlay",
+            &body,
+            CLIENT_OVERLAY_RESPONSE_TIMEOUT,
+            "overlay",
+        )?;
         match code {
             200 => pushoverlayack_from_json(&resp)
                 .ok_or_else(|| TransportError::Protocol("malformed push_overlay ack".into())),
@@ -2357,6 +2379,12 @@ mod tests {
         .expect_err("permanent backpressure must not loop forever");
 
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn overlay_ack_allows_server_side_apply_after_upload() {
+        assert_eq!(CLIENT_OVERLAY_RESPONSE_TIMEOUT, Duration::from_secs(120));
+        assert!(CLIENT_OVERLAY_RESPONSE_TIMEOUT > CLIENT_IO_TIMEOUT);
     }
 
     #[test]
