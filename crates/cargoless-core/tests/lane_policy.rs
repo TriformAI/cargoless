@@ -42,8 +42,8 @@ const WINDOW: u64 = 60;
 /// arithmetic, and asserted against the real defaults in
 /// `the_infra_retry_constants_match_the_shipped_defaults` — a test that would
 /// otherwise silently start proving nothing if a default changed.
-const INFRA_BACKOFF: u64 = 30;
-const INFRA_MAX_ATTEMPTS: u32 = 5;
+const INFRA_BACKOFF: u64 = 120;
+const INFRA_MAX_ATTEMPTS: u32 = 10;
 
 /// A lane with the default capture window.
 fn lane() -> LaneState {

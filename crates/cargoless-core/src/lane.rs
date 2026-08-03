@@ -456,14 +456,34 @@ impl Default for LaneConfig {
             // agent pushes, negligible against a build measured in tens of
             // minutes.
             capture_window_ticks: 60,
-            // 30s between infra retries. Long enough that a persistent failure
-            // costs ~2 attempts a minute rather than ~24, short enough that a
-            // genuinely transient one (a brief forge outage) recovers without
-            // anyone noticing.
-            infra_backoff_ticks: 30,
-            // Five attempts ≈ 2.5 minutes of retrying before the lane concludes
-            // the failure is not going to clear on its own and says so.
-            infra_max_attempts: 5,
+            // 120s between infra retries.
+            //
+            // This was 30s, calibrated against "a brief forge outage". The
+            // failure that actually dominates in production is slower by an
+            // order of magnitude: the PREVIEW DAEMON RESTARTING. A preview pod
+            // that rolls takes minutes to come back — it answers /readyz with
+            // `warming` while it seeds, and every lane leg that targets it
+            // fails with connection-refused until it finishes.
+            //
+            // Measured 2026-08-03: a preview roll at 18:29 burned lane
+            // generations 46,47,48,49,50 in roughly six minutes — a candidate
+            // attempt every ~30s against a daemon that could not possibly
+            // answer yet — and then ejected pr-10388, pr-10394 and pr-6956 as
+            // `infrastructure`. Three innocent PRs lost their place in the
+            // queue because an unrelated pod restarted.
+            infra_backoff_ticks: 120,
+            // Ten attempts x 120s = 20 minutes of patience before the lane
+            // concludes the failure is not transient.
+            //
+            // This bound must exceed the slowest infra failure that DOES clear
+            // on its own, and that is the preview restart above (minutes, not
+            // seconds). The previous 5 x 30s = 2.5 minutes was shorter than the
+            // most common recoverable outage, so the cap fired on exactly the
+            // case it was meant to ride out. The permanent failures this cap
+            // exists for — an unreachable commit, an unwritable scratch dir —
+            // are still caught, just 20 minutes later, and that lateness costs
+            // far less than ejecting members who did nothing wrong.
+            infra_max_attempts: 10,
         }
     }
 }
