@@ -3,15 +3,15 @@
 //! This command is intentionally a wrapper around the transport request JSON
 //! rather than a second CLI grammar for every batch member. Product wrappers
 //! such as `dev-merge` already know their submitter overlays; they can write
-//! one `{"op":"batch_check",...}` body, send it through this command, and
-//! consume the same JSON report the HTTP/Unix/in-proc adapters use.
+//! one `{"op":"batch_check",...}` body. The command adds exact semantic
+//! identities and emits a validated `cargoless.outcome/v3` envelope.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use cargoless_core::batch::BatchVerdict;
+use cargoless_core::outcome::CheckState;
+use cargoless_core::transport::Request;
 use cargoless_core::transport::http::HttpClient;
-use cargoless_core::transport::{Request, TransportClient, batchreport_to_json};
 
 /// EX_TEMPFAIL — the fleet-wide "escalate, do not fix" exit code: the gate
 /// could not produce a real green/red verdict (indeterminate report, or a
@@ -25,12 +25,13 @@ pub struct BatchCheckOpts {
     pub request_json: PathBuf,
 }
 
-/// Green ⇒ 0, Red ⇒ 1, Indeterminate ⇒ 75 ([`EXIT_TEMPFAIL`]).
-fn verdict_exit_code(verdict: BatchVerdict) -> u8 {
-    match verdict {
-        BatchVerdict::Green => 0,
-        BatchVerdict::Red => 1,
-        BatchVerdict::Indeterminate => EXIT_TEMPFAIL,
+/// The process convention is a projection of the serialized reaction, never a
+/// second verdict interpretation.
+fn reaction_exit_code(state: CheckState) -> u8 {
+    match state {
+        CheckState::Success | CheckState::NoUpdate => 0,
+        CheckState::Failure => 1,
+        CheckState::Pending | CheckState::Error => EXIT_TEMPFAIL,
     }
 }
 
@@ -45,7 +46,7 @@ pub fn run(opts: &BatchCheckOpts) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let request = match Request::from_json(&body) {
+    let mut request = match Request::from_json(&body) {
         Some(Request::BatchCheck(request)) => request,
         _ => {
             crate::ui::error(format!(
@@ -69,33 +70,45 @@ pub fn run(opts: &BatchCheckOpts) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let report = match client.batch_check(&request) {
-        Ok(report) => report,
+    let semantic = match crate::verdict::attempt_context_from_env(&request.batch_id) {
+        Ok(context) => context,
+        Err(error) => {
+            crate::ui::error(format!("batch-check: invalid semantic identity: {error}"));
+            return ExitCode::from(2);
+        }
+    };
+    request.options.semantic = Some(semantic);
+    let body = Request::BatchCheck(request).to_json();
+    let outcome = match client.submit_attempt_v3(&body) {
+        Ok(outcome) => outcome,
         Err(e) => {
             crate::ui::error(format!("batch-check: remote `{}` failed: {e}", opts.remote));
-            // Transport/IO failure: no verdict was produced — EX_TEMPFAIL,
-            // so gate wrappers escalate instead of treating it as red.
             return ExitCode::from(EXIT_TEMPFAIL);
         }
     };
 
-    // Machine-readable stdout. Stderr gets human errors/logging.
-    println!("{}", batchreport_to_json(&report));
-    ExitCode::from(verdict_exit_code(report.verdict))
+    println!(
+        "{}",
+        serde_json::to_string(&outcome).expect("outcome-v3 serializes")
+    );
+    ExitCode::from(reaction_exit_code(outcome.reaction.state))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cargoless_core::batch::{BatchMember, BatchReport};
-    use cargoless_core::transport::{BatchCheckRequest, batchreport_from_json};
+    use cargoless_core::batch::{BatchMember, BatchReport, BatchVerdict};
+    use cargoless_core::transport::{
+        BatchCheckRequest, batchreport_from_json, batchreport_to_json,
+    };
 
     #[test]
-    fn verdict_exit_codes_green_0_red_1_indeterminate_75() {
-        assert_eq!(verdict_exit_code(BatchVerdict::Green), 0);
-        assert_eq!(verdict_exit_code(BatchVerdict::Red), 1);
-        // 75 = EX_TEMPFAIL, the fleet-wide escalate-do-not-fix convention.
-        assert_eq!(verdict_exit_code(BatchVerdict::Indeterminate), 75);
+    fn reaction_exit_codes_are_not_reinterpreted() {
+        assert_eq!(reaction_exit_code(CheckState::Success), 0);
+        assert_eq!(reaction_exit_code(CheckState::Failure), 1);
+        assert_eq!(reaction_exit_code(CheckState::Error), 75);
+        assert_eq!(reaction_exit_code(CheckState::Pending), 75);
+        assert_eq!(reaction_exit_code(CheckState::NoUpdate), 0);
     }
 
     #[test]
@@ -154,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn report_json_is_the_stdout_shape() {
+    fn legacy_report_json_still_decodes_for_fixture_coverage() {
         let report = BatchReport {
             batch_id: "batch-cli".into(),
             verdict: BatchVerdict::Green,
