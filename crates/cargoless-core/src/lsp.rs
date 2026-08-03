@@ -2804,4 +2804,50 @@ mod tests {
             Err(DiagnosticPullError::Protocol(_))
         ));
     }
+
+    #[test]
+    fn diagnostic_pull_capabilities_request_a_refresh_fence() {
+        let capabilities = client_capabilities();
+        assert_eq!(
+            capabilities["textDocument"]["diagnostic"]["relatedDocumentSupport"],
+            json!(true)
+        );
+        assert_eq!(
+            capabilities["workspace"]["diagnostics"]["refreshSupport"],
+            json!(true),
+            "pull diagnostics are not fresh until RA announces the changed snapshot"
+        );
+    }
+
+    #[test]
+    fn diagnostic_refresh_generation_is_monotonic_and_waitable() {
+        let refresh = DiagnosticRefreshState::default();
+        let before = refresh.generation();
+        assert_eq!(before, 0);
+        refresh.mark();
+        refresh
+            .wait_after(before, Duration::from_millis(10))
+            .expect("a newer refresh must release the waiter");
+        assert_eq!(refresh.generation(), 1);
+        assert!(matches!(
+            refresh.wait_after(1, Duration::from_millis(1)),
+            Err(DiagnosticPullError::FreshnessTimeout)
+        ));
+    }
+
+    #[test]
+    fn only_workspace_diagnostic_refresh_is_a_freshness_boundary() {
+        assert!(is_diagnostic_refresh_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "workspace/diagnostic/refresh",
+            "params": null
+        })));
+        assert!(!is_diagnostic_refresh_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "workspace/configuration",
+            "params": { "items": [] }
+        })));
+    }
 }
