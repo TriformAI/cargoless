@@ -91,7 +91,7 @@ const CLIENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// decompresses, decodes, and applies the complete overlay before replying.
 /// Large generated candidates can legitimately exceed the ordinary 10-second
 /// request timeout even after the upload itself has drained successfully.
-const CLIENT_OVERLAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const CLIENT_OVERLAY_APPLY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const CLIENT_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// TCP connect only — read/write keep [`CLIENT_IO_TIMEOUT`]. Daemon-down
 /// detection drops 10s to 2s; the gate failover ladder relies on fast
@@ -2024,7 +2024,7 @@ impl HttpClient {
         let (code, body) = self.post_json(
             "/v3/attempts",
             body,
-            CLIENT_IO_TIMEOUT,
+            CLIENT_OVERLAY_APPLY_RESPONSE_TIMEOUT,
             "outcome-v3 attempt",
         )?;
         match code {
@@ -2234,7 +2234,7 @@ impl TransportClient for HttpClient {
         let (code, resp) = self.post_json(
             "/overlay",
             &body,
-            CLIENT_OVERLAY_RESPONSE_TIMEOUT,
+            CLIENT_OVERLAY_APPLY_RESPONSE_TIMEOUT,
             "overlay",
         )?;
         match code {
@@ -2382,9 +2382,12 @@ mod tests {
     }
 
     #[test]
-    fn overlay_ack_allows_server_side_apply_after_upload() {
-        assert_eq!(CLIENT_OVERLAY_RESPONSE_TIMEOUT, Duration::from_secs(120));
-        assert!(CLIENT_OVERLAY_RESPONSE_TIMEOUT > CLIENT_IO_TIMEOUT);
+    fn overlay_routes_allow_server_side_apply_after_upload() {
+        assert_eq!(
+            CLIENT_OVERLAY_APPLY_RESPONSE_TIMEOUT,
+            Duration::from_secs(120)
+        );
+        assert!(CLIENT_OVERLAY_APPLY_RESPONSE_TIMEOUT > CLIENT_IO_TIMEOUT);
     }
 
     #[test]
