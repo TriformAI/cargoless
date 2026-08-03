@@ -1,5 +1,5 @@
-//! `cargoless verdict` — **A1**: the one-shot merge-gate verdict client
-//! (push → await → attributed verdict → machine-readable output).
+//! `cargoless verdict` — the outcome-v3 merge-gate client
+//! (submit an exact attempt → await its typed outcome → obey its reaction).
 //!
 //! The 0.4 wedge that lets gate wrappers collapse from ~1,700 lines of
 //! shard-selection/retry/parsing bash to a single binary call:
@@ -12,7 +12,7 @@
 //!   -- "$repo"
 //! ```
 //!
-//! What the subcommand owns (so caller bash does not):
+//! What the subcommand owns:
 //!
 //! * **Routing headers (C1):** `--header` values ride EVERY request —
 //!   the push and all status polls — because the pool ingress
@@ -20,28 +20,20 @@
 //!   the header would hash to a different shard than the push it is
 //!   awaiting. Injection is client-wide by construction
 //!   (`HttpClient::with_header`).
-//! * **Failover ladder:** repeatable `--remote`, tried in order. A
-//!   remote is skipped on transport failure, on `401`, or when it
-//!   rejects the push (quiescing drain / payload guard); the await then
-//!   stays PINNED to the remote that accepted — shards are
-//!   verdict-equivalent for pushes, but only the accepting daemon owes
-//!   us a fresh verdict for this overlay.
-//! * **Verdict attribution (A2 consumer):** the await accepts a status
-//!   echoing `base_sha == our resolved --base SHA`. Equal SHAs accept
-//!   even a pre-push publication (idempotent re-run fast-path: same
-//!   key + same SHA ⇒ same overlay content ⇒ same verdict). A status
-//!   carrying no `base_sha` (older daemon, fs-watch verdict) falls back
-//!   to the freshness guard; a MISMATCHED SHA never matches — that is
-//!   another branch's verdict on a shared key.
+//! * **Exact identity:** request, attempt, execution, and trace identities
+//!   are distinct from the overlay SHA. Polling is by `attempt_id`; equal
+//!   SHAs in different retries or PRs can never satisfy one another.
+//! * **Failover ladder:** repeatable `--remote`, tried in order for
+//!   submission. Awaiting stays pinned to the daemon that accepted the
+//!   attempt because that daemon owns its evidence and terminal outcome.
 //! * **Witness check-ids (B3 surface):** `--check-id` values travel as
 //!   `PushOverlayOptions::check_ids` on the wire. Today's daemons
 //!   store-and-ignore them; per-check witness selection consumes them
 //!   server-side when B3 lands.
-//! * **EX_TEMPFAIL honesty:** exit 0 = green, 1 = red, **75** = the
-//!   infrastructure could not produce a verdict (await timeout, ladder
-//!   exhausted, daemon said `unknown`) — callers escalate instead of
-//!   treating infra trouble as a code red. 2 = setup/config error
-//!   (bad flags, unauthorized everywhere, oversized payload).
+//! * **One reaction mapping:** the validated outcome carries the required
+//!   `pending`, `success`, `failure`, `error`, or `no_update` reaction.
+//!   Exit 0 = success, 1 = code failure, 75 = retryable/persistent
+//!   infrastructure indeterminacy, and 2 = local setup/protocol error.
 //!
 //! **Trivial-green short-circuit:** when the diff vs `--base` carries
 //! no content-bearing files (empty diff, or excluded/metadata-only
@@ -51,26 +43,31 @@
 //! apart from a daemon verdict. This mirrors the incumbent gate
 //! workflow's own no-Rust-relevant-changes success arm.
 //!
-//! **Output contract** (`--output json`, the default): exactly one JSON
-//! object on stdout — the `WorktreeStatus` wire shape plus two additive
-//! keys: `remote` (which ladder entry answered) and `source`
-//! (`"daemon"` = echoed from a daemon publication; `"client"` =
-//! synthesized here: trivial green, ladder exhausted, await timeout).
-//! All human diagnostics stay on stderr. `--output text` prints just
-//! the verdict word (`green`/`red`/`unknown`) for `$(...)` capture.
+//! **Output contract** (`--output json`, the default): one validated
+//! `cargoless.outcome/v3` envelope plus `remote`, `source`, and the same
+//! contract-derived `reaction`. All human diagnostics stay on stderr.
+//! `--output text` prints the reaction state.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use cargoless_core::transport::http::HttpClient;
-use cargoless_core::transport::{
-    PushOverlayOptions, TransportClient, TransportError, WorktreeStatus, status_to_json,
+use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
+use cargoless_core::outcome::{
+    AttemptId, CheckState, Component, Conclusion, IndeterminateCause, NonEmptyText,
+    OutcomeEnvelope, PassBasis, Phase, PhaseRecord, Producer, RequestId, RetryDirective, Subject,
+    Surface, TraceId,
 };
+use cargoless_core::transport::http::HttpClient;
+use cargoless_core::transport::{AttemptContext, PushOverlayOptions, TransportError};
+#[cfg(test)]
+use cargoless_core::transport::{TransportClient, WorktreeStatus, status_to_json};
 
+#[cfg(test)]
+use crate::push::AwaitFreshness;
 use crate::push::{
-    AwaitFreshness, build_push_payload, emit_payload_diagnostics, git_changed_files,
-    git_resolve_ref, push_overlay_request_body, validate_overlay_http_cap,
+    build_push_payload, emit_payload_diagnostics, git_changed_files, git_resolve_ref,
+    push_overlay_request_body, validate_overlay_http_cap,
 };
 
 /// `--output` mode. JSON is the default: the subcommand exists for
@@ -155,14 +152,25 @@ pub fn run(opts: &VerdictOpts) -> ExitCode {
     };
     payload.files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let resolved_sha = git_resolve_ref(&opts.repo, &opts.base).ok();
-    if resolved_sha.is_none() {
-        crate::ui::warn(format!(
-            "verdict: could not resolve `{}` to a commit SHA; verdict attribution \
-             falls back to freshness-only",
-            opts.base
-        ));
-    }
+    let resolved_sha = match git_resolve_ref(&opts.repo, &opts.base) {
+        Ok(sha) => Some(sha),
+        Err(error) => {
+            crate::ui::error(format!(
+                "verdict: outcome-v3 requires an immutable base SHA, but `{}` \
+                 could not be resolved: {error}",
+                opts.base
+            ));
+            return ExitCode::from(2);
+        }
+    };
+    let semantic = match attempt_context_from_env(resolved_sha.as_deref().expect("resolved above"))
+    {
+        Ok(context) => context,
+        Err(error) => {
+            crate::ui::error(format!("verdict: invalid outcome-v3 identity: {error}"));
+            return ExitCode::from(2);
+        }
+    };
 
     // 2. Trivial-green short-circuit (module doc): nothing content-bearing
     //    to push ⇒ nothing the daemon could evaluate beyond the gated base.
@@ -177,7 +185,21 @@ pub fn run(opts: &VerdictOpts) -> ExitCode {
                 opts.base
             )
         };
-        return emit_client_verdict(opts, "green", &detail, None, resolved_sha.as_deref(), 0);
+        return match local_trivial_outcome_v3(
+            opts,
+            &semantic,
+            resolved_sha.as_deref().expect("resolved above"),
+            &changed,
+            &detail,
+        ) {
+            Ok(outcome) => emit_local_outcome_v3(opts, &outcome),
+            Err(error) => {
+                crate::ui::error(format!(
+                    "verdict: could not persist the trivial-pass evidence: {error}"
+                ));
+                ExitCode::from(75)
+            }
+        };
     }
 
     // 3. Wire options: gate + check-ids + attribution SHA (+ central-mode
@@ -197,17 +219,14 @@ pub fn run(opts: &VerdictOpts) -> ExitCode {
             Some(opts.check_ids.clone())
         },
         base_sha: resolved_sha.clone(),
+        semantic: Some(semantic.clone()),
         ..PushOverlayOptions::default()
     };
     if let Some(root) = opts.server_root.as_ref() {
         options.repo_relative = true;
         options.analysis_root = Some(root.to_string_lossy().into_owned());
     }
-    let options = if options.is_empty() {
-        None
-    } else {
-        Some(options)
-    };
+    let options = Some(options);
     let body = push_overlay_request_body(
         &opts.worktree,
         &opts.base,
@@ -236,13 +255,7 @@ pub fn run(opts: &VerdictOpts) -> ExitCode {
     }
 
     // 5. Push down the ladder; pin the await to the accepting remote.
-    let accepted = match push_with_failover(
-        &endpoints,
-        &opts.worktree,
-        &opts.base,
-        &payload.files,
-        options.as_ref(),
-    ) {
+    let accepted = match submit_v3_with_failover(&endpoints, &body, &semantic) {
         Ok(accepted) => accepted,
         Err(exhausted) => {
             let reason = format!(
@@ -252,45 +265,83 @@ pub fn run(opts: &VerdictOpts) -> ExitCode {
             // Unauthorized everywhere is a config problem (one shared
             // token), not transient infra: exit 2 so callers fix setup
             // instead of retrying.
-            let exit = if exhausted.all_unauthorized() { 2 } else { 75 };
-            return emit_client_verdict(
+            if exhausted.all_unauthorized() {
+                crate::ui::error(format!("verdict: {reason}"));
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": "cargoless.protocol-error/v3",
+                        "code": "authentication.rejected",
+                        "request_id": semantic.request_id.as_str(),
+                        "attempt_id": semantic.attempt_id.as_str(),
+                        "summary": reason,
+                    })
+                );
+                return ExitCode::from(2);
+            }
+            return match local_indeterminate_outcome_v3(
                 opts,
-                "unknown",
+                &semantic,
+                resolved_sha.as_deref().expect("resolved above"),
+                &changed,
                 &reason,
-                None,
-                resolved_sha.as_deref(),
-                exit,
-            );
+                IndeterminateCause::DependencyUnavailable {
+                    component: Component::Protocol,
+                },
+            ) {
+                Ok(outcome) => emit_local_outcome_v3(opts, &outcome),
+                Err(error) => {
+                    crate::ui::error(format!(
+                        "verdict: could not persist the indeterminate outcome: {error}"
+                    ));
+                    ExitCode::from(75)
+                }
+            };
         }
     };
     eprintln!(
-        "[cargoless:verdict] push accepted by {} (applied_files={}); awaiting attributed verdict (timeout {}s)",
-        accepted.remote, accepted.applied_files, opts.await_timeout_secs
+        "[cargoless:verdict] attempt={} request={} accepted by {}; awaiting exact attempt outcome (timeout {}s)",
+        semantic.attempt_id, semantic.request_id, accepted.remote, opts.await_timeout_secs
     );
 
-    // 6. Await the attributed verdict on the SAME client (routing-key
-    //    affinity: polls must hash to the shard that took the push).
-    match await_attributed_verdict(
+    // 6. Await the exact attempt on the SAME client. Commit-addressed
+    // status is intentionally not used by outcome-v3: a retry of the same
+    // SHA is a different execution and therefore a different attempt.
+    match await_attempt_v3(
         accepted.client,
-        &opts.worktree,
-        resolved_sha.as_deref(),
-        accepted.freshness,
+        &semantic.attempt_id,
+        accepted.initial,
         opts.await_timeout_secs,
     ) {
-        Some(status) => emit_daemon_verdict(opts, &status, accepted.remote),
+        Some(outcome) => emit_daemon_outcome_v3(opts, &outcome, accepted.remote),
         None => {
             let reason = format!(
-                "timed out after {}s awaiting an attributed verdict from {} for {}",
-                opts.await_timeout_secs, accepted.remote, opts.worktree
+                "timed out after {}s awaiting exact attempt {} from {}",
+                opts.await_timeout_secs, semantic.attempt_id, accepted.remote
             );
-            emit_client_verdict(
+            match local_indeterminate_outcome_v3(
                 opts,
-                "unknown",
+                &semantic,
+                resolved_sha.as_deref().expect("resolved above"),
+                &changed,
                 &reason,
-                Some(accepted.remote),
-                resolved_sha.as_deref(),
-                75,
-            )
+                IndeterminateCause::BudgetExhausted {
+                    component: Component::ProjectCheck,
+                    budget: NonEmptyText::new(format!(
+                        "await_timeout_secs={}",
+                        opts.await_timeout_secs
+                    ))
+                    .expect("timeout budget is non-empty"),
+                },
+            ) {
+                Ok(outcome) => emit_local_outcome_v3(opts, &outcome),
+                Err(error) => {
+                    crate::ui::error(format!(
+                        "verdict: could not persist the timeout outcome: {error}"
+                    ));
+                    ExitCode::from(75)
+                }
+            }
         }
     }
 }
@@ -329,10 +380,397 @@ fn build_client(
     Ok(client)
 }
 
+pub(crate) fn attempt_context_from_env(base_sha: &str) -> Result<AttemptContext, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seed =
+        cargoless_core::sha256_hex(format!("{base_sha}:{}:{now}", std::process::id()).as_bytes());
+    let request_id = match std::env::var("CARGOLESS_REQUEST_ID") {
+        Ok(value) => RequestId::new(value).map_err(|error| error.to_string())?,
+        Err(_) => {
+            RequestId::new(format!("req.{}", &seed[..24])).map_err(|error| error.to_string())?
+        }
+    };
+    let attempt_id = match std::env::var("CARGOLESS_ATTEMPT_ID") {
+        Ok(value) => AttemptId::new(value).map_err(|error| error.to_string())?,
+        Err(_) => AttemptId::new(format!("attempt.{}", &seed[8..32]))
+            .map_err(|error| error.to_string())?,
+    };
+    let trace_id = match std::env::var("CARGOLESS_TRACE_ID") {
+        Ok(value) => TraceId::new(value).map_err(|error| error.to_string())?,
+        Err(_) => TraceId::new(seed[..32].to_string()).map_err(|error| error.to_string())?,
+    };
+    let parse_u32 = |name: &str, default: u32| -> Result<u32, String> {
+        match std::env::var(name) {
+            Ok(value) => value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("{name} must be an unsigned integer")),
+            Err(_) => Ok(default),
+        }
+    };
+    let parse_u64 = |name: &str, default: u64| -> Result<u64, String> {
+        match std::env::var(name) {
+            Ok(value) => value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{name} must be an unsigned integer")),
+            Err(_) => Ok(default),
+        }
+    };
+    let context = AttemptContext {
+        request_id,
+        attempt_id,
+        trace_id,
+        previous_attempt_id: std::env::var("CARGOLESS_PREVIOUS_ATTEMPT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(AttemptId::new)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+        attempt_number: parse_u32("CARGOLESS_ATTEMPT_NUMBER", 1)?,
+        maximum_attempts: parse_u32("CARGOLESS_MAX_ATTEMPTS", 3)?,
+        retry_after_ms: parse_u64("CARGOLESS_RETRY_AFTER_MS", 10_000)?,
+    };
+    context.validate().map_err(str::to_string)?;
+    Ok(context)
+}
+
+fn local_trivial_outcome_v3(
+    opts: &VerdictOpts,
+    context: &AttemptContext,
+    base_sha: &str,
+    changed: &[String],
+    detail: &str,
+) -> Result<OutcomeEnvelope, String> {
+    let text = |value: String| NonEmptyText::new(value).map_err(|error| error.to_string());
+    let root = std::fs::canonicalize(&opts.repo).unwrap_or_else(|_| opts.repo.clone());
+    let mut changed_files: Vec<String> = changed.to_vec();
+    changed_files.sort();
+    let check_plan = format!("gate={};check_ids={:?}", opts.gate, opts.check_ids);
+    let subject = Subject::Overlay {
+        repository: text(root.to_string_lossy().into_owned())?,
+        worktree_key: text(opts.worktree.clone())?,
+        base_ref: text(opts.base.clone())?,
+        base_sha: text(base_sha.to_string())?,
+        overlay_digest: text(cargoless_core::sha256_hex(b""))?,
+        changed_files_digest: text(cargoless_core::sha256_hex(
+            changed_files.join("\n").as_bytes(),
+        ))?,
+        check_plan_digest: text(cargoless_core::sha256_hex(check_plan.as_bytes()))?,
+    };
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let mut bundle = EvidenceBundle::default();
+    bundle.push(
+        ArtifactKind::Events,
+        format!(
+            "{{\"at_unix_ms\":{now_ms},\"event\":\"local.trivial_pass\",\
+             \"attempt_id\":\"{}\",\"summary\":{}}}\n",
+            context.attempt_id,
+            serde_json::to_string(detail).map_err(|error| error.to_string())?
+        ),
+    );
+    let store = EvidenceStore::new(root.join(".cargoless"));
+    let evidence = store
+        .reference_for(&context.attempt_id, &bundle)
+        .map_err(|error| error.to_string())?;
+    let mut outcome = OutcomeEnvelope::new(
+        context.request_id.clone(),
+        context.attempt_id.clone(),
+        context.trace_id.clone(),
+        Surface::Overlay,
+        subject,
+        Producer {
+            daemon_build_id: text(cargoless_core::build_id().to_string())?,
+            process_id: std::process::id(),
+            process_generation: 1,
+            pod_uid: None,
+            rust_analyzer_generation: None,
+        },
+        Conclusion::Passed {
+            basis: PassBasis::PolicySatisfied {
+                policy: text("trivial.no_content_bearing_changes".to_string())?,
+            },
+            evidence,
+            summary: text(detail.to_string())?,
+        },
+    );
+    outcome.timeline = vec![
+        PhaseRecord {
+            phase: Phase::Accepted,
+            started_at_unix_ms: now_ms,
+            finished_at_unix_ms: Some(now_ms),
+        },
+        PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: now_ms,
+            finished_at_unix_ms: Some(now_ms),
+        },
+    ];
+    store
+        .persist(&outcome, EvidenceClass::Success, &bundle)
+        .map_err(|error| error.to_string())?;
+    Ok(outcome)
+}
+
+fn local_indeterminate_outcome_v3(
+    opts: &VerdictOpts,
+    context: &AttemptContext,
+    base_sha: &str,
+    changed: &[String],
+    reason: &str,
+    cause: IndeterminateCause,
+) -> Result<OutcomeEnvelope, String> {
+    let text = |value: String| NonEmptyText::new(value).map_err(|error| error.to_string());
+    let root = std::fs::canonicalize(&opts.repo).unwrap_or_else(|_| opts.repo.clone());
+    let mut changed_files: Vec<String> = changed.to_vec();
+    changed_files.sort();
+    let subject = Subject::Overlay {
+        repository: text(root.to_string_lossy().into_owned())?,
+        worktree_key: text(opts.worktree.clone())?,
+        base_ref: text(opts.base.clone())?,
+        base_sha: text(base_sha.to_string())?,
+        overlay_digest: text(cargoless_core::sha256_hex(b"client-side-failure"))?,
+        changed_files_digest: text(cargoless_core::sha256_hex(
+            changed_files.join("\n").as_bytes(),
+        ))?,
+        check_plan_digest: text(cargoless_core::sha256_hex(
+            format!("gate={};check_ids={:?}", opts.gate, opts.check_ids).as_bytes(),
+        ))?,
+    };
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let mut bundle = EvidenceBundle::default();
+    bundle.push(
+        ArtifactKind::Events,
+        format!(
+            "{{\"at_unix_ms\":{now_ms},\"event\":\"client.indeterminate\",\
+             \"attempt_id\":\"{}\",\"summary\":{}}}\n",
+            context.attempt_id,
+            serde_json::to_string(reason).map_err(|error| error.to_string())?
+        ),
+    );
+    let store = EvidenceStore::new(root.join(".cargoless"));
+    let evidence = store
+        .reference_for(&context.attempt_id, &bundle)
+        .map_err(|error| error.to_string())?;
+    let mut outcome = OutcomeEnvelope::new(
+        context.request_id.clone(),
+        context.attempt_id.clone(),
+        context.trace_id.clone(),
+        Surface::Overlay,
+        subject,
+        Producer {
+            daemon_build_id: text(cargoless_core::build_id().to_string())?,
+            process_id: std::process::id(),
+            process_generation: 1,
+            pod_uid: None,
+            rust_analyzer_generation: None,
+        },
+        Conclusion::Indeterminate {
+            cause,
+            retry: RetryDirective::Automatic {
+                attempt: context.attempt_number,
+                maximum_attempts: context.maximum_attempts,
+                after_ms: context.retry_after_ms,
+            },
+            evidence,
+            summary: text(reason.to_string())?,
+        },
+    );
+    outcome.timeline = vec![
+        PhaseRecord {
+            phase: Phase::Accepted,
+            started_at_unix_ms: now_ms,
+            finished_at_unix_ms: Some(now_ms),
+        },
+        PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: now_ms,
+            finished_at_unix_ms: Some(now_ms),
+        },
+    ];
+    store
+        .persist(&outcome, EvidenceClass::Terminal, &bundle)
+        .map_err(|error| error.to_string())?;
+    Ok(outcome)
+}
+
+fn emit_local_outcome_v3(opts: &VerdictOpts, outcome: &OutcomeEnvelope) -> ExitCode {
+    let reaction = outcome.reaction.clone();
+    eprintln!(
+        "[cargoless:verdict] attempt={} conclusion={} reaction={:?} source=client",
+        outcome.attempt_id,
+        outcome.conclusion.semantic_code(),
+        reaction.state,
+    );
+    match opts.output {
+        OutputMode::Json => {
+            let mut value = serde_json::to_value(outcome)
+                .unwrap_or_else(|_| serde_json::json!({"schema":"serialization-error"}));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("source".into(), serde_json::json!("client"));
+                object.insert(
+                    "reaction".into(),
+                    serde_json::to_value(&reaction)
+                        .unwrap_or_else(|_| serde_json::json!({"state":"error"})),
+                );
+            }
+            println!("{value}");
+        }
+        OutputMode::Text => println!(
+            "{}:{}",
+            outcome.conclusion.semantic_code(),
+            reaction.code.as_str()
+        ),
+    }
+    let exit = match reaction.state {
+        CheckState::Success => 0,
+        CheckState::Failure => 1,
+        CheckState::Pending | CheckState::Error | CheckState::NoUpdate => 75,
+    };
+    ExitCode::from(exit)
+}
+
+struct AcceptedAttempt<'a> {
+    remote: &'a str,
+    client: &'a HttpClient,
+    initial: OutcomeEnvelope,
+}
+
+fn submit_v3_with_failover<'a>(
+    endpoints: &'a [(String, HttpClient)],
+    body: &str,
+    context: &AttemptContext,
+) -> Result<AcceptedAttempt<'a>, LadderExhausted> {
+    let mut attempts = Vec::new();
+    for (remote, client) in endpoints {
+        match client.submit_attempt_v3(body) {
+            Ok(outcome)
+                if outcome.request_id == context.request_id
+                    && outcome.attempt_id == context.attempt_id
+                    && outcome.trace_id == context.trace_id =>
+            {
+                return Ok(AcceptedAttempt {
+                    remote,
+                    client,
+                    initial: outcome,
+                });
+            }
+            Ok(outcome) => {
+                let detail = format!(
+                    "daemon returned mismatched identity request={} attempt={} trace={}",
+                    outcome.request_id, outcome.attempt_id, outcome.trace_id
+                );
+                crate::ui::warn(format!("verdict: `{remote}` violated outcome-v3: {detail}"));
+                attempts.push((remote.clone(), AttemptFailure::Transport(detail)));
+            }
+            Err(TransportError::Unauthorized) => {
+                crate::ui::warn(format!(
+                    "verdict: `{remote}` refused the bearer token; trying next remote"
+                ));
+                attempts.push((remote.clone(), AttemptFailure::Unauthorized));
+            }
+            Err(error) => {
+                crate::ui::warn(format!(
+                    "verdict: outcome-v3 submission to `{remote}` failed ({error}); \
+                     trying next remote"
+                ));
+                attempts.push((remote.clone(), AttemptFailure::Transport(error.to_string())));
+            }
+        }
+    }
+    Err(LadderExhausted { attempts })
+}
+
+fn await_attempt_v3(
+    client: &HttpClient,
+    attempt_id: &AttemptId,
+    initial: OutcomeEnvelope,
+    timeout_secs: u64,
+) -> Option<OutcomeEnvelope> {
+    if !matches!(initial.conclusion, Conclusion::Pending { .. }) {
+        return Some(initial);
+    }
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        match client.get_attempt_v3(attempt_id) {
+            Ok(Some(outcome)) if !matches!(outcome.conclusion, Conclusion::Pending { .. }) => {
+                return Some(outcome);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                crate::ui::warn(format!(
+                    "verdict: exact-attempt poll for {attempt_id} failed ({error}); retrying"
+                ));
+            }
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let wait = remaining.min(Duration::from_millis(200));
+        if wait.is_zero() {
+            break;
+        }
+        std::thread::sleep(wait);
+    }
+    None
+}
+
+fn emit_daemon_outcome_v3(opts: &VerdictOpts, outcome: &OutcomeEnvelope, remote: &str) -> ExitCode {
+    let reaction = outcome.reaction.clone();
+    eprintln!(
+        "[cargoless:verdict] attempt={} conclusion={} reaction={:?} code={} via {}",
+        outcome.attempt_id,
+        outcome.conclusion.semantic_code(),
+        reaction.state,
+        reaction.code.as_str(),
+        remote
+    );
+    match opts.output {
+        OutputMode::Json => {
+            let mut value = serde_json::to_value(outcome)
+                .unwrap_or_else(|_| serde_json::json!({"schema":"serialization-error"}));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("source".into(), serde_json::json!("daemon"));
+                object.insert("remote".into(), serde_json::json!(remote));
+                object.insert(
+                    "reaction".into(),
+                    serde_json::to_value(&reaction)
+                        .unwrap_or_else(|_| serde_json::json!({"state":"error"})),
+                );
+            }
+            println!("{value}");
+        }
+        OutputMode::Text => println!(
+            "{}:{}",
+            outcome.conclusion.semantic_code(),
+            reaction.code.as_str()
+        ),
+    }
+    let exit = match reaction.state {
+        CheckState::Success => 0,
+        CheckState::Failure => 1,
+        CheckState::Pending | CheckState::Error | CheckState::NoUpdate => 75,
+    };
+    ExitCode::from(exit)
+}
+
 /// A push the ladder landed: which remote took it, the client pinned to
 /// that remote for the await, and the freshness guard captured BEFORE
 /// the push (so a pre-existing stale publication cannot satisfy the
 /// freshness arm of the acceptance predicate).
+#[cfg(test)]
 struct AcceptedPush<'a, C> {
     remote: &'a str,
     client: &'a C,
@@ -346,6 +784,7 @@ enum AttemptFailure {
     Unauthorized,
     /// `accepted: false` ack. The ack wire shape carries no reason; the
     /// daemon's stderr has it (quiescing drain or a payload guard).
+    #[cfg(test)]
     Rejected,
 }
 
@@ -354,6 +793,7 @@ impl AttemptFailure {
         match self {
             AttemptFailure::Transport(e) => format!("transport error: {e}"),
             AttemptFailure::Unauthorized => "unauthorized (401)".to_string(),
+            #[cfg(test)]
             AttemptFailure::Rejected => {
                 "push rejected (quiescing daemon or payload guard)".to_string()
             }
@@ -388,6 +828,7 @@ impl LadderExhausted {
 /// freshness is captured from a pre-push status poll on that same
 /// entry; a failed pre-poll degrades to push-time freshness (warn, not
 /// failover — the push itself is the authoritative liveness probe).
+#[cfg(test)]
 fn push_with_failover<'a, C: TransportClient>(
     endpoints: &'a [(String, C)],
     worktree: &str,
@@ -457,6 +898,7 @@ fn push_with_failover<'a, C: TransportClient>(
 ///   not echo `base_sha`, or an unresolvable local ref). Freshness
 ///   means "published after OUR accepted push", which on a single
 ///   per-key publication stream attributes the verdict to our overlay.
+#[cfg(test)]
 fn status_is_acceptable(
     status: &WorktreeStatus,
     resolved_sha: Option<&str>,
@@ -473,6 +915,7 @@ fn status_is_acceptable(
 /// keep polling — transient drops mid-await must not abandon a verdict
 /// the daemon is still computing (and failing over mid-await would poll
 /// a shard that never saw the push).
+#[cfg(test)]
 fn await_attributed_verdict<C: TransportClient>(
     client: &C,
     worktree: &str,
@@ -511,24 +954,7 @@ fn await_attributed_verdict<C: TransportClient>(
     None
 }
 
-/// Stdout emit for a daemon-published verdict: the full status wire
-/// shape + `remote` + `source:"daemon"`.
-fn emit_daemon_verdict(opts: &VerdictOpts, status: &WorktreeStatus, remote: &str) -> ExitCode {
-    eprintln!(
-        "[cargoless:verdict] verdict={} worktree={} base_sha={} published_at={} via {}",
-        status.verdict,
-        status.worktree,
-        status.base_sha.as_deref().unwrap_or("-"),
-        status.published_at,
-        remote
-    );
-    match opts.output {
-        OutputMode::Json => println!("{}", daemon_verdict_json(status, remote)),
-        OutputMode::Text => println!("{}", status.verdict),
-    }
-    ExitCode::from(exit_byte_for_verdict(&status.verdict))
-}
-
+#[cfg(test)]
 fn daemon_verdict_json(status: &WorktreeStatus, remote: &str) -> String {
     let mut value: serde_json::Value =
         serde_json::from_str(&status_to_json(status)).unwrap_or_else(|_| serde_json::json!({}));
@@ -545,33 +971,7 @@ fn daemon_verdict_json(status: &WorktreeStatus, remote: &str) -> String {
     value.to_string()
 }
 
-/// Stdout emit for a CLIENT-synthesized verdict (trivial green, ladder
-/// exhausted, await timeout): same top-level keys as the daemon shape
-/// where they exist, `source:"client"`, plus the reason under
-/// `trivial_reason` (green) or `verdict_failure_reason` (unknown).
-fn emit_client_verdict(
-    opts: &VerdictOpts,
-    verdict: &str,
-    detail: &str,
-    remote: Option<&str>,
-    resolved_sha: Option<&str>,
-    exit: u8,
-) -> ExitCode {
-    if verdict == "green" {
-        eprintln!("[cargoless:verdict] trivial green: {detail}");
-    } else {
-        crate::ui::error(format!("verdict: {detail}"));
-    }
-    match opts.output {
-        OutputMode::Json => println!(
-            "{}",
-            client_verdict_json(&opts.worktree, verdict, detail, remote, resolved_sha)
-        ),
-        OutputMode::Text => println!("{verdict}"),
-    }
-    ExitCode::from(exit)
-}
-
+#[cfg(test)]
 fn client_verdict_json(
     worktree: &str,
     verdict: &str,
@@ -613,6 +1013,7 @@ fn client_verdict_json(
 
 /// 0 green / 1 red / 75 anything else (EX_TEMPFAIL: `unknown`,
 /// `Indeterminate`-class strings — infra trouble, never a code red).
+#[cfg(test)]
 fn exit_byte_for_verdict(verdict: &str) -> u8 {
     match verdict {
         "green" => 0,

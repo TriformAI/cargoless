@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# Prove that both public Cargoless remotes publish the exact integrated commit.
+# This stays separate from triple-guard-ff: a successful Forgejo fast-forward
+# does not prove that the GitHub mirror has caught up.
+#
+# Usage: scripts/mirror-verify [expected-sha] [branch]
+#   expected-sha defaults to the current HEAD; branch defaults to main.
+set -euo pipefail
+
+prog=${0##*/}
+die() { printf '%s: FAIL: %s\n' "$prog" "$*" >&2; exit 1; }
+ok()  { printf '%s: ok: %s\n' "$prog" "$*"; }
+
+EXPECTED=${1:-HEAD}
+BRANCH=${2:-main}
+
+EXPECTED=$(git rev-parse --verify "${EXPECTED}^{commit}") \
+  || die "expected-sha is not a commit: ${EXPECTED}"
+[[ "$EXPECTED" =~ ^[0-9a-f]{40}$ ]] \
+  || die "resolved expected-sha is not a lowercase 40-hex object: $EXPECTED"
+[[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
+  || die "branch contains unsupported characters: $BRANCH"
+
+resolve_remote_branch() {
+  local remote=$1 line sha
+  git remote get-url "$remote" >/dev/null 2>&1 \
+    || die "required remote is not configured: $remote"
+  line=$(git ls-remote --exit-code "$remote" "refs/heads/$BRANCH") \
+    || die "cannot resolve $remote/$BRANCH"
+  read -r sha _ <<<"$line"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] \
+    || die "$remote/$BRANCH did not resolve to one 40-hex commit"
+  printf '%s\n' "$sha"
+}
+
+FORGEJO_SHA=$(resolve_remote_branch origin)
+GITHUB_SHA=$(resolve_remote_branch github)
+
+[ "$FORGEJO_SHA" = "$EXPECTED" ] \
+  || die "origin/$BRANCH ($FORGEJO_SHA) != expected ($EXPECTED)"
+[ "$GITHUB_SHA" = "$EXPECTED" ] \
+  || die "github/$BRANCH ($GITHUB_SHA) != expected ($EXPECTED)"
+[ "$FORGEJO_SHA" = "$GITHUB_SHA" ] \
+  || die "mirrors diverge: origin=$FORGEJO_SHA github=$GITHUB_SHA"
+
+ok "origin/$BRANCH == github/$BRANCH == $EXPECTED"

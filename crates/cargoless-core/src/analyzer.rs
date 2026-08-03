@@ -18,8 +18,11 @@
 //! separate module so this — the AC#6 contract — has the smallest possible
 //! surface that can break.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
-use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::{self, BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +45,62 @@ const MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// growth rate the field report measured — fine for a runaway detector,
 /// which is all this is.
 const RSS_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+const RA_STDERR_FINGERPRINT_CAP: usize = 256;
+const RA_STDERR_TAIL_CAP: usize = 200;
+const RA_STDERR_LINE_CAP: usize = 16 * 1024;
+const RA_STACK_CAPTURE_CAP: usize = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const RA_STACK_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaStderrFingerprint {
+    pub fingerprint: String,
+    pub count: u64,
+    pub level: String,
+    pub sample: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RaStderrSnapshot {
+    pub process_generation: u64,
+    pub pid: Option<u32>,
+    pub total_lines: u64,
+    pub error_lines: u64,
+    pub suppressed_lines: u64,
+    pub overflow_fingerprints: u64,
+    pub fingerprints: Vec<RaStderrFingerprint>,
+    pub tail: Vec<String>,
+    pub stack_captures: Vec<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct RaStderrState {
+    process_generation: u64,
+    pid: Option<u32>,
+    total_lines: u64,
+    error_lines: u64,
+    suppressed_lines: u64,
+    overflow_fingerprints: u64,
+    fingerprints: BTreeMap<String, RaStderrFingerprint>,
+    tail: VecDeque<String>,
+    stack_captures: VecDeque<Vec<u8>>,
+}
+
+impl RaStderrState {
+    fn snapshot(&self) -> RaStderrSnapshot {
+        RaStderrSnapshot {
+            process_generation: self.process_generation,
+            pid: self.pid,
+            total_lines: self.total_lines,
+            error_lines: self.error_lines,
+            suppressed_lines: self.suppressed_lines,
+            overflow_fingerprints: self.overflow_fingerprints,
+            fingerprints: self.fingerprints.values().cloned().collect(),
+            tail: self.tail.iter().cloned().collect(),
+            stack_captures: self.stack_captures.iter().cloned().collect(),
+        }
+    }
+}
 
 /// CGLS-28 — RSS ceiling (MiB) for the supervised rust-analyzer.
 /// **`0` (the default) = disabled**, matching the repo's knob convention
@@ -78,6 +137,7 @@ fn should_reap(rss_kb: u64, cap_mb: u64) -> bool {
 /// Matches `VmRSS` exactly and not by prefix: the adjacent `VmHWM` is the
 /// high-water mark and is >= `VmRSS`, so a sloppy match would fire the cap
 /// early — on memory that has already been returned.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn parse_vm_rss_kb(status_contents: &str) -> Option<u64> {
     status_contents.lines().find_map(|line| {
         let (key, rest) = line.split_once(':')?;
@@ -142,6 +202,7 @@ struct Shared {
     /// byte-identically (the AC#6 crash-respawn path is unchanged); only
     /// a deliberate `TF_RA_IDLE_EVICT` eviction ever sets it.
     suspended: AtomicBool,
+    ra_stderr: Arc<Mutex<RaStderrState>>,
 }
 
 /// Owns a supervised child + its monitor thread. Drop = graceful shutdown.
@@ -180,9 +241,11 @@ impl Supervisor {
             }),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
+            ra_stderr: Arc::new(Mutex::new(RaStderrState::default())),
         });
 
         let mut first = (shared.spawn)()?;
+        supervise_child_stderr(&shared, &mut first);
         invoke_on_spawn(&shared, &mut first);
         {
             let mut st = lock(&shared.state);
@@ -222,6 +285,13 @@ impl Supervisor {
     /// How many times the child has been restarted after an unexpected exit.
     pub fn restart_count(&self) -> u64 {
         lock(&self.shared.state).restarts
+    }
+
+    /// Bounded aggregate of the supervised child's stderr. Repeated lines
+    /// are represented by a fingerprint and count, never by an unbounded
+    /// vector of duplicates.
+    pub fn stderr_snapshot(&self) -> RaStderrSnapshot {
+        lock(&self.shared.ra_stderr).snapshot()
     }
 
     /// Best-effort liveness of the current child. Reaps it if it has exited
@@ -331,6 +401,266 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // state; recovering the guard is the least-bad option (the alternative
     // is the daemon aborting, which violates AC#6's "never crashes").
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn ra_stack_storm_threshold() -> u64 {
+    std::env::var("CARGOLESS_RA_STACK_STORM_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1000)
+}
+
+fn supervise_child_stderr(shared: &Shared, child: &mut Child) {
+    let Some(stderr) = child.stderr.take() else {
+        return;
+    };
+    let pid = child.id();
+    let generation = {
+        let mut state = lock(&shared.ra_stderr);
+        state.process_generation = state.process_generation.saturating_add(1);
+        state.pid = Some(pid);
+        state.process_generation
+    };
+    let stats = Arc::clone(&shared.ra_stderr);
+    let threshold = ra_stack_storm_threshold();
+    let _ = thread::Builder::new()
+        .name(format!("cargoless-ra-stderr-{pid}"))
+        .spawn(move || {
+            let mut stack_requested = BTreeSet::new();
+            for line in BufReader::new(stderr).lines() {
+                let raw = match line {
+                    Ok(line) => line,
+                    Err(error) => {
+                        eprintln!(
+                            "[cargoless:ra-stderr] generation={generation} pid={pid} \
+                             read_error={error}"
+                        );
+                        break;
+                    }
+                };
+                let sample = truncate_utf8(&raw, RA_STDERR_LINE_CAP);
+                let level = stderr_level(&sample);
+                let fingerprint = crate::sha256_hex(sample.as_bytes())[..16].to_string();
+                let mut capture = false;
+                let (count, emitted_sample) = {
+                    let mut state = lock(&stats);
+                    state.total_lines = state.total_lines.saturating_add(1);
+                    if level == "error" {
+                        state.error_lines = state.error_lines.saturating_add(1);
+                    }
+                    state.tail.push_back(sample.clone());
+                    while state.tail.len() > RA_STDERR_TAIL_CAP {
+                        state.tail.pop_front();
+                    }
+                    let key = format!("{generation}:{fingerprint}");
+                    if !state.fingerprints.contains_key(&key)
+                        && state.fingerprints.len() >= RA_STDERR_FINGERPRINT_CAP
+                    {
+                        state.overflow_fingerprints = state.overflow_fingerprints.saturating_add(1);
+                        state.suppressed_lines = state.suppressed_lines.saturating_add(1);
+                        (0, false)
+                    } else {
+                        let entry =
+                            state
+                                .fingerprints
+                                .entry(key)
+                                .or_insert_with(|| RaStderrFingerprint {
+                                    fingerprint: fingerprint.clone(),
+                                    count: 0,
+                                    level: level.to_string(),
+                                    sample: sample.clone(),
+                                });
+                        entry.count = entry.count.saturating_add(1);
+                        let count = entry.count;
+                        if count > 1 {
+                            state.suppressed_lines = state.suppressed_lines.saturating_add(1);
+                        }
+                        if threshold > 0
+                            && count >= threshold
+                            && stack_requested.insert(fingerprint.clone())
+                        {
+                            capture = true;
+                        }
+                        (count, count == 1)
+                    }
+                };
+                if emitted_sample {
+                    eprintln!(
+                        "[cargoless:ra-stderr] generation={generation} pid={pid} \
+                         level={level} fingerprint={fingerprint} count=1 sample={sample}"
+                    );
+                } else if count > 1 && count.is_power_of_two() {
+                    eprintln!(
+                        "[cargoless:ra-stderr] generation={generation} pid={pid} \
+                         level={level} fingerprint={fingerprint} count={count} \
+                         duplicates_suppressed={}",
+                        count - 1
+                    );
+                }
+                if capture {
+                    let stack = capture_process_stack(pid, &fingerprint, count);
+                    eprintln!(
+                        "[cargoless:ra-stderr] generation={generation} pid={pid} \
+                         event=stack_capture fingerprint={fingerprint} count={count} bytes={}",
+                        stack.len()
+                    );
+                    let mut state = lock(&stats);
+                    state.stack_captures.push_back(stack);
+                    while state.stack_captures.len() > 4 {
+                        state.stack_captures.pop_front();
+                    }
+                }
+            }
+        });
+}
+
+fn stderr_level(line: &str) -> &'static str {
+    if line.contains(" ERROR ") || line.starts_with("ERROR") || line.contains("[ERROR") {
+        "error"
+    } else if line.contains(" WARN ") || line.starts_with("WARN") || line.contains("[WARN") {
+        "warn"
+    } else {
+        "other"
+    }
+}
+
+fn truncate_utf8(value: &str, cap: usize) -> String {
+    if value.len() <= cap {
+        return value.to_string();
+    }
+    let mut end = cap;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &value[..end])
+}
+
+fn capture_process_stack(pid: u32, fingerprint: &str, count: u64) -> Vec<u8> {
+    let mut evidence = format!(
+        "schema=cargoless.stack/v3\npid={pid}\nfingerprint={fingerprint}\n\
+         repeated_lines={count}\ncaptured_by_pid={}\n",
+        std::process::id()
+    )
+    .into_bytes();
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read(format!("/proc/{pid}/stack")) {
+            Ok(stack) => {
+                evidence.extend_from_slice(b"\n--- /proc/pid/stack ---\n");
+                evidence.extend_from_slice(&stack);
+            }
+            Err(error) => {
+                evidence.extend_from_slice(
+                    format!("\n/proc/{pid}/stack unavailable: {error}\n").as_bytes(),
+                );
+            }
+        }
+        let candidates: [(&str, &[&str]); 3] = [
+            ("/usr/bin/eu-stack", &["-p", "__PID__"]),
+            (
+                "/usr/bin/gdb",
+                &[
+                    "--batch",
+                    "--quiet",
+                    "-ex",
+                    "set pagination off",
+                    "-ex",
+                    "thread apply all bt full",
+                    "-p",
+                    "__PID__",
+                ],
+            ),
+            ("/usr/bin/pstack", &["__PID__"]),
+        ];
+        for (program, args) in candidates {
+            if !std::path::Path::new(program).is_file() {
+                continue;
+            }
+            let pid_text = pid.to_string();
+            let args: Vec<&str> = args
+                .iter()
+                .map(|argument| {
+                    if *argument == "__PID__" {
+                        pid_text.as_str()
+                    } else {
+                        argument
+                    }
+                })
+                .collect();
+            evidence.extend_from_slice(format!("\n--- {program} ---\n").as_bytes());
+            match command_output_with_timeout(program, &args, RA_STACK_CAPTURE_TIMEOUT) {
+                Ok(output) => evidence.extend_from_slice(&output),
+                Err(error) => {
+                    evidence.extend_from_slice(format!("capture failed: {error}\n").as_bytes());
+                }
+            }
+            // One successful user-space stack tool is enough. Keeping the
+            // attach window singular minimizes disruption to RA.
+            if evidence.len() > 1024 {
+                break;
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        evidence.extend_from_slice(b"\nuser-space stack attach is only enabled on Linux\n");
+    }
+    evidence.truncate(RA_STACK_CAPTURE_CAP);
+    evidence
+}
+
+#[cfg(target_os = "linux")]
+fn command_output_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(stdout) = stdout {
+            let _ = stdout
+                .take(RA_STACK_CAPTURE_CAP as u64)
+                .read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(stderr) = stderr {
+            let _ = stderr
+                .take(RA_STACK_CAPTURE_CAP as u64)
+                .read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let status = child.wait()?;
+            break status;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let mut bytes = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !stderr.is_empty() {
+        bytes.extend_from_slice(b"\n--- stderr ---\n");
+        bytes.extend_from_slice(&stderr);
+    }
+    bytes.extend_from_slice(format!("\nexit_status={status}\n").as_bytes());
+    bytes.truncate(RA_STACK_CAPTURE_CAP);
+    Ok(bytes)
 }
 
 /// CGLS-28 — SIGKILL the supervised child if it is over `cap_mb`.
@@ -473,6 +803,7 @@ fn monitor_loop(shared: Arc<Shared>) {
                 // Re-establish the LSP session on the new process BEFORE it
                 // is visible as the current child — this is what makes the
                 // restart transparent to subscribers (AC#6 in the live loop).
+                supervise_child_stderr(&shared, &mut child);
                 invoke_on_spawn(&shared, &mut child);
                 let mut st = lock(&shared.state);
                 st.last_pid = Some(child.id());
@@ -531,13 +862,14 @@ pub fn rust_analyzer_command() -> io::Result<Command> {
     // this was `Stdio::null()`, which made a crash-looping or dead RA
     // INVISIBLE in the daemon logs — a dead cluster RA could sit unrespawned
     // and the only symptom was verdict=unknown, with nothing explaining why.
-    // Default to INHERIT so RA's crash output lands in the pod log alongside
-    // the daemon's. Opt out with `CARGOLESS_RA_STDERR=null` for callers that
-    // want the old silent behavior (or set `CARGOLESS_RA_LOG_FILE` to route
-    // RA's own structured log to a file instead — the two are independent).
+    // Default to PIPE so the supervisor can fingerprint repetition, retain a
+    // bounded tail, and trigger stack evidence during a storm. `inherit` is
+    // an explicit escape hatch for interactive debugging; `null` remains the
+    // explicit silent mode.
     let ra_stderr = match std::env::var("CARGOLESS_RA_STDERR").as_deref() {
         Ok("null") | Ok("off") | Ok("0") => Stdio::null(),
-        _ => Stdio::inherit(),
+        Ok("inherit") => Stdio::inherit(),
+        _ => Stdio::piped(),
     };
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -924,6 +1256,43 @@ pub fn probe_abi_alignment(ra: &OsString) -> AbiAlignment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_stderr_aggregates_a_repetition_storm() {
+        let supervisor = Supervisor::start(|| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(
+                    "i=0; while [ \"$i\" -lt 64 ]; do \
+                     echo 'ERROR inference diagnostic in desugared expr' >&2; \
+                     i=$((i+1)); done; sleep 5",
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .expect("start supervised stderr fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = supervisor.stderr_snapshot();
+            if snapshot.total_lines >= 64 {
+                assert_eq!(snapshot.error_lines, 64);
+                assert_eq!(snapshot.suppressed_lines, 63);
+                assert_eq!(snapshot.fingerprints.len(), 1);
+                assert_eq!(snapshot.fingerprints[0].count, 64);
+                assert_eq!(snapshot.tail.len(), 64);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stderr drain did not observe the fixture storm"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        supervisor.shutdown();
+    }
 
     // ────────── CGLS-28 — RA memory cap (default-off) ──────────
 

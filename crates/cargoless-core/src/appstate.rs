@@ -140,6 +140,13 @@ pub struct InstanceState {
     /// cold rebuilds forever. Same `pub`/contract caveat as
     /// `indeterminate_streak`.
     pub enospc_streak: u8,
+    /// Consecutive failed *recovery* boots of an already-green bundle. A
+    /// respawn failure is environmental (the sha built green and served
+    /// once), so it is retried rather than latched — latching would make the
+    /// green permanently unrecoverable, because `request_build` never retries
+    /// a `last_red` sha. Capped so a genuinely unbootable bundle still
+    /// escalates. Same `pub`/contract caveat as `indeterminate_streak`.
+    pub respawn_streak: u8,
 }
 
 /// Input to [`AppState::step`] — everything the daemon can observe.
@@ -509,6 +516,9 @@ impl AppState {
         }
         inst.last_green = Some(sha);
         inst.needs_respawn = false;
+        // A child is serving again: whatever made the earlier recovery boots
+        // fail has cleared, so the next unrelated respawn gets a full budget.
+        inst.respawn_streak = 0;
         inst.pipeline = Pipeline::Idle;
         self.settle_idle(instance, actions);
         self.dispatch(actions);
@@ -535,12 +545,38 @@ impl AppState {
             instance: instance.to_string(),
             generation,
         });
-        let reason = if respawn {
-            format!("respawn of previously-green bundle failed health probe: {reason}")
+        if respawn {
+            // Infra-red: this sha ALREADY built green and promoted once — the
+            // bundle on disk is proven. A failed *recovery* boot says the
+            // environment is unwell (pod restart mid-warm, cold caches, a
+            // starved health budget), not that the sha is defective. Latching
+            // it would be self-sealing: `request_build` refuses to retry a
+            // `last_red` sha, so the green would become permanently
+            // unrecoverable and the lane would rebuild a candidate it had
+            // already proven. Mirror the ENOSPC discipline — do NOT latch,
+            // re-arm the respawn, and cap the streak so a bundle that is
+            // genuinely unbootable still escalates to a surfaced red.
+            const RESPAWN_RETRY_CAP: u8 = 2;
+            if inst.respawn_streak >= RESPAWN_RETRY_CAP {
+                inst.respawn_streak = 0;
+                self.record_red(
+                    instance,
+                    sha,
+                    format!("respawn of previously-green bundle failed health probe: {reason}"),
+                    actions,
+                );
+            } else {
+                inst.respawn_streak += 1;
+                inst.needs_respawn = true;
+            }
         } else {
-            format!("health probe failed: {reason}")
-        };
-        self.record_red(instance, sha, reason, actions);
+            self.record_red(
+                instance,
+                sha,
+                format!("health probe failed: {reason}"),
+                actions,
+            );
+        }
         self.settle_idle(instance, actions);
         self.dispatch(actions);
     }
@@ -1472,6 +1508,122 @@ mod tests {
             s.instance("dev").unwrap().serving.as_ref().unwrap().sha,
             "aaa"
         );
+    }
+
+    /// The production failure, 2026-08-03: preview slot `lane` came back from
+    /// a pod restart carrying `last_green == last_red_sha == d408705a` with
+    /// "respawn of previously-green bundle failed health probe". That sha was
+    /// a candidate the lane had already built green and served. Latching it
+    /// made the green unrecoverable: `request_build` never retries a
+    /// `last_red` sha, so the only way back was a fresh 45-minute build of a
+    /// tree that had already passed.
+    #[test]
+    fn a_failed_respawn_does_not_latch_the_proven_green_sha() {
+        let mut s = state(&["lane"]);
+        let g = drive_to_serving(&mut s, "lane", "d408705a");
+
+        // Pod restart: the serving child dies, recovery boot is owed.
+        let actions = s.step("lane", Event::ServingExited { generation: g });
+        let respawn_gen = match actions.first() {
+            Some(Action::Respawn { generation, .. }) => *generation,
+            other => panic!("expected Respawn, got {other:?}"),
+        };
+
+        // The recovery boot exhausts its health budget (cold caches, a
+        // starved node — the environment, not the sha).
+        let actions = s.step(
+            "lane",
+            Event::ProbeFailed {
+                generation: respawn_gen,
+                reason: "no 200 on /health within 600000ms".into(),
+            },
+        );
+
+        let inst = s.instance("lane").unwrap();
+        assert_eq!(
+            inst.last_red, None,
+            "a failed RESPAWN must not latch a sha that already built green \
+             and served — that is what made d408705a unrecoverable"
+        );
+        assert_eq!(
+            inst.last_green.as_deref(),
+            Some("d408705a"),
+            "the proven green stays authoritative"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Respawn { .. })),
+            "the recovery is re-armed rather than abandoned: {actions:?}"
+        );
+    }
+
+    /// The cap still surfaces a bundle that genuinely cannot boot, so a
+    /// corrupt-but-green-on-paper artifact does not retry forever.
+    #[test]
+    fn a_persistently_unbootable_bundle_still_escalates_to_a_real_red() {
+        let mut s = state(&["lane"]);
+        let g = drive_to_serving(&mut s, "lane", "d408705a");
+        let mut actions = s.step("lane", Event::ServingExited { generation: g });
+
+        let mut reds = 0;
+        for attempt in 0..6 {
+            let Some(Action::Respawn { generation, .. }) =
+                actions.iter().find(|a| matches!(a, Action::Respawn { .. }))
+            else {
+                break; // no further recovery attempted — escalation happened
+            };
+            let generation = *generation;
+            actions = s.step(
+                "lane",
+                Event::ProbeFailed {
+                    generation,
+                    reason: "no 200 on /health within 600000ms".into(),
+                },
+            );
+            if s.instance("lane").unwrap().last_red.is_some() {
+                reds = attempt + 1;
+                break;
+            }
+        }
+
+        let inst = s.instance("lane").unwrap();
+        assert!(
+            inst.last_red.is_some(),
+            "an unbootable bundle must eventually surface a real red"
+        );
+        assert!(
+            (2..=4).contains(&reds),
+            "escalation should take a couple of retries, not one and not \
+             forever (took {reds})"
+        );
+        assert!(
+            inst.last_red.as_ref().unwrap().1.contains("respawn"),
+            "the surfaced reason names the respawn path: {:?}",
+            inst.last_red
+        );
+    }
+
+    /// A pre-promote probe failure is a genuine verdict on that sha and must
+    /// keep latching — this guards the fix against over-reach.
+    #[test]
+    fn a_first_boot_probe_failure_still_latches() {
+        let mut s = state(&["dev"]);
+        let a = head(&mut s, "dev", "newsha");
+        let g = build_gen(&a);
+        let _ = green(&mut s, "dev", g);
+        let _ = s.step(
+            "dev",
+            Event::ProbeFailed {
+                generation: g,
+                reason: "no 200 on /health within 120000ms".into(),
+            },
+        );
+        let inst = s.instance("dev").unwrap();
+        assert_eq!(
+            inst.last_red.as_ref().map(|(sha, _)| sha.as_str()),
+            Some("newsha"),
+            "a sha that never served is genuinely red when it fails to boot"
+        );
+        assert_eq!(inst.last_green, None);
     }
 
     #[test]

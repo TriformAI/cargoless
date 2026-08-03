@@ -41,31 +41,21 @@
 //!   only ever sees `ClusterAction`) ⇒ pre-settle attribution stays
 //!   unrepresentable through the composition.
 //!
-//!   **CGLS-27/CGLS-11 — three DISPATCH sites, still one WRITE site.**
-//!   Three callers reach `publish_verdict`:
+//!   **CGLS-27 — multiple dispatch paths, still one WRITE site.**
+//!   Production callers reach `publish_verdict` through:
 //!
 //!   1. the `ClusterAction::EmitVerdict` match arm — the only site that
-//!      can express *any* verdict (Green / Red / Unknown), and the only
-//!      one that observes a settled barrier;
-//!   2. `publish_stranded_unknown`, called from the respawn handler for
-//!      a push the respawn stranded — structurally `Unknown`-ONLY;
-//!   3. the CGLS-11 forced-reopen cap arm inside the `SwitchOverlay`
-//!      exec, when the per-(wt, base_sha) nudge budget is exhausted —
-//!      also structurally `Unknown`-ONLY (constructs
-//!      `VerdictPayload::unknown("ra_reopen_cap_exceeded")` inline).
+//!      can publish a rust-analyzer result, after correlated diagnostic
+//!      pulls have settled its barrier;
+//!   2. the hard-witness supervisor — the only site that can publish a
+//!      direct exact-Git Cargo result, after the witness process completes;
+//!   3. `publish_stranded_unknown`, called from the respawn handler for
+//!      a push the respawn stranded — structurally `Unknown`-ONLY.
 //!
-//!   Sites 2 and 3 are **safe widenings, not weakenings**: neither takes
-//!   a verdict parameter — both build `VerdictPayload::unknown`
-//!   internally, so Green and Red are unrepresentable there *by
-//!   signature at the call site* (site 2 by function signature; site 3
-//!   by the inline literal). The property this doctrine protects — "no
-//!   verdict is attributed outside a settled barrier" — is preserved,
-//!   because an `Unknown` attributes no analysis result; it reports that
-//!   no analysis could be completed. The `verdict.publish` span's
-//!   `trigger_source` distinguishes the three dispatch sites
-//!   (`EmitVerdict` / `RaRespawnStranded` / `Cgls11ReopenCapExceeded`),
-//!   so the split stays visible in telemetry rather than folded into one
-//!   label.
+//!   The property this doctrine protects is therefore: every Green or Red
+//!   is backed by a completed analysis mechanism, while paths that did not
+//!   complete can express only Unknown. The `verdict.publish` span's
+//!   `trigger_source` keeps those paths visible in telemetry.
 //! * **(v) respawn-staleness closure:** the cluster's
 //!   `OverlayMultiplexer::reset()` is called at EXACTLY ONE site — the
 //!   `Spawned` control-message handler, which is the sole place a
@@ -125,6 +115,18 @@ const DEFAULT_PROJECT_CHECKS_WARN_MAX_PARALLEL: usize = 2;
 
 static PROJECT_CHECKS_WARN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Provenance for events entering the cluster driver's LSP channel.
+///
+/// rust-analyzer emits unsolicited workspace diagnostics and progress-end
+/// notifications while an explicit `textDocument/diagnostic` transaction is
+/// still running. Those native events are useful for readiness while idle, but
+/// they must not settle an overlay verdict ahead of the correlated pull that
+/// owns the final overlay content.
+enum LspIngressEvent {
+    Native(LspEvent),
+    DiagnosticPull { generation: u64, event: LspEvent },
+}
+
 /// One cluster's live state. Constructed at exactly one site (the
 /// `SpawnRa` arm); the `ClusterDriver`/`OverlayMultiplexer` are mutated
 /// only from the single serve loop (Judgment A as composed).
@@ -134,7 +136,7 @@ struct ClusterState {
     /// This cluster's hash and event sink, retained so background cargo
     /// checks can feed their completion back through the same driver.
     cluster: WorkspaceConfigHash,
-    lsp_tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    lsp_tx: Sender<(WorkspaceConfigHash, LspIngressEvent)>,
     /// The currently-live RA's client; `None` until the first
     /// `Spawned` message lands, swapped on every (re)spawn.
     lsp: Option<Arc<LspClient>>,
@@ -151,13 +153,15 @@ struct ClusterState {
     /// Worktrees with a routed batch that arrived before the current RA
     /// instance reached project-ready.
     deferred: VecDeque<WtId>,
-    /// CGLS-11 — per-(wt_key, base_sha) count of forced close+reopen
-    /// fires. Bounded by CARGOLESS_RA_REOPEN_CAP (default 3). Beyond
-    /// cap → publish unknown(ra_reopen_cap_exceeded) instead of nudging.
-    /// A new base_sha for the same wt_key resets the budget: entries
-    /// whose wt_key matches the current push but whose base_sha differs
-    /// are evicted on entry to the CGLS-11 guard.
-    forced_reopen_count: BTreeMap<(String, Option<String>), u32>,
+    /// Identity of the pull from the latest overlay mutation until its
+    /// correlated terminal event. While set, unsolicited native verdict
+    /// events and late events from retired pulls are excluded from the
+    /// driver's transaction barrier.
+    active_diagnostic_pull_generation: Option<u64>,
+    /// Monotonic cluster-local identity for diagnostic pulls. A pull from a
+    /// retired RA instance can finish after respawn; its generation must never
+    /// be mistaken for the next live transaction.
+    next_diagnostic_pull_generation: u64,
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -216,23 +220,7 @@ fn select_boot_warm_target(
         })
 }
 
-fn ra_native_settle_delay() -> Duration {
-    std::env::var("CARGOLESS_RA_SETTLE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(2_000))
-}
-
-/// CGLS-11 — cap on how many times the forced close+reopen nudge is
-/// allowed to fire for the SAME (wt_key, base_sha) pair. Beyond the cap
-/// the guard publishes `unknown(ra_reopen_cap_exceeded)` instead of
-/// nudging RA again, bounding the balloon-driver storm from repeated
-/// zero-verb re-pushes of the same content. A value of `0` disables the
-/// cap (unlimited nudges — the pre-cap behavior). Default is 3, which
-/// permits the first N nudges (so a genuinely stuck-once re-push still
-/// gets the nudge; only sustained storms hit the cap).
+#[cfg(test)]
 fn ra_reopen_cap() -> u32 {
     std::env::var("CARGOLESS_RA_REOPEN_CAP")
         .ok()
@@ -240,32 +228,14 @@ fn ra_reopen_cap() -> u32 {
         .unwrap_or(3)
 }
 
-/// CGLS-11 — result of consulting the forced-reopen cap for a
-/// (wt_key, base_sha) pair.
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 enum ReopenBudget {
-    /// The nudge fires; `count` is the post-increment fire count for
-    /// this (wt_key, base_sha).
     Nudge { count: u32, cap: u32 },
-    /// The cap fired; the caller must publish
-    /// `unknown(ra_reopen_cap_exceeded)` instead of nudging.
     CapExceeded { count: u32, cap: u32 },
 }
 
-/// CGLS-11 — consult and update the per-(wt, base_sha) forced-reopen
-/// budget. Evicts stale entries whose wt matches but whose base_sha
-/// differs (a new push on the same wt resets the budget), then returns
-/// [`ReopenBudget::CapExceeded`] if `cap > 0 && count >= cap`; otherwise
-/// increments the counter and returns [`ReopenBudget::Nudge`]. Pure so
-/// the cap semantics are unit-testable without a live daemon (5 tests).
-///
-/// Load-bearing: `cap > 0 && count >= cap` is structurally unreachable
-/// when `count == 0` (`0 >= cap` requires `cap == 0`, which the guard
-/// excludes). The first N nudges always fire; only sustained storms hit
-/// the cap. `cgls11_forced_reopen_cap_first_push_still_nudges` pins
-/// this — a regression here re-opens the "zero-verb re-push with NO
-/// nudge → unknown forever" failure the original CGLS-11 fix closed
-/// (commit `6fb3aa1`).
+#[cfg(test)]
 fn consult_reopen_budget(
     map: &mut BTreeMap<(String, Option<String>), u32>,
     wt_key: &str,
@@ -285,6 +255,19 @@ fn consult_reopen_budget(
             cap,
         }
     }
+}
+
+#[cfg(test)]
+fn should_force_freshness_reopen(
+    is_from_pushed_overlay: bool,
+    zero_verbs: bool,
+    target_is_empty: bool,
+) -> bool {
+    is_from_pushed_overlay && zero_verbs && !target_is_empty
+}
+
+fn diagnostic_refresh_fence(generation: u64, zero_verbs: bool) -> Option<u64> {
+    (!zero_verbs).then_some(generation)
 }
 
 /// Control messages from the per-cluster Supervisor `on_spawn` hook to
@@ -400,7 +383,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     };
 
     // ---- per-cluster RA event + control channels ---------------------
-    let (lsp_tx, lsp_rx) = channel::<(WorkspaceConfigHash, LspEvent)>();
+    let (lsp_tx, lsp_rx) = channel::<(WorkspaceConfigHash, LspIngressEvent)>();
     let (ctrl_tx, ctrl_rx) = channel::<Ctrl>();
 
     let mut clusters: BTreeMap<WorkspaceConfigHash, ClusterState> = BTreeMap::new();
@@ -655,6 +638,8 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // that race by construction.
     let (push_tx, push_rx) = channel::<String>();
     api.attach_push_signal(push_tx);
+    let (direct_gate_tx, direct_gate_rx) = channel::<crate::serveapi::DirectGateRequest>();
+    api.attach_direct_gate_signal(direct_gate_tx);
 
     // C1 observability — record the resolved RA config for `GET /daemon`.
     // Resolved from the SAME env + repo root the per-cluster RA spawn uses
@@ -802,18 +787,25 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             // watch/push path treats this cluster as already-spawned, then
             // spawn its RA and drain the spawn control messages).
             if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&root), h.clone()) {
-                spawn_cluster(
+                if let Err(error) = spawn_cluster(
                     &mut clusters,
                     &h,
                     root.clone(),
                     lsp_tx.clone(),
                     ctrl_tx.clone(),
-                );
-                drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
-                eprintln!(
-                    "[cargoless:obs] eager-boot-warm — spawned base cluster RA at {} (push-only; /readyz no longer traffic-dependent)",
-                    root.display()
-                );
+                ) {
+                    let _ = lifecycle.deactivate(path_key(&root));
+                    eprintln!(
+                        "[cargoless:obs] ra-spawn-failed phase=eager-boot root={} error={error}",
+                        root.display()
+                    );
+                } else {
+                    drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
+                    eprintln!(
+                        "[cargoless:obs] eager-boot-warm — spawned base cluster RA at {} (push-only; /readyz no longer traffic-dependent)",
+                        root.display()
+                    );
+                }
             }
         }
     }
@@ -877,6 +869,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // state.
         drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
 
+        // Gated project checks are authoritative Cargo jobs over isolated
+        // scratch worktrees. Dispatch them directly from ingest; they do not
+        // enter the shared rust-analyzer transaction queue.
+        while let Ok(request) = direct_gate_rx.try_recv() {
+            dispatch_direct_gate(request, Arc::clone(&api));
+        }
+
         // #240/2b — overlay-push ingest drain. The PushOverlay write-plane
         // wakeup signal: every `api.push_overlay(...)` call sends the
         // worktree key here. We synthesize a `DriverEvent::RoutedBatch`
@@ -910,13 +909,22 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             // Ensure the cluster's RA exists (proven 0→1 SpawnRa) — same
             // as the FS path's gate.
             if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
-                spawn_cluster(
+                if let Err(error) = spawn_cluster(
                     &mut clusters,
                     &h,
                     cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
                     lsp_tx.clone(),
                     ctrl_tx.clone(),
-                );
+                ) {
+                    let wt_key = path_key(&wt);
+                    let _ = lifecycle.deactivate(wt_key.clone());
+                    eprintln!(
+                        "[cargoless:obs] ra-spawn-failed phase=pushed-overlay wt={} error={error}",
+                        wt.display()
+                    );
+                    api.fail_next_pushed_overlay(&wt_key, &format!("ra_spawn_failed: {error}"));
+                    continue;
+                }
                 // `spawn_cluster` runs the initial LSP handshake inside
                 // the Supervisor hook and queues `Ctrl::Spawned` before
                 // returning. Drain it now so the first pushed batch does
@@ -932,9 +940,21 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         }
 
         // Drain forwarded RA events → the owning cluster's ClusterDriver.
-        while let Ok((h, ev)) = lsp_rx.try_recv() {
+        while let Ok((h, ingress)) = lsp_rx.try_recv() {
             if clusters.contains_key(&h) {
-                let ev = early_red_event(ev);
+                let ev = {
+                    let Some(cluster) = clusters.get_mut(&h) else {
+                        continue;
+                    };
+                    correlate_lsp_event(&mut cluster.active_diagnostic_pull_generation, ingress)
+                };
+                let Some(ev) = ev else {
+                    eprintln!(
+                        "[cargoless:obs] lsp-event-suppressed cluster={} reason=diagnostic-pull-correlation",
+                        h.as_str()
+                    );
+                    continue;
+                };
                 let indexing_ended = matches!(ev, LspEvent::IndexingEnded);
                 step(
                     &mut clusters,
@@ -1018,13 +1038,20 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 pending_batch.insert(wt.clone(), batch);
                 // Ensure the cluster's RA exists (proven 0→1 SpawnRa).
                 if let LifecycleAction::SpawnRa(_) = lifecycle.activate(path_key(&wt), h.clone()) {
-                    spawn_cluster(
+                    if let Err(error) = spawn_cluster(
                         &mut clusters,
                         &h,
                         cluster_root.get(&h).cloned().unwrap_or_else(|| wt.clone()),
                         lsp_tx.clone(),
                         ctrl_tx.clone(),
-                    );
+                    ) {
+                        let _ = lifecycle.deactivate(path_key(&wt));
+                        eprintln!(
+                            "[cargoless:obs] ra-spawn-failed phase=fs-watch wt={} error={error}",
+                            wt.display()
+                        );
+                        continue;
+                    }
                     drain_spawned(&mut clusters, &ctrl_rx, &wt_hash, &api);
                 }
                 route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
@@ -1193,11 +1220,11 @@ fn spawn_cluster(
     clusters: &mut BTreeMap<WorkspaceConfigHash, ClusterState>,
     h: &WorkspaceConfigHash,
     root: PathBuf,
-    lsp_tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    lsp_tx: Sender<(WorkspaceConfigHash, LspIngressEvent)>,
     ctrl_tx: Sender<Ctrl>,
-) {
+) -> Result<(), String> {
     if clusters.contains_key(h) {
-        return; // ClusterLifecycle proves SpawnRa is 0→1 only; defensive.
+        return Ok(()); // ClusterLifecycle proves SpawnRa is 0→1 only; defensive.
     }
     let spawn_root = root.clone();
     let spawn = move || -> std::io::Result<Child> {
@@ -1247,16 +1274,21 @@ fn spawn_cluster(
                 // lifecycle: a dropped/dead channel just stops the
                 // forwarder; the next on_spawn starts a fresh one).
                 while let Ok(ev) = events.recv() {
-                    if fwd_tx.send((fwd_h.clone(), ev)).is_err() {
+                    if fwd_tx
+                        .send((fwd_h.clone(), LspIngressEvent::Native(ev)))
+                        .is_err()
+                    {
                         break;
                     }
                 }
             });
     };
-    let Ok(supervisor) = Supervisor::start_with_hook(spawn, on_spawn) else {
-        crate::ui::warn("rust-analyzer spawn failed for a cluster — skipping");
-        return;
-    };
+    let supervisor = Supervisor::start_with_hook(spawn, on_spawn).map_err(|error| {
+        format!(
+            "could not spawn rust-analyzer in `{}`: {error}",
+            root.display()
+        )
+    })?;
     clusters.insert(
         h.clone(),
         ClusterState {
@@ -1273,9 +1305,11 @@ fn spawn_cluster(
             next_ver: 2,
             ready: false,
             deferred: VecDeque::new(),
-            forced_reopen_count: BTreeMap::new(),
+            active_diagnostic_pull_generation: None,
+            next_diagnostic_pull_generation: 1,
         },
     );
+    Ok(())
 }
 
 /// CGLS-27 — the worktree keys belonging to cluster `h`, in the
@@ -1327,9 +1361,14 @@ fn drain_spawned(
             for (wt_key, attribution) in
                 api.drain_push_attributions_for(&worktree_keys_for_cluster(wt_hash, &h))
             {
+                api.record_ra_evidence_v3(
+                    attribution.semantic.as_ref(),
+                    cs._supervisor.stderr_snapshot(),
+                );
                 publish_stranded_unknown(Path::new(&wt_key), attribution, api);
             }
             cs.mux.reset();
+            cs.active_diagnostic_pull_generation = None;
             cs.lsp = Some(client);
             // In pushed RA-native service mode, a request already carries the
             // concrete overlay to check and `spawn_ra_native_settle` provides
@@ -1397,6 +1436,44 @@ fn mark_ready_and_take_deferred(
     };
     cs.ready = true;
     cs.deferred.drain(..).collect()
+}
+
+/// Admit only events that belong to the active analysis boundary.
+///
+/// Before an overlay starts, native RA notifications keep their historical
+/// behavior. Once the exact diagnostic pull is armed, native diagnostics and
+/// terminal notifications are unsolicited observations of the shared base
+/// workspace and cannot prove the pushed overlay. Readiness remains admitted.
+/// The pull's own terminal event both reaches the driver and releases the
+/// fence for the next serialized transaction.
+fn correlate_lsp_event(
+    active_diagnostic_pull_generation: &mut Option<u64>,
+    ingress: LspIngressEvent,
+) -> Option<LspEvent> {
+    match ingress {
+        LspIngressEvent::DiagnosticPull { generation, event }
+            if *active_diagnostic_pull_generation == Some(generation) =>
+        {
+            if matches!(
+                event,
+                LspEvent::FlycheckEnded | LspEvent::FlycheckFailed { .. }
+            ) {
+                *active_diagnostic_pull_generation = None;
+            }
+            Some(event)
+        }
+        LspIngressEvent::DiagnosticPull { .. } => None,
+        LspIngressEvent::Native(LspEvent::IndexingEnded) => Some(LspEvent::IndexingEnded),
+        LspIngressEvent::Native(event) if active_diagnostic_pull_generation.is_some() => {
+            let _ = event;
+            None
+        }
+        // Preserve the historical fail-fast behavior for native diagnostics
+        // while idle. Correlated pull diagnostics deliberately bypass this
+        // conversion: the pull's terminal event is the only safe boundary
+        // for advancing the serialized overlay queue.
+        LspIngressEvent::Native(event) => Some(early_red_event(event)),
+    }
 }
 
 fn early_red_event(ev: LspEvent) -> LspEvent {
@@ -1499,10 +1576,13 @@ fn exec(
                 worktree = %wt.display(),
                 file_count = tracing::field::Empty,
                 overlay_size_bytes = tracing::field::Empty,
+                request_id = tracing::field::Empty,
+                attempt_id = tracing::field::Empty,
+                trace_id = tracing::field::Empty,
             )
             .entered();
             // #247 obs: log the wire-side check-start (the SwitchOverlay
-            // arm dispatching mux.switch_to + did_save = the flycheck
+            // arm dispatching mux.switch_to + diagnostic pulls = the analysis
             // trigger). Pairs with `flycheck-end` (step's EmitVerdict
             // detection) and `verdict-emit` (publish_verdict) to give a
             // grep-able sequence per WT per generation. Dep-free.
@@ -1531,54 +1611,60 @@ fn exec(
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
-            // CGLS-11: track whether this SwitchOverlay cycle is sourced
-            // from a pushed overlay (true) or the FS-watch path (false).
-            // Used below to gate the forced-reopen guard.
-            let mut is_from_pushed_overlay = false;
-            // CGLS-11 forced-reopen cap: capture the pushed base_sha so
-            // the guard can key its per-push budget by (wt_key, base_sha)
-            // — a new base_sha for the same wt resets the budget.
-            let mut pushed_base_sha: Option<String> = None;
-            let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
-                // #A2/#A7 — stamp attribution (base_sha + receipt/consume
-                // clocks) the instant the push is consumed, BEFORE the
-                // partial moves below; `publish_verdict` pops it at the
-                // sole attribution site.
-                api.record_push_attribution(&wt_key, &pushed);
-                pushed_check_profile = pushed.check_profile;
-                pushed_base_sha = pushed.base_sha.clone();
-                let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
-                let materialize_overlay = pushed.analysis_root.is_some();
-                api.record_project_check_context(
-                    &wt_key,
-                    crate::serveapi::ProjectCheckRunContext {
-                        root: project_root,
-                        changed_files: pushed.changed_files.clone(),
-                        base_ref: pushed.base_ref.clone(),
-                        overlay_files: pushed.files.clone(),
-                        materialize_overlay,
-                        gate: pushed.gate,
-                        check_ids: pushed.check_ids.clone(),
-                    },
-                );
-                is_from_pushed_overlay = true;
-                pushed.files
-            } else {
-                // #A2 — this verdict cycle is FS-derived. A leftover
-                // attribution from an earlier consumed-but-never-published
-                // push (RA wedge, restart) must not stamp its base_sha
-                // onto a verdict computed from the on-disk tree.
-                let _ = api.take_push_attribution(&wt_key);
-                let mut pairs = Vec::new();
-                if let Some(files) = pending_batch.get(&wt) {
-                    for f in files {
-                        if let Ok(text) = std::fs::read_to_string(f) {
-                            pairs.push((f.to_string_lossy().into_owned(), text));
+            let (pairs, lsp_root): (Vec<(String, String)>, PathBuf) =
+                if let Some(pushed) = api.take_overlay_for(&wt_key) {
+                    if let Some(context) = pushed.semantic.as_ref() {
+                        _span.record("request_id", context.request_id.as_str());
+                        _span.record("attempt_id", context.attempt_id.as_str());
+                        _span.record("trace_id", context.trace_id.as_str());
+                        tracing::info!(
+                            request_id = %context.request_id,
+                            attempt_id = %context.attempt_id,
+                            trace_id = %context.trace_id,
+                            worktree = %wt.display(),
+                            "attempt entered rust-analyzer overlay transaction"
+                        );
+                    }
+                    // #A2/#A7 — stamp attribution (base_sha + receipt/consume
+                    // clocks) the instant the push is consumed, BEFORE the
+                    // partial moves below; `publish_verdict` pops it at the
+                    // sole attribution site.
+                    api.record_push_attribution(&wt_key, &pushed);
+                    pushed_check_profile = pushed.check_profile;
+                    let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
+                    let materialize_overlay = pushed.analysis_root.is_some();
+                    api.record_project_check_context(
+                        &wt_key,
+                        crate::serveapi::ProjectCheckRunContext {
+                            root: project_root.clone(),
+                            changed_files: pushed.changed_files.clone(),
+                            base_ref: pushed.base_ref.clone(),
+                            base_sha: pushed.base_sha.clone(),
+                            source_ref: pushed.source_ref.clone(),
+                            source_sha: pushed.source_sha.clone(),
+                            overlay_files: pushed.files.clone(),
+                            materialize_overlay,
+                            gate: pushed.gate,
+                            check_ids: pushed.check_ids.clone(),
+                        },
+                    );
+                    (pushed.files, project_root)
+                } else {
+                    // #A2 — this verdict cycle is FS-derived. A leftover
+                    // attribution from an earlier consumed-but-never-published
+                    // push (RA wedge, restart) must not stamp its base_sha
+                    // onto a verdict computed from the on-disk tree.
+                    let _ = api.take_push_attribution(&wt_key);
+                    let mut pairs = Vec::new();
+                    if let Some(files) = pending_batch.get(&wt) {
+                        for f in files {
+                            if let Ok(text) = std::fs::read_to_string(f) {
+                                pairs.push((f.to_string_lossy().into_owned(), text));
+                            }
                         }
                     }
-                }
-                pairs
-            };
+                    (pairs, wt.clone())
+                };
             let file_count = pairs.len() as u64;
             let overlay_size_bytes: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
             _span.record("file_count", file_count);
@@ -1590,7 +1676,11 @@ fn exec(
                 // carries valid attrs at drop.
                 return;
             };
-            let lsp_pairs = lsp_source_pairs(&pairs);
+            // Capture the last RA quiescence boundary before sending any
+            // document mutation. The diagnostic pull must observe a strictly
+            // newer boundary before its result can settle this transaction.
+            let diagnostic_refresh_generation = lsp.diagnostic_refresh_generation();
+            let lsp_pairs = lsp_source_pairs(&pairs, &lsp_root);
             let target =
                 OverlaySet::from_pairs(lsp_pairs.iter().map(|(p, c)| (p.clone(), c.clone())));
             // Collect the diff verbs once so we can inspect the count and
@@ -1604,102 +1694,22 @@ fn exec(
                         let _ = lsp.did_open(&path.to_string_lossy(), &content, 1);
                     }
                     LspVerb::DidChange { path, content } => {
-                        // CGLS verdict-flow fix: a bare `textDocument/didChange`
-                        // does NOT make rust-analyzer re-publish diagnostics for
-                        // an already-open document here (empirically: with
-                        // checkOnSave off / RA-native-only, the first push of a
-                        // file `didOpen`s → RA analyzes → green, but every
-                        // SUBSEQUENT push of the SAME file `didChange`s → RA stays
-                        // silent → the 2s liveness timer settles an empty window →
-                        // verdict=unknown, FOREVER, because agents iterating a
-                        // branch re-push the same changed files. Confirmed live: a
-                        // close+reopen of the path restores analysis (green); a
-                        // didChange does not, even 25s later. So re-open the
-                        // document (close → open) instead of changing it, which
-                        // forces RA to re-run native analysis on the new content.
-                        // The OverlayMultiplexer's proven `applied`/open-set core
-                        // is untouched; we keep `self.open` truthful by closing
-                        // before re-opening at the wire seam.
                         let v = cs.next_ver;
                         cs.next_ver += 1;
                         let p = path.to_string_lossy();
-                        let _ = lsp.did_close(&p);
-                        let _ = lsp.did_open(&p, &content, v);
+                        // Keep the mutation as one ordered LSP notification.
+                        // A close+open pair can emit a refresh for the close
+                        // before RA has analyzed the reopened content, which
+                        // made a stale empty pull look authoritative.
+                        let _ = lsp.did_change(&p, &content, v);
                     }
                     LspVerb::DidClose { path } => {
                         let _ = lsp.did_close(&path.to_string_lossy());
                     }
                 }
             }
-            // CGLS-11 fix — forced close+reopen for identical-content
-            // re-pushes on the pool ingress path.
-            //
-            // When `overlay::diff` yields zero verbs (the minimality
-            // property: identical content in `applied` and `target` ⇒ no
-            // ops), RA receives no LSP notification → no `publishDiagnostics`
-            // → `real_flycheck_activity_seen` stays false → the 2s settle
-            // timer fires on an empty window → the CGLS-9 fail-closed guard
-            // publishes `verdict=unknown(ra_native_timer_settled_no_flycheck_
-            // activity)`. Observed live: agents iterating a branch re-push the
-            // same changed-file content on every attempt; the first push gets a
-            // real verdict, every subsequent push is unknown forever.
-            //
-            // Fix: when all three conditions hold —
-            //   1. `is_from_pushed_overlay` — this is a pool-push cycle, not
-            //      the FS-watch path (the FS path must be byte-identical to the
-            //      pre-fix behavior; non-regression test pins this).
-            //   2. `zero_verbs` — `overlay::diff` found no delta; RA is
-            //      otherwise not notified. When verbs were emitted, RA is
-            //      already triggered by the loop above; no extra nudge needed.
-            //   3. `target` is non-empty — there IS an overlay to analyze (an
-            //      intentional empty push clears all overlays; nothing to nudge).
-            // — force a close+reopen of the lexicographically first .rs file in
-            // the overlay. This is the SAME close+reopen mechanic already used
-            // for `DidChange` above (confirmed live: a close+reopen forces RA to
-            // re-run native analysis; a bare `didChange` does not). The
-            // `OverlayMultiplexer` state stays correct: `applied` already equals
-            // `target` after `switch_to`, so the multiplexer's open-set reflects
-            // reality — the forced close+reopen simply ensures RA re-analyzes
-            // content it otherwise believed was unchanged.
-            //
-            // Determinism: `first_rs_in_overlay` picks the lex-first key from
-            // the `OverlaySet`'s internal `BTreeMap`, which is sorted and stable.
-            if is_from_pushed_overlay && zero_verbs && !target.is_empty() {
-                // CGLS-11 forced-reopen cap — bound the per-(wt, base_sha)
-                // nudge count so an unbounded storm of zero-verb re-pushes
-                // stops pinning RA into repeated inference-diagnostic
-                // recomputations (the balloon-driver observed on pod-A).
-                // A new base_sha for the same wt resets the budget
-                // (handled inside `consult_reopen_budget`).
-                match consult_reopen_budget(
-                    &mut cs.forced_reopen_count,
-                    &wt_key,
-                    &pushed_base_sha,
-                    ra_reopen_cap(),
-                ) {
-                    ReopenBudget::CapExceeded { count, cap } => {
-                        let attribution = api.take_push_attribution(&wt_key);
-                        publish_reopen_cap_exceeded(&wt, count, cap, attribution, api);
-                        return;
-                    }
-                    ReopenBudget::Nudge { count, cap } => {
-                        if let Some((path, content)) = first_rs_in_overlay(&target) {
-                            eprintln!(
-                                "[cargoless:obs] cgls11-forced-reopen wt={} path={} count={} cap={} (zero-verb re-push nudge)",
-                                wt.display(),
-                                path.display(),
-                                count,
-                                cap,
-                            );
-                            let v = cs.next_ver;
-                            cs.next_ver += 1;
-                            let p = path.to_string_lossy();
-                            let _ = lsp.did_close(&p);
-                            let _ = lsp.did_open(&p, &content, v);
-                        }
-                    }
-                }
-            }
+            let diagnostic_refresh_fence =
+                diagnostic_refresh_fence(diagnostic_refresh_generation, zero_verbs);
             // Cargoless replaces iterative cargo check/clippy; pushed Cargo
             // selectors are compatibility metadata, not an execution request.
             // They must not create a minute-scale direct Cargo lane inside
@@ -1710,16 +1720,29 @@ fn exec(
                     wt.display()
                 );
             }
-            // The replacement verdict path has no didSave/runFlycheck and no
-            // direct Cargo subprocess. A delayed synthetic settle lets RA
-            // publish diagnostics for the just-applied overlay before the
-            // existing barrier publishes the worktree bit.
-            spawn_ra_native_settle(&wt, cs.cluster.clone(), cs.lsp_tx.clone());
+            let diagnostic_paths: Vec<PathBuf> =
+                target.iter_rs().map(|(path, _)| path.to_owned()).collect();
+            let diagnostic_pull_generation = cs.next_diagnostic_pull_generation;
+            cs.next_diagnostic_pull_generation = cs
+                .next_diagnostic_pull_generation
+                .checked_add(1)
+                .expect("diagnostic pull generation overflow");
+            cs.active_diagnostic_pull_generation = Some(diagnostic_pull_generation);
+            spawn_ra_diagnostic_pull(
+                &wt,
+                cs.cluster.clone(),
+                cs.lsp_tx.clone(),
+                lsp,
+                diagnostic_paths,
+                diagnostic_refresh_fence,
+                diagnostic_pull_generation,
+            );
         }
         ClusterAction::EmitVerdict {
             wt,
             authoritative_error,
             real_flycheck_activity_seen,
+            analysis_failure_reason,
         } => {
             // THE sole verdict-attribution site (Judgment B as composed).
             //
@@ -1766,6 +1789,12 @@ fn exec(
             // base_sha onto the first push's verdict — silent
             // cross-attribution, the exact failure #A2 exists to prevent.
             let attribution = api.take_push_attribution(&wt.to_string_lossy());
+            api.record_ra_evidence_v3(
+                attribution
+                    .as_ref()
+                    .and_then(|value| value.semantic.as_ref()),
+                cs._supervisor.stderr_snapshot(),
+            );
             // #A4.3 gate promotion: an explicit `--gate` push gets the
             // witness-gated (Hard) verdict even while the daemon-wide
             // default stays Warn — the deployed posture keeps ~2s
@@ -1800,6 +1829,7 @@ fn exec(
                         authoritative_error,
                         timer_settled_no_flycheck,
                         macro_blind_hit,
+                        analysis_failure_reason.as_deref(),
                     )
                 }
                 ProjectChecksMode::Warn => {
@@ -1815,6 +1845,7 @@ fn exec(
                         authoritative_error,
                         timer_settled_no_flycheck,
                         macro_blind_hit,
+                        analysis_failure_reason.as_deref(),
                     )
                 }
                 ProjectChecksMode::Hard => {
@@ -1865,16 +1896,51 @@ fn save_trigger_path(
         .unwrap_or_else(|| wt.join("Cargo.toml"))
 }
 
-fn lsp_source_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+fn lsp_source_pairs(pairs: &[(String, String)], analysis_root: &Path) -> Vec<(String, String)> {
     pairs
         .iter()
         .filter(|(path, _)| is_rust_source_path(path))
-        .cloned()
+        .map(|(path, content)| {
+            let path = Path::new(path);
+            let absolute_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                analysis_root.join(path)
+            };
+            (
+                absolute_path.to_string_lossy().into_owned(),
+                content.clone(),
+            )
+        })
         .collect()
 }
 
 fn is_rust_source_path(path: &str) -> bool {
     Path::new(path).extension().is_some_and(|ext| ext == "rs")
+}
+
+const DEFAULT_RA_DIAGNOSTIC_PULL_TIMEOUT_MS: u64 = 120_000;
+
+/// One fail-closed deadline for the complete diagnostic-pull transaction.
+///
+/// The pull walks every changed Rust document serially, so the former 30s
+/// constant routinely expired on healthy multi-document transactions. Keep a
+/// bounded default while allowing operators to tune unusually large fleets
+/// without rebuilding the daemon. Invalid and zero values fall back to the
+/// safe default rather than disabling the deadline.
+fn ra_diagnostic_pull_timeout() -> Duration {
+    let env_ms = std::env::var("CARGOLESS_RA_DIAGNOSTIC_PULL_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    ra_diagnostic_pull_timeout_from(env_ms)
+}
+
+fn ra_diagnostic_pull_timeout_from(env_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        env_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .unwrap_or(DEFAULT_RA_DIAGNOSTIC_PULL_TIMEOUT_MS),
+    )
 }
 
 /// CGLS-11 — pick the lexicographically first `.rs` file from an
@@ -1883,6 +1949,7 @@ fn is_rust_source_path(path: &str) -> bool {
 /// deterministic and reproducible across runs. Returns `None` when the
 /// overlay contains no `.rs` entries (all Cargo.toml / Cargo.lock / etc.)
 /// — in that case the guard is a no-op (nothing to nudge RA with).
+#[cfg(test)]
 fn first_rs_in_overlay(target: &OverlaySet) -> Option<(PathBuf, String)> {
     target
         .iter_rs()
@@ -1900,28 +1967,129 @@ fn overlay_path_for_wt(wt: &WtId, path: &str) -> PathBuf {
     }
 }
 
-fn spawn_ra_native_settle(
+fn spawn_ra_diagnostic_pull(
     wt: &WtId,
     h: WorkspaceConfigHash,
-    tx: Sender<(WorkspaceConfigHash, LspEvent)>,
+    tx: Sender<(WorkspaceConfigHash, LspIngressEvent)>,
+    lsp: Arc<LspClient>,
+    paths: Vec<PathBuf>,
+    refresh_generation: Option<u64>,
+    generation: u64,
 ) {
     let wt = wt.clone();
-    let delay = ra_native_settle_delay();
-    let _ = std::thread::Builder::new()
-        .name("tf-ra-settle".into())
+    let failure_h = h.clone();
+    let failure_tx = tx.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("tf-ra-diagnostic-pull".into())
         .spawn(move || {
+            const CANCEL_RETRIES: usize = 3;
+            let pull_timeout = ra_diagnostic_pull_timeout();
             eprintln!(
-                "[cargoless:obs] ra-native-settle-started wt={} delay_ms={} (#tfmv)",
+                "[cargoless:obs] ra-diagnostic-pull-started wt={} documents={} timeout_ms={}",
                 wt.display(),
-                delay.as_millis()
+                paths.len(),
+                pull_timeout.as_millis(),
             );
-            std::thread::sleep(delay);
+            if paths.is_empty() {
+                let _ = tx.send((
+                    h,
+                    LspIngressEvent::DiagnosticPull {
+                        generation,
+                        event: LspEvent::FlycheckFailed {
+                            message: "ra_diagnostic_pull:no Rust documents in transaction"
+                                .to_string(),
+                        },
+                    },
+                ));
+                return;
+            }
+            let deadline = Instant::now() + pull_timeout;
+            if let Some(refresh_generation) = refresh_generation {
+                let refresh_remaining = deadline.saturating_duration_since(Instant::now());
+                if let Err(error) =
+                    lsp.wait_for_diagnostic_refresh(refresh_generation, refresh_remaining)
+                {
+                    let _ = tx.send((
+                        h,
+                        LspIngressEvent::DiagnosticPull {
+                            generation,
+                            event: LspEvent::FlycheckFailed {
+                                message: format!("ra_diagnostic_pull:{error}"),
+                            },
+                        },
+                    ));
+                    return;
+                }
+            }
+            for path in paths {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let _ = tx.send((
+                        h,
+                        LspIngressEvent::DiagnosticPull {
+                            generation,
+                            event: LspEvent::FlycheckFailed {
+                                message: "ra_diagnostic_pull:transaction deadline exceeded"
+                                    .to_string(),
+                            },
+                        },
+                    ));
+                    return;
+                }
+                match lsp.pull_diagnostics(&path.to_string_lossy(), remaining, CANCEL_RETRIES) {
+                    Ok(reports) => {
+                        for report in reports {
+                            if tx
+                                .send((
+                                    h.clone(),
+                                    LspIngressEvent::DiagnosticPull {
+                                        generation,
+                                        event: LspEvent::Diagnostics(report),
+                                    },
+                                ))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send((
+                            h,
+                            LspIngressEvent::DiagnosticPull {
+                                generation,
+                                event: LspEvent::FlycheckFailed {
+                                    message: format!("ra_diagnostic_pull:{error}"),
+                                },
+                            },
+                        ));
+                        return;
+                    }
+                }
+            }
             eprintln!(
-                "[cargoless:obs] ra-native-settle-ended wt={} status=settled (#tfmv)",
+                "[cargoless:obs] ra-diagnostic-pull-ended wt={} status=settled",
                 wt.display()
             );
-            let _ = tx.send((h, LspEvent::FlycheckEnded));
-        });
+            let _ = tx.send((
+                h,
+                LspIngressEvent::DiagnosticPull {
+                    generation,
+                    event: LspEvent::FlycheckEnded,
+                },
+            ));
+        })
+    {
+        let _ = failure_tx.send((
+            failure_h,
+            LspIngressEvent::DiagnosticPull {
+                generation,
+                event: LspEvent::FlycheckFailed {
+                    message: format!("ra_diagnostic_pull:thread spawn failed: {error}"),
+                },
+            },
+        ));
+    }
 }
 
 /// Write `wt`'s per-worktree verdict — the only place a verdict is
@@ -2024,6 +2192,21 @@ fn publish_verdict(
             .as_ref()
             .and_then(|a| a.base_sha.as_deref())
             .unwrap_or(""),
+        request_id = attribution
+            .as_ref()
+            .and_then(|a| a.semantic.as_ref())
+            .map(|context| context.request_id.as_str())
+            .unwrap_or(""),
+        attempt_id = attribution
+            .as_ref()
+            .and_then(|a| a.semantic.as_ref())
+            .map(|context| context.attempt_id.as_str())
+            .unwrap_or(""),
+        trace_id = attribution
+            .as_ref()
+            .and_then(|a| a.semantic.as_ref())
+            .map(|context| context.trace_id.as_str())
+            .unwrap_or(""),
         // #A8 — lets a SigNoz query split "green on a blind path"
         // (necessary-not-sufficient) from plain green without joining
         // against the push side.
@@ -2087,9 +2270,10 @@ fn publish_verdict(
     api.publish_attributed_with_checks(
         wt,
         payload,
-        attribution.and_then(|a| a.base_sha),
+        attribution.as_ref().and_then(|a| a.base_sha.clone()),
         ra_blind_paths,
         gated_checks_ran,
+        attribution.and_then(|a| a.semantic),
     );
 }
 
@@ -2104,17 +2288,10 @@ fn publish_verdict(
 /// the `ra_respawn_` prefix.
 const STRANDED_PUSH_REASON: &str = "ra_respawn_stranded_push";
 
-/// CGLS-11 — stable classifier for a verdict published when the
-/// forced-reopen cap fires. Downstream dashboards group on this literal;
-/// changing it is a telemetry break.
+#[cfg(test)]
 const REOPEN_CAP_EXCEEDED_REASON: &str = "ra_reopen_cap_exceeded";
 
-/// CGLS-11 — publish an honest `unknown` when the per-(wt, base_sha)
-/// forced-reopen budget is exhausted. This is the third dispatch site
-/// documented in the module-doc's `publish_verdict` doctrine block;
-/// like [`publish_stranded_unknown`] it takes NO verdict parameter and
-/// constructs [`statusfile::VerdictPayload::unknown`] internally, so
-/// Green and Red are unrepresentable here by signature.
+#[cfg(test)]
 fn publish_reopen_cap_exceeded(
     wt: &Path,
     count: u32,
@@ -2123,18 +2300,17 @@ fn publish_reopen_cap_exceeded(
     api: &Arc<crate::serveapi::ServeVerdictState>,
 ) {
     eprintln!(
-        "[cargoless:obs] cgls11-reopen-cap-exceeded wt={} count={} cap={} verdict=unknown reason={} (CGLS-11)",
+        "[cargoless:obs] freshness-reopen-cap wt={} count={} cap={}",
         wt.display(),
         count,
         cap,
-        REOPEN_CAP_EXCEEDED_REASON,
     );
     publish_verdict(
         wt,
         statusfile::VerdictPayload::unknown(REOPEN_CAP_EXCEEDED_REASON),
         attribution,
         Vec::new(),
-        "Cgls11ReopenCapExceeded",
+        "DiagnosticFreshnessReopenCap",
         api,
     );
 }
@@ -2278,7 +2454,11 @@ fn ra_native_payload(
     authoritative_error: bool,
     timer_settled_no_flycheck: bool,
     macro_blind_hit: bool,
+    analysis_failure_reason: Option<&str>,
 ) -> statusfile::VerdictPayload {
+    if let Some(reason) = analysis_failure_reason {
+        return statusfile::VerdictPayload::unknown(reason);
+    }
     if timer_settled_no_flycheck {
         return statusfile::VerdictPayload::unknown("ra_native_timer_settled_no_flycheck_activity");
     }
@@ -2318,7 +2498,7 @@ fn compose_hard_mode_payload(
 ) -> statusfile::VerdictPayload {
     use statusfile::VerdictPayload;
     match (authoritative_error, summary) {
-        (_, ProjectCheckSummary::Red { error_count }) => VerdictPayload::red(error_count),
+        (_, ProjectCheckSummary::Red { error_count, .. }) => VerdictPayload::red(error_count),
         (_, ProjectCheckSummary::Indeterminate { reason, detail }) => {
             VerdictPayload::unknown(format!("{reason}: {detail}"))
         }
@@ -2357,7 +2537,7 @@ fn spawn_project_checks_warn(
                 match &summary {
                     ProjectCheckSummary::Green => "green".to_string(),
                     ProjectCheckSummary::Empty => "empty".to_string(),
-                    ProjectCheckSummary::Red { error_count } => {
+                    ProjectCheckSummary::Red { error_count, .. } => {
                         format!("red(errors={error_count})")
                     }
                     ProjectCheckSummary::Indeterminate { reason, .. } => {
@@ -2450,6 +2630,19 @@ fn apply_require_checks(summary: ProjectCheckSummary, require: bool) -> ProjectC
         },
         other => other,
     }
+}
+
+fn dispatch_direct_gate(
+    request: crate::serveapi::DirectGateRequest,
+    api: Arc<crate::serveapi::ServeVerdictState>,
+) {
+    spawn_project_checks_hard(
+        request.wt,
+        false,
+        Some(request.context),
+        Some(request.attribution),
+        api,
+    );
 }
 
 /// #A4.3 — Hard-mode witness, OFF the serve loop, watchdog included.
@@ -2619,8 +2812,13 @@ fn spawn_project_checks_hard_with_timeout(
                 );
             }
             let summary = apply_require_checks(summary, require_checks);
+            let retained_diagnostics = match &summary {
+                ProjectCheckSummary::Red { diagnostics, .. } => diagnostics.clone(),
+                _ => Vec::new(),
+            };
             let payload = compose_hard_mode_payload(authoritative_error, summary);
             if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
+                api.retain_diagnostics(&wt_key, witness_base_sha.as_deref(), retained_diagnostics);
                 publish_verdict(
                     &wt,
                     payload,
@@ -2656,6 +2854,7 @@ fn spawn_project_checks_hard_with_timeout(
         );
         if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
             // No supervisor thread spawned ⇒ no witness ran ⇒ no gated checks.
+            api.retain_diagnostics(&wt_key, witness_base_sha.as_deref(), Vec::new());
             publish_verdict(
                 &wt,
                 payload,
@@ -2732,7 +2931,10 @@ pub(crate) enum ProjectCheckSummary {
     Green,
     /// Checks ran and at least one required check failed; `error_count`
     /// is the count of error-severity diagnostics.
-    Red { error_count: u32 },
+    Red {
+        error_count: u32,
+        diagnostics: Vec<cargoless_core::Diagnostic>,
+    },
     /// Checks could not run (manifest load error, overlay-apply error,
     /// etc.). `reason` is the stable classifier; `detail` is the
     /// human-readable tail for diagnosis. Maps to `Verdict::Unknown`,
@@ -2816,12 +3018,32 @@ fn run_project_checks_and_log(
     let gated_ids = context
         .as_ref()
         .and_then(|ctx| crate::serveapi::gated_witness_ids(ctx.gate, ctx.check_ids.as_ref()));
+    let identity = context.as_ref().and_then(|ctx| {
+        Some(cargoless_core::project_checks::ProjectCheckRunIdentity {
+            source_sha: ctx.source_sha.clone()?,
+            base_sha: ctx.base_sha.clone()?,
+        })
+    });
     let report = match (context.as_ref(), gated_ids.as_deref()) {
         (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_profile_with_ids_in(root, "dev", ids, None, warm)
+            cargoless_core::project_checks::run_profile_with_ids_in_at(
+                root,
+                "dev",
+                ids,
+                None,
+                warm,
+                identity.as_ref(),
+            )
         }),
         (Some(ctx), None) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_dev_with_changes_in(root, changed_files, warm)
+            cargoless_core::project_checks::run_profile_with_ids_in_at(
+                root,
+                "dev",
+                &[],
+                changed_files,
+                warm,
+                identity.as_ref(),
+            )
         }),
         (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
             root,
@@ -2864,8 +3086,18 @@ fn run_project_checks_and_log(
                 .filter(|d| d.severity == cargoless_core::Severity::Error)
                 .count() as u32;
             let tree_red = report.tree == cargoless_core::TreeState::Red;
+            let has_indeterminate = report.has_indeterminate();
+            let has_degraded = report.has_degraded();
             tracing::info!(
-                outcome = if tree_red { "red" } else { "green" },
+                outcome = if has_indeterminate {
+                    "indeterminate"
+                } else if tree_red {
+                    "red"
+                } else if has_degraded {
+                    "degraded"
+                } else {
+                    "green"
+                },
                 checks = report.results.len(),
                 skipped = report.skipped.len(),
                 cache_hits = cache_hits,
@@ -2878,7 +3110,15 @@ fn run_project_checks_and_log(
                 "[cargoless:obs] project-checks wt={} root={} verdict={} checks={} skipped={} cache_hits={} duration_ms={} error_count={} slowest={}",
                 wt.display(),
                 root.display(),
-                if tree_red { "red" } else { "green" },
+                if has_indeterminate {
+                    "unknown"
+                } else if tree_red {
+                    "red"
+                } else if has_degraded {
+                    "warn"
+                } else {
+                    "green"
+                },
                 report.results.len(),
                 report.skipped.len(),
                 cache_hits,
@@ -2901,7 +3141,29 @@ fn run_project_checks_and_log(
                     diagnostic.message.lines().next().unwrap_or("")
                 );
             }
-            if tree_red {
+            if has_indeterminate {
+                let detail = report
+                    .results
+                    .iter()
+                    .find(|result| {
+                        result.outcome
+                            == cargoless_core::project_checks::ProjectCheckOutcome::Indeterminate
+                    })
+                    .and_then(|result| result.diagnostics.first())
+                    .or_else(|| report.diagnostics.first())
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .unwrap_or_else(|| {
+                        "structured project check did not produce an authoritative result"
+                            .to_string()
+                    });
+                (
+                    ProjectCheckSummary::Indeterminate {
+                        reason: "structured_result_indeterminate",
+                        detail,
+                    },
+                    ran_check_ids,
+                )
+            } else if tree_red {
                 // Defensive: if the tree is Red the error_count should
                 // be > 0 (per `result_from_diags` in cargoless-core,
                 // which enforces it at the per-check layer). If it
@@ -2921,7 +3183,13 @@ fn run_project_checks_and_log(
                         ran_check_ids,
                     )
                 } else {
-                    (ProjectCheckSummary::Red { error_count }, ran_check_ids)
+                    (
+                        ProjectCheckSummary::Red {
+                            error_count,
+                            diagnostics: report.diagnostics,
+                        },
+                        ran_check_ids,
+                    )
                 }
             } else {
                 (ProjectCheckSummary::Green, ran_check_ids)
@@ -3065,9 +3333,12 @@ mod tests {
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("deadbeef".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack =
             api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options));
@@ -3113,9 +3384,12 @@ mod tests {
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3171,9 +3445,12 @@ mod tests {
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["Cargo.toml".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -3246,6 +3523,7 @@ mod tests {
 
     #[test]
     fn lsp_overlay_pairs_keep_only_rust_sources() {
+        let analysis_root = Path::new("/workspace/tf-multiverse");
         let pairs = vec![
             ("/repo/wt-01/Cargo.toml".into(), "[workspace]".into()),
             ("/repo/wt-01/Cargo.lock".into(), "# lock".into()),
@@ -3256,13 +3534,35 @@ mod tests {
             ("/repo/wt-01/.cargo/config.toml".into(), "[build]".into()),
         ];
 
-        let lsp_pairs = lsp_source_pairs(&pairs);
+        let lsp_pairs = lsp_source_pairs(&pairs, analysis_root);
 
         assert_eq!(
             lsp_pairs,
             vec![(
                 "/repo/wt-01/alchemy/src/protocols/transfer.rs".into(),
                 "pub struct TransferProtocol;".into(),
+            )]
+        );
+    }
+
+    #[test]
+    fn lsp_overlay_pairs_resolve_relative_sources_from_analysis_root() {
+        let analysis_root = Path::new("/workspace/tf-multiverse");
+        let pairs = vec![
+            (
+                "alchemy/src/telemetry.rs".into(),
+                "pub fn broken() { let _: u32 = \"wrong\"; }".into(),
+            ),
+            ("alchemy/Cargo.toml".into(), "[package]".into()),
+        ];
+
+        let lsp_pairs = lsp_source_pairs(&pairs, analysis_root);
+
+        assert_eq!(
+            lsp_pairs,
+            vec![(
+                "/workspace/tf-multiverse/alchemy/src/telemetry.rs".into(),
+                "pub fn broken() { let _: u32 = \"wrong\"; }".into(),
             )]
         );
     }
@@ -3393,6 +3693,24 @@ mod tests {
         assert!(
             zero_verbs2,
             "re-push of identical content must yield zero verbs — this is the CGLS-11 trigger"
+        );
+    }
+
+    #[test]
+    fn diagnostic_freshness_reopens_only_zero_verb_pushed_overlays() {
+        assert!(should_force_freshness_reopen(true, true, false));
+        assert!(!should_force_freshness_reopen(false, true, false));
+        assert!(!should_force_freshness_reopen(true, false, false));
+        assert!(!should_force_freshness_reopen(true, true, true));
+    }
+
+    #[test]
+    fn diagnostic_refresh_fence_applies_only_after_a_real_overlay_mutation() {
+        assert_eq!(diagnostic_refresh_fence(41, false), Some(41));
+        assert_eq!(
+            diagnostic_refresh_fence(41, true),
+            None,
+            "an identical overlay has no new refresh boundary to await; its current open-document diagnostics must be pulled directly",
         );
     }
 
@@ -3571,9 +3889,12 @@ mod tests {
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("beefface".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack =
             api.push_overlay_with_options(&wt_key, "origin/main", &files, None, Some(&options));
@@ -3710,6 +4031,166 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn native_verdict_events_cannot_settle_an_active_diagnostic_pull() {
+        let mut pull_active = Some(7);
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::Diagnostics(diagnostic)),
+            )
+            .is_none(),
+            "unsolicited native diagnostics must not race the exact pull"
+        );
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "only the correlated pull may clear its fence"
+        );
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::FlycheckEnded),
+            )
+            .is_none(),
+            "a native progress end must not publish before the exact pull finishes"
+        );
+        assert_eq!(pull_active, Some(7));
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::IndexingEnded),
+            ),
+            Some(LspEvent::IndexingEnded)
+        ));
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "readiness remains observable without settling the check"
+        );
+    }
+
+    #[test]
+    fn correlated_pull_is_the_only_event_source_that_clears_its_fence() {
+        let mut pull_active = Some(7);
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 0,
+            total: 0,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::Diagnostics(diagnostic),
+                },
+            ),
+            Some(LspEvent::Diagnostics(_))
+        ));
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "diagnostic rows precede the pull's terminal boundary"
+        );
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::FlycheckEnded,
+                },
+            ),
+            Some(LspEvent::FlycheckEnded)
+        ));
+        assert_eq!(
+            pull_active, None,
+            "the correlated terminal event releases the fence"
+        );
+    }
+
+    #[test]
+    fn correlated_error_diagnostics_wait_for_the_pull_terminal_boundary() {
+        let mut pull_active = Some(7);
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::Diagnostics(diagnostic),
+                },
+            ),
+            Some(LspEvent::Diagnostics(_))
+        ));
+        assert_eq!(
+            pull_active,
+            Some(7),
+            "an error row must remain in the barrier window until the pull ends"
+        );
+    }
+
+    #[test]
+    fn retired_pull_generation_cannot_touch_the_live_transaction() {
+        let mut pull_active = Some(8);
+
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull {
+                    generation: 7,
+                    event: LspEvent::FlycheckEnded,
+                },
+            )
+            .is_none()
+        );
+        assert_eq!(
+            pull_active,
+            Some(8),
+            "a late terminal from a retired pull must not release the live fence"
+        );
+    }
+
+    #[test]
+    fn correlated_pull_failure_releases_the_fence_and_fails_closed() {
+        let mut pull_active = Some(7);
+        let event = correlate_lsp_event(
+            &mut pull_active,
+            LspIngressEvent::DiagnosticPull {
+                generation: 7,
+                event: LspEvent::FlycheckFailed {
+                    message: "ra_diagnostic_pull:timeout".into(),
+                },
+            },
+        );
+
+        assert!(matches!(
+            event,
+            Some(LspEvent::FlycheckFailed { message }) if message.contains("timeout")
+        ));
+        assert_eq!(pull_active, None);
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // INFRA-36 — compose_hard_mode_payload truth table
     //
@@ -3740,7 +4221,13 @@ mod tests {
 
     #[test]
     fn compose_clean_red_is_red_with_diagnostics() {
-        let p = compose_hard_mode_payload(false, ProjectCheckSummary::Red { error_count: 12 });
+        let p = compose_hard_mode_payload(
+            false,
+            ProjectCheckSummary::Red {
+                error_count: 12,
+                diagnostics: Vec::new(),
+            },
+        );
         assert_eq!(p.verdict, statusfile::Verdict::Red);
         assert_eq!(p.red_diagnostics, 12);
         assert!(
@@ -3777,7 +4264,13 @@ mod tests {
         // Both inputs error, but project-checks have specific diagnostic
         // evidence; the composition uses that evidence rather than
         // collapsing to a generic Unknown.
-        let p = compose_hard_mode_payload(true, ProjectCheckSummary::Red { error_count: 3 });
+        let p = compose_hard_mode_payload(
+            true,
+            ProjectCheckSummary::Red {
+                error_count: 3,
+                diagnostics: Vec::new(),
+            },
+        );
         assert_eq!(p.verdict, statusfile::Verdict::Red);
         assert_eq!(p.red_diagnostics, 3);
     }
@@ -3847,8 +4340,17 @@ mod tests {
                 ProjectCheckSummary::Green
             );
             assert_eq!(
-                apply_require_checks(ProjectCheckSummary::Red { error_count: 3 }, require),
-                ProjectCheckSummary::Red { error_count: 3 }
+                apply_require_checks(
+                    ProjectCheckSummary::Red {
+                        error_count: 3,
+                        diagnostics: Vec::new(),
+                    },
+                    require,
+                ),
+                ProjectCheckSummary::Red {
+                    error_count: 3,
+                    diagnostics: Vec::new(),
+                }
             );
             let indeterminate = ProjectCheckSummary::Indeterminate {
                 reason: "witness",
@@ -3879,6 +4381,22 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_pull_timeout_defaults_to_two_minutes_and_accepts_positive_override() {
+        assert_eq!(
+            ra_diagnostic_pull_timeout_from(None),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            ra_diagnostic_pull_timeout_from(Some(45_000)),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            ra_diagnostic_pull_timeout_from(Some(0)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
     fn summarize_witness_input_reports_payload_shape() {
         // CGLS-23 H4: the watchdog-fire log line includes a one-line
         // summary so hung-witness post-mortems can correlate with input
@@ -3895,6 +4413,9 @@ mod tests {
                 "physics/src/runtime/wire/lib.rs".to_string(),
             ]),
             base_ref: "origin/dev".to_string(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![
                 (
                     "physics/src/runtime/wire/executor.rs".to_string(),
@@ -3942,7 +4463,7 @@ mod tests {
     #[test]
     fn ra_native_payload_clean_non_blind_is_green() {
         // The ONLY green path: a real, witnessed, non-blind clean window.
-        let p = ra_native_payload(false, false, false);
+        let p = ra_native_payload(false, false, false, None);
         assert_eq!(p.verdict, statusfile::Verdict::Green);
         assert!(p.analysis_failure_reason.is_none());
     }
@@ -3953,7 +4474,7 @@ mod tests {
         // NOT green — RA could not witness the expanded macro. This is the
         // view!-macro false-GREEN closer. The historical behavior here was
         // `from_bool_unattributed(false)` ⇒ GREEN.
-        let p = ra_native_payload(false, false, true);
+        let p = ra_native_payload(false, false, true, None);
         assert_eq!(
             p.verdict,
             statusfile::Verdict::Unknown,
@@ -3973,7 +4494,7 @@ mod tests {
         // unknown) whether or not the path is blind — the blind downgrade
         // only ever turns a GREEN into unknown, never masks a real error.
         for blind in [false, true] {
-            let p = ra_native_payload(true, false, blind);
+            let p = ra_native_payload(true, false, blind, None);
             assert_eq!(p.verdict, statusfile::Verdict::Unknown, "blind={blind}");
             assert_eq!(
                 p.analysis_failure_reason.as_deref(),
@@ -3989,7 +4510,7 @@ mod tests {
         // the timer reason regardless of the blind bit (RA never ran at
         // all, which subsumes "RA ran but is macro-blind").
         for blind in [false, true] {
-            let p = ra_native_payload(false, true, blind);
+            let p = ra_native_payload(false, true, blind, None);
             assert_eq!(p.verdict, statusfile::Verdict::Unknown, "blind={blind}");
             assert_eq!(
                 p.analysis_failure_reason.as_deref(),
@@ -4073,6 +4594,7 @@ mod tests {
             push_received_unix: statusfile::now_unix(),
             consumed_unix: statusfile::now_unix(),
             consumed_at: Instant::now(),
+            semantic: None,
         }
     }
 
@@ -4352,6 +4874,9 @@ checks:
             root: root.clone(),
             changed_files: Some(vec!["src/added.rs".into()]),
             base_ref: "origin/main".to_string(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![(
                 root.join("src/added.rs").to_string_lossy().into_owned(),
                 "pub fn added() {}\n".to_string(),

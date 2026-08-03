@@ -36,6 +36,8 @@ RUN apt-get update -qq \
         ca-certificates \
         clang \
         curl \
+        elfutils \
+        gdb \
         git \
         jq \
         libssl-dev \
