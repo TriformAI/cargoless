@@ -289,11 +289,9 @@ impl LegPlan {
 
     /// Does this plan produce a LOCAL artifact for a lander to publish?
     ///
-    /// Only in-process does. Both remote plans build elsewhere and report
-    /// `artifact: None`, so pairing either with a publishing lander would leave
-    /// it taking its "green with nothing to publish" branch forever: no error,
-    /// no pointer movement, and an operator watching a publishing lane publish
-    /// nothing.
+    /// Only in-process does. Remote plans may report an opaque identity to a
+    /// command lander, but they do not create a LOCAL file that PointerLander
+    /// can publish.
     #[must_use]
     pub fn publishes_locally(&self) -> bool {
         matches!(
@@ -708,10 +706,12 @@ impl LegRunner for DispatchLegRunner {
         Ok(LegOutcome {
             tree,
             diagnostics,
-            // The artifact lives wherever the external builder put it (a
-            // registry tag, a CAS handle); the dispatcher reports it, and the
-            // lander promotes it. Nothing local to publish.
-            artifact: None,
+            // This is the immutable candidate identity the external builder
+            // just verdict-ed. It is deliberately carried through the existing
+            // artifact seam to CommandLander, which exports it as
+            // CARGOLESS_LANE_ARTIFACT. Nothing local is published; the trusted
+            // lander fetches the content-addressed ref and CASes this exact sha.
+            artifact: Some(sha),
             legs: vec![LegReport {
                 id: "dispatch".to_string(),
                 tree,
@@ -1357,30 +1357,22 @@ pub struct CommandLander {
     pub timeout: Duration,
 }
 
-/// Default land budget. Deliberately large, and that needs justifying because
-/// the number it replaces was chosen for a good reason that turned out to
-/// describe a different lander than the one we run.
+/// Default budget for publishing an already-green candidate.
 ///
-/// "Landing is a push plus N PR reconciles — seconds, not minutes" is true of a
-/// lander that lands *itself*. The lander actually configured on tf-multiverse
-/// is `scripts/ci/lane-land.sh`, which delegates to
-/// `scripts/merge-train-controller --land` — and the controller does not just
-/// push. It re-derives the candidate, publishes a merge-train ref, DISPATCHES A
-/// CANDIDATE BUILD and waits for the verdict, under its own
-/// `TRAIN_BUILD_MAX_WAIT_SECS` (default 5400).
+/// The original tf-multiverse delegate rebuilt the candidate during landing,
+/// so this budget was raised to two hours after a 600s parent repeatedly killed
+/// healthy nested builds. The exact-tree contract removed that second build:
+/// the dispatcher returns the green candidate SHA and the lander now verifies
+/// that same SHA, performs one compare-and-swap push, and reconciles its PRs.
+/// Keeping the old two-hour ceiling would therefore hide a wedged forge or
+/// broken lander long after there is useful evidence to report.
 ///
-/// A parent budget below the delegate's own ceiling cannot ever observe an
-/// outcome: it SIGKILLs a healthy land mid-wait and reports infrastructure
-/// failure. Measured 2026-08-02 — five green candidates in a row, each killed
-/// at exactly 600s and re-enqueued, so the trunk never moved and the trail read
-/// `outcome=green` followed by a fresh build with no reason in between.
-///
-/// So: 7200s, above the delegate's 5400 with room for the forge round-trips
-/// that bracket it. This still bounds a hung forge — it does not remove the
-/// timeout, it makes it mean what it says. Override with
-/// `CARGOLESS_LANE_LAND_TIMEOUT_SECS` when the delegate's budget differs; the
-/// rule to preserve is **parent > delegate**, never the reverse.
-const LAND_TIMEOUT_DEFAULT_SECS: u64 = 7200;
+/// Thirty minutes still covers the deliberately pessimistic bound for ten
+/// members when every forge call consumes its full 30s timeout, plus fetch,
+/// verification, CAS, and reconciliation headroom. Override with
+/// `CARGOLESS_LANE_LAND_TIMEOUT_SECS` for another forge shape; no build timeout
+/// belongs inside this budget because landing must never rebuild.
+const LAND_TIMEOUT_DEFAULT_SECS: u64 = 1800;
 
 impl CommandLander {
     pub fn new(command: Vec<String>) -> Self {
@@ -2242,40 +2234,11 @@ mod materialize_context_tests {
 mod land_timeout_tests {
     use super::{LAND_TIMEOUT_DEFAULT_SECS, parse_land_timeout};
 
-    /// The regression that cost a day. The configured lander delegates to
-    /// `merge-train-controller --land`, whose own `TRAIN_BUILD_MAX_WAIT_SECS`
-    /// defaults to 5400. A parent budget at or below that can never observe an
-    /// outcome — it SIGKILLs a healthy land mid-wait and calls it infra.
-    ///
-    /// Asserted against the delegate's real number, not a copy of our own, so
-    /// this fails if someone lowers the default back toward it.
-    ///
-    /// Asserted on `parse_land_timeout(None)` — the budget the code actually
-    /// resolves when unset — rather than on the constant. Two constants compare
-    /// at compile time, so `assertions_on_constants` folds the check away and
-    /// the test proves nothing at runtime; going through the resolver also
-    /// covers the (real) possibility of the default being reachable but the
-    /// fallback path not returning it.
     #[test]
-    fn the_default_outlives_the_delegates_own_budget() {
-        const CONTROLLER_BUILD_MAX_WAIT_SECS: u64 = 5400;
+    fn the_default_bounds_exact_landing_without_build_time() {
         let resolved = parse_land_timeout(None);
-        assert!(
-            resolved > CONTROLLER_BUILD_MAX_WAIT_SECS,
-            "the land budget ({resolved}s) must exceed the delegate's \
-             ({CONTROLLER_BUILD_MAX_WAIT_SECS}s) or every land is killed before it can answer"
-        );
-    }
-
-    /// Specifically 600s, the value that was there. Named because a comment
-    /// explaining why it was wrong is not a test.
-    #[test]
-    fn the_old_600s_budget_would_still_be_wrong() {
-        let resolved = parse_land_timeout(None);
-        assert!(
-            resolved > 600,
-            "600s killed five consecutive green candidates on 2026-08-02"
-        );
+        assert_eq!(resolved, 1800);
+        assert!(resolved < 5400, "landing must not inherit a build budget");
     }
 
     #[test]

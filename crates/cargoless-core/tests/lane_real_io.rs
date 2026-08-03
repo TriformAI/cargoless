@@ -533,6 +533,17 @@ fn dispatching_never_executes_code_from_the_candidate_tree() {
             .any(|x| matches!(x, cargoless_core::lane::LaneAction::LandAndPublish { .. })),
         "a green dispatch must still reach a landing: {actions:?}"
     );
+    let landed_artifact = actions.iter().find_map(|x| match x {
+        cargoless_core::lane::LaneAction::LandAndPublish { artifact, .. } => artifact.as_deref(),
+        _ => None,
+    });
+    assert_eq!(
+        landed_artifact,
+        Some(dispatched_sha),
+        "the trusted lander must receive the exact candidate identity that the \
+         unprivileged builder greened; rediscovering it from a separate preview \
+         would create a second source of truth: {actions:?}"
+    );
 
     // The candidate must be FETCHABLE by the builder — a ref the sandbox cannot
     // reach is a build that cannot happen. Resolve the ref the dispatcher was
