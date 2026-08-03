@@ -43,12 +43,12 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cargoless_core::analyzer::RaStderrSnapshot;
-use cargoless_core::batch::{run_batch, BatchChecker, BatchMember, BatchReport, BatchVerdict};
+use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
 use cargoless_core::lane::{LaneMember, LaneState};
@@ -60,12 +60,12 @@ use cargoless_core::outcome::{
     OutcomeEnvelope, PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind,
     RetryDirective, Subject, Surface,
 };
-use cargoless_core::project_checks::{plan_dev_with_changes, ProjectCheckReport};
+use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
-    batchreport_to_json, AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity,
-    LaneEnqueueRequest, PushOverlayAck, PushOverlayOptions, TransitionEvent, VerdictService,
-    WorktreeStatus, WorktreeSummary,
+    AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, LaneEnqueueRequest,
+    PushOverlayAck, PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus,
+    WorktreeSummary, batchreport_to_json,
 };
 use cargoless_core::{Diagnostic, Severity, TreeState};
 
@@ -5726,12 +5726,16 @@ mod tests {
                 .conclusion,
             Conclusion::Pending { .. }
         ));
-        assert!(state_dir
-            .join("evidence-v3/attempt-1/ra-summary.json")
-            .is_file());
-        assert!(state_dir
-            .join("evidence-v3/attempt-1/stack-001.txt")
-            .is_file());
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-1/ra-summary.json")
+                .is_file()
+        );
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-1/stack-001.txt")
+                .is_file()
+        );
 
         let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
         assert_eq!(
@@ -5936,9 +5940,10 @@ mod tests {
             first.reaction.state,
             cargoless_core::outcome::CheckState::Pending
         );
-        assert!(api
-            .get_evidence_v3(&first.attempt_id, "batch-report.json")
-            .is_some());
+        assert!(
+            api.get_evidence_v3(&first.attempt_id, "batch-report.json")
+                .is_some()
+        );
 
         let final_attempt = api.submit_batch_v3(&request(3)).unwrap();
         assert_eq!(
@@ -6082,9 +6087,11 @@ mod tests {
         for member in report.members {
             assert_eq!(member.verdict, BatchVerdict::Indeterminate);
             assert_eq!(member.provenance, BatchProvenance::Indeterminate);
-            assert!(member.diagnostics[0]
-                .message
-                .contains("requires a shared analysis_root"));
+            assert!(
+                member.diagnostics[0]
+                    .message
+                    .contains("requires a shared analysis_root")
+            );
         }
     }
 
@@ -6114,9 +6121,11 @@ mod tests {
             files: vec![("../outside.rs".into(), "bad".into())],
             changed_files: vec![],
         }];
-        assert!(map_batch_members(&root, true, &escaping)
-            .unwrap_err()
-            .contains("escapes repo root"));
+        assert!(
+            map_batch_members(&root, true, &escaping)
+                .unwrap_err()
+                .contains("escapes repo root")
+        );
     }
 
     #[test]
@@ -6150,9 +6159,11 @@ mod tests {
                 changed_files: vec![],
             },
         ];
-        assert!(union_overlay_files(&conflicting)
-            .unwrap_err()
-            .contains("different content"));
+        assert!(
+            union_overlay_files(&conflicting)
+                .unwrap_err()
+                .contains("different content")
+        );
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -6564,9 +6575,11 @@ checks:
             executed_ids.len() >= 2,
             "≥2 physical flushes should have distinct executed_batch_id values; got {executed_ids:?}"
         );
-        assert!(reports
-            .iter()
-            .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1));
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1)
+        );
     }
 
     #[test]
@@ -7937,10 +7950,11 @@ checks:
         let bad = member_result(&report, "/client/bad");
         assert_eq!(bad.verdict, BatchVerdict::Red);
         assert_eq!(bad.provenance, BatchProvenance::SoloRed);
-        assert!(bad
-            .diagnostics
-            .iter()
-            .any(|diag| diag.code.as_deref() == Some("batch.fail_token")));
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|diag| diag.code.as_deref() == Some("batch.fail_token"))
+        );
         assert_overlay_paths_cleaned(&project.root, &overlay_paths);
     }
 
@@ -8992,7 +9006,7 @@ checks:
     /// content) would flip exactly this assertion.
     #[test]
     fn composing_equivalence_pushed_vs_fs_pairs_yield_identical_overlay_ops() {
-        use cargoless_core::overlay::{diff, OverlaySet};
+        use cargoless_core::overlay::{OverlaySet, diff};
 
         let prev = OverlaySet::from_pairs(vec![(
             "/wt-a/src/old.rs".to_string(),
