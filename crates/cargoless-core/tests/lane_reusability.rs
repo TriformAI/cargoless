@@ -20,9 +20,10 @@ use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use cargoless_core::lane::{LaneAction, LaneEvent, LaneMember, LaneState};
+use cargoless_core::lane::{EjectReason, LaneAction, LaneEvent, LaneMember, LaneState};
 use cargoless_core::lanedrv::{
     CandidateTree, LandOutcome, LaneDriver, LaneLander, LegOutcome, LegRunner, MaterializeError,
+    RedAttribution,
 };
 use cargoless_proto::{Diagnostic, Severity, TreeState};
 
@@ -219,6 +220,58 @@ fn a_red_ejects_the_author_and_ships_everyone_else() {
         &[vec!["good".to_string()]],
         "the innocent member ships in the very next build — no waiting for the \
          ejected one to be fixed"
+    );
+}
+
+#[test]
+fn a_preview_red_never_attributes_its_synthetic_anchor_to_a_member() {
+    // Production regression, 2026-08-03: preview returned three E0382s in
+    // library_panel.rs but could expose only a free-text terminal summary. Its
+    // display diagnostic was anchored at cargoless.checks.yaml, and the lane
+    // ejected the innocent PR that happened to edit that manifest instead of
+    // the PR that changed library_panel.rs.
+    let drv = driver(vec![LegOutcome {
+        tree: TreeState::Red,
+        diagnostics: vec![err_in("cargoless.checks.yaml")],
+        red_attribution: RedAttribution::Unattributed,
+        ..Default::default()
+    }]);
+    let mut lane = LaneState::with_config(
+        APP_ROOT,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 5,
+            ..Default::default()
+        },
+    );
+    lane.step(LaneEvent::Enqueue(
+        LaneMember::new("manifest-editor", "m1").with_changed_files(["cargoless.checks.yaml"]),
+    ));
+    lane.step(LaneEvent::Enqueue(
+        LaneMember::new("other-rider", "o1").with_changed_files(["src/other.rs"]),
+    ));
+
+    let actions = drv.pump(&mut lane, LaneEvent::Tick { now: 5 });
+    let ejections: Vec<(&str, &EjectReason)> = actions
+        .iter()
+        .filter_map(|action| match action {
+            LaneAction::Eject { id, reason } => Some((id.as_str(), reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ejections.len(),
+        2,
+        "every rider is held until the owner is known"
+    );
+    assert!(
+        ejections
+            .iter()
+            .all(|(_, reason)| matches!(reason, EjectReason::Unattributed { .. })),
+        "the synthetic manifest anchor must never invent an owner: {ejections:?}"
+    );
+    assert!(
+        drv.lander.landed.borrow().is_empty(),
+        "a real preview red must not land"
     );
 }
 
