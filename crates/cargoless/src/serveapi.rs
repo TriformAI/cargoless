@@ -5399,6 +5399,21 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_overlay_rejection_preserves_the_exact_reason() {
+        let ack = rejected_push(
+            "/workspace/tf-multiverse",
+            "git fetch origin local-only-sha failed: upload-pack: not our ref",
+        );
+
+        assert!(!ack.accepted);
+        assert_eq!(ack.reject_http_status, Some(409));
+        assert_eq!(
+            ack.reject_body.as_deref(),
+            Some("git fetch origin local-only-sha failed: upload-pack: not our ref")
+        );
+    }
+
+    #[test]
     fn outcome_v3_keeps_retries_distinct_and_classes_ra_storm_as_analyzer_pathology() {
         let state_dir = temp_root("outcome-v3");
         let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
