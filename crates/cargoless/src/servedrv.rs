@@ -207,6 +207,7 @@ fn ra_reopen_cap() -> u32 {
         .unwrap_or(3)
 }
 
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 enum ReopenBudget {
     Nudge { count: u32, cap: u32 },
