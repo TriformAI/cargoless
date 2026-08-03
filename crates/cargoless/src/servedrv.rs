@@ -1573,6 +1573,30 @@ fn is_rust_source_path(path: &str) -> bool {
     Path::new(path).extension().is_some_and(|ext| ext == "rs")
 }
 
+const DEFAULT_RA_DIAGNOSTIC_PULL_TIMEOUT_MS: u64 = 120_000;
+
+/// One fail-closed deadline for the complete diagnostic-pull transaction.
+///
+/// The pull walks every changed Rust document serially, so the former 30s
+/// constant routinely expired on healthy multi-document transactions. Keep a
+/// bounded default while allowing operators to tune unusually large fleets
+/// without rebuilding the daemon. Invalid and zero values fall back to the
+/// safe default rather than disabling the deadline.
+fn ra_diagnostic_pull_timeout() -> Duration {
+    let env_ms = std::env::var("CARGOLESS_RA_DIAGNOSTIC_PULL_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    ra_diagnostic_pull_timeout_from(env_ms)
+}
+
+fn ra_diagnostic_pull_timeout_from(env_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        env_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .unwrap_or(DEFAULT_RA_DIAGNOSTIC_PULL_TIMEOUT_MS),
+    )
+}
+
 /// CGLS-11 — pick the lexicographically first `.rs` file from an
 /// `OverlaySet` to use as the forced close+reopen target. The
 /// `OverlaySet`'s internal `BTreeMap` is sorted, so iteration order is
@@ -1608,13 +1632,13 @@ fn spawn_ra_diagnostic_pull(
     let _ = std::thread::Builder::new()
         .name("tf-ra-diagnostic-pull".into())
         .spawn(move || {
-            const PULL_TIMEOUT: Duration = Duration::from_secs(30);
             const CANCEL_RETRIES: usize = 3;
+            let pull_timeout = ra_diagnostic_pull_timeout();
             eprintln!(
                 "[cargoless:obs] ra-diagnostic-pull-started wt={} documents={} timeout_ms={}",
                 wt.display(),
                 paths.len(),
-                PULL_TIMEOUT.as_millis(),
+                pull_timeout.as_millis(),
             );
             if paths.is_empty() {
                 let _ = tx.send((
@@ -1625,7 +1649,7 @@ fn spawn_ra_diagnostic_pull(
                 ));
                 return;
             }
-            let deadline = Instant::now() + PULL_TIMEOUT;
+            let deadline = Instant::now() + pull_timeout;
             for path in paths {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
