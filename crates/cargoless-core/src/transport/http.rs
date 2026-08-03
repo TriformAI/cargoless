@@ -1058,15 +1058,21 @@ fn handle(
                     Some(&options),
                 );
                 // R3 mitigation — the ack can carry an explicit non-200
-                // HTTP status (e.g. 429 for pushed-queue-full) plus a
-                // structured JSON body. `None` ⇒ historical 200 with the
-                // ack JSON, byte-identical to before this shipped.
-                let (code, reason, body) = match (ack.reject_http_status, &ack.reject_body) {
-                    (Some(429), Some(body)) => (429, "Too Many Requests", body.clone()),
-                    (Some(status), Some(body)) => (status, "Rejected", body.clone()),
-                    _ => (200, "OK", pushoverlayack_to_json(&ack)),
-                };
-                write_response(&mut writer, code, reason, "application/json", &body);
+                // HTTP status plus the exact refusal reason. Queue pressure is
+                // structured JSON; ordinary 409 refusals are plain text so the
+                // content type never lies while v3 can embed the same text in
+                // its typed `summary`. `None` keeps historical 200 ack JSON.
+                let (code, reason, content_type, body) =
+                    match (ack.reject_http_status, &ack.reject_body) {
+                        (Some(429), Some(body)) => {
+                            (429, "Too Many Requests", "application/json", body.clone())
+                        }
+                        (Some(status), Some(body)) => {
+                            (status, "Rejected", "text/plain", body.clone())
+                        }
+                        _ => (200, "OK", "application/json", pushoverlayack_to_json(&ack)),
+                    };
+                write_response(&mut writer, code, reason, content_type, &body);
             }
             _ => write_response(
                 &mut writer,

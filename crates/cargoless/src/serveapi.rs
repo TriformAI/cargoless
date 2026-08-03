@@ -4476,7 +4476,8 @@ fn rejected_push(worktree: &str, why: &str) -> PushOverlayAck {
         worktree: worktree.to_string(),
         accepted: false,
         applied_files: 0,
-        ..Default::default()
+        reject_http_status: Some(409),
+        reject_body: Some(why.to_string()),
     }
 }
 

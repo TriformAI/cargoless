@@ -1579,14 +1579,14 @@ pub struct PushOverlayAck {
     pub applied_files: u32,
     /// R3 mitigation — when set, the HTTP layer maps this ack to a
     /// specific non-200 status. `None` ⇒ historical 200 semantics
-    /// (accepted/rejected both). `Some(429)` ⇒ pushed-queue-full
-    /// backpressure; `Some(<other>)` reserved for future use. Absent on
-    /// the JSON wire so pre-existing pollers/tests are byte-identical.
+    /// (accepted/rejected both). `Some(409)` preserves an ordinary refusal's
+    /// exact reason; `Some(429)` denotes pushed-queue-full backpressure.
+    /// Absent on the JSON wire so pre-existing pollers/tests are byte-identical.
     pub reject_http_status: Option<u16>,
     /// R3 mitigation — structured reject payload paired with
-    /// [`Self::reject_http_status`]. When set, the HTTP layer serves it
-    /// as the response body verbatim (application/json). `None` ⇒ fall
-    /// back to `pushoverlayack_to_json(self)`.
+    /// [`Self::reject_http_status`]. The v3 HTTP layer embeds this text as its
+    /// rejection summary; the legacy route serves it as the response body.
+    /// `None` falls back to `pushoverlayack_to_json(self)`.
     pub reject_body: Option<String>,
 }
 
