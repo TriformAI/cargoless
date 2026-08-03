@@ -322,7 +322,7 @@ pub struct LegReport {
     pub duration_ms: u128,
 }
 
-/// Hand-written rather than derived because `TreeState` is a frozen `tf-proto`
+/// Hand-written rather than derived because `TreeState` is a frozen `cargoless-proto`
 /// seam with no `Default` — and giving it one there would be a contract change
 /// to answer a convenience question here.
 ///
