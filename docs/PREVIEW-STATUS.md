@@ -24,7 +24,7 @@ bearer gate in `cargoless-core::transport::http`:
 | Route | Meaning |
 |---|---|
 | `GET /healthz` | serve loop is up (`200` ready, `503` starting) |
-| `GET /readyz` | RA warm + at least one ever-green instance serves (`200`/`503`) |
+| `GET /readyz` | the daemon can accept and serve work (`200`/`503`) — see below |
 | `GET /app` | full per-instance JSON snapshot |
 
 Every other control-plane route (`/admin/*`, `/status`, `/verdict`,
@@ -32,6 +32,39 @@ Every other control-plane route (`/admin/*`, `/status`, `/verdict`,
 token from `cargoless-serve-auth` — an unauthenticated caller on
 `cargoless.preview.triform.dev` gets `401` for those paths. The split
 is enforced by route, not by host.
+
+## What `/readyz` means
+
+**"This daemon can accept and serve work."** Concretely:
+
+```
+ready  ⟺  some instance is currently serving
+      AND  no LIVE instance is failing to serve a green it owns
+```
+
+*Live* is a **liveness test**, not merely "this slot exists and is not
+green": an instance counts only while its observable state changed within
+the last hour (`readiness.stale_after_secs`). An instance on someone's
+critical path re-arms that stamp simply by being used — every push moves
+its ref, which advances its phase — so a broken `dev` people are actively
+pushing to holds the probe at `503` for exactly as long as it is broken.
+A slot nobody has touched in weeks emits no transitions, goes quiet, and
+**ages out of the calculation** by rule, with no per-name allowlist.
+
+This is what stops the two useless readiness probes:
+
+- **Not always-green.** "Some instance is currently serving" is a fact
+  about the present with no stamp to age, so it can never be excused. A
+  daemon with nothing serving is `503` however quiet every slot is.
+- **Not wedged-red.** Before this rule, one abandoned instance — `merge`
+  last built 2026-08-02, `feature-x` 2026-06-24 — held `/readyz` at `503`
+  indefinitely, delisting the pod and its *healthy* `dev` and `lane` with
+  it.
+
+An aged-out instance is reported, never hidden: it keeps its full row on
+`/app` (including `stale: true` and `idle_secs`) and is named in
+`readiness.stale_degraded`. `/readyz` answers "is this daemon working";
+`/app` answers "…and here is exactly what is not".
 
 ## `/app` JSON shape
 
@@ -46,15 +79,35 @@ is enforced by route, not by host.
       "last_red_sha": null,
       "last_red_reason": null,
       "pending_sha": null,
-      "draining": 0
+      "draining": 0,
+      "last_change_unix": 1754000000,
+      "idle_secs": 12,
+      "stale": false
     }
   ],
-  "ready": true
+  "ready": true,
+  "readiness": {
+    "stale_after_secs": 3600,
+    "stale_degraded": []
+  }
 }
 ```
 
 `phase` ∈ `building` | `queued` | `probing` | `probing+serving` |
 `serving` | `idle`.
+
+`last_change_unix` / `idle_secs` / `stale` are the per-instance liveness
+stamp `/readyz` ages against. `stale_degraded` lists the instances that
+*are* failing to serve a green they own but were aged out of the
+readiness verdict — empty on a healthy daemon; non-empty means "ready,
+but these slots are abandoned".
+
+```bash
+# Which slots were excused from the readiness answer, and for how long?
+curl -s https://cargoless.preview.triform.dev/app \
+  | jq '{ready, stale_degraded: .readiness.stale_degraded,
+          idle: [.instances[] | {name, phase, idle_secs, stale}]}'
+```
 
 ## Watching a roll-in-progress
 

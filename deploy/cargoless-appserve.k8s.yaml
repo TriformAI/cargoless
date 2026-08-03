@@ -262,7 +262,12 @@ spec:
             - { name: feature-x, containerPort: 8081 } # feature-x instance app proxy
           # Startup gets a long budget: a cold build on a fresh PVC is tens of
           # minutes. /healthz = control-plane liveness (the daemon is up);
-          # /readyz = "every ever-green instance is serving" (real readiness).
+          # /readyz = "the daemon can accept and serve work" — something is
+          # serving AND no *live* instance is failing to serve a green it owns.
+          # An instance that has not transitioned for an hour ages out of that
+          # verdict (it is still reported on /app under readiness.stale_degraded),
+          # so one abandoned slot cannot hold the whole pod NotReady and delist
+          # its healthy siblings.
           startupProbe:
             httpGet: { path: /healthz, port: ctl }
             periodSeconds: 10
