@@ -1928,12 +1928,20 @@ mod land_timeout_tests {
     ///
     /// Asserted against the delegate's real number, not a copy of our own, so
     /// this fails if someone lowers the default back toward it.
+    ///
+    /// Asserted on `parse_land_timeout(None)` — the budget the code actually
+    /// resolves when unset — rather than on the constant. Two constants compare
+    /// at compile time, so `assertions_on_constants` folds the check away and
+    /// the test proves nothing at runtime; going through the resolver also
+    /// covers the (real) possibility of the default being reachable but the
+    /// fallback path not returning it.
     #[test]
     fn the_default_outlives_the_delegates_own_budget() {
         const CONTROLLER_BUILD_MAX_WAIT_SECS: u64 = 5400;
+        let resolved = parse_land_timeout(None);
         assert!(
-            LAND_TIMEOUT_DEFAULT_SECS > CONTROLLER_BUILD_MAX_WAIT_SECS,
-            "the land budget ({LAND_TIMEOUT_DEFAULT_SECS}s) must exceed the delegate's \
+            resolved > CONTROLLER_BUILD_MAX_WAIT_SECS,
+            "the land budget ({resolved}s) must exceed the delegate's \
              ({CONTROLLER_BUILD_MAX_WAIT_SECS}s) or every land is killed before it can answer"
         );
     }
@@ -1942,8 +1950,9 @@ mod land_timeout_tests {
     /// explaining why it was wrong is not a test.
     #[test]
     fn the_old_600s_budget_would_still_be_wrong() {
+        let resolved = parse_land_timeout(None);
         assert!(
-            LAND_TIMEOUT_DEFAULT_SECS > 600,
+            resolved > 600,
             "600s killed five consecutive green candidates on 2026-08-02"
         );
     }
