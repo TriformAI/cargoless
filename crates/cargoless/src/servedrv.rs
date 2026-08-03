@@ -141,9 +141,6 @@ struct ClusterState {
     /// Worktrees with a routed batch that arrived before the current RA
     /// instance reached project-ready.
     deferred: VecDeque<WtId>,
-    /// Bound identical-content close/reopen nudges per pushed worktree/base.
-    /// A fresh base SHA resets the allowance.
-    forced_reopen_count: BTreeMap<(String, Option<String>), u32>,
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -202,6 +199,7 @@ fn select_boot_warm_target(
         })
 }
 
+#[cfg(test)]
 fn ra_reopen_cap() -> u32 {
     std::env::var("CARGOLESS_RA_REOPEN_CAP")
         .ok()
@@ -215,6 +213,7 @@ enum ReopenBudget {
     CapExceeded { count: u32, cap: u32 },
 }
 
+#[cfg(test)]
 fn consult_reopen_budget(
     map: &mut BTreeMap<(String, Option<String>), u32>,
     wt_key: &str,
@@ -236,12 +235,17 @@ fn consult_reopen_budget(
     }
 }
 
+#[cfg(test)]
 fn should_force_freshness_reopen(
     is_from_pushed_overlay: bool,
     zero_verbs: bool,
     target_is_empty: bool,
 ) -> bool {
     is_from_pushed_overlay && zero_verbs && !target_is_empty
+}
+
+fn diagnostic_refresh_fence(generation: u64, zero_verbs: bool) -> Option<u64> {
+    (!zero_verbs).then_some(generation)
 }
 
 /// Control messages from the per-cluster Supervisor `on_spawn` hook to
@@ -1036,7 +1040,6 @@ fn spawn_cluster(
             next_ver: 2,
             ready: false,
             deferred: VecDeque::new(),
-            forced_reopen_count: BTreeMap::new(),
         },
     );
     Ok(())
@@ -1302,8 +1305,6 @@ fn exec(
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
-            let mut is_from_pushed_overlay = false;
-            let mut pushed_base_sha: Option<String> = None;
             let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
                 if let Some(context) = pushed.semantic.as_ref() {
                     _span.record("request_id", context.request_id.as_str());
@@ -1323,8 +1324,6 @@ fn exec(
                 // sole attribution site.
                 api.record_push_attribution(&wt_key, &pushed);
                 pushed_check_profile = pushed.check_profile;
-                pushed_base_sha = pushed.base_sha.clone();
-                is_from_pushed_overlay = true;
                 let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
                 let materialize_overlay = pushed.analysis_root.is_some();
                 api.record_project_check_context(
@@ -1391,50 +1390,19 @@ fn exec(
                         let v = cs.next_ver;
                         cs.next_ver += 1;
                         let p = path.to_string_lossy();
-                        // RA's pull handler may otherwise answer from the
-                        // previous in-memory snapshot. Closing and reopening
-                        // invalidates that snapshot and makes the subsequent
-                        // diagnostic-refresh request causally belong to this
-                        // buffer generation.
-                        let _ = lsp.did_close(&p);
-                        let _ = lsp.did_open(&p, &content, v);
+                        // Keep the mutation as one ordered LSP notification.
+                        // A close+open pair can emit a refresh for the close
+                        // before RA has analyzed the reopened content, which
+                        // made a stale empty pull look authoritative.
+                        let _ = lsp.did_change(&p, &content, v);
                     }
                     LspVerb::DidClose { path } => {
                         let _ = lsp.did_close(&path.to_string_lossy());
                     }
                 }
             }
-            if should_force_freshness_reopen(is_from_pushed_overlay, zero_verbs, target.is_empty())
-            {
-                match consult_reopen_budget(
-                    &mut cs.forced_reopen_count,
-                    &wt_key,
-                    &pushed_base_sha,
-                    ra_reopen_cap(),
-                ) {
-                    ReopenBudget::CapExceeded { count, cap } => {
-                        let attribution = api.take_push_attribution(&wt_key);
-                        publish_reopen_cap_exceeded(&wt, count, cap, attribution, api);
-                        return;
-                    }
-                    ReopenBudget::Nudge { count, cap } => {
-                        if let Some((path, content)) = first_rs_in_overlay(&target) {
-                            eprintln!(
-                                "[cargoless:obs] freshness-reopen wt={} path={} count={} cap={}",
-                                wt.display(),
-                                path.display(),
-                                count,
-                                cap,
-                            );
-                            let version = cs.next_ver;
-                            cs.next_ver += 1;
-                            let path = path.to_string_lossy();
-                            let _ = lsp.did_close(&path);
-                            let _ = lsp.did_open(&path, &content, version);
-                        }
-                    }
-                }
-            }
+            let diagnostic_refresh_fence =
+                diagnostic_refresh_fence(diagnostic_refresh_generation, zero_verbs);
             // Cargoless replaces iterative cargo check/clippy; pushed Cargo
             // selectors are compatibility metadata, not an execution request.
             // They must not create a minute-scale direct Cargo lane inside
@@ -1453,7 +1421,7 @@ fn exec(
                 cs.lsp_tx.clone(),
                 lsp,
                 diagnostic_paths,
-                diagnostic_refresh_generation,
+                diagnostic_refresh_fence,
             );
         }
         ClusterAction::EmitVerdict {
@@ -1656,6 +1624,7 @@ fn ra_diagnostic_pull_timeout_from(env_ms: Option<u64>) -> Duration {
 /// deterministic and reproducible across runs. Returns `None` when the
 /// overlay contains no `.rs` entries (all Cargo.toml / Cargo.lock / etc.)
 /// — in that case the guard is a no-op (nothing to nudge RA with).
+#[cfg(test)]
 fn first_rs_in_overlay(target: &OverlaySet) -> Option<(PathBuf, String)> {
     target
         .iter_rs()
@@ -1679,7 +1648,7 @@ fn spawn_ra_diagnostic_pull(
     tx: Sender<(WorkspaceConfigHash, LspEvent)>,
     lsp: Arc<LspClient>,
     paths: Vec<PathBuf>,
-    refresh_generation: u64,
+    refresh_generation: Option<u64>,
 ) {
     let wt = wt.clone();
     let _ = std::thread::Builder::new()
@@ -1703,17 +1672,19 @@ fn spawn_ra_diagnostic_pull(
                 return;
             }
             let deadline = Instant::now() + pull_timeout;
-            let refresh_remaining = deadline.saturating_duration_since(Instant::now());
-            if let Err(error) =
-                lsp.wait_for_diagnostic_refresh(refresh_generation, refresh_remaining)
-            {
-                let _ = tx.send((
-                    h,
-                    LspEvent::FlycheckFailed {
-                        message: format!("ra_diagnostic_pull:{error}"),
-                    },
-                ));
-                return;
+            if let Some(refresh_generation) = refresh_generation {
+                let refresh_remaining = deadline.saturating_duration_since(Instant::now());
+                if let Err(error) =
+                    lsp.wait_for_diagnostic_refresh(refresh_generation, refresh_remaining)
+                {
+                    let _ = tx.send((
+                        h,
+                        LspEvent::FlycheckFailed {
+                            message: format!("ra_diagnostic_pull:{error}"),
+                        },
+                    ));
+                    return;
+                }
             }
             for path in paths {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1949,8 +1920,10 @@ fn publish_verdict(
 /// the `ra_respawn_` prefix.
 const STRANDED_PUSH_REASON: &str = "ra_respawn_stranded_push";
 
+#[cfg(test)]
 const REOPEN_CAP_EXCEEDED_REASON: &str = "ra_reopen_cap_exceeded";
 
+#[cfg(test)]
 fn publish_reopen_cap_exceeded(
     wt: &Path,
     count: u32,
