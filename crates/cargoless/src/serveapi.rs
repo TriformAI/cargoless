@@ -2019,12 +2019,13 @@ impl ServeVerdictState {
                     reason,
                     "ra_blind_path_green_unwitnessed"
                         | "ra_native_timer_settled_no_flycheck_activity"
+                        | "ra_native_unattributed_error"
                 ) {
                     (
                         cargoless_core::outcome::IndeterminateCause::CompilerWitnessRequired {
                             component: OutcomeComponent::RustAnalyzer,
                             limitation: text_v3(
-                                "rust-analyzer did not observe authoritative compiler activity for this input",
+                                "rust-analyzer did not produce an attributable authoritative compiler result for this input",
                             ),
                         },
                         RetryDirective::NewInputRequired,
