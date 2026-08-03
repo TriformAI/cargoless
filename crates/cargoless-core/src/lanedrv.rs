@@ -295,6 +295,13 @@ impl LegRunner for Box<dyn LegRunner + Send> {
 pub struct LegOutcome {
     pub tree: TreeState,
     pub diagnostics: Vec<cargoless_proto::Diagnostic>,
+    /// Whether error paths are evidence for member attribution.
+    ///
+    /// Compiler/project-check legs emit structured source paths and use
+    /// [`RedAttribution::ChangedFiles`]. A preview daemon currently exposes a
+    /// free-text terminal reason only; its synthetic diagnostic anchor is for
+    /// display, never ownership, so it uses [`RedAttribution::Unattributed`].
+    pub red_attribution: RedAttribution,
     /// The rendered artifact this build produced, if any.
     ///
     /// `None` is legitimate — a check-only lane proves a tree compiles without
@@ -322,6 +329,17 @@ pub struct LegReport {
     pub duration_ms: u128,
 }
 
+/// How a red leg's diagnostics may be mapped back to lane members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedAttribution {
+    /// Diagnostic paths came from the checker and may be matched to changed
+    /// files.
+    ChangedFiles,
+    /// Diagnostics describe a real red but their paths are synthetic display
+    /// anchors. No member may be blamed from them.
+    Unattributed,
+}
+
 /// Hand-written rather than derived because `TreeState` is a frozen `tf-proto`
 /// seam with no `Default` — and giving it one there would be a contract change
 /// to answer a convenience question here.
@@ -335,6 +353,7 @@ impl Default for LegOutcome {
         Self {
             tree: TreeState::Green,
             diagnostics: Vec::new(),
+            red_attribution: RedAttribution::ChangedFiles,
             artifact: None,
             legs: Vec::new(),
         }
@@ -418,6 +437,7 @@ impl LegRunner for ProfileLegRunner {
         Ok(LegOutcome {
             tree: report.tree,
             diagnostics: report.diagnostics,
+            red_attribution: RedAttribution::ChangedFiles,
             artifact,
             legs,
         })
@@ -677,6 +697,7 @@ impl LegRunner for DispatchLegRunner {
         Ok(LegOutcome {
             tree,
             diagnostics,
+            red_attribution: RedAttribution::ChangedFiles,
             // The artifact lives wherever the external builder put it (a
             // registry tag, a CAS handle); the dispatcher reports it, and the
             // lander promotes it. Nothing local to publish.
@@ -1119,6 +1140,7 @@ impl LegRunner for PreviewLegRunner {
                 return Ok(LegOutcome {
                     tree: TreeState::Green,
                     diagnostics: Vec::new(),
+                    red_attribution: RedAttribution::Unattributed,
                     artifact: None,
                     legs: vec![LegReport {
                         id: format!(
@@ -1217,6 +1239,7 @@ impl LegRunner for PreviewLegRunner {
                         ),
                         source: Some("cargoless-preview".to_string()),
                     }],
+                    red_attribution: RedAttribution::Unattributed,
                     artifact: None,
                     legs: vec![LegReport {
                         id: format!("preview:{}", self.slot),
@@ -1769,13 +1792,19 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             Ok(LegOutcome {
                 tree,
                 diagnostics,
+                red_attribution,
                 artifact,
                 legs,
             }) => {
                 self.record_legs(generation, &legs);
                 match tree {
                     TreeState::Green => LaneBuildOutcome::Green { artifact },
-                    TreeState::Red => LaneBuildOutcome::Red { diagnostics },
+                    TreeState::Red => match red_attribution {
+                        RedAttribution::ChangedFiles => LaneBuildOutcome::Red { diagnostics },
+                        RedAttribution::Unattributed => {
+                            LaneBuildOutcome::UnattributedRed { diagnostics }
+                        }
+                    },
                 }
             }
             Err(e) => LaneBuildOutcome::Infra {
@@ -1793,6 +1822,11 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             )),
             LaneBuildOutcome::Red { diagnostics } => self.trail_line(&format!(
                 "[cargoless:obs] lane-build generation={generation} outcome=red diagnostics={}",
+                diagnostics.len()
+            )),
+            LaneBuildOutcome::UnattributedRed { diagnostics } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} \
+                     outcome=red-unattributed diagnostics={}",
                 diagnostics.len()
             )),
             LaneBuildOutcome::Infra { reason } => self.trail_line(&format!(

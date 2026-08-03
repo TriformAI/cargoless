@@ -81,7 +81,7 @@ use std::path::{Path, PathBuf};
 
 use cargoless_proto::{Diagnostic, Severity};
 
-use crate::attribution::{FingerprintCounts, fingerprint_counts};
+use crate::attribution::{fingerprint_counts, FingerprintCounts};
 
 /// A candidate waiting to be built into the trunk.
 ///
@@ -277,6 +277,14 @@ pub enum LaneBuildOutcome {
     Green { artifact: Option<String> },
     /// Compiled red. Diagnostics drive attribution.
     Red { diagnostics: Vec<Diagnostic> },
+    /// Compiled red, but the reporting leg could not provide source paths that
+    /// are evidence of ownership.
+    ///
+    /// The diagnostics remain attached for fingerprinting and operator
+    /// context, but every member is held as unattributed. This is distinct from
+    /// [`Self::Infra`]: the code really was built and rejected; only the owner
+    /// is unknown.
+    UnattributedRed { diagnostics: Vec<Diagnostic> },
     /// A named member could not be merged onto the candidate. Nothing was
     /// compiled, but unlike [`Self::Infra`] we know exactly whose fault it is —
     /// git told us, by name, before any inference.
@@ -966,6 +974,9 @@ impl LaneState {
             LaneBuildOutcome::Red { diagnostics } => {
                 self.attribute_red(&members, &diagnostics, actions);
             }
+            LaneBuildOutcome::UnattributedRed { diagnostics } => {
+                self.eject_unattributed(&members, &diagnostics, actions);
+            }
             LaneBuildOutcome::Conflict { id, files, reason } => {
                 // The infrastructure worked — git ran and answered. Reset the
                 // consecutive-failure count so a conflict cannot creep the lane
@@ -1067,36 +1078,17 @@ impl LaneState {
             }
         }
 
-        let owned: Vec<Diagnostic> = errors.iter().map(|d| (*d).clone()).collect();
-        let fingerprints = fingerprint_counts(&self.root, &owned);
-        let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
-
         if owners.is_empty() {
             // Nobody touched a failing file. Could be an interaction between
             // members, could be a base red. Either way we do not know, so we
             // hold everyone and say so — never invent a culprit.
-            let all: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
-            for m in members {
-                let reason = EjectReason::Unattributed {
-                    fingerprints: fingerprints.clone(),
-                    shared_with: all.clone(),
-                };
-                self.ejected.insert(
-                    m.id.clone(),
-                    Ejection {
-                        reason: reason.clone(),
-                        head: m.head.clone(),
-                        changed_files: m.changed_files.clone(),
-                        expires_at_tick: expires,
-                    },
-                );
-                actions.push(LaneAction::Eject {
-                    id: m.id.clone(),
-                    reason,
-                });
-            }
+            self.eject_unattributed(members, diagnostics, actions);
             return;
         }
+
+        let owned: Vec<Diagnostic> = errors.iter().map(|d| (*d).clone()).collect();
+        let fingerprints = fingerprint_counts(&self.root, &owned);
+        let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
 
         // One or more owners: eject exactly those, and requeue everyone else so
         // the next build starts immediately with the survivors plus anything
@@ -1135,6 +1127,48 @@ impl LaneState {
                     state: "not implicated — requeued for the next build".to_string(),
                 });
             }
+        }
+    }
+
+    /// Hold every member for a real red whose owner cannot be proven.
+    ///
+    /// This is shared by ordinary changed-file attribution when no diagnostic
+    /// path has an owner and by legs that explicitly declare their paths to be
+    /// synthetic display anchors. Keeping one implementation prevents those
+    /// two honest-uncertainty paths from drifting in TTL, fingerprints, or
+    /// readmission behavior.
+    fn eject_unattributed(
+        &mut self,
+        members: &[LaneMember],
+        diagnostics: &[Diagnostic],
+        actions: &mut Vec<LaneAction>,
+    ) {
+        let errors: Vec<Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .cloned()
+            .collect();
+        let fingerprints = fingerprint_counts(&self.root, &errors);
+        let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
+        let all: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
+        for m in members {
+            let reason = EjectReason::Unattributed {
+                fingerprints: fingerprints.clone(),
+                shared_with: all.clone(),
+            };
+            self.ejected.insert(
+                m.id.clone(),
+                Ejection {
+                    reason: reason.clone(),
+                    head: m.head.clone(),
+                    changed_files: m.changed_files.clone(),
+                    expires_at_tick: expires,
+                },
+            );
+            actions.push(LaneAction::Eject {
+                id: m.id.clone(),
+                reason,
+            });
         }
     }
 
