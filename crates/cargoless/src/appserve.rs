@@ -514,9 +514,16 @@ impl BuildBackend for ThreadBuildBackend {
                 // out-of-disk red is non-latching (requeue-once) so the
                 // control loop's pressure-prune can free space and the sha
                 // retries, instead of pinning a good commit red forever.
-                BuildReport::Red { reason, enospc, .. } => {
-                    cargoless_core::appstate::AppBuildOutcome::Red { reason, enospc }
-                }
+                BuildReport::Red {
+                    reason,
+                    enospc,
+                    files,
+                    ..
+                } => cargoless_core::appstate::AppBuildOutcome::Red {
+                    reason,
+                    enospc,
+                    files,
+                },
                 BuildReport::Indeterminate { reason, .. } => {
                     cargoless_core::appstate::AppBuildOutcome::Indeterminate { reason }
                 }

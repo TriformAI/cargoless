@@ -45,6 +45,7 @@ is enforced by route, not by host.
       "last_green": "<sha or null>",
       "last_red_sha": null,
       "last_red_reason": null,
+      "last_red_files": [],
       "pending_sha": null,
       "draining": 0
     }

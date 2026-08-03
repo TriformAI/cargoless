@@ -77,7 +77,14 @@ pub enum AppBuildOutcome {
     /// marks an out-of-disk failure — environmental, not a defect in the sha —
     /// which is handled non-latching (requeue-once) so a transient full disk
     /// the daemon then self-relieves does not pin a good commit red forever.
-    Red { reason: String, enospc: bool },
+    /// `files` is the compile-error attribution evidence (worktree-relative;
+    /// empty for non-compile failures) — latched beside `last_red` so the
+    /// build lane can name the owner instead of holding every member.
+    Red {
+        reason: String,
+        enospc: bool,
+        files: Vec<String>,
+    },
     /// The build cannot be trusted (e.g. the worktree changed underneath
     /// it). Not red — requeued once, then red on a repeat.
     Indeterminate { reason: String },
@@ -118,6 +125,16 @@ pub struct InstanceState {
     pub pending: Option<String>,
     /// Last red `(sha, reason)` — that sha is never auto-retried.
     pub last_red: Option<(String, String)>,
+    /// Worktree-relative source files named by ERROR diagnostics in the build
+    /// behind [`Self::last_red`]. Attribution evidence for the build lane:
+    /// with it a red names its owner; without it every queued member is held.
+    /// Empty for non-compile reds (checkout/manifest/timeout/harvest).
+    ///
+    /// MUST never be read except alongside a live `last_red` — a file list
+    /// that outlives its red would attribute the NEXT failure to the previous
+    /// failure's files. Writers replace it in `record_red`; readers
+    /// (`appsvc`, `appstatefile`) gate on `last_red.is_some()`.
+    pub last_red_files: Vec<String>,
     /// Most recent successfully promoted sha (survives a serving-child
     /// death; names the bundle a recovery respawn boots from).
     pub last_green: Option<String>,
@@ -395,6 +412,7 @@ impl AppState {
             AppBuildOutcome::Red {
                 reason,
                 enospc: true,
+                ..
             } => {
                 // Infra-red: the disk failed transiently, the sha is fine.
                 // Mirror the Indeterminate requeue-once discipline — do NOT
@@ -414,6 +432,8 @@ impl AppState {
                         format!(
                             "disk full, self-relief exhausted (PVC likely too small): {reason}"
                         ),
+                        // Environmental: no member's code carries this red.
+                        Vec::new(),
                         actions,
                     );
                     self.settle_idle(instance, actions);
@@ -432,13 +452,14 @@ impl AppState {
             AppBuildOutcome::Red {
                 reason,
                 enospc: false,
+                files,
             } => {
                 // Code-red: a real defect in this sha. Latch it (unchanged) so
                 // the bad commit is not auto-retried until a new one arrives.
                 inst.indeterminate_streak = 0;
                 inst.enospc_streak = 0;
                 inst.pipeline = Pipeline::Idle;
-                self.record_red(instance, sha, reason, actions);
+                self.record_red(instance, sha, reason, files, actions);
                 self.settle_idle(instance, actions);
             }
             AppBuildOutcome::Indeterminate { reason } => {
@@ -462,6 +483,8 @@ impl AppState {
                         instance,
                         sha,
                         format!("indeterminate twice in a row: {reason}"),
+                        // An untrusted build produced no attributable spans.
+                        Vec::new(),
                         actions,
                     );
                     self.settle_idle(instance, actions);
@@ -540,7 +563,8 @@ impl AppState {
         } else {
             format!("health probe failed: {reason}")
         };
-        self.record_red(instance, sha, reason, actions);
+        // A probe failure is a runtime fault, not a compile span — no files.
+        self.record_red(instance, sha, reason, Vec::new(), actions);
         self.settle_idle(instance, actions);
         self.dispatch(actions);
     }
@@ -709,10 +733,15 @@ impl AppState {
         instance: &str,
         sha: String,
         reason: String,
+        files: Vec<String>,
         actions: &mut Vec<Action>,
     ) {
         let inst = self.instances.get_mut(instance).expect("checked");
         inst.last_red = Some((sha.clone(), reason.clone()));
+        // REPLACE, never merge: these files describe exactly this red. An
+        // empty list is itself information (a non-compile red has no owner
+        // evidence) and must overwrite a previous red's list.
+        inst.last_red_files = files;
         actions.push(Action::RecordRed {
             instance: instance.to_string(),
             sha,
@@ -769,6 +798,7 @@ mod tests {
                 outcome: AppBuildOutcome::Red {
                     reason: "bundle harvest failed: No space left on device (os error 28)".into(),
                     enospc: true,
+                    files: Vec::new(),
                 },
             },
         )
@@ -879,6 +909,7 @@ mod tests {
                 outcome: AppBuildOutcome::Red {
                     reason: "step `server` exited 101".into(),
                     enospc: false,
+                    files: Vec::new(),
                 },
             },
         );
@@ -1368,6 +1399,7 @@ mod tests {
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
                     enospc: false,
+                    files: Vec::new(),
                 },
             },
         );
@@ -1499,6 +1531,7 @@ mod tests {
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
                     enospc: false,
+                    files: Vec::new(),
                 },
             },
         );
