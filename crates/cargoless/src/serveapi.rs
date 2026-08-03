@@ -45,17 +45,27 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cargoless_core::analyzer::RaStderrSnapshot;
 use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
+use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
 use cargoless_core::lane::{LaneMember, LaneState};
 use cargoless_core::lanehost::LaneHost;
+use cargoless_core::outcome::{
+    AttemptId, Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation,
+    DiagnosticOrigin, DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef,
+    ExecutionId, FailureCause, IndeterminateCause, NonEmptyDiagnostics, NonEmptyText,
+    OutcomeEnvelope, PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind,
+    RetryDirective, Subject, Surface,
+};
 use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
-    BatchCheckRequest, CheckProfile, DaemonActivity, LaneEnqueueRequest, PushOverlayAck,
-    PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
+    AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, LaneEnqueueRequest,
+    PushOverlayAck, PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus,
+    WorktreeSummary, batchreport_to_json,
 };
 use cargoless_core::{Diagnostic, Severity, TreeState};
 
@@ -88,6 +98,7 @@ const HARD_WITNESS_HISTORY_CAP_DEFAULT: usize = 64;
 /// 128 MiB per `transport::http`'s cap). Same-base_sha still latest-wins
 /// (replace in place) even at the cap. Override via env.
 const PUSHED_MAX_PER_WT_DEFAULT: usize = 8;
+const OUTCOME_V3_MEMORY_CAP: usize = 1024;
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 /// CGLS-26 — bump when the warm shared-target-dir layout or keying changes,
 /// so a daemon rolling a new image never reuses an incompatible warm tree
@@ -120,6 +131,10 @@ pub struct PushedOverlay {
     /// Client's resolved base SHA, diagnostics-only. The server fetch/reset
     /// result remains authoritative.
     pub base_sha: Option<String>,
+    /// Advertised remote ref used to fetch the exact candidate.
+    pub source_ref: Option<String>,
+    /// Verified candidate commit used by git-native project checks.
+    pub source_sha: Option<String>,
     /// Unix timestamp of the push receipt. Diagnostics-only for 2b;
     /// future idle-evict policy (Wave-2) reads this.
     pub last_push_unix: u64,
@@ -142,6 +157,9 @@ pub struct PushedOverlay {
     /// environmental reds) through a gating verdict. `None`/empty ⇒ the
     /// gated lane runs the full profile (prior behavior).
     pub check_ids: Option<Vec<String>>,
+    /// Exact v3 attempt identity. Legacy/local pushes omit it and retain the
+    /// historical status-only behavior.
+    pub semantic: Option<AttemptContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +167,9 @@ pub(crate) struct ProjectCheckRunContext {
     pub root: PathBuf,
     pub changed_files: Option<Vec<String>>,
     pub base_ref: String,
+    pub base_sha: Option<String>,
+    pub source_ref: Option<String>,
+    pub source_sha: Option<String>,
     pub overlay_files: Vec<(String, String)>,
     pub materialize_overlay: bool,
     /// Carried from [`PushedOverlay::gate`]: the EmitVerdict arm promotes
@@ -158,6 +179,17 @@ pub(crate) struct ProjectCheckRunContext {
     /// for the gated lane. Only consulted when `gate` is true.
     pub check_ids: Option<Vec<String>>,
 }
+
+/// Owned handoff from HTTP ingest to the hard-witness dispatcher. Gated
+/// checks do not enter the rust-analyzer transaction queue.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectGateRequest {
+    pub wt: PathBuf,
+    pub context: ProjectCheckRunContext,
+    pub attribution: PushAttribution,
+}
+
+type AttributedDiagnostics = BTreeMap<(String, Option<String>), Vec<Diagnostic>>;
 
 /// Verdict-attribution record for one consumed push (#A2/#A7). Captured by
 /// the serve loop's SwitchOverlay arm at the moment a [`PushedOverlay`] is
@@ -187,6 +219,9 @@ pub(crate) struct PushAttribution {
     /// granularity) + exact analysis time (consume→publish, monotonic ms).
     pub consumed_unix: u64,
     pub consumed_at: Instant,
+    /// Kept on the consumed push so final publication can update exactly the
+    /// attempt that caused it, even when the same SHA is retried.
+    pub semantic: Option<AttemptContext>,
 }
 
 impl PushAttribution {
@@ -210,6 +245,154 @@ fn latency_ms(push_received_unix: u64, consumed_unix: u64, analysis: Duration) -
         .saturating_sub(push_received_unix)
         .saturating_mul(1000)
         .saturating_add(u64::try_from(analysis.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn text_v3(value: impl Into<String>) -> NonEmptyText {
+    NonEmptyText::new(value).expect("v3 producer must construct non-empty semantic text")
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn producer_v3() -> Producer {
+    Producer {
+        daemon_build_id: text_v3(cargoless_core::build_id()),
+        process_id: std::process::id(),
+        process_generation: 1,
+        pod_uid: std::env::var("POD_UID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(text_v3),
+        rust_analyzer_generation: None,
+    }
+}
+
+fn reaction_state_name(state: cargoless_core::outcome::CheckState) -> &'static str {
+    match state {
+        cargoless_core::outcome::CheckState::Pending => "pending",
+        cargoless_core::outcome::CheckState::Success => "success",
+        cargoless_core::outcome::CheckState::Failure => "failure",
+        cargoless_core::outcome::CheckState::Error => "error",
+        cargoless_core::outcome::CheckState::NoUpdate => "no_update",
+    }
+}
+
+fn evidence_mut_v3(conclusion: &mut Conclusion) -> Option<&mut EvidenceRef> {
+    match conclusion {
+        Conclusion::Passed { evidence, .. }
+        | Conclusion::Failed { evidence, .. }
+        | Conclusion::Indeterminate { evidence, .. }
+        | Conclusion::Rejected { evidence, .. }
+        | Conclusion::Cancelled { evidence, .. }
+        | Conclusion::Superseded { evidence, .. } => Some(evidence),
+        Conclusion::Pending { .. } => None,
+    }
+}
+
+/// Evidence durability is part of the result, not an out-of-band warning.
+/// A real code failure remains a failure if harvesting breaks; every other
+/// conclusion becomes an operational error so a missing bundle can never be
+/// mistaken for a proven pass.
+fn mark_evidence_unavailable_v3(outcome: &mut OutcomeEnvelope, explanation: String) {
+    let explanation_text = text_v3(explanation);
+    let mut conclusion = outcome.conclusion.clone();
+    let Some(evidence) = evidence_mut_v3(&mut conclusion) else {
+        return;
+    };
+    evidence.availability = EvidenceAvailability::Unavailable {
+        explanation: explanation_text.clone(),
+    };
+    let evidence = evidence.clone();
+    match conclusion {
+        Conclusion::Failed {
+            cause,
+            path_overlap,
+            ..
+        } => outcome.conclude(Conclusion::Failed {
+            cause,
+            path_overlap,
+            evidence,
+            summary: text_v3(format!(
+                "code failure retained, but its durable evidence bundle is unavailable: {}",
+                explanation_text.as_str()
+            )),
+        }),
+        _ => outcome.conclude(Conclusion::Rejected {
+            cause: IndeterminateCause::DependencyUnavailable {
+                component: OutcomeComponent::EvidenceStore,
+            },
+            retry: RetryDirective::OperatorRequired,
+            evidence,
+            summary: text_v3(format!(
+                "result cannot be accepted because durable evidence is unavailable: {}",
+                explanation_text.as_str()
+            )),
+        }),
+    }
+}
+
+fn canonical_pairs_digest(files: &[(String, String)]) -> String {
+    let mut files = files.to_vec();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut bytes = Vec::new();
+    for (path, content) in files {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(content.len().to_string().as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(sha256_hex(content.as_bytes()).as_bytes());
+        bytes.push(b'\n');
+    }
+    sha256_hex(&bytes)
+}
+
+fn canonical_strings_digest(values: &[String]) -> String {
+    let mut values = values.to_vec();
+    values.sort();
+    values.dedup();
+    sha256_hex(values.join("\n").as_bytes())
+}
+
+fn overlay_subject_v3(
+    worktree: &str,
+    base_ref: &str,
+    files: &[(String, String)],
+    profile: Option<&CheckProfile>,
+    options: &PushOverlayOptions,
+) -> Result<Subject, &'static str> {
+    let base_sha = options
+        .base_sha
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("v3 overlay requires base_sha")?;
+    let repository = options
+        .analysis_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(worktree);
+    if repository.trim().is_empty() || worktree.trim().is_empty() || base_ref.trim().is_empty() {
+        return Err("v3 overlay requires repository, worktree, and base_ref");
+    }
+    let changed_files = options.changed_files.as_deref().unwrap_or_default();
+    let plan = format!(
+        "profile={profile:?};gate={};check_ids={:?}",
+        options.gate, options.check_ids
+    );
+    Ok(Subject::Overlay {
+        repository: text_v3(repository),
+        worktree_key: text_v3(worktree),
+        base_ref: text_v3(base_ref),
+        base_sha: text_v3(base_sha),
+        overlay_digest: text_v3(canonical_pairs_digest(files)),
+        changed_files_digest: text_v3(canonical_strings_digest(changed_files)),
+        check_plan_digest: text_v3(sha256_hex(plan.as_bytes())),
+    })
 }
 
 /// #A8 — the operator's proc-macro-blind path globs, comma-separated in
@@ -397,6 +580,10 @@ pub struct ServeVerdictState {
     /// remote `get_status(<wt>)` resolves the exact tree the loop
     /// attributed.
     statuses: Mutex<BTreeMap<String, WorktreeStatus>>,
+    /// Full diagnostics keyed by the same `(worktree, base_sha)` identity as
+    /// attributed verdict history. This prevents simultaneous PRs sharing a
+    /// worktree key from reading each other's compiler output.
+    diagnostics: Mutex<AttributedDiagnostics>,
     /// Live transition-event subscribers (the SSE / in-proc fan-out).
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
@@ -437,6 +624,10 @@ pub struct ServeVerdictState {
     /// `HttpServer::bind` exposes `push_overlay` to clients (so no
     /// push can race the channel-not-yet-attached window).
     push_signal: Mutex<Option<Sender<String>>>,
+    /// Direct gated-check handoff, wired before HTTP bind just like
+    /// `push_signal`. A gate push is accepted only when this dispatcher is
+    /// available; it is never queued behind rust-analyzer.
+    direct_gate_signal: Mutex<Option<Sender<DirectGateRequest>>>,
     /// Admin drain state. A restart requests quiesce through HTTP; after
     /// that, new pushes are refused while accepted pushed worktrees stay
     /// active until their next authoritative verdict is published.
@@ -470,6 +661,14 @@ pub struct ServeVerdictState {
     /// scratch worktrees. `None` keeps the in-root v0 path for unit tests
     /// and embedded callers that do not have a resolved fleet config.
     project_check_state_dir: Option<PathBuf>,
+    /// Exact attempt-keyed semantic state. This is intentionally independent
+    /// of the last-writer-wins worktree status slot.
+    outcomes_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, OutcomeEnvelope>>,
+    outcome_order_v3: Mutex<VecDeque<cargoless_core::outcome::AttemptId>>,
+    /// Durable proof store, configured alongside the daemon state directory.
+    evidence_store_v3: Option<EvidenceStore>,
+    ra_evidence_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, RaStderrSnapshot>>,
+    outcome_metrics_v3: Mutex<OutcomeMetricsV3>,
     /// Per-`(worktree, base_sha)` Hard-witness generation counter. The latest
     /// generation for each key is the only witness that may publish; stale
     /// witnesses (from a prior push whose EmitVerdict fired while a newer
@@ -551,6 +750,16 @@ pub struct ServeVerdictState {
 struct DrainState {
     quiescing: bool,
     active_worktrees: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct OutcomeMetricsV3 {
+    terminal_by_code: BTreeMap<String, u64>,
+    reactions_by_state: BTreeMap<String, u64>,
+    ra_storm_outcomes: u64,
+    evidence_persist_failures: u64,
+    last_ra_error_lines: u64,
+    last_ra_suppressed_lines: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1619,8 +1828,438 @@ impl ServeVerdictState {
     /// project-check scratch worktrees. This keeps slow advisory/project
     /// checks out of the shared mutable analysis root.
     pub fn with_project_check_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.evidence_store_v3 = Some(EvidenceStore::new(&state_dir));
         self.project_check_state_dir = Some(state_dir);
         self
+    }
+
+    fn remember_outcome_v3(&self, outcome: OutcomeEnvelope) {
+        let attempt_id = outcome.attempt_id.clone();
+        let mut outcomes = poisoned(&self.outcomes_v3);
+        let mut order = poisoned(&self.outcome_order_v3);
+        if outcomes.insert(attempt_id.clone(), outcome).is_some() {
+            order.retain(|existing| existing != &attempt_id);
+        }
+        order.push_back(attempt_id);
+        while order.len() > OUTCOME_V3_MEMORY_CAP {
+            if let Some(expired) = order.pop_front() {
+                outcomes.remove(&expired);
+            }
+        }
+    }
+
+    fn begin_outcome_v3(
+        &self,
+        context: &AttemptContext,
+        surface: Surface,
+        subject: Subject,
+        phase: Phase,
+        summary: impl Into<String>,
+    ) -> OutcomeEnvelope {
+        let now = now_unix_ms();
+        let mut outcome = OutcomeEnvelope::new(
+            context.request_id.clone(),
+            context.attempt_id.clone(),
+            context.trace_id.clone(),
+            surface,
+            subject,
+            producer_v3(),
+            Conclusion::Pending {
+                phase,
+                retry: None,
+                summary: text_v3(summary),
+            },
+        );
+        let attempt_digest = sha256_hex(context.attempt_id.as_str().as_bytes());
+        let execution_id = ExecutionId::new(format!(
+            "execution.{}.{}.{}",
+            std::process::id(),
+            now,
+            &attempt_digest[..16]
+        ))
+        .expect("generated execution identity is contract-safe");
+        outcome.execution_id = Some(execution_id.clone());
+        outcome.relations.push(Relation {
+            kind: RelationKind::ExecutedBy,
+            attempt_id: None,
+            execution_id: Some(execution_id),
+        });
+        outcome.timeline = vec![
+            PhaseRecord {
+                phase: Phase::Accepted,
+                started_at_unix_ms: now,
+                finished_at_unix_ms: Some(now),
+            },
+            PhaseRecord {
+                phase,
+                started_at_unix_ms: now,
+                finished_at_unix_ms: None,
+            },
+        ];
+        if let Some(previous_attempt_id) = context.previous_attempt_id.clone() {
+            outcome.relations.push(Relation {
+                kind: RelationKind::RetriedFrom,
+                attempt_id: Some(previous_attempt_id),
+                execution_id: None,
+            });
+        }
+        self.remember_outcome_v3(outcome.clone());
+        outcome
+    }
+
+    fn forget_outcome_v3(&self, attempt_id: &AttemptId) {
+        poisoned(&self.outcomes_v3).remove(attempt_id);
+        poisoned(&self.outcome_order_v3).retain(|existing| existing != attempt_id);
+    }
+
+    pub(crate) fn record_ra_evidence_v3(
+        &self,
+        context: Option<&AttemptContext>,
+        snapshot: RaStderrSnapshot,
+    ) {
+        let Some(context) = context else {
+            return;
+        };
+        poisoned(&self.ra_evidence_v3).insert(context.attempt_id.clone(), snapshot);
+    }
+
+    fn finish_outcome_v3(
+        &self,
+        context: &AttemptContext,
+        payload: &crate::statusfile::VerdictPayload,
+        gated_checks_ran: &[String],
+        worktree: &str,
+    ) {
+        let Some(mut outcome) = poisoned(&self.outcomes_v3)
+            .get(&context.attempt_id)
+            .cloned()
+        else {
+            tracing::error!(
+                attempt_id = %context.attempt_id,
+                request_id = %context.request_id,
+                "outcome-v3 publish has no accepted attempt"
+            );
+            return;
+        };
+
+        let published_at = now_unix_ms();
+        if let Some(queued) = outcome
+            .timeline
+            .iter_mut()
+            .rev()
+            .find(|record| record.finished_at_unix_ms.is_none())
+        {
+            queued.finished_at_unix_ms = Some(published_at);
+        }
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Publishing,
+            started_at_unix_ms: published_at,
+            finished_at_unix_ms: Some(published_at),
+        });
+
+        let mut evidence = EvidenceBundle::default();
+        let ra_snapshot = poisoned(&self.ra_evidence_v3).remove(&context.attempt_id);
+        evidence.push(
+            ArtifactKind::Events,
+            format!(
+                "{{\"at_unix_ms\":{published_at},\"event\":\"verdict.publish\",\
+                 \"attempt_id\":\"{}\",\"request_id\":\"{}\",\"trace_id\":\"{}\",\
+                 \"worktree\":{},\"verdict\":\"{}\",\"red_diagnostics\":{},\
+                 \"failure_reason\":{}}}\n",
+                context.attempt_id,
+                context.request_id,
+                context.trace_id,
+                serde_json::to_string(worktree).expect("worktree JSON"),
+                payload.verdict.as_str(),
+                payload.red_diagnostics,
+                serde_json::to_string(&payload.analysis_failure_reason).expect("reason JSON"),
+            ),
+        );
+        let (
+            ra_process_generation,
+            ra_pid,
+            ra_total_lines,
+            ra_error_lines,
+            ra_suppressed_lines,
+            ra_overflow_fingerprints,
+            ra_fingerprints,
+        ) = match ra_snapshot.as_ref() {
+            Some(snapshot) => (
+                snapshot.process_generation,
+                snapshot.pid,
+                snapshot.total_lines,
+                snapshot.error_lines,
+                snapshot.suppressed_lines,
+                snapshot.overflow_fingerprints,
+                snapshot
+                    .fingerprints
+                    .iter()
+                    .map(|fingerprint| {
+                        serde_json::json!({
+                            "fingerprint": fingerprint.fingerprint,
+                            "count": fingerprint.count,
+                            "level": fingerprint.level,
+                            "sample": fingerprint.sample,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            None => (0, None, 0, 0, 0, 0, Vec::new()),
+        };
+        let ra_storm = ra_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .fingerprints
+                .iter()
+                .filter(|fingerprint| fingerprint.level == "error")
+                .max_by_key(|fingerprint| fingerprint.count)
+                .filter(|fingerprint| fingerprint.count >= 1000)
+                .cloned()
+        });
+        evidence.push(
+            ArtifactKind::RustAnalyzerSummary,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "cargoless.rust-analyzer-summary/v3",
+                "classification": if gated_checks_ran.is_empty() {
+                    "rust_analyzer_flycheck"
+                } else {
+                    "project_check"
+                },
+                "process_generation": ra_process_generation,
+                "pid": ra_pid,
+                "stderr": {
+                    "total_lines": ra_total_lines,
+                    "error_lines": ra_error_lines,
+                    "duplicates_suppressed": ra_suppressed_lines,
+                    "overflow_fingerprints": ra_overflow_fingerprints,
+                    "fingerprints": ra_fingerprints,
+                },
+                "reported_error_diagnostics": payload.red_diagnostics,
+                "item_level_diagnostics_retained": false,
+                "gated_checks_executed": gated_checks_ran,
+            }))
+            .expect("summary JSON"),
+        );
+        if let Some(snapshot) = ra_snapshot {
+            if !snapshot.tail.is_empty() {
+                evidence.push(
+                    ArtifactKind::StderrTail,
+                    format!("{}\n", snapshot.tail.join("\n")),
+                );
+            }
+            for (index, stack) in snapshot.stack_captures.into_iter().enumerate() {
+                evidence.push(ArtifactKind::Stack(index as u32 + 1), stack);
+            }
+        }
+        let reference_store = self
+            .evidence_store_v3
+            .clone()
+            .unwrap_or_else(|| EvidenceStore::new("."));
+        let evidence_ref = match reference_store.reference_for(&context.attempt_id, &evidence) {
+            Ok(reference) => reference,
+            Err(error) => {
+                tracing::error!(
+                    attempt_id = %context.attempt_id,
+                    error = %error,
+                    "could not construct outcome-v3 evidence reference"
+                );
+                return;
+            }
+        };
+
+        let origin = if gated_checks_ran.is_empty() {
+            DiagnosticOrigin::RustAnalyzerFlycheck
+        } else {
+            DiagnosticOrigin::ProjectCheck
+        };
+        let conclusion = match payload.verdict {
+            crate::statusfile::Verdict::Green => Conclusion::Passed {
+                basis: if gated_checks_ran.is_empty() {
+                    PassBasis::DiagnosticsClear { origin }
+                } else {
+                    PassBasis::ChecksPassed {
+                        requested_check_ids: gated_checks_ran.iter().map(text_v3).collect(),
+                        executed_check_ids: gated_checks_ran.iter().map(text_v3).collect(),
+                    }
+                },
+                evidence: evidence_ref,
+                summary: text_v3(if gated_checks_ran.is_empty() {
+                    "rust-analyzer flycheck completed with no blocking diagnostics"
+                } else {
+                    "every requested blocking project check executed and passed"
+                }),
+            },
+            crate::statusfile::Verdict::Red
+                if gated_checks_ran.is_empty() && ra_storm.is_some() =>
+            {
+                let storm = ra_storm.as_ref().expect("guarded by is_some");
+                Conclusion::Indeterminate {
+                    cause: cargoless_core::outcome::IndeterminateCause::AnalyzerPathology {
+                        component: OutcomeComponent::RustAnalyzer,
+                        signature: text_v3(&storm.fingerprint),
+                        repeated_events: storm.count,
+                    },
+                    retry: RetryDirective::OperatorRequired,
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "rust-analyzer emitted the same internal error {} times; this is an analyzer pathology, not a compiler diagnostic",
+                        storm.count
+                    )),
+                }
+            }
+            crate::statusfile::Verdict::Red => {
+                let count = std::num::NonZeroU32::new(payload.red_diagnostics)
+                    .expect("VerdictPayload makes red-with-zero unrepresentable");
+                Conclusion::Failed {
+                    cause: cargoless_core::outcome::FailureCause::UnlocatedDiagnosticReport {
+                        origin,
+                        authority: Authority::Blocking,
+                        reported_count: count,
+                        producer: text_v3("legacy_verdict_payload"),
+                        raw_report_digest: text_v3(sha256_hex(
+                            format!(
+                                "{}:{}:{:?}",
+                                payload.verdict.as_str(),
+                                payload.red_diagnostics,
+                                payload.analysis_failure_reason
+                            )
+                            .as_bytes(),
+                        )),
+                    },
+                    path_overlap: PathOverlap::NotComputable,
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "producer reported {} blocking diagnostic(s), but item-level file, line, \
+                         code, and message records were not retained",
+                        payload.red_diagnostics
+                    )),
+                }
+            }
+            crate::statusfile::Verdict::Unknown => {
+                let reason = payload
+                    .analysis_failure_reason
+                    .as_deref()
+                    .filter(|reason| !reason.trim().is_empty())
+                    .unwrap_or("producer returned unknown without a reason");
+                let (cause, retry) = if matches!(
+                    reason,
+                    "ra_blind_path_green_unwitnessed"
+                        | "ra_native_timer_settled_no_flycheck_activity"
+                        | "ra_native_unattributed_error"
+                ) {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::CompilerWitnessRequired {
+                            component: OutcomeComponent::RustAnalyzer,
+                            limitation: text_v3(
+                                "rust-analyzer did not produce an attributable authoritative compiler result for this input",
+                            ),
+                        },
+                        RetryDirective::NewInputRequired,
+                    )
+                } else if reason.starts_with("ra_respawn_") {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::ProcessLost {
+                            component: OutcomeComponent::RustAnalyzer,
+                            respawned: true,
+                        },
+                        RetryDirective::Automatic {
+                            attempt: context.attempt_number,
+                            maximum_attempts: context.maximum_attempts,
+                            after_ms: context.retry_after_ms,
+                        },
+                    )
+                } else if reason.starts_with("ra_spawn_failed") {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::ProcessLost {
+                            component: OutcomeComponent::RustAnalyzer,
+                            respawned: false,
+                        },
+                        RetryDirective::Automatic {
+                            attempt: context.attempt_number,
+                            maximum_attempts: context.maximum_attempts,
+                            after_ms: context.retry_after_ms,
+                        },
+                    )
+                } else if reason.contains("timeout") {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::BudgetExhausted {
+                            component: OutcomeComponent::ProjectCheck,
+                            budget: text_v3(reason),
+                        },
+                        RetryDirective::Automatic {
+                            attempt: context.attempt_number,
+                            maximum_attempts: context.maximum_attempts,
+                            after_ms: context.retry_after_ms,
+                        },
+                    )
+                } else {
+                    (
+                        cargoless_core::outcome::IndeterminateCause::InternalContractViolation {
+                            invariant: text_v3(reason),
+                        },
+                        RetryDirective::OperatorRequired,
+                    )
+                };
+                Conclusion::Indeterminate {
+                    cause,
+                    retry,
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "evaluation was indeterminate because {reason}; this is not a code failure"
+                    )),
+                }
+            }
+        };
+        outcome.conclude(conclusion);
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: published_at,
+            finished_at_unix_ms: Some(published_at),
+        });
+        if ra_process_generation > 0 {
+            outcome.producer.rust_analyzer_generation = Some(ra_process_generation);
+        }
+        let evidence_error = if let Some(store) = self.evidence_store_v3.as_ref() {
+            let class = if matches!(outcome.conclusion, Conclusion::Passed { .. }) {
+                EvidenceClass::Success
+            } else {
+                EvidenceClass::Terminal
+            };
+            store
+                .persist(&outcome, class, &evidence)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            Some("durable evidence store is not configured".to_string())
+        };
+        if let Some(error) = evidence_error {
+            mark_evidence_unavailable_v3(&mut outcome, error.clone());
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            metrics.evidence_persist_failures = metrics.evidence_persist_failures.saturating_add(1);
+            drop(metrics);
+            tracing::error!(
+                attempt_id = %context.attempt_id,
+                error = %error,
+                "outcome-v3 durable evidence persistence failed"
+            );
+        }
+        {
+            let reaction_state = reaction_state_name(outcome.reaction.state);
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            *metrics
+                .terminal_by_code
+                .entry(outcome.conclusion.semantic_code().to_string())
+                .or_insert(0) += 1;
+            *metrics
+                .reactions_by_state
+                .entry(reaction_state.to_string())
+                .or_insert(0) += 1;
+            if ra_storm.is_some() {
+                metrics.ra_storm_outcomes = metrics.ra_storm_outcomes.saturating_add(1);
+            }
+            metrics.last_ra_error_lines = ra_error_lines;
+            metrics.last_ra_suppressed_lines = ra_suppressed_lines;
+        }
+        self.remember_outcome_v3(outcome);
     }
 
     /// CGLS-25 — acquire a Hard-witness compile slot from the global gate.
@@ -1682,7 +2321,14 @@ impl ServeVerdictState {
         base_sha: Option<String>,
         ra_blind_paths: bool,
     ) {
-        self.publish_attributed_with_checks(wt, payload, base_sha, ra_blind_paths, Vec::new());
+        self.publish_attributed_with_checks(
+            wt,
+            payload,
+            base_sha,
+            ra_blind_paths,
+            Vec::new(),
+            None,
+        );
     }
 
     /// [`Self::publish_attributed`] carrying the ids of the project checks
@@ -1704,6 +2350,7 @@ impl ServeVerdictState {
         base_sha: Option<String>,
         ra_blind_paths: bool,
         gated_checks_ran: Vec<String>,
+        semantic: Option<AttemptContext>,
     ) {
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
@@ -1727,7 +2374,7 @@ impl ServeVerdictState {
             // The witness's positive "the gated check ran" proof. Empty for
             // FS-watch / coalesced / RA-native verdicts (no enumerated
             // report) ⇒ absent on the wire (additive, same as base_sha).
-            gated_checks_ran,
+            gated_checks_ran: gated_checks_ran.clone(),
             // Freshly published ⇒ age computed at read time (get_status)
             // from `published_at` so a remote reader sees an honest age.
             heartbeat_age_secs: 0,
@@ -1750,6 +2397,18 @@ impl ServeVerdictState {
             while ring.len() > self.witness_history_cap {
                 ring.pop_front();
             }
+            let retained_shas: BTreeSet<String> = ring
+                .iter()
+                .filter_map(|entry| entry.base_sha.clone())
+                .collect();
+            drop(hist);
+            poisoned(&self.diagnostics).retain(|(key_wt, key_sha), _| {
+                key_wt != &worktree
+                    || key_sha.is_none()
+                    || key_sha
+                        .as_ref()
+                        .is_some_and(|candidate| retained_shas.contains(candidate))
+            });
         }
         // The slot is last-writer-wins, but never regresses to a STRICTLY
         // staler timestamp — two Hard-witness supervisor threads can publish
@@ -1778,6 +2437,9 @@ impl ServeVerdictState {
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
         self.mark_worktree_published(&worktree);
+        if let Some(context) = semantic.as_ref() {
+            self.finish_outcome_v3(context, &payload, &gated_checks_ran, &worktree);
+        }
     }
 
     /// #240/2b — wire the push-arrival signal channel. Called ONCE by
@@ -1793,6 +2455,11 @@ impl ServeVerdictState {
     /// fail-soft transport ethos applied to the write-plane wakeup.
     pub fn attach_push_signal(&self, tx: Sender<String>) {
         *poisoned(&self.push_signal) = Some(tx);
+    }
+
+    /// Wire the direct hard-witness dispatcher before exposing HTTP ingest.
+    pub(crate) fn attach_direct_gate_signal(&self, tx: Sender<DirectGateRequest>) {
+        *poisoned(&self.direct_gate_signal) = Some(tx);
     }
 
     /// C1 observability — record the resolved RA config JSON
@@ -1842,6 +2509,30 @@ impl ServeVerdictState {
         popped.0
     }
 
+    /// Terminalize the next accepted overlay when its rust-analyzer cluster
+    /// cannot be created. Accepted exact attempts must never remain queued
+    /// after the adapter has already abandoned their execution.
+    pub(crate) fn fail_next_pushed_overlay(&self, wt_key: &str, reason: &str) -> bool {
+        let Some(pushed) = self.take_overlay_for(wt_key) else {
+            return false;
+        };
+        let macro_blind_hit = compute_macro_blind_hit(
+            pushed.changed_files.as_deref(),
+            &macro_blind_globs(),
+            &pushed.files,
+            &macro_blind_macros(),
+        );
+        self.publish_attributed_with_checks(
+            Path::new(wt_key),
+            crate::statusfile::VerdictPayload::unknown(reason),
+            pushed.base_sha,
+            macro_blind_hit,
+            Vec::new(),
+            pushed.semantic,
+        );
+        true
+    }
+
     /// #240/2b — non-consuming peek. Used by the serve loop's first-push
     /// cluster-hash derivation (`cluster_hash_from_pushed`) which needs
     /// to read the pushed workspace-config files WITHOUT consuming the
@@ -1883,6 +2574,24 @@ impl ServeVerdictState {
         worktree: &str,
     ) -> Option<ProjectCheckRunContext> {
         poisoned(&self.project_check_context).remove(worktree)
+    }
+
+    pub(crate) fn retain_diagnostics(
+        &self,
+        worktree: &str,
+        base_sha: Option<&str>,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        let mut retained = poisoned(&self.diagnostics);
+        let key = (
+            worktree.to_string(),
+            base_sha.filter(|sha| !sha.is_empty()).map(str::to_string),
+        );
+        if diagnostics.is_empty() {
+            retained.remove(&key);
+        } else {
+            retained.insert(key, diagnostics);
+        }
     }
 
     /// #A2/#A7 — stamp the attribution for the push just consumed by the
@@ -1928,6 +2637,7 @@ impl ServeVerdictState {
                 push_received_unix: pushed.last_push_unix,
                 consumed_unix: crate::statusfile::now_unix(),
                 consumed_at: Instant::now(),
+                semantic: pushed.semantic.clone(),
             },
         );
     }
@@ -2041,6 +2751,10 @@ impl ServeVerdictState {
         if let Some(state_dir) = self.project_check_state_dir.as_deref() {
             return self.with_project_check_scratch_overlay(context, state_dir, f);
         }
+        if context.source_sha.is_some() {
+            let fallback_state = context.root.join(".cargoless");
+            return self.with_project_check_scratch_overlay(context, &fallback_state, f);
+        }
 
         self.with_project_check_locked_overlay(context, f)
     }
@@ -2079,8 +2793,18 @@ impl ServeVerdictState {
 
         {
             let _guard = poisoned(&self.sync_lock);
-            sync_analysis_root(&context.root, &context.base_ref)?;
-            prepare_project_check_scratch(&context.root, &scratch_root, &context.base_ref)?;
+            let checkout_ref = if let Some(source_sha) = context.source_sha.as_deref() {
+                if !local_commit_exists(&context.root, source_sha) {
+                    return Err(format!(
+                        "verified source commit {source_sha} is no longer present locally"
+                    ));
+                }
+                source_sha
+            } else {
+                sync_analysis_root(&context.root, &context.base_ref)?;
+                context.base_ref.as_str()
+            };
+            prepare_project_check_scratch(&context.root, &scratch_root, checkout_ref)?;
         }
 
         // CGLS-26 — resolve a WARM shared target dir (or None = cold per-run).
@@ -2090,13 +2814,17 @@ impl ServeVerdictState {
         let warm = self.resolve_warm_target(state_dir, &scratch_root);
         let warm_dir = warm.as_ref().map(|w| w.dir.as_path());
 
-        let result = match materialize_overlay_files_from_root(
-            &context.root,
-            &scratch_root,
-            &context.overlay_files,
-        ) {
-            Ok(()) => Ok(f(&scratch_root, warm_dir)),
-            Err(e) => Err(e),
+        let result = if context.source_sha.is_some() {
+            Ok(f(&scratch_root, warm_dir))
+        } else {
+            match materialize_overlay_files_from_root(
+                &context.root,
+                &scratch_root,
+                &context.overlay_files,
+            ) {
+                Ok(()) => Ok(f(&scratch_root, warm_dir)),
+                Err(e) => Err(e),
+            }
         };
         // Warm-lock guard drops here (after the compile), releasing both
         // layers. Explicit for clarity — the locks must outlive `f`.
@@ -2251,7 +2979,10 @@ impl ServeVerdictState {
             self.record_warm_obs(&warm_dir, "cold-fallback", "contended:in-proc");
             return None;
         }
-        let in_proc = InProcWarmGuard { busy };
+        let in_proc = InProcWarmGuard {
+            busy,
+            released: false,
+        };
 
         // 3b. Cross-process advisory flock (insurance for a future
         //     multi-daemon topology; today serve is single-replica). LOCK_NB
@@ -2299,8 +3030,8 @@ impl ServeVerdictState {
         self.record_warm_obs(&warm_dir, "warm", "hit");
         Some(WarmTargetGuard {
             dir: warm_dir,
-            _in_proc: in_proc,
-            _flock: flock,
+            in_proc,
+            flock: Some(flock),
         })
     }
 
@@ -2342,6 +3073,12 @@ impl ServeVerdictState {
         wt: &Path,
         context: &ProjectCheckRunContext,
     ) -> Option<(crate::servedrv::ProjectCheckSummary, Vec<String>)> {
+        // Git-native candidates are already complete, immutable trees. Until
+        // the batch API carries per-member source SHAs, never union them into
+        // a base-ref overlay batch: exactness outranks this optimization.
+        if context.source_sha.is_some() {
+            return None;
+        }
         let base_ref = context.base_ref.trim();
         let root_str = context.root.to_string_lossy();
         if base_ref.is_empty() || root_str.trim().is_empty() {
@@ -2364,6 +3101,8 @@ impl ServeVerdictState {
             repo_relative: false,
             analysis_root: Some(root_str.into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None, // changed_files live on the member, not the options
             // Carry the push's gate + witness-only filter through the coalesced
             // lane. `run_batch_check_now` reads these off `request.options` to
@@ -2375,6 +3114,7 @@ impl ServeVerdictState {
             // on the same root+base.
             gate: context.gate,
             check_ids: context.check_ids.clone(),
+            semantic: None,
         };
         request.members = vec![member];
         request.corun = true;
@@ -2471,7 +3211,10 @@ impl ServeVerdictState {
                             )
                         } else {
                             (
-                                crate::servedrv::ProjectCheckSummary::Red { error_count },
+                                crate::servedrv::ProjectCheckSummary::Red {
+                                    error_count,
+                                    diagnostics: m.diagnostics.clone(),
+                                },
                                 ran_check_ids,
                             )
                         }
@@ -2645,6 +3388,342 @@ impl ServeVerdictState {
         }
         stitch_suspect_members(inner, &members, &suspect_reasons)
     }
+
+    fn execute_batch_report(&self, request: &BatchCheckRequest) -> BatchReport {
+        if let Some(key) = batch_coalesce_key(request) {
+            self.batch_coalescer
+                .submit(key, request, |combined| self.run_batch_check_now(combined))
+        } else {
+            self.run_batch_check_now(request)
+        }
+    }
+
+    fn execute_batch_outcome_v3(&self, request: &BatchCheckRequest) -> Option<OutcomeEnvelope> {
+        let context = request.options.semantic.as_ref()?;
+        context.validate().ok()?;
+        if let Some(existing) = self.get_outcome_v3(&context.attempt_id) {
+            return Some(existing);
+        }
+
+        let mut member_identity = Vec::new();
+        for member in &request.members {
+            member_identity.extend_from_slice(member.worktree.as_bytes());
+            member_identity.push(0);
+            member_identity.extend_from_slice(canonical_pairs_digest(&member.files).as_bytes());
+            member_identity.push(0);
+            for path in &member.changed_files {
+                member_identity.extend_from_slice(path.as_bytes());
+                member_identity.push(0);
+            }
+        }
+        let check_plan = serde_json::json!({
+            "check_profile": request.check_profile.as_ref().map(|profile| format!("{profile:?}")),
+            "check_ids": request.options.check_ids,
+            "corun": request.corun,
+        });
+        let subject = Subject::Batch {
+            batch_id: NonEmptyText::new(request.batch_id.clone()).ok()?,
+            base_sha: text_v3(
+                request
+                    .options
+                    .base_sha
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(&request.base_ref),
+            ),
+            ordered_member_digest: text_v3(sha256_hex(&member_identity)),
+            check_plan_digest: text_v3(sha256_hex(check_plan.to_string().as_bytes())),
+        };
+        let mut outcome = self.begin_outcome_v3(
+            context,
+            Surface::Batch,
+            subject,
+            Phase::WaitingForExecutionSlot,
+            "batch accepted and waiting for its physical execution",
+        );
+        let started = now_unix_ms();
+        if let Some(queued) = outcome.timeline.last_mut() {
+            queued.finished_at_unix_ms = Some(started);
+        }
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Executing,
+            started_at_unix_ms: started,
+            finished_at_unix_ms: None,
+        });
+        self.remember_outcome_v3(outcome.clone());
+
+        let report = self.execute_batch_report(request);
+        let report_json = batchreport_to_json(&report);
+        let mut evidence = EvidenceBundle::default();
+        evidence.push(ArtifactKind::BatchReport, report_json.clone());
+        evidence.push(
+            ArtifactKind::Events,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": "batch_terminal",
+                    "attempt_id": context.attempt_id.as_str(),
+                    "execution_id": outcome.execution_id.as_ref().map(ToString::to_string),
+                    "batch_id": report.batch_id,
+                    "executed_batch_id": report.executed_batch_id,
+                    "combined_checks": report.combined_checks,
+                    "solo_checks": report.solo_checks,
+                    "executed_members": report.executed_members,
+                    "duration_ms": report.duration_ms,
+                    "queue_wait_ms": report.queue_wait_ms,
+                })
+            ),
+        );
+        let store = self
+            .evidence_store_v3
+            .clone()
+            .unwrap_or_else(|| EvidenceStore::new("."));
+        let evidence_ref = store.reference_for(&context.attempt_id, &evidence).ok()?;
+
+        let requested_check_ids = request
+            .options
+            .check_ids
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(text_v3)
+            .collect();
+        let mut executed_check_ids: BTreeSet<String> = BTreeSet::new();
+        for member in &report.members {
+            executed_check_ids.extend(member.ran_check_ids.iter().cloned());
+        }
+        let executed_check_ids = executed_check_ids.into_iter().map(text_v3).collect();
+
+        let conclusion = match report.verdict {
+            BatchVerdict::Green => Conclusion::Passed {
+                basis: PassBasis::ChecksPassed {
+                    requested_check_ids,
+                    executed_check_ids,
+                },
+                evidence: evidence_ref,
+                summary: text_v3(format!(
+                    "batch passed: {} submitted member(s), {} physical member(s), {} combined and {} solo check(s)",
+                    request.members.len(),
+                    report.executed_members,
+                    report.combined_checks,
+                    report.solo_checks
+                )),
+            },
+            BatchVerdict::Red => {
+                let mut diagnostics = Vec::new();
+                for member in &report.members {
+                    diagnostics.extend(
+                        member
+                            .diagnostics
+                            .iter()
+                            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                            .map(diagnostic_record_v3),
+                    );
+                }
+                let cause = if let Some(first) = diagnostics.first().cloned() {
+                    FailureCause::Diagnostics {
+                        diagnostics: NonEmptyDiagnostics::new(
+                            first,
+                            diagnostics.into_iter().skip(1).collect(),
+                        ),
+                    }
+                } else {
+                    let red_members = report
+                        .members
+                        .iter()
+                        .filter(|member| member.verdict == BatchVerdict::Red)
+                        .count()
+                        .max(1);
+                    FailureCause::UnlocatedDiagnosticReport {
+                        origin: DiagnosticOrigin::ProjectCheck,
+                        authority: Authority::Blocking,
+                        reported_count: std::num::NonZeroU32::new(
+                            u32::try_from(red_members).unwrap_or(u32::MAX),
+                        )
+                        .expect("red member count is clamped to at least one"),
+                        producer: text_v3("batch_report_v1"),
+                        raw_report_digest: text_v3(sha256_hex(report_json.as_bytes())),
+                    }
+                };
+                Conclusion::Failed {
+                    cause,
+                    path_overlap: batch_path_overlap(&report, request),
+                    evidence: evidence_ref,
+                    summary: text_v3(format!(
+                        "batch failed: {} of {} returned member result(s) are red; see batch-report.json for every member and provenance",
+                        report
+                            .members
+                            .iter()
+                            .filter(|member| member.verdict == BatchVerdict::Red)
+                            .count(),
+                        report.members.len()
+                    )),
+                }
+            }
+            BatchVerdict::Indeterminate => Conclusion::Indeterminate {
+                cause: IndeterminateCause::AttributionUnavailable {
+                    producer: text_v3("batch_report_v1"),
+                },
+                retry: RetryDirective::Automatic {
+                    attempt: context.attempt_number,
+                    maximum_attempts: context.maximum_attempts,
+                    after_ms: context.retry_after_ms,
+                },
+                evidence: evidence_ref,
+                summary: text_v3(
+                    "batch execution did not produce a trustworthy code conclusion; legacy detail is retained in batch-report.json",
+                ),
+            },
+        };
+        outcome.conclude(conclusion);
+        let terminal = now_unix_ms();
+        if let Some(executing) = outcome.timeline.last_mut() {
+            executing.finished_at_unix_ms = Some(terminal);
+        }
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: terminal,
+            finished_at_unix_ms: Some(terminal),
+        });
+
+        let evidence_error = if let Some(durable) = self.evidence_store_v3.as_ref() {
+            let class = if matches!(outcome.conclusion, Conclusion::Passed { .. }) {
+                EvidenceClass::Success
+            } else {
+                EvidenceClass::Terminal
+            };
+            durable
+                .persist(&outcome, class, &evidence)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            Some("durable evidence store is not configured".to_string())
+        };
+        if let Some(error) = evidence_error {
+            mark_evidence_unavailable_v3(&mut outcome, error);
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            metrics.evidence_persist_failures = metrics.evidence_persist_failures.saturating_add(1);
+        }
+        {
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            *metrics
+                .terminal_by_code
+                .entry(outcome.conclusion.semantic_code().to_string())
+                .or_insert(0) += 1;
+            *metrics
+                .reactions_by_state
+                .entry(reaction_state_name(outcome.reaction.state).to_string())
+                .or_insert(0) += 1;
+        }
+        self.remember_outcome_v3(outcome.clone());
+        Some(outcome)
+    }
+}
+
+fn diagnostic_record_v3(diagnostic: &Diagnostic) -> DiagnosticRecord {
+    let path = diagnostic.file_path.to_string_lossy();
+    let origin = match diagnostic.source.as_deref() {
+        Some("rustc") => DiagnosticOrigin::Rustc,
+        Some(source) if source.contains("rust-analyzer") => DiagnosticOrigin::RustAnalyzerNative,
+        Some("cargoless") => DiagnosticOrigin::SyntheticCheck,
+        _ => DiagnosticOrigin::ProjectCheck,
+    };
+    let severity = match diagnostic.severity {
+        Severity::Error => DiagnosticSeverity::Error,
+        Severity::Warning => DiagnosticSeverity::Warning,
+        Severity::Info => DiagnosticSeverity::Information,
+        Severity::Hint => DiagnosticSeverity::Hint,
+    };
+    let location = if diagnostic.line > 0
+        && !path.trim().is_empty()
+        && !path.starts_with("<cargoless-")
+    {
+        DiagnosticLocation::Located {
+            file: text_v3(path.as_ref()),
+            line: diagnostic.line,
+            column: diagnostic.col,
+        }
+    } else {
+        DiagnosticLocation::Unlocated {
+            explanation: text_v3("the producing project check did not retain a source location"),
+        }
+    };
+    let message = if diagnostic.message.trim().is_empty() {
+        "producer emitted an empty diagnostic message"
+    } else {
+        diagnostic.message.as_str()
+    };
+    let fingerprint = sha256_hex(
+        format!(
+            "{origin:?}|{:?}|{}|{}|{}|{}|{}",
+            diagnostic.severity,
+            path,
+            diagnostic.line,
+            diagnostic.col,
+            diagnostic.code.as_deref().unwrap_or("-"),
+            message
+        )
+        .as_bytes(),
+    );
+    DiagnosticRecord {
+        origin,
+        severity,
+        authority: if diagnostic.severity == Severity::Error {
+            Authority::Blocking
+        } else {
+            Authority::Advisory
+        },
+        location,
+        code: diagnostic
+            .code
+            .as_deref()
+            .filter(|code| !code.trim().is_empty())
+            .map(text_v3),
+        message: text_v3(message),
+        fingerprint: text_v3(fingerprint),
+    }
+}
+
+fn batch_path_overlap(report: &BatchReport, request: &BatchCheckRequest) -> PathOverlap {
+    let changed: Vec<&str> = request
+        .members
+        .iter()
+        .flat_map(|member| member.changed_files.iter().map(String::as_str))
+        .collect();
+    let diagnostics: Vec<&Diagnostic> = report
+        .members
+        .iter()
+        .flat_map(|member| member.diagnostics.iter())
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect();
+    if diagnostics.is_empty() || changed.is_empty() {
+        return PathOverlap::NotComputable;
+    }
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.line == 0
+            || diagnostic
+                .file_path
+                .to_string_lossy()
+                .starts_with("<cargoless-")
+    }) {
+        return PathOverlap::NotComputable;
+    }
+    let overlaps = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            let path = diagnostic.file_path.to_string_lossy();
+            let normalized = path.trim_start_matches("./");
+            changed.iter().any(|changed_path| {
+                let changed_path = changed_path.trim_start_matches("./");
+                normalized == changed_path || normalized.ends_with(&format!("/{changed_path}"))
+            })
+        })
+        .count();
+    match overlaps {
+        0 => PathOverlap::NoPathsOverlap,
+        count if count == diagnostics.len() => PathOverlap::AllPathsOverlap,
+        _ => PathOverlap::SomePathsOverlap,
+    }
 }
 
 impl VerdictService for ServeVerdictState {
@@ -2813,13 +3892,68 @@ impl VerdictService for ServeVerdictState {
             .map(|s| s.verdict.clone())
     }
 
-    fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
-        // Honest Inc-0 boundary: the serve loop does not yet thread
-        // `diagnostics_store` retention (a later increment). Empty here is
-        // the *correct* answer for the state the loop computes — never a
-        // fabricated diagnostic. (`get_diagnostics` empty ⇒ "no detail",
-        // the same contract `transport` documents for green/unknown.)
-        Vec::new()
+    fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic> {
+        let current_sha = poisoned(&self.statuses)
+            .get(worktree)
+            .and_then(|status| status.base_sha.clone());
+        poisoned(&self.diagnostics)
+            .get(&(worktree.to_string(), current_sha))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get_diagnostics_attributed(
+        &self,
+        worktree: &str,
+        base_sha: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        let Some(base_sha) = base_sha.filter(|sha| !sha.is_empty()) else {
+            return self.get_diagnostics(worktree);
+        };
+        poisoned(&self.diagnostics)
+            .get(&(worktree.to_string(), Some(base_sha.to_string())))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get_outcome_v3(
+        &self,
+        attempt_id: &cargoless_core::outcome::AttemptId,
+    ) -> Option<OutcomeEnvelope> {
+        if let Some(outcome) = poisoned(&self.outcomes_v3).get(attempt_id).cloned() {
+            return Some(outcome);
+        }
+        self.evidence_store_v3
+            .as_ref()
+            .and_then(|store| store.read_outcome(attempt_id).ok().flatten())
+    }
+
+    fn outcome_metrics_v3(&self) -> Option<serde_json::Value> {
+        let metrics = poisoned(&self.outcome_metrics_v3);
+        let pending_attempts = poisoned(&self.outcomes_v3)
+            .values()
+            .filter(|outcome| matches!(outcome.conclusion, Conclusion::Pending { .. }))
+            .count();
+        Some(serde_json::json!({
+            "schema": "cargoless.metrics/v3",
+            "pending_attempts": pending_attempts,
+            "terminal_by_code": &metrics.terminal_by_code,
+            "reactions_by_state": &metrics.reactions_by_state,
+            "ra_storm_outcomes": metrics.ra_storm_outcomes,
+            "evidence_persist_failures": metrics.evidence_persist_failures,
+            "last_ra_error_lines": metrics.last_ra_error_lines,
+            "last_ra_duplicates_suppressed": metrics.last_ra_suppressed_lines,
+        }))
+    }
+
+    fn get_evidence_v3(
+        &self,
+        attempt_id: &cargoless_core::outcome::AttemptId,
+        artifact: &str,
+    ) -> Option<Vec<u8>> {
+        self.evidence_store_v3
+            .as_ref()
+            .and_then(|store| store.read_named(attempt_id, artifact).ok().flatten())
     }
 
     fn list_worktrees(&self) -> Vec<WorktreeSummary> {
@@ -2843,15 +3977,10 @@ impl VerdictService for ServeVerdictState {
     /// #240/2b — overlay-push ingest. The WRITE-PLANE entry for the
     /// pushed-mode central-daemon topology (D-PUSHOVERLAY §2.4 / §4).
     ///
-    /// 1. Record the `(base_ref, files)` pair in the per-WT pushed
-    ///    store. A subsequent push for the same WT REPLACES (latest
-    ///    wins; per-WT serialization is the natural BTreeMap semantic).
-    /// 2. Signal the serve loop via the attached `push_signal` channel
-    ///    (best-effort: a wedged send leaves the overlay stored, only
-    ///    the wakeup is lost). The loop synthesizes a
-    ///    `DriverEvent::RoutedBatch` for this WT, which feeds the
-    ///    proven core EXACTLY as if it came from the FS watcher path
-    ///    — same event shape, no new emission seam.
+    /// 1. Plain pushes record `(base_ref, files)` in the per-WT queue
+    ///    and wake the rust-analyzer serve loop.
+    /// 2. Gated pushes are handed directly to the isolated Cargo witness
+    ///    dispatcher and never enter the rust-analyzer overlay queue.
     /// 3. Return an ack: `accepted=true` + `applied_files` count. The
     ///    ack does NOT block on the verdict; the client uses the
     ///    already-shipped subscribe (SSE) or `get_status` for the
@@ -2883,12 +4012,43 @@ impl VerdictService for ServeVerdictState {
         check_profile: Option<&CheckProfile>,
         options: Option<&PushOverlayOptions>,
     ) -> PushOverlayAck {
+        let semantic = options.and_then(|options| options.semantic.clone());
+        if let Some(context) = semantic.as_ref() {
+            if let Err(reason) = context.validate() {
+                return rejected_push(worktree, reason);
+            }
+            if poisoned(&self.outcomes_v3).contains_key(&context.attempt_id) {
+                // Attempt submission is idempotent. A network retry must not
+                // enqueue the same execution twice or overwrite its terminal
+                // result; callers poll the existing exact attempt.
+                return PushOverlayAck {
+                    worktree: worktree.to_string(),
+                    accepted: true,
+                    applied_files: files.len() as u32,
+                    ..Default::default()
+                };
+            }
+        }
+        let semantic_subject = match (semantic.as_ref(), options) {
+            (Some(_), Some(options)) => {
+                match overlay_subject_v3(worktree, base_ref, files, check_profile, options) {
+                    Ok(subject) => Some(subject),
+                    Err(reason) => return rejected_push(worktree, reason),
+                }
+            }
+            (Some(_), None) => {
+                return rejected_push(worktree, "v3 overlay requires semantic options");
+            }
+            (None, _) => None,
+        };
         if self.quiescing() {
             return rejected_push(worktree, "daemon is quiescing");
         }
         let mut mapped_files = files.to_vec();
         let mut analysis_root = None;
         let mut base_sha = None;
+        let mut source_ref = None;
+        let mut source_sha = None;
         let mut changed_files = None;
         let mut gate = false;
         let mut check_ids = None;
@@ -2908,6 +4068,59 @@ impl VerdictService for ServeVerdictState {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            source_ref = options
+                .source_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            source_sha = options
+                .source_sha
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            if source_ref.is_some() != source_sha.is_some() {
+                return rejected_push(
+                    worktree,
+                    "source_ref and source_sha must be supplied together",
+                );
+            }
+            if let Some(source_ref) = source_ref.as_deref() {
+                if let Err(e) = validate_source_ref(source_ref) {
+                    return rejected_push(worktree, &e);
+                }
+            }
+            if let Some(source_sha) = source_sha.as_deref() {
+                if !is_commit_hash(source_sha) {
+                    return rejected_push(
+                        worktree,
+                        "source_sha must be a full 40- or 64-hex object id",
+                    );
+                }
+                if !files.is_empty() {
+                    return rejected_push(
+                        worktree,
+                        "exact-Git push must carry an empty files array",
+                    );
+                }
+                if base_sha.as_deref() != Some(source_sha) {
+                    return rejected_push(
+                        worktree,
+                        "base_sha must equal source_sha for exact-Git attribution",
+                    );
+                }
+                if !gate {
+                    return rejected_push(worktree, "exact-Git source requires gate=true");
+                }
+                if analysis_root.is_none() {
+                    return rejected_push(
+                        worktree,
+                        "exact-Git source requires an analysis_root checkout",
+                    );
+                }
+            }
 
             if options.repo_relative {
                 let Some(root) = analysis_root.as_ref() else {
@@ -2932,7 +4145,7 @@ impl VerdictService for ServeVerdictState {
             // "revert RA to the on-disk tree" operation. Placed BEFORE
             // `ensure_analysis_root` so a doomed push never spends the
             // sync_lock on a fetch.
-            if files.is_empty() {
+            if files.is_empty() && source_sha.is_none() {
                 if let Some(changed) = changed_files.as_ref().filter(|c| !c.is_empty()) {
                     return rejected_push(
                         worktree,
@@ -2953,11 +4166,20 @@ impl VerdictService for ServeVerdictState {
             }
 
             if let Some(root) = analysis_root.as_ref() {
-                let base = base_ref.trim();
-                if !base.is_empty() {
+                if let (Some(source_ref), Some(source_sha)) =
+                    (source_ref.as_deref(), source_sha.as_deref())
+                {
                     let _guard = poisoned(&self.sync_lock);
-                    if let Err(e) = ensure_analysis_root(root, base, base_sha.as_deref()) {
+                    if let Err(e) = fetch_verified_source(root, source_ref, source_sha) {
                         return rejected_push(worktree, &e);
+                    }
+                } else {
+                    let base = base_ref.trim();
+                    if !base.is_empty() {
+                        let _guard = poisoned(&self.sync_lock);
+                        if let Err(e) = ensure_analysis_root(root, base, base_sha.as_deref()) {
+                            return rejected_push(worktree, &e);
+                        }
                     }
                 }
             }
@@ -2973,12 +4195,83 @@ impl VerdictService for ServeVerdictState {
             files: mapped_files,
             analysis_root,
             base_sha,
+            source_ref,
+            source_sha,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files,
             check_profile: check_profile.cloned(),
             gate,
             check_ids,
+            semantic: semantic.clone(),
         };
+        if pushed.gate {
+            let Some(tx) = poisoned(&self.direct_gate_signal).as_ref().cloned() else {
+                self.mark_worktree_published(worktree);
+                return rejected_push(worktree, "direct gate dispatcher is unavailable");
+            };
+            let now = crate::statusfile::now_unix();
+            let attribution = PushAttribution {
+                base_sha: pushed.base_sha.clone(),
+                macro_blind_hit: compute_macro_blind_hit(
+                    pushed.changed_files.as_deref(),
+                    &macro_blind_globs(),
+                    &pushed.files,
+                    &macro_blind_macros(),
+                ),
+                push_received_unix: pushed.last_push_unix,
+                consumed_unix: now,
+                consumed_at: Instant::now(),
+                semantic: pushed.semantic.clone(),
+            };
+            let project_root = pushed
+                .analysis_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(worktree));
+            let request = DirectGateRequest {
+                wt: PathBuf::from(worktree),
+                context: ProjectCheckRunContext {
+                    root: project_root,
+                    changed_files: pushed.changed_files.clone(),
+                    base_ref: pushed.base_ref.clone(),
+                    base_sha: pushed.base_sha.clone(),
+                    source_ref: pushed.source_ref.clone(),
+                    source_sha: pushed.source_sha.clone(),
+                    overlay_files: pushed.files.clone(),
+                    materialize_overlay: pushed.analysis_root.is_some(),
+                    gate: true,
+                    check_ids: pushed.check_ids.clone(),
+                },
+                attribution,
+            };
+            if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
+                self.begin_outcome_v3(
+                    context,
+                    Surface::Overlay,
+                    subject,
+                    Phase::Queued,
+                    "gated overlay accepted and queued for compiler witness",
+                );
+            }
+            if tx.send(request).is_err() {
+                if let Some(context) = semantic.as_ref() {
+                    self.forget_outcome_v3(&context.attempt_id);
+                }
+                self.mark_worktree_published(worktree);
+                return rejected_push(worktree, "direct gate dispatcher disconnected");
+            }
+            eprintln!(
+                "[cargoless:obs] witness-direct-dispatch wt={} source_sha={} files={}",
+                worktree,
+                pushed.source_sha.as_deref().unwrap_or("overlay"),
+                pushed.files.len()
+            );
+            return PushOverlayAck {
+                worktree: worktree.to_string(),
+                accepted: true,
+                applied_files,
+                ..Default::default()
+            };
+        }
         // CGLS-25 — base_sha-keyed enqueue: a concurrent PR pushing on the
         // same hardcoded worktree key must not destroy this one's pending
         // overlay before the serve loop consumes it. But a rapid re-push of
@@ -3001,7 +4294,13 @@ impl VerdictService for ServeVerdictState {
         {
             let mut store = poisoned(&self.pushed);
             let queue = store.entry(worktree.to_string()).or_default();
-            match queue.iter_mut().find(|q| q.base_sha == pushed.base_sha) {
+            match queue
+                .iter_mut()
+                .find(|queued| match (&queued.semantic, &pushed.semantic) {
+                    (Some(left), Some(right)) => left.attempt_id == right.attempt_id,
+                    (None, None) => queued.base_sha == pushed.base_sha,
+                    _ => false,
+                }) {
                 Some(existing) => *existing = pushed,
                 None => {
                     if queue.len() >= self.pushed_max_per_wt {
@@ -3013,6 +4312,19 @@ impl VerdictService for ServeVerdictState {
                     queue.push_back(pushed);
                 }
             }
+        }
+        // Publish the pending identity before waking the serve loop. The loop
+        // can fail an initial rust-analyzer spawn immediately; waking first
+        // lets that failure race ahead of the accepted outcome and strand the
+        // later pending record forever.
+        if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
+            self.begin_outcome_v3(
+                context,
+                Surface::Overlay,
+                subject,
+                Phase::Queued,
+                "overlay accepted and queued for analysis",
+            );
         }
         // Wake the serve loop (best-effort — see attach_push_signal doc).
         if let Some(tx) = poisoned(&self.push_signal).as_ref() {
@@ -3027,12 +4339,11 @@ impl VerdictService for ServeVerdictState {
     }
 
     fn batch_check(&self, request: &BatchCheckRequest) -> BatchReport {
-        if let Some(key) = batch_coalesce_key(request) {
-            self.batch_coalescer
-                .submit(key, request, |combined| self.run_batch_check_now(combined))
-        } else {
-            self.run_batch_check_now(request)
-        }
+        self.execute_batch_report(request)
+    }
+
+    fn submit_batch_v3(&self, request: &BatchCheckRequest) -> Option<OutcomeEnvelope> {
+        self.execute_batch_outcome_v3(request)
     }
 
     fn daemon_activity(&self) -> DaemonActivity {
@@ -3132,6 +4443,9 @@ impl ServeBatchChecker<'_> {
             root: self.root.clone(),
             changed_files: changed_files.clone(),
             base_ref: self.base_ref.clone(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
             overlay_files,
             materialize_overlay: true,
             gate: self.gate,
@@ -3384,7 +4698,8 @@ fn rejected_push(worktree: &str, why: &str) -> PushOverlayAck {
         worktree: worktree.to_string(),
         accepted: false,
         applied_files: 0,
-        ..Default::default()
+        reject_http_status: Some(409),
+        reject_body: Some(why.to_string()),
     }
 }
 
@@ -3445,6 +4760,75 @@ fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
         return Err("repo-relative push carried an empty path".to_string());
     }
     Ok(out)
+}
+
+fn validate_source_ref(source_ref: &str) -> Result<(), String> {
+    let allowed_namespace =
+        source_ref.starts_with("refs/heads/") || source_ref.starts_with("refs/pull/");
+    if !allowed_namespace
+        || source_ref.contains("..")
+        || source_ref.contains("@{")
+        || source_ref.ends_with('/')
+        || source_ref.bytes().any(|b| {
+            b.is_ascii_control()
+                || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        return Err(format!(
+            "source_ref `{source_ref}` is not an allowed heads/pull ref"
+        ));
+    }
+    let valid = Command::new("git")
+        .args(["check-ref-format", source_ref])
+        .status()
+        .map_err(|e| format!("failed to validate source_ref with git: {e}"))?
+        .success();
+    if !valid {
+        return Err(format!("source_ref `{source_ref}` is not a valid Git ref"));
+    }
+    Ok(())
+}
+
+/// Fetch one advertised ref, then prove the requested immutable candidate is
+/// a commit reachable from it. The checkout itself is not moved: project
+/// checks create a detached scratch worktree at `source_sha`.
+fn fetch_verified_source(root: &Path, source_ref: &str, source_sha: &str) -> Result<(), String> {
+    if !root.join(".git").exists() {
+        return Err(format!(
+            "analysis_root `{}` is not a git checkout",
+            root.display()
+        ));
+    }
+    validate_source_ref(source_ref)?;
+    if !is_commit_hash(source_sha) {
+        return Err("source_sha must be a full 40- or 64-hex object id".to_string());
+    }
+    retry_with_sleeps(
+        &[Duration::from_secs(1), Duration::from_secs(3)],
+        |attempt| {
+            if attempt > 0 {
+                eprintln!(
+                    "[cargoless:git] source fetch retry attempt={attempt} root={}",
+                    root.display()
+                );
+            }
+            run_git(root, &["fetch", "--no-tags", "origin", source_ref])
+        },
+    )?;
+    if !local_commit_exists(root, source_sha) {
+        return Err(format!(
+            "source_sha {source_sha} is not a commit after fetching {source_ref}"
+        ));
+    }
+    if !run_git_success(
+        root,
+        &["merge-base", "--is-ancestor", source_sha, "FETCH_HEAD"],
+    )? {
+        return Err(format!(
+            "source_sha {source_sha} is not reachable from fetched {source_ref}"
+        ));
+    }
+    Ok(())
 }
 
 /// Run `op` up to `1 + sleeps.len()` times, sleeping `sleeps[n]` after
@@ -3574,14 +4958,7 @@ fn prepare_project_check_scratch(
     scratch_root: &Path,
     base_ref: &str,
 ) -> Result<(), String> {
-    if scratch_root.exists() {
-        std::fs::remove_dir_all(scratch_root).map_err(|e| {
-            format!(
-                "could not remove stale project-check scratch `{}`: {e}",
-                scratch_root.display()
-            )
-        })?;
-    }
+    cleanup_project_check_scratch(root, scratch_root)?;
     if let Some(parent) = scratch_root.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -3595,20 +4972,23 @@ fn prepare_project_check_scratch(
 }
 
 fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(), String> {
-    if !scratch_root.exists() {
-        return Ok(());
-    }
     let scratch = scratch_root.to_string_lossy().into_owned();
     match run_git(root, &["worktree", "remove", "--force", &scratch]) {
         Ok(()) => Ok(()),
         Err(git_err) => {
-            let fallback = std::fs::remove_dir_all(scratch_root).map_err(|e| {
-                format!(
-                    "{git_err}; fallback remove_dir_all `{}` failed: {e}",
-                    scratch_root.display()
-                )
-            });
-            fallback.and(Err(git_err))
+            if scratch_root.exists() {
+                std::fs::remove_dir_all(scratch_root).map_err(|e| {
+                    format!(
+                        "{git_err}; fallback remove_dir_all `{}` failed: {e}",
+                        scratch_root.display()
+                    )
+                })?;
+            }
+            // If the directory was unregistered, the remove above fails even
+            // though there is nothing else to do. If registration metadata is
+            // damaged or stale, pruning after filesystem cleanup removes the
+            // prunable entry from the persistent repository volume.
+            run_git(root, &["worktree", "prune", "--expire", "now"])
         }
     }
 }
@@ -3833,12 +5213,27 @@ fn warm_obs_bucket(reason: &str) -> &str {
     reason.split([':', ',']).next().unwrap_or(reason)
 }
 
-/// RAII holder for the resolved warm dir + its two locks. Dropping it
-/// releases the in-process busy flag and the flock (the compile is done).
+/// RAII holder for the resolved warm dir + its two locks. Dropping it releases
+/// the cross-process flock *before* publishing the in-process key as idle.
+/// That ordering is load-bearing: another thread may acquire the in-process
+/// flag as soon as it becomes false, so exposing false while the prior flock
+/// is still held creates a spurious `contended:flock` cold fallback.
 struct WarmTargetGuard {
     dir: PathBuf,
-    _in_proc: InProcWarmGuard,
-    _flock: WarmFlock,
+    in_proc: InProcWarmGuard,
+    flock: Option<WarmFlock>,
+}
+
+impl Drop for WarmTargetGuard {
+    fn drop(&mut self) {
+        // `WarmFlock::drop` performs an explicit LOCK_UN and then closes the
+        // fd. Complete that transition before a racing resolver can observe
+        // the in-process key as available.
+        if let Some(flock) = self.flock.take() {
+            drop(flock);
+        }
+        self.in_proc.release();
+    }
 }
 
 /// Clears the per-key busy flag on drop (normal return OR panic-unwind), so a
@@ -3846,11 +5241,21 @@ struct WarmTargetGuard {
 /// busy. Holds the `Arc` so the flag outlives the daemon map entry if pruned.
 struct InProcWarmGuard {
     busy: Arc<std::sync::atomic::AtomicBool>,
+    released: bool,
+}
+
+impl InProcWarmGuard {
+    fn release(&mut self) {
+        if !self.released {
+            self.busy.store(false, std::sync::atomic::Ordering::Release);
+            self.released = true;
+        }
+    }
 }
 
 impl Drop for InProcWarmGuard {
     fn drop(&mut self) {
-        self.busy.store(false, std::sync::atomic::Ordering::Release);
+        self.release();
     }
 }
 
@@ -3859,7 +5264,7 @@ impl Drop for InProcWarmGuard {
 /// single-replica. Holds the open `File` (fd) for the compile; closing it at
 /// Drop releases the lock.
 struct WarmFlock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
 impl WarmFlock {
@@ -3880,7 +5285,7 @@ impl WarmFlock {
             flock(file.as_raw_fd(), LOCK_EX_NB)
         };
         if rc == 0 {
-            Ok(Some(WarmFlock { _file: file }))
+            Ok(Some(WarmFlock { file }))
         } else {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
@@ -3890,6 +5295,24 @@ impl WarmFlock {
                 _ => Err(err),
             }
         }
+    }
+}
+
+impl Drop for WarmFlock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // LOCK_UN = 8 on Linux and macOS. Closing the fd is also specified to
+        // release flock, but doing that implicitly left the lock transition
+        // unobservable and produced rare post-drop contention in CI. Make the
+        // release synchronous and explicit; close remains the final backstop.
+        const LOCK_UN: i32 = 8;
+        // SAFETY: the File owns a valid fd for the duration of this Drop call.
+        let _ = unsafe {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            flock(self.file.as_raw_fd(), LOCK_UN)
+        };
     }
 }
 
@@ -4165,8 +5588,8 @@ mod tests {
     use cargoless_core::batch::{BatchMember, BatchProvenance, BatchReport, BatchVerdict};
     use cargoless_core::transport::http::{HttpClient, HttpServer};
     use cargoless_core::transport::{
-        AllowAll, BatchCheckRequest, CargoSubcommand, PushOverlayOptions, TransportClient,
-        VerdictService,
+        AllowAll, AttemptContext, BatchCheckRequest, CargoSubcommand, PushOverlayOptions,
+        TransportClient, VerdictService,
     };
 
     use super::*;
@@ -4183,6 +5606,383 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn attempt_context(id: &str, attempt_number: u32) -> AttemptContext {
+        AttemptContext {
+            request_id: cargoless_core::outcome::RequestId::new("request-1").unwrap(),
+            attempt_id: cargoless_core::outcome::AttemptId::new(id).unwrap(),
+            trace_id: cargoless_core::outcome::TraceId::new("0123456789abcdef").unwrap(),
+            previous_attempt_id: (attempt_number > 1)
+                .then(|| cargoless_core::outcome::AttemptId::new("attempt-one").unwrap()),
+            attempt_number,
+            maximum_attempts: 3,
+            retry_after_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn ordinary_overlay_rejection_preserves_the_exact_reason() {
+        let ack = rejected_push(
+            "/workspace/tf-multiverse",
+            "git fetch origin local-only-sha failed: upload-pack: not our ref",
+        );
+
+        assert!(!ack.accepted);
+        assert_eq!(ack.reject_http_status, Some(409));
+        assert_eq!(
+            ack.reject_body.as_deref(),
+            Some("git fetch origin local-only-sha failed: upload-pack: not our ref")
+        );
+    }
+
+    #[test]
+    fn outcome_v3_keeps_retries_distinct_and_classes_ra_storm_as_analyzer_pathology() {
+        let state_dir = temp_root("outcome-v3");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let files = vec![("src/lib.rs".to_string(), "pub fn broken() {}".to_string())];
+        let options = |attempt_id: &str, attempt_number: u32| PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(attempt_context(attempt_id, attempt_number)),
+            ..PushOverlayOptions::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options("attempt-1", 1)),
+            )
+            .accepted
+        );
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options("attempt-2", 2)),
+            )
+            .accepted
+        );
+        assert_eq!(
+            poisoned(&api.pushed).get("/client/wt").unwrap().len(),
+            2,
+            "same commit retries remain distinct execution attempts"
+        );
+
+        let first = api.take_overlay_for("/client/wt").expect("first attempt");
+        api.record_push_attribution("/client/wt", &first);
+        let attribution = api
+            .take_push_attribution("/client/wt")
+            .expect("attempt attribution");
+        let context = attribution.semantic.clone().expect("v3 identity");
+        api.record_ra_evidence_v3(
+            Some(&context),
+            RaStderrSnapshot {
+                process_generation: 7,
+                pid: Some(4242),
+                total_lines: 1_500,
+                error_lines: 1_500,
+                suppressed_lines: 1_499,
+                overflow_fingerprints: 0,
+                fingerprints: vec![cargoless_core::analyzer::RaStderrFingerprint {
+                    fingerprint: "storm-fingerprint".into(),
+                    count: 1_500,
+                    level: "error".into(),
+                    sample: "ERROR inference diagnostic in desugared expr".into(),
+                }],
+                tail: vec!["ERROR inference diagnostic in desugared expr".into()],
+                stack_captures: vec![b"thread apply all bt".to_vec()],
+            },
+        );
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::red(1),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let first_outcome = api
+            .get_outcome_v3(&context.attempt_id)
+            .expect("terminal exact attempt");
+        match &first_outcome.conclusion {
+            Conclusion::Indeterminate {
+                cause:
+                    cargoless_core::outcome::IndeterminateCause::AnalyzerPathology {
+                        component,
+                        signature,
+                        repeated_events,
+                    },
+                summary,
+                ..
+            } => {
+                assert_eq!(*component, OutcomeComponent::RustAnalyzer);
+                assert_eq!(signature.as_str(), "storm-fingerprint");
+                assert_eq!(*repeated_events, 1_500);
+                assert!(
+                    summary.as_str().contains("analyzer pathology"),
+                    "the semantic conclusion must name the analyzer pathology"
+                );
+            }
+            other => panic!("expected analyzer pathology, got {other:?}"),
+        }
+        assert_eq!(
+            first_outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            first_outcome.reaction.code.as_str(),
+            "indeterminate.analyzer_pathology"
+        );
+        assert!(matches!(
+            api.get_outcome_v3(&cargoless_core::outcome::AttemptId::new("attempt-2").unwrap())
+                .unwrap()
+                .conclusion,
+            Conclusion::Pending { .. }
+        ));
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-1/ra-summary.json")
+                .is_file()
+        );
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-1/stack-001.txt")
+                .is_file()
+        );
+
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        assert_eq!(
+            reopened
+                .get_outcome_v3(&context.attempt_id)
+                .expect("durable outcome after process-state loss"),
+            first_outcome
+        );
+        let metrics = api.outcome_metrics_v3().unwrap();
+        assert_eq!(metrics["ra_storm_outcomes"], 1);
+        assert_eq!(metrics["reactions_by_state"]["error"], 1);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn evidence_failure_preserves_code_red_but_marks_bundle_unavailable() {
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "broken".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(attempt_context("attempt-no-store", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").unwrap();
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api.take_push_attribution("/client/wt").unwrap();
+        let context = attribution.semantic.clone().unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::red(1),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+        let outcome = api.get_outcome_v3(&context.attempt_id).unwrap();
+        assert_eq!(
+            outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Failure,
+            "an evidence-store outage must not erase a real code failure"
+        );
+        let Conclusion::Failed {
+            evidence, summary, ..
+        } = outcome.conclusion
+        else {
+            panic!("code red was not retained");
+        };
+        assert!(matches!(
+            evidence.availability,
+            EvidenceAvailability::Unavailable { .. }
+        ));
+        assert!(summary.as_str().contains("code failure retained"));
+        assert_eq!(
+            api.outcome_metrics_v3().unwrap()["evidence_persist_failures"],
+            1
+        );
+    }
+
+    #[test]
+    fn analyzer_blind_result_requires_a_compiler_witness_by_typed_code() {
+        let state_dir = temp_root("outcome-v3-blind");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/view.rs".into()]),
+            semantic: Some(attempt_context("attempt-blind", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &[("src/view.rs".into(), "view! { <div/> }".into())],
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").unwrap();
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api.take_push_attribution("/client/wt").unwrap();
+        let context = attribution.semantic.clone().unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::unknown(
+                "ra_native_timer_settled_no_flycheck_activity",
+            ),
+            attribution.base_sha,
+            true,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let outcome = api.get_outcome_v3(&context.attempt_id).unwrap();
+        assert!(matches!(
+            outcome.conclusion,
+            Conclusion::Indeterminate {
+                cause: IndeterminateCause::CompilerWitnessRequired { .. },
+                retry: RetryDirective::NewInputRequired,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            outcome.reaction.code.as_str(),
+            "indeterminate.compiler_witness_required"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn analyzer_unattributed_error_requires_a_compiler_witness_by_typed_code() {
+        let state_dir = temp_root("outcome-v3-unattributed-error");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/view.rs".into()]),
+            semantic: Some(attempt_context("attempt-unattributed-error", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &[("src/view.rs".into(), "view! { <div/> }".into())],
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").unwrap();
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api.take_push_attribution("/client/wt").unwrap();
+        let context = attribution.semantic.clone().unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::unknown("ra_native_unattributed_error"),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let outcome = api.get_outcome_v3(&context.attempt_id).unwrap();
+        assert!(matches!(
+            outcome.conclusion,
+            Conclusion::Indeterminate {
+                cause: IndeterminateCause::CompilerWitnessRequired { .. },
+                retry: RetryDirective::NewInputRequired,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            outcome.reaction.code.as_str(),
+            "indeterminate.compiler_witness_required"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn batch_outcome_v3_is_typed_persisted_and_retry_bounded() {
+        let state_dir = temp_root("batch-outcome-v3");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let request = |attempt_number| {
+            let mut request = BatchCheckRequest::new("physical-batch-42", "origin/dev");
+            request.members = vec![BatchMember::new("member-a")];
+            request.options.semantic = Some(attempt_context(
+                &format!("batch-attempt-{attempt_number}"),
+                attempt_number,
+            ));
+            request
+        };
+
+        let first = api.submit_batch_v3(&request(1)).unwrap();
+        assert_eq!(first.surface, Surface::Batch);
+        assert!(matches!(
+            first.conclusion,
+            Conclusion::Indeterminate {
+                cause: IndeterminateCause::AttributionUnavailable { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            first.reaction.state,
+            cargoless_core::outcome::CheckState::Pending
+        );
+        assert!(
+            api.get_evidence_v3(&first.attempt_id, "batch-report.json")
+                .is_some()
+        );
+
+        let final_attempt = api.submit_batch_v3(&request(3)).unwrap();
+        assert_eq!(
+            final_attempt.reaction.state,
+            cargoless_core::outcome::CheckState::Error
+        );
+        assert_eq!(
+            final_attempt.reaction.code.as_str(),
+            "indeterminate.attribution"
+        );
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        assert_eq!(
+            reopened
+                .get_outcome_v3(&final_attempt.attempt_id)
+                .unwrap()
+                .reaction,
+            final_attempt.reaction
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     fn git_capture(root: &Path, args: &[&str]) -> String {
@@ -4434,6 +6234,11 @@ checks:
   - id: no-fail-token
     kind: forbidden_patterns
     inputs: ["src/*.rs"]
+    # The HTTP batch tests exercise attribution and corun policy, not the
+    # engine's timeout policy.  Forty no-corun members intentionally repeat
+    # this scan serially; give each tiny synthetic scan enough headroom that a
+    # loaded CI volume cannot turn this fixture into a project-check timeout.
+    timeout_ms: 12000
     patterns:
       - code: batch.fail_token
         literal: FAIL_BATCH
@@ -4466,9 +6271,12 @@ checks:
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         request.members = members;
         request
@@ -4576,9 +6384,12 @@ checks:
             repo_relative: true,
             analysis_root: Some("/workspace/repo".into()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         request.members = vec![BatchMember::new(member)];
         request
@@ -5751,9 +7562,12 @@ checks:
                 repo_relative: false,
                 analysis_root: Some(root_str.clone()),
                 base_sha: None,
+                source_ref: None,
+                source_sha: None,
                 changed_files: None,
                 gate: false,
                 check_ids: None,
+                semantic: None,
             };
             request.members = vec![cargoless_core::batch::BatchMember {
                 worktree: wt.clone(),
@@ -6064,6 +7878,9 @@ checks:
             root: project.root.clone(),
             changed_files: Some(vec!["src/added.rs".into()]),
             base_ref: "origin/main".to_string(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![(
                 project
                     .root
@@ -6289,7 +8106,11 @@ checks:
 
         let report = http_batch_check(&request);
 
-        assert_eq!(report.verdict, BatchVerdict::Green);
+        assert_eq!(
+            report.verdict,
+            BatchVerdict::Green,
+            "clean no-corun members must remain green: {report:#?}"
+        );
         assert_eq!(report.members.len(), 40);
         assert_eq!(report.combined_checks, 0);
         assert_eq!(
@@ -6545,42 +8366,83 @@ checks:
     }
 
     #[test]
-    fn get_diagnostics_is_honest_empty_inc0_boundary() {
-        // **INFRA-36 update (was: Inc-0 boundary):** the diagnostics
-        // *list* (per-diag detail) is still not retained at the
-        // serveapi layer — that's a later increment as the original
-        // contract said. But the *count* (`red_diagnostics` on
-        // `WorktreeStatus`) is now honest: when the publish path
-        // supplies a real count, `get_status` returns it.
-        //
-        // This test now pins two things:
-        //   1. The per-diagnostic detail list is still empty here
-        //      (the increment-0 boundary the original test guarded).
-        //   2. But `red_diagnostics` is the real count, NOT 0 — the
-        //      INFRA-36 invariant that closes the "verdict=red, 0
-        //      diagnostics" liar state.
+    fn get_diagnostics_retains_full_red_details_and_clears_on_success() {
         let api = ServeVerdictState::new();
+        let diagnostic = Diagnostic {
+            file_path: PathBuf::from("/r/wt/src/lib.rs"),
+            line: 12,
+            col: 7,
+            severity: Severity::Error,
+            code: Some("E0308".to_string()),
+            message: "mismatched types".to_string(),
+            source: Some("rustc".to_string()),
+        };
+        api.retain_diagnostics("/r/wt", None, vec![diagnostic.clone()]);
         api.publish(
             Path::new("/r/wt"),
-            crate::statusfile::VerdictPayload::red(5),
+            crate::statusfile::VerdictPayload::red(1),
+        );
+        assert_eq!(api.get_diagnostics("/r/wt"), vec![diagnostic]);
+        let status = api.get_status("/r/wt").expect("status present");
+        assert_eq!(status.verdict, "red");
+        assert_eq!(status.red_diagnostics, 1);
+        assert!(
+            status.verdict_failure_reason.is_none(),
+            "a real Red verdict carries its concrete diagnostics, not an infra reason"
+        );
+
+        api.retain_diagnostics("/r/wt", None, Vec::new());
+        api.publish(
+            Path::new("/r/wt"),
+            crate::statusfile::VerdictPayload::green(),
         );
         assert!(
             api.get_diagnostics("/r/wt").is_empty(),
-            "per-diagnostic detail list is not retained at this layer \
-             (the original Inc-0 boundary still holds)"
+            "a later successful run must not expose stale RED diagnostics"
         );
-        let status = api.get_status("/r/wt").expect("status present");
-        assert_eq!(status.verdict, "red");
+    }
+
+    #[test]
+    fn attributed_diagnostics_do_not_cross_between_shared_worktree_prs() {
+        let api = ServeVerdictState::new();
+        let make = |path: &str, message: &str| Diagnostic {
+            file_path: PathBuf::from(path),
+            line: 1,
+            col: 1,
+            severity: Severity::Error,
+            code: Some("E0308".to_string()),
+            message: message.to_string(),
+            source: Some("rustc".to_string()),
+        };
+        let a = make("/repo/a.rs", "PR A");
+        let b = make("/repo/b.rs", "PR B");
+        api.retain_diagnostics("/shared", Some("sha-a"), vec![a.clone()]);
+        api.publish_attributed(
+            Path::new("/shared"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("sha-a".to_string()),
+            false,
+        );
+        api.retain_diagnostics("/shared", Some("sha-b"), vec![b.clone()]);
+        api.publish_attributed(
+            Path::new("/shared"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("sha-b".to_string()),
+            false,
+        );
+
         assert_eq!(
-            status.red_diagnostics, 5,
-            "INFRA-36: red_diagnostics MUST reflect the count supplied \
-             at publish time — not the historical hardcoded 0 that \
-             produced the verdict=red,0-diagnostics liar state"
+            api.get_diagnostics_attributed("/shared", Some("sha-a")),
+            vec![a]
         );
-        assert!(
-            status.verdict_failure_reason.is_none(),
-            "a real Red verdict carries no failure reason — the reason \
-             is the populated-vs-empty diagnostic count itself"
+        assert_eq!(
+            api.get_diagnostics_attributed("/shared", Some("sha-b")),
+            vec![b.clone()]
+        );
+        assert_eq!(
+            api.get_diagnostics("/shared"),
+            vec![b],
+            "unattributed readers see the current live slot only"
         );
     }
 
@@ -6678,9 +8540,12 @@ checks:
             repo_relative: true,
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -6726,9 +8591,12 @@ checks:
             repo_relative: true,
             analysis_root: Some(root.to_string_lossy().into_owned()),
             base_sha: Some(head),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options(
@@ -6745,6 +8613,151 @@ checks:
         );
         assert!(api.peek_overlay_for("/client/wt").is_some());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_git_gate_fetches_verified_sha_and_checks_it_in_isolated_scratch() {
+        let root = temp_root("exact-git-gate");
+        let remote = temp_root("exact-git-gate-remote");
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn base() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        let base_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn candidate() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate"]);
+        let source_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["push", "origin", "HEAD:main"]);
+        git(&root, &["reset", "--hard", &base_sha]);
+
+        let api = ServeVerdictState::new();
+        let (direct_tx, direct_rx) = channel();
+        api.attach_direct_gate_signal(direct_tx);
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some(source_sha.clone()),
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(source_sha.clone()),
+            changed_files: Some(vec!["src/lib.rs".to_string()]),
+            gate: true,
+            check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+            semantic: None,
+        };
+
+        let ack = api.push_overlay_with_options(
+            "/workspace/tf-multiverse",
+            "origin/dev",
+            &[],
+            None,
+            Some(&options),
+        );
+        assert!(ack.accepted, "{:?}", ack.reject_body);
+        assert_eq!(ack.applied_files, 0);
+        assert!(api.peek_overlay_for("/workspace/tf-multiverse").is_none());
+
+        let request = direct_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("direct gate dispatch");
+        assert_eq!(
+            request.context.source_sha.as_deref(),
+            Some(source_sha.as_str())
+        );
+        let seen = api
+            .with_project_check_overlay(&request.context, |scratch, _warm| {
+                (
+                    git_capture(scratch, &["rev-parse", "HEAD"]),
+                    std::fs::read_to_string(scratch.join("src/lib.rs")).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_eq!(seen.0, source_sha);
+        assert_eq!(seen.1, "pub fn candidate() {}\n");
+        assert_eq!(
+            git_capture(&root, &["rev-parse", "HEAD"]),
+            base_sha,
+            "the shared analysis root must not move"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn base() {}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[test]
+    fn exact_git_gate_rejects_source_body_or_cross_sha_attribution() {
+        let api = ServeVerdictState::new();
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+        let base = PushOverlayOptions {
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(sha.clone()),
+            base_sha: Some(other),
+            ..Default::default()
+        };
+        let mismatch = api.push_overlay_with_options("/wt", "", &[], None, Some(&base));
+        assert!(!mismatch.accepted);
+
+        let mut with_body = base;
+        with_body.base_sha = Some(sha.clone());
+        let body = vec![("src/lib.rs".to_string(), "ignored".to_string())];
+        let rejected = api.push_overlay_with_options("/wt", "", &body, None, Some(&with_body));
+        assert!(!rejected.accepted);
+
+        let missing_gate = PushOverlayOptions {
+            analysis_root: Some("/workspace/repo".to_string()),
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(sha.clone()),
+            base_sha: Some(sha.clone()),
+            gate: false,
+            ..Default::default()
+        };
+        let rejected = api.push_overlay_with_options("/wt", "", &[], None, Some(&missing_gate));
+        assert!(!rejected.accepted);
+
+        let missing_root = PushOverlayOptions {
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(sha.clone()),
+            base_sha: Some(sha),
+            gate: true,
+            ..Default::default()
+        };
+        let rejected = api.push_overlay_with_options("/wt", "", &[], None, Some(&missing_root));
+        assert!(!rejected.accepted);
+    }
+
+    #[test]
+    fn source_ref_accepts_only_valid_heads_and_pull_refs() {
+        assert!(validate_source_ref("refs/heads/dev").is_ok());
+        assert!(validate_source_ref("refs/pull/123/head").is_ok());
+        for invalid in [
+            "dev",
+            "refs/tags/v1",
+            "refs/heads/../main",
+            "refs/heads/bad name",
+            "refs/heads/.hidden",
+        ] {
+            assert!(
+                validate_source_ref(invalid).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -6770,6 +8783,9 @@ checks:
             root: root.clone(),
             changed_files: Some(vec!["src/lib.rs".into(), "new.yaml".into()]),
             base_ref: base,
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![
                 (
                     root.join("src/lib.rs").to_string_lossy().into_owned(),
@@ -6817,6 +8833,9 @@ checks:
             root: project.root.clone(),
             changed_files: Some(vec!["src/lib.rs".into(), "new.yaml".into()]),
             base_ref: "origin/main".to_string(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
             overlay_files: vec![
                 (
                     project
@@ -6866,6 +8885,43 @@ checks:
     }
 
     #[test]
+    fn project_check_scratch_recovers_registration_left_by_prior_process() {
+        let project = setup_batch_project("project-overlay-stale-registration");
+        let state_dir = temp_root("project-overlay-stale-registration-state");
+        let scratch = state_dir.join("project-check-runs/run-1-8");
+
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
+        assert!(
+            scratch.exists(),
+            "the prior process created its scratch tree"
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(
+            !scratch.exists(),
+            "simulate pod replacement after the directory disappeared but Git metadata survived"
+        );
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main")
+            .expect("a restarted process may safely reclaim the same scratch path");
+        assert!(scratch.exists(), "the replacement scratch tree exists");
+
+        cleanup_project_check_scratch(&project.root, &scratch).unwrap();
+        assert!(!scratch.exists(), "cleanup removes the scratch directory");
+        let registrations = Command::new("git")
+            .arg("-C")
+            .arg(&project.root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("worktree list remains readable");
+        assert!(registrations.status.success());
+        let registrations = String::from_utf8_lossy(&registrations.stdout);
+        assert!(
+            !registrations.contains(scratch.to_string_lossy().as_ref()),
+            "cleanup removes the Git worktree registration as well"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn push_overlay_with_options_rejects_escaping_repo_relative_paths() {
         let api = ServeVerdictState::new();
         let files = vec![("../outside.rs".to_string(), "bad".to_string())];
@@ -6873,9 +8929,12 @@ checks:
             repo_relative: true,
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
 
         let ack = api.push_overlay_with_options("/client/wt", "", &files, None, Some(&options));
@@ -6904,6 +8963,52 @@ checks:
         );
         // peek also None.
         assert!(api.peek_overlay_for("/wt").is_none());
+    }
+
+    #[test]
+    fn ra_spawn_failure_terminalizes_the_exact_queued_attempt() {
+        let state_dir = temp_root("ra-spawn-failure-outcome");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = attempt_context("attempt-ra-spawn-failure", 1);
+        let files = vec![("src/lib.rs".to_string(), "pub fn changed() {}".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..PushOverlayOptions::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/client/ra-spawn-failure",
+                "0123456789abcdef0123456789abcdef01234567",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        assert!(api.fail_next_pushed_overlay(
+            "/client/ra-spawn-failure",
+            "ra_spawn_failed: Resource temporarily unavailable (os error 11)",
+        ));
+
+        assert!(api.peek_overlay_for("/client/ra-spawn-failure").is_none());
+        assert_eq!(api.daemon_activity().active_worktrees, 0);
+        let outcome = api
+            .get_outcome_v3(&context.attempt_id)
+            .expect("accepted attempt remains queryable");
+        assert_eq!(
+            outcome.conclusion.semantic_code(),
+            "indeterminate.process_lost"
+        );
+        assert!(
+            outcome.timeline.last().is_some_and(|phase| {
+                phase.phase == Phase::Terminal && phase.finished_at_unix_ms.is_some()
+            }),
+            "spawn failure must become terminal instead of remaining queued forever"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     /// **THE load-bearing composing-equivalence assertion (2b spec §5.3).**
@@ -7053,9 +9158,12 @@ checks:
             repo_relative: false,
             analysis_root: None,
             base_sha: Some(sha.to_string()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
-            gate: true,
+            gate: false,
             check_ids: None,
+            semantic: None,
         };
         // PR-A pushes, then PR-B pushes on the SAME worktree key before the
         // serve loop has consumed A.
@@ -7196,11 +9304,14 @@ checks:
             files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
             analysis_root: None,
             base_sha: Some(sha.into()),
+            source_ref: None,
+            source_sha: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         api.record_push_attribution("/wt", &pushed("first"));
         api.record_push_attribution("/wt", &pushed("second"));
@@ -7225,11 +9336,14 @@ checks:
             files: vec![("src/lib.rs".into(), "pub fn x() {}".into())],
             analysis_root: None,
             base_sha: Some(sha.into()),
+            source_ref: None,
+            source_sha: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         }
     }
 
@@ -7366,11 +9480,14 @@ checks:
             files: vec![("portal/src/app.rs".into(), "fn a() {}".into())],
             analysis_root: None,
             base_sha: Some("cafe1234".into()),
+            source_ref: None,
+            source_sha: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: changed,
             check_profile: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         // No macro names ⇒ pure path-glob (pre-CGLS-12 behavior).
         api.record_push_attribution_with_globs(
@@ -7546,9 +9663,12 @@ checks:
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&options));
         assert!(!ack.accepted, "truncation signature must be rejected");
@@ -7569,9 +9689,12 @@ checks:
             repo_relative: false,
             analysis_root: Some("/workspace/tf-multiverse".into()),
             base_sha: None,
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack = api.push_overlay_with_options("/wt", "", &[], None, Some(&options));
         assert!(
@@ -7591,9 +9714,12 @@ checks:
             repo_relative: false,
             analysis_root: None,
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: Some(vec!["src/removed.rs".into()]),
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         let ack = api.push_overlay_with_options("/wt", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted, "delete-only diff (empty content) must pass");
@@ -7996,6 +10122,7 @@ checks:
             Some("abc123".into()),
             false,
             vec!["wasm-compiler-witness".into(), "fmt".into()],
+            None,
         );
 
         // Retrievable by base_sha with the ran ids intact (the witness polls
@@ -8038,21 +10165,45 @@ checks:
     }
 
     #[test]
-    fn push_overlay_with_options_stamps_gate_on_pushed_overlay() {
-        // #A4.3 gate wire: options.gate must survive into the stored
-        // PushedOverlay (SwitchOverlay carries it onward into the
-        // ProjectCheckRunContext the EmitVerdict arm promotes on).
+    fn gated_push_dispatches_directly_without_entering_ra_queue() {
         let api = ServeVerdictState::new();
+        let (direct_tx, direct_rx) = channel();
+        api.attach_direct_gate_signal(direct_tx);
         let files = vec![("src/lib.rs".to_string(), "pub fn x() {}".to_string())];
+        let context = attempt_context("attempt-gated", 1);
         let options = PushOverlayOptions {
             gate: true,
+            base_sha: Some("candidate".to_string()),
+            check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+            semantic: Some(context.clone()),
             ..Default::default()
         };
-        let ack = api.push_overlay_with_options("/wt-gate", "", &files, None, Some(&options));
+        let ack =
+            api.push_overlay_with_options("/wt-gate", "origin/main", &files, None, Some(&options));
         assert!(ack.accepted);
         assert!(
-            api.peek_overlay_for("/wt-gate").expect("stored").gate,
-            "gate=true push stores gate=true"
+            matches!(
+                api.get_outcome_v3(&context.attempt_id)
+                    .expect("accepted gated attempt must publish an outcome synchronously")
+                    .conclusion,
+                Conclusion::Pending { .. }
+            ),
+            "POST /v3/attempts must never acknowledge a gated attempt before its pending outcome exists"
+        );
+        assert!(
+            api.peek_overlay_for("/wt-gate").is_none(),
+            "gated work must not enter the shared RA overlay queue"
+        );
+        let direct = direct_rx.recv_timeout(Duration::from_millis(200)).unwrap();
+        assert_eq!(direct.wt, PathBuf::from("/wt-gate"));
+        assert!(direct.context.gate);
+        assert_eq!(
+            direct.context.check_ids,
+            Some(vec!["ssr-compiler-witness".to_string()])
+        );
+        assert!(
+            direct.context.source_sha.is_none(),
+            "legacy body-overlay gates remain supported during rollout"
         );
 
         let ack = api.push_overlay_with_options("/wt-plain", "", &files, None, None);
@@ -8060,6 +10211,35 @@ checks:
         assert!(
             !api.peek_overlay_for("/wt-plain").expect("stored").gate,
             "optionless push defaults gate=false (warn-fast posture)"
+        );
+    }
+
+    #[test]
+    fn disconnected_gate_dispatcher_does_not_strand_a_pending_outcome() {
+        let api = ServeVerdictState::new();
+        let (direct_tx, direct_rx) = channel();
+        drop(direct_rx);
+        api.attach_direct_gate_signal(direct_tx);
+        let context = attempt_context("attempt-disconnected-gate", 1);
+        let options = PushOverlayOptions {
+            gate: true,
+            base_sha: Some("candidate".to_string()),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+
+        let ack = api.push_overlay_with_options(
+            "/wt-disconnected-gate",
+            "origin/main",
+            &[("src/lib.rs".to_string(), "pub fn x() {}".to_string())],
+            None,
+            Some(&options),
+        );
+
+        assert!(!ack.accepted);
+        assert!(
+            api.get_outcome_v3(&context.attempt_id).is_none(),
+            "a rejected dispatch must be retryable with the same attempt id"
         );
     }
 
@@ -8072,6 +10252,9 @@ checks:
                 root: PathBuf::from("/root"),
                 changed_files: None,
                 base_ref: String::new(),
+                base_sha: None,
+                source_ref: None,
+                source_sha: None,
                 overlay_files: Vec::new(),
                 materialize_overlay: false,
                 gate: true,
@@ -8435,9 +10618,8 @@ checks:
     /// dropping the guard makes the key warm-resolvable again. This is the
     /// serialization interlock that keeps CGLS-24 structurally impossible.
     ///
-    /// KNOWN INTERMITTENT — 2 failures in ~365 sampled `test` runs
-    /// (2026-07-30, tasks 206746 and 207005), with a passing run between them.
-    /// The final assertion fails; the other 340 tests pass.
+    /// This test caught 3 intermittent failures across the 2026-07-30/31 CI
+    /// runs. The final assertion failed while every other test passed.
     ///
     /// LOCALISED TO THE FLOCK RUNG. Task 207005 captured the obs lines, which
     /// map one-to-one onto the three resolves:
@@ -8459,19 +10641,14 @@ checks:
     ///     `warm_flock_second_acquire_contended_until_release` both passed in
     ///     the same run.
     ///
-    /// So an open-file-description still held the lock when #3 opened a new fd,
-    /// and the only one ever created for that path was `first`'s.
-    ///
-    /// STILL NOT ROOT-CAUSED: why the lock outlived the close. `WarmFlock` has
-    /// no explicit `Drop` and relies on `File`'s close to release `flock(2)`.
-    /// Note `warm_flock_second_acquire_contended_until_release` exercises that
-    /// exact acquire/drop/re-acquire cycle directly and passes consistently, so
-    /// the difference is either this guard's field-order drop (`dir`,
-    /// `_in_proc`, `_flock` — flock released last) interacting with timing, or
-    /// something environmental. Not guessing between them here.
-    ///
-    /// Deliberately NOT `#[ignore]`d: at ~2-in-365 a silenced flake stops being
-    /// evidence, and the next occurrence would carry no signal.
+    /// The lifecycle bug was that `WarmTargetGuard` exposed the in-process key
+    /// as idle before releasing its flock: Rust drops struct fields in
+    /// declaration order, and `_in_proc` preceded `_flock`. A racing resolver
+    /// could therefore pass the CAS while the prior file description still
+    /// owned the kernel lock. The guard now explicitly `LOCK_UN`s and closes
+    /// the flock before its idempotent in-process release. This assertion pins
+    /// the complete handoff and remains unignored so that either lock leaking
+    /// becomes a visible regression.
     ///
     /// Until the CI de-dupe landed such a failure was invisible — the duplicate
     /// push/pull_request matrices raced and cancelled each other, so a flaky

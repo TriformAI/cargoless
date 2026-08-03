@@ -65,7 +65,26 @@ pub fn run(cfg: &Config) -> ExitCode {
         cfg.detection.describe()
     ));
 
-    match cargoless_core::model::check_once_with_diagnostics(&cfg.root) {
+    let result = cargoless_core::model::check_once_with_diagnostics(&cfg.root);
+    let semantic_outcome = crate::outcome_adapter::persist_local_check(&cfg.root, &result);
+    match &semantic_outcome {
+        Ok(outcome) => ui::step(format!(
+            "outcome={} code={} request={} attempt={} evidence=.cargoless/evidence-v3/{}",
+            serde_json::to_value(outcome.reaction.state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "error".into()),
+            outcome.reaction.code.as_str(),
+            outcome.request_id,
+            outcome.attempt_id,
+            outcome.attempt_id,
+        )),
+        Err(error) => ui::error(format!(
+            "could not persist semantic outcome evidence: {error}"
+        )),
+    }
+
+    let legacy_exit = match result {
         Ok(cargoless_core::CheckResult {
             tree: cargoless_core::TreeState::Green,
             diagnostics,
@@ -140,6 +159,21 @@ pub fn run(cfg: &Config) -> ExitCode {
             ));
             ExitCode::from(2)
         }
+    };
+    match semantic_outcome {
+        Ok(outcome) => match outcome.reaction.state {
+            cargoless_core::outcome::CheckState::Success => ExitCode::SUCCESS,
+            cargoless_core::outcome::CheckState::Failure => ExitCode::from(1),
+            cargoless_core::outcome::CheckState::Pending
+            | cargoless_core::outcome::CheckState::Error
+            | cargoless_core::outcome::CheckState::NoUpdate => ExitCode::from(2),
+        },
+        // Evidence failure must never turn a red tree green. A successful
+        // analyzer result without its required proof is an operational error.
+        Err(_) => match legacy_exit {
+            code if code == ExitCode::from(1) => code,
+            _ => ExitCode::from(2),
+        },
     }
 }
 

@@ -302,7 +302,32 @@ pub struct PerCrate {
     /// map would falsely read all-green). The authoritative `verdict=`
     /// line is unaffected either way.
     pub all_errors_attributed: bool,
+    /// The error diagnostics that resolved to NO known crate, as
+    /// `<path>:<line>[:<code>]` — up to [`UNATTRIBUTED_SAMPLE_MAX`], in
+    /// first-seen order, deduplicated.
+    ///
+    /// Why this exists: when `all_errors_attributed` is false the caller
+    /// omits `crates=` (correctly — a partial map would read as
+    /// falsely-all-green), so the published status became
+    /// `red_diagnostics=N` with `crates: []` and **no way to learn which
+    /// file N referred to**. The `file_path` was right here in the
+    /// `Diagnostic` and was dropped on the floor; only the scalar
+    /// survived. That is the same wound INFRA-36 closed for the
+    /// `red_diagnostics=0` liar state — a red nobody can attribute is a
+    /// red nobody fixes, and this one cost a PR six witness attempts
+    /// before an operator had to ask why the verdict named nothing.
+    ///
+    /// This is a diagnostic BREADCRUMB, deliberately not a second
+    /// verdict channel: it never affects `error_count`, `verdicts`, or
+    /// `all_errors_attributed`, and it is capped so a pathological
+    /// thousand-error tree cannot bloat the status payload.
+    pub unattributed_errors: Vec<String>,
 }
+
+/// Cap on [`PerCrate::unattributed_errors`]. Small on purpose: the point
+/// is to name the offender so a human can go look, not to mirror the
+/// whole diagnostic stream into a status line.
+pub const UNATTRIBUTED_SAMPLE_MAX: usize = 5;
 
 /// Pure roll-up of per-file diagnostics into per-crate verdicts. No
 /// filesystem, no clock — exhaustively unit-tested. See the module-level
@@ -317,6 +342,7 @@ pub fn aggregate(diags: &[Diagnostic], map: &CrateMap) -> PerCrate {
         .collect();
     let mut error_count: u32 = 0;
     let mut all_errors_attributed = true;
+    let mut unattributed_errors: Vec<String> = Vec::new();
     for d in diags {
         if d.severity != Severity::Error {
             continue; // warnings/info/hint never flip a crate red
@@ -329,6 +355,20 @@ pub fn aggregate(diags: &[Diagnostic], map: &CrateMap) -> PerCrate {
             None => {
                 // An error we cannot attribute ⇒ a partial map would lie.
                 all_errors_attributed = false;
+                // ...but the diagnostic still KNOWS where it is. Keep a
+                // bounded, deduplicated sample so the omitted `crates=`
+                // does not also erase every trace of WHICH file the
+                // surviving `red_diagnostics=N` counted.
+                if unattributed_errors.len() < UNATTRIBUTED_SAMPLE_MAX {
+                    let mut loc = format!("{}:{}", d.file_path.display(), d.line);
+                    if let Some(code) = d.code.as_deref() {
+                        loc.push(':');
+                        loc.push_str(code);
+                    }
+                    if !unattributed_errors.contains(&loc) {
+                        unattributed_errors.push(loc);
+                    }
+                }
             }
         }
     }
@@ -336,6 +376,7 @@ pub fn aggregate(diags: &[Diagnostic], map: &CrateMap) -> PerCrate {
         verdicts: verdicts.into_iter().collect(),
         error_count,
         all_errors_attributed,
+        unattributed_errors,
     }
 }
 
@@ -475,6 +516,14 @@ mod tests {
             !pc.all_errors_attributed,
             "an unattributable error must mark the per-crate map untrustworthy"
         );
+        // ...and it must still SAY WHERE. Omitting `crates=` is the honest
+        // move; omitting every trace of the offending file is what turned a
+        // red into an unreadable one.
+        assert_eq!(
+            pc.unattributed_errors,
+            vec!["/somewhere/else/gen.rs:1:E0308".to_string()],
+            "an unattributable error must still name its own location"
+        );
     }
 
     #[test]
@@ -484,5 +533,83 @@ mod tests {
         assert_eq!(pc.verdicts, vec![("physics".to_string(), Verdict::Red)]);
         assert_eq!(pc.error_count, 2, "scalar counts errors, not crates");
         assert!(pc.all_errors_attributed);
+    }
+
+    /// CONTROL for the breadcrumb: a fully-attributed red must carry NO
+    /// sample. Without this the field could be unconditionally populated
+    /// and every assertion above would still pass — a sample that always
+    /// fires tells you nothing about attribution.
+    #[test]
+    fn attributed_errors_leave_the_sample_empty() {
+        let m = CrateMap::from_pairs([("/ws/p", "physics")]);
+        let pc = aggregate(&[err("/ws/p/src/a.rs")], &m);
+        assert!(pc.all_errors_attributed);
+        assert!(
+            pc.unattributed_errors.is_empty(),
+            "an attributed red has nothing unattributed to name"
+        );
+    }
+
+    #[test]
+    fn unattributed_sample_is_capped() {
+        let m = CrateMap::from_pairs([("/ws/p", "physics")]);
+        // 7 distinct unattributable files, > UNATTRIBUTED_SAMPLE_MAX (5).
+        let diags: Vec<_> = (0..7).map(|i| err(&format!("/nope/f{i}.rs"))).collect();
+        let pc = aggregate(&diags, &m);
+        assert_eq!(pc.error_count, 7, "every error still counts");
+        assert_eq!(
+            pc.unattributed_errors.len(),
+            UNATTRIBUTED_SAMPLE_MAX,
+            "the sample is bounded — it names offenders, it is not a stream mirror"
+        );
+        assert_eq!(pc.unattributed_errors[0], "/nope/f0.rs:1:E0308");
+    }
+
+    /// Dedup must be exercised BELOW the cap, otherwise the assertion is
+    /// vacuous: past the cap nothing is pushed at all, so a build with the
+    /// `contains` check deleted would still pass. Three diagnostics, two
+    /// identical ⇒ two slots used, well inside the bound.
+    #[test]
+    fn unattributed_sample_deduplicates_below_the_cap() {
+        let m = CrateMap::from_pairs([("/ws/p", "physics")]);
+        let pc = aggregate(
+            &[err("/nope/a.rs"), err("/nope/a.rs"), err("/nope/b.rs")],
+            &m,
+        );
+        assert_eq!(pc.error_count, 3, "dedup must not touch the count");
+        assert_eq!(
+            pc.unattributed_errors,
+            vec![
+                "/nope/a.rs:1:E0308".to_string(),
+                "/nope/b.rs:1:E0308".to_string()
+            ],
+            "a repeated location must not burn a second slot"
+        );
+    }
+
+    #[test]
+    fn unattributed_sample_carries_the_code_when_present() {
+        let m = CrateMap::from_pairs([("/ws/p", "physics")]);
+        let mut d = err("/nope/g.rs");
+        d.line = 42;
+        d.code = Some("E0308".to_string());
+        let pc = aggregate(&[d], &m);
+        assert_eq!(
+            pc.unattributed_errors,
+            vec!["/nope/g.rs:42:E0308".to_string()]
+        );
+    }
+
+    /// A WARNING under no known crate is not an error: it must neither
+    /// count, nor flip the honesty bit, nor appear in the sample.
+    #[test]
+    fn unattributed_warning_does_not_enter_the_sample() {
+        let m = CrateMap::from_pairs([("/ws/p", "physics")]);
+        let mut d = err("/nope/w.rs");
+        d.severity = Severity::Warning;
+        let pc = aggregate(&[d], &m);
+        assert_eq!(pc.error_count, 0);
+        assert!(pc.all_errors_attributed);
+        assert!(pc.unattributed_errors.is_empty());
     }
 }

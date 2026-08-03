@@ -50,6 +50,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use cargoless_proto::outcome::{AttemptId, OutcomeEnvelope, RequestId, TraceId};
 use cargoless_proto::{Diagnostic, Severity};
 
 use crate::batch::{BatchMember, BatchMemberResult, BatchProvenance, BatchReport, BatchVerdict};
@@ -144,6 +145,12 @@ pub struct PushOverlayOptions {
     /// Client's resolved base SHA, diagnostics-only. The server still fetches
     /// its own latest base ref before accepting central-mode pushes.
     pub base_sha: Option<String>,
+    /// Advertised remote ref containing the candidate commit. Central
+    /// daemons fetch only this ref from their fixed `origin`.
+    pub source_ref: Option<String>,
+    /// Exact candidate commit to check. When paired with `source_ref`, the
+    /// daemon verifies reachability and checks this Git tree directly.
+    pub source_sha: Option<String>,
     /// Repo-relative files changed by the client diff. These are distinct
     /// from `files`: the overlay payload also includes workspace config files
     /// needed for cluster routing, while project-check triggers should see
@@ -161,6 +168,11 @@ pub struct PushOverlayOptions {
     /// it (consumption lands with the B3 per-check witness gating) — old
     /// daemons simply ignore the key.
     pub check_ids: Option<Vec<String>>,
+    /// Required by the v3 attempt protocol. The three identities answer
+    /// different questions and are deliberately not collapsed into the
+    /// commit SHA: request groups retries, attempt identifies one submitted
+    /// evaluation, and trace joins the daemon/process evidence for it.
+    pub semantic: Option<AttemptContext>,
 }
 
 impl PushOverlayOptions {
@@ -173,6 +185,8 @@ impl PushOverlayOptions {
                 .trim()
                 .is_empty()
             && self.base_sha.as_deref().unwrap_or("").trim().is_empty()
+            && self.source_ref.as_deref().unwrap_or("").trim().is_empty()
+            && self.source_sha.as_deref().unwrap_or("").trim().is_empty()
             && self
                 .changed_files
                 .as_ref()
@@ -182,6 +196,33 @@ impl PushOverlayOptions {
                 .check_ids
                 .as_ref()
                 .is_none_or(|check_ids| check_ids.is_empty())
+            && self.semantic.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptContext {
+    pub request_id: RequestId,
+    pub attempt_id: AttemptId,
+    pub trace_id: TraceId,
+    /// Exact predecessor when this is an automatic retry. This is an identity,
+    /// not a commit SHA, and lets the daemon publish an explicit causal edge.
+    pub previous_attempt_id: Option<AttemptId>,
+    /// One-based ordinal for bounded automatic retries.
+    pub attempt_number: u32,
+    pub maximum_attempts: u32,
+    pub retry_after_ms: u64,
+}
+
+impl AttemptContext {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.attempt_number == 0
+            || self.maximum_attempts == 0
+            || self.attempt_number > self.maximum_attempts
+        {
+            return Err("attempt_number must be within 1..=maximum_attempts");
+        }
+        Ok(())
     }
 }
 
@@ -422,6 +463,40 @@ pub trait VerdictService: Send + Sync {
     /// detail" and "green" the same — correct, a green tree retains
     /// nothing; see [`crate::diagnostics_store`]).
     fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic>;
+
+    /// Exact semantic outcome for one execution attempt. Unlike
+    /// `get_status_attributed`, this is never addressed by a mutable
+    /// worktree slot or commit SHA.
+    fn get_outcome_v3(&self, _attempt_id: &AttemptId) -> Option<OutcomeEnvelope> {
+        None
+    }
+
+    /// Execute a batch as one exact semantic attempt. Implementations return
+    /// `None` when they do not support the v3 batch producer.
+    fn submit_batch_v3(&self, _request: &BatchCheckRequest) -> Option<OutcomeEnvelope> {
+        None
+    }
+
+    /// Bounded-cardinality operational counters for the semantic protocol.
+    fn outcome_metrics_v3(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// One allow-listed document from an exact attempt's evidence bundle.
+    fn get_evidence_v3(&self, _attempt_id: &AttemptId, _artifact: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Diagnostics addressed by the same immutable verdict identity as
+    /// [`Self::get_status_attributed`]. The default preserves compatibility
+    /// for services without per-commit retention.
+    fn get_diagnostics_attributed(
+        &self,
+        worktree: &str,
+        _base_sha: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        self.get_diagnostics(worktree)
+    }
 
     /// All discovered worktrees with their light verdict summary.
     fn list_worktrees(&self) -> Vec<WorktreeSummary>;
@@ -1122,6 +1197,18 @@ impl Request {
                             serde_json::Value::String(sha.to_string()),
                         );
                     }
+                    if let Some(source_ref) = options.source_ref.as_deref() {
+                        map.insert(
+                            "source_ref".to_string(),
+                            serde_json::Value::String(source_ref.to_string()),
+                        );
+                    }
+                    if let Some(source_sha) = options.source_sha.as_deref() {
+                        map.insert(
+                            "source_sha".to_string(),
+                            serde_json::Value::String(source_sha.to_string()),
+                        );
+                    }
                     if let Some(changed_files) = options
                         .changed_files
                         .as_ref()
@@ -1155,6 +1242,7 @@ impl Request {
                             ),
                         );
                     }
+                    insert_attempt_context(map, options.semantic.as_ref());
                 }
                 v
             }
@@ -1268,6 +1356,18 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
                 serde_json::Value::String(sha.to_string()),
             );
         }
+        if let Some(source_ref) = options.source_ref.as_deref() {
+            map.insert(
+                "source_ref".to_string(),
+                serde_json::Value::String(source_ref.to_string()),
+            );
+        }
+        if let Some(source_sha) = options.source_sha.as_deref() {
+            map.insert(
+                "source_sha".to_string(),
+                serde_json::Value::String(source_sha.to_string()),
+            );
+        }
         if let Some(changed_files) = options
             .changed_files
             .as_ref()
@@ -1301,8 +1401,30 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
                 ),
             );
         }
+        insert_attempt_context(map, options.semantic.as_ref());
     }
     value
+}
+
+fn insert_attempt_context(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    context: Option<&AttemptContext>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    map.insert(
+        "semantic".to_string(),
+        serde_json::json!({
+            "request_id": context.request_id.as_str(),
+            "attempt_id": context.attempt_id.as_str(),
+            "trace_id": context.trace_id.as_str(),
+            "previous_attempt_id": context.previous_attempt_id.as_ref().map(AttemptId::as_str),
+            "attempt_number": context.attempt_number,
+            "maximum_attempts": context.maximum_attempts,
+            "retry_after_ms": context.retry_after_ms,
+        }),
+    );
 }
 
 fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
@@ -1321,13 +1443,44 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty()),
+        source_ref: v
+            .get("source_ref")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        source_sha: v
+            .get("source_sha")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
         changed_files: string_array_from_json(v.get("changed_files")),
         gate: v
             .get("gate")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         check_ids: string_array_from_json(v.get("check_ids")).filter(|ids| !ids.is_empty()),
+        semantic: attempt_context_from_json(v.get("semantic")),
     }
+}
+
+fn attempt_context_from_json(v: Option<&serde_json::Value>) -> Option<AttemptContext> {
+    let v = v?;
+    let context = AttemptContext {
+        request_id: RequestId::new(v.get("request_id")?.as_str()?).ok()?,
+        attempt_id: AttemptId::new(v.get("attempt_id")?.as_str()?).ok()?,
+        trace_id: TraceId::new(v.get("trace_id")?.as_str()?).ok()?,
+        previous_attempt_id: v
+            .get("previous_attempt_id")
+            .and_then(serde_json::Value::as_str)
+            .map(AttemptId::new)
+            .transpose()
+            .ok()?,
+        attempt_number: u32::try_from(v.get("attempt_number")?.as_u64()?).ok()?,
+        maximum_attempts: u32::try_from(v.get("maximum_attempts")?.as_u64()?).ok()?,
+        retry_after_ms: v.get("retry_after_ms")?.as_u64()?,
+    };
+    context.validate().ok()?;
+    Some(context)
 }
 
 fn string_array_from_json(v: Option<&serde_json::Value>) -> Option<Vec<String>> {
@@ -2126,9 +2279,12 @@ mod tests {
             repo_relative: true,
             analysis_root: Some("/workspace/repo".into()),
             base_sha: Some("abc123".into()),
+            source_ref: None,
+            source_sha: None,
             changed_files: None,
             gate: false,
             check_ids: None,
+            semantic: None,
         };
         req.corun = false;
         req.coalesce_key = Some("tf-multiverse:origin/dev:project-checks".into());
@@ -2422,9 +2578,12 @@ mod tests {
                 repo_relative: true,
                 analysis_root: Some("/workspace/tf-multiverse".into()),
                 base_sha: Some("abc123".into()),
+                source_ref: Some("refs/pull/42/head".into()),
+                source_sha: Some("0123456789012345678901234567890123456789".into()),
                 changed_files: Some(vec!["src/lib.rs".into()]),
                 gate: true,
                 check_ids: None,
+                semantic: None,
             },
         };
         assert_eq!(Request::from_json(&req.to_json()), Some(req));

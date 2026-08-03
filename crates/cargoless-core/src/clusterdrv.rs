@@ -110,6 +110,9 @@ struct ActiveTxn {
     /// seam (the #247 [[proven-core-precondition-violated-at-integration-seam]]
     /// pattern).
     real_flycheck_activity_seen: bool,
+    /// Stable reason from an explicit diagnostic-pull failure. Ordinary
+    /// flycheck failures leave this empty and retain their historical path.
+    analysis_failure_reason: Option<String>,
 }
 
 /// What the live serve-loop adapter must do next for this cluster. The
@@ -138,6 +141,7 @@ pub enum ClusterAction {
         /// timer that out-raced (or replaced) analysis is "RA never ran",
         /// not "RA verified clean". See [`ActiveTxn`].
         real_flycheck_activity_seen: bool,
+        analysis_failure_reason: Option<String>,
     },
     /// Nothing to do for this event (serialized-wait, stray pre-arm RA
     /// chatter, deduped re-request, or pruned deactivation).
@@ -231,6 +235,7 @@ impl ClusterDriver {
                 wt: wt.clone(),
                 barrier: FlycheckBarrier::arm(false),
                 real_flycheck_activity_seen: false,
+                analysis_failure_reason: None,
             });
             return ClusterAction::SwitchOverlay { wt };
         }
@@ -273,6 +278,12 @@ impl ClusterDriver {
                 ) {
                     active.real_flycheck_activity_seen = true;
                 }
+                if let LspEvent::FlycheckFailed { message } = &ev {
+                    if let Some(detail) = message.strip_prefix("ra_diagnostic_pull:") {
+                        active.analysis_failure_reason =
+                            Some(format!("ra_diagnostic_pull_failed: {detail}"));
+                    }
+                }
                 active.barrier.observe(&ev)
             }
         };
@@ -297,6 +308,7 @@ impl ClusterDriver {
                     wt: txn.wt.clone(),
                     authoritative_error: verdict_error,
                     real_flycheck_activity_seen: txn.real_flycheck_activity_seen,
+                    analysis_failure_reason: txn.analysis_failure_reason,
                 };
                 // Transaction complete ⇒ start the next serialized one
                 // (self-recheck of the just-finished WT takes priority
@@ -342,6 +354,7 @@ impl ClusterDriver {
                 wt,
                 barrier: FlycheckBarrier::arm(false),
                 real_flycheck_activity_seen: false,
+                analysis_failure_reason: None,
             });
         }
     }
@@ -526,7 +539,8 @@ mod tests {
                 wt: wt("/r/a"),
                 authoritative_error: true,
                 // rustc_err (Diagnostics) observed before settle ⇒ RA ran.
-                real_flycheck_activity_seen: true
+                real_flycheck_activity_seen: true,
+                analysis_failure_reason: None,
             }
         );
         // Transaction consumed ⇒ idle again, no follow-up (queue empty).
@@ -550,7 +564,27 @@ mod tests {
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
                 authoritative_error: false,
-                real_flycheck_activity_seen: false
+                real_flycheck_activity_seen: false,
+                analysis_failure_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn diagnostic_pull_failure_surfaces_stable_unknown_reason() {
+        let mut d = ClusterDriver::with_verdict_policy(VerdictPolicy::RaNative);
+        d.on_event(DriverEvent::RoutedBatch { wt: wt("/r/a") });
+        assert_eq!(
+            d.on_event(DriverEvent::Lsp(LspEvent::FlycheckFailed {
+                message: "ra_diagnostic_pull:diagnostic pull timed out".to_string(),
+            })),
+            ClusterAction::EmitVerdict {
+                wt: wt("/r/a"),
+                authoritative_error: true,
+                real_flycheck_activity_seen: true,
+                analysis_failure_reason: Some(
+                    "ra_diagnostic_pull_failed: diagnostic pull timed out".to_string()
+                ),
             }
         );
     }
@@ -606,7 +640,8 @@ mod tests {
                 wt: wt("/r/a"),
                 authoritative_error: true,
                 // advisory_err (Diagnostics) observed before settle ⇒ RA ran.
-                real_flycheck_activity_seen: true
+                real_flycheck_activity_seen: true,
+                analysis_failure_reason: None,
             }
         );
     }
@@ -624,7 +659,8 @@ mod tests {
             ClusterAction::EmitVerdict {
                 wt: wt("/r/a"),
                 authoritative_error: false,
-                real_flycheck_activity_seen: false
+                real_flycheck_activity_seen: false,
+                analysis_failure_reason: None,
             }
         );
         assert!(d.is_busy(), "B's txn started — still exactly one in flight");
@@ -761,6 +797,7 @@ mod tests {
                 wt: wt("/r/a"),
                 authoritative_error: false,
                 real_flycheck_activity_seen: false,
+                analysis_failure_reason: None,
             },
             "after fresh RoutedBatch + fresh FlycheckEnded, the settle attributes correctly"
         );
@@ -800,6 +837,7 @@ mod tests {
                 wt: wt("/r/a"),
                 authoritative_error: false,
                 real_flycheck_activity_seen: false,
+                analysis_failure_reason: None,
             }
         );
         // start_next_after_settle drained /r/b from pending ⇒ that's the

@@ -175,6 +175,16 @@ pub fn run(cfg: &Config) -> ExitCode {
             let crates = if pc.all_errors_attributed {
                 pc.verdicts
             } else {
+                // Omitting the line is right; omitting the EVIDENCE is not.
+                // Without this the watcher published `red_diagnostics=N`
+                // with no way to learn which file N counted.
+                if !pc.unattributed_errors.is_empty() {
+                    eprintln!(
+                        "[cargoless:obs] unattributed-red error_count={} at={}",
+                        pc.error_count,
+                        pc.unattributed_errors.join(" ")
+                    );
+                }
                 Vec::new()
             };
             (crates, pc.error_count)
