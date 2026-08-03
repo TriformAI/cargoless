@@ -579,6 +579,20 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 remote,
                 ref_prefix,
                 base_slot,
+                // COMPOSE the profile legs with the preview roll rather than
+                // discarding the profile here.
+                //
+                // This arm used to drop `profile` on the floor. The live
+                // deployment sets BOTH `CARGOLESS_LANE_PROFILE=lane` and
+                // `CARGOLESS_LANE_PREVIEW_SLOT=lane`, so it took this arm and
+                // ran the preview alone — six `tier: lane` legs, each added
+                // after a real outage, never executed and nothing said so.
+                //
+                // A preview proves the tree boots; it compiles nothing itself,
+                // so a cfg-cone it does not exercise stays unchecked. The two
+                // are complementary, and `ComposedLegRunner` runs the cheap
+                // attributable legs first.
+                profile: profile.clone(),
             }
         } else if !dispatch_cmd.is_empty() {
             cargoless_core::lanedrv::LegPlan::Dispatch {
@@ -618,9 +632,28 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // in this pod and compiling it in a sandbox, the second between a lane
         // that observes and one that MERGES. An operator must read both without
         // inspecting behaviour.
+        //
+        // `profile=` comes from the PLAN, never from the env var it was read
+        // from. Those two used to disagree: with a preview slot configured the
+        // daemon printed `profile=lane where=preview:lane` while running no
+        // profile leg at all, so an operator saw the profile configured, saw
+        // the daemon confirm it, and reasonably concluded the legs ran. The
+        // config was not wrong and the daemon agreed with it — which is exactly
+        // why nobody caught it. Deriving the line from the constructed plan
+        // makes advertising a profile the plan cannot use unrepresentable.
+        //
+        // Owned rather than borrowed: `plan` is moved into `with_lane` below,
+        // and a borrow living across that move is a needless hazard for one
+        // boot-time allocation.
+        let announced_profile = plan.profile().to_string();
         eprintln!(
-            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={} \
+            "[cargoless:obs] build-lane enabled profile={} base={base} artifact={} \
              where={} land={}",
+            if announced_profile.is_empty() {
+                "<none: this destination runs no profile>"
+            } else {
+                announced_profile.as_str()
+            },
             artifact
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -631,6 +664,19 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 None => "<none: reports only, lands nothing>".to_string(),
             }
         );
+        // A profile that was configured but will not be read is a silent
+        // no-op, and this is the whole class of bug above: the operator asked
+        // for legs and got none. Only `Dispatch` can reach this — it owns its
+        // build end to end — but say so loudly rather than leaving the absence
+        // to be inferred from a line that no longer mentions it.
+        if announced_profile.is_empty() && !profile.trim().is_empty() {
+            eprintln!(
+                "[cargoless:obs] WARNING: CARGOLESS_LANE_PROFILE={profile:?} is set but this \
+                 lane destination runs no cargoless.checks.yaml profile — those legs will NOT \
+                 execute. The dispatcher owns the build; put the checks there, or unset the \
+                 profile so the configuration says what happens."
+            );
+        }
         api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, plan, land_command);
     }
     let api = Arc::new(api_state);

@@ -68,6 +68,27 @@ a member on no evidence. Fail-safe.
 
    No such line means no lane, whatever the environment claims to hold.
 
+   **Read `profile=` and `where=` together — they are one statement.** Both are
+   derived from the plan the daemon actually constructed, not from the
+   environment it read, so `where=` names every stage that will run and
+   `profile=` names the profile that will really be consulted. A destination
+   that consults none says so:
+
+   ```
+   profile=<none: this destination runs no profile>   where=dispatched:...
+   ```
+
+   plus a `WARNING` line if a profile was configured anyway. That distinction is
+   not cosmetic: the line used to print the raw `CARGOLESS_LANE_PROFILE` beside
+   the destination, so a preview lane announced `profile=lane where=preview:lane`
+   while running **no profile leg at all**. The config was not wrong and the
+   daemon agreed with it, which is why it went unnoticed. A preview lane with a
+   profile now announces both halves:
+
+   ```
+   where=profile:lane legs, then preview:lane daemon=... remote=origin
+   ```
+
    A **wrong** profile name does not start a lane either — the daemon refuses
    to boot and names the profiles the manifest actually declares. That is
    deliberate: an unrecognised name would otherwise inherit a fallback that

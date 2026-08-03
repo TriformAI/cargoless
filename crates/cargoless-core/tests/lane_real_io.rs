@@ -22,8 +22,8 @@ use std::process::Command;
 
 use cargoless_core::lane::{LaneEvent, LaneMember, LaneState};
 use cargoless_core::lanedrv::{
-    CommandLander, DispatchLegRunner, LaneDriver, LaneLander, LegRunner, PointerLander,
-    ProfileLegRunner, ReportOnlyLander,
+    CommandLander, ComposedLegRunner, DispatchLegRunner, LaneDriver, LaneLander, LegPlan,
+    LegRunner, PointerLander, ProfileLegRunner, ReportOnlyLander,
 };
 use cargoless_core::lanetree::GitCandidateTree;
 use cargoless_proto::{Severity, TreeState};
@@ -1131,4 +1131,346 @@ fn a_failing_lander_backs_off_instead_of_spinning() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+// ── composing the profile legs with the preview roll ──────────────────────
+//
+// The gap these close: `LegPlan` was an EXCLUSIVE choice, and the live
+// deployment sets both `CARGOLESS_LANE_PROFILE=lane` and
+// `CARGOLESS_LANE_PREVIEW_SLOT=lane`. It therefore took the preview arm and
+// `ProfileLegRunner` never ran — so six `tier: lane` legs, each added after a
+// real outage (the csr cone pinned the site ~6h, the cfg(test) cone hid 5.5
+// weeks of unit-test rot, the vsock cone froze image bakes for 8 days), were
+// dead code in production.
+//
+// A real `PreviewLegRunner` needs a preview daemon to POST to, which no unit
+// test should require. So these use the REAL `ProfileLegRunner` — the half that
+// was being skipped, and the half that produces attributable diagnostics — and
+// stand in for the preview with a runner that records whether it was reached.
+// What is under test is the COMPOSITION, not the preview's own HTTP.
+
+/// Records whether it ran, and reports what it is told to.
+///
+/// Deliberately not a general mock: it answers exactly the two questions the
+/// composition raises — "did the expensive second leg get reached?" and "whose
+/// verdict came back?".
+struct SpyLegs {
+    ran: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    outcome: cargoless_core::lanedrv::LegOutcome,
+}
+
+impl SpyLegs {
+    fn green(id: &str) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Self {
+                ran: ran.clone(),
+                outcome: cargoless_core::lanedrv::LegOutcome {
+                    tree: TreeState::Green,
+                    legs: vec![cargoless_core::lanedrv::LegReport {
+                        id: id.to_string(),
+                        tree: TreeState::Green,
+                        required: true,
+                        duration_ms: 7,
+                    }],
+                    ..Default::default()
+                },
+            },
+            ran,
+        )
+    }
+}
+
+impl LegRunner for SpyLegs {
+    fn run(
+        &self,
+        _root: &Path,
+        _changed: &[String],
+    ) -> std::io::Result<cargoless_core::lanedrv::LegOutcome> {
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.outcome.clone())
+    }
+}
+
+/// THE GAP, pinned: with a profile configured AND a preview slot configured,
+/// BOTH must execute.
+///
+/// Before this, the preview arm discarded the profile and only the preview ran.
+/// The assertion that matters is `profile_ran == 1` — everything else about the
+/// lane looked healthy while it was 0.
+#[test]
+fn a_profile_and_a_preview_slot_both_run_rather_than_one_replacing_the_other() {
+    let root = repo_with_legs("compose-both", &leg("lane-csr", "true"));
+    let (preview, preview_ran) = SpyLegs::green("preview:lane live at x");
+
+    let composed = ComposedLegRunner::new(ProfileLegRunner::new("lane"), preview);
+    let outcome = composed.run(&root, &[]).expect("legs run");
+
+    // The preview half was never in doubt; the profile half is the defect.
+    assert_eq!(
+        outcome.legs.iter().filter(|l| l.id == "lane-csr").count(),
+        1,
+        "the profile legs must actually execute — with a preview slot configured \
+         they did not run at all, and six cfg-cone legs were dead code: {:?}",
+        outcome.legs
+    );
+    assert_eq!(
+        preview_ran.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "and the preview roll must still happen — composing must not trade one \
+         gate for the other"
+    );
+    // Order is the contract: cheap attributable compile legs, then the
+    // expensive boot-and-serve proof.
+    assert_eq!(
+        outcome
+            .legs
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["lane-csr", "preview:lane live at x"],
+        "both runners' LegReports must appear, in execution order — `record_legs` \
+         writes exactly these to the durable trail, which is the only place \
+         per-leg evidence outlives the candidate worktree"
+    );
+    assert_eq!(outcome.tree, TreeState::Green);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A profile-leg RED short-circuits BEFORE the preview roll, and carries its
+/// diagnostics.
+///
+/// Both halves matter and for different reasons. The short-circuit saves a
+/// 20-45 minute preview roll that could not tell anyone anything new. The
+/// diagnostics are what make the red ATTRIBUTABLE: the profile legs emit cargo
+/// JSON with real file paths, while a preview red is free text with none — so
+/// losing them here would turn a red the lane can pin on one member into one
+/// that holds the entire queue.
+#[test]
+fn a_profile_leg_red_short_circuits_the_preview_and_keeps_its_diagnostics() {
+    // A leg that emits one real cargo-JSON error against a real file, then
+    // fails — exactly the shape `lane-leg.sh csr` has when a cfg-cone breaks.
+    //
+    // The JSON lives in a FILE that the leg cats, rather than inline in the
+    // command, so this fixture has nothing to escape.
+    //
+    // Writing it inline means `printf '%s\n'`, and `unquote_yaml` replaces
+    // `\n` BEFORE `\\` — so the `\\n` that a Rust `{:?}` emits becomes a REAL
+    // newline, splitting the printf format string across two lines and printing
+    // nothing parseable. `project_checks`' own `aa-advisory` fixture carries a
+    // comment recording exactly that bite. A test that failed that way would
+    // look like the composition dropping diagnostics when it is really the
+    // manifest scanner, which is the most expensive kind of wrong test.
+    let legs = format!(
+        "  - id: \"lane-csr\"\n    kind: command\n    tier: lane\n    read_only: true\n    \
+         timeout_ms: 30000\n    cache: none\n    output: cargo-json\n    \
+         command: [\"bash\", \"-lc\", {:?}]\n",
+        "cat diag.json; exit 1"
+    );
+    let root = repo_with_legs("compose-red", &legs);
+    fs::write(
+        root.join("diag.json"),
+        r#"{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0382"},"message":"borrow of moved value","rendered":"error[E0382]: borrow of moved value","spans":[{"file_name":"portal/src/arm.rs","is_primary":true,"line_start":42,"column_start":9}]}}"#,
+    )
+    .unwrap();
+    let (preview, preview_ran) = SpyLegs::green("preview:lane");
+
+    let composed = ComposedLegRunner::new(ProfileLegRunner::new("lane"), preview);
+    let outcome = composed.run(&root, &[]).expect("legs run");
+
+    assert_eq!(outcome.tree, TreeState::Red);
+    assert_eq!(
+        preview_ran.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a compile red must NOT spend a preview roll: it cannot exonerate the red, \
+         and it costs the slot the next candidate needs"
+    );
+    // The whole point of running the compile legs first.
+    let attributable: Vec<_> = outcome
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .filter(|d| d.file_path.ends_with("portal/src/arm.rs"))
+        .collect();
+    assert_eq!(
+        attributable.len(),
+        1,
+        "the profile leg's cargo-JSON diagnostics must survive the composition — \
+         they carry the file paths that let the lane name WHO broke the build, \
+         which a preview red never can: {:?}",
+        outcome.diagnostics
+    );
+    assert_eq!(attributable[0].line, 42, "with its real span, not a stub");
+    assert!(
+        outcome
+            .legs
+            .iter()
+            .any(|l| l.id == "lane-csr" && l.tree == TreeState::Red),
+        "and the red leg must be reported: {:?}",
+        outcome.legs
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// An EMPTY profile keeps today's behaviour exactly: preview only.
+///
+/// This ships to a live lane, so a configuration that works today must not
+/// change meaning because a field it never sets now exists. Asserted through
+/// `LegPlan` rather than by constructing the runner directly, because the plan
+/// is where the choice is actually made.
+#[test]
+fn an_empty_profile_still_yields_a_preview_only_lane() {
+    let plan = LegPlan::Preview {
+        daemon: "http://preview.invalid".to_string(),
+        token: String::new(),
+        slot: "lane".to_string(),
+        remote: "origin".to_string(),
+        ref_prefix: "refs/heads/lane-candidate".to_string(),
+        base_slot: "dev".to_string(),
+        profile: String::new(),
+    };
+    // The boot line must not grow a profile clause it cannot honour.
+    assert_eq!(
+        plan.describe(),
+        "preview:lane daemon=http://preview.invalid remote=origin",
+        "an unset profile must leave the announcement byte-identical"
+    );
+    assert!(
+        plan.profile().is_empty(),
+        "and the plan must report no profile, so the boot line cannot invent one"
+    );
+
+    // With a profile it says so — and that is the shape the live deployment is
+    // in, since it sets both env vars.
+    let composed = LegPlan::Preview {
+        daemon: "http://preview.invalid".to_string(),
+        token: String::new(),
+        slot: "lane".to_string(),
+        remote: "origin".to_string(),
+        ref_prefix: "refs/heads/lane-candidate".to_string(),
+        base_slot: "dev".to_string(),
+        profile: "lane".to_string(),
+    };
+    assert_eq!(composed.profile(), "lane");
+    assert!(
+        composed
+            .describe()
+            .contains("profile:lane legs, then preview:lane"),
+        "a composed plan must announce BOTH halves — the daemon used to print \
+         `profile=lane where=preview:lane` while running no profile leg at all: {}",
+        composed.describe()
+    );
+    // Neither shape publishes a local artifact; both build remotely.
+    assert!(!plan.publishes_locally());
+    assert!(!composed.publishes_locally());
+}
+
+/// A destination that reads NO profile must say so, so the boot line cannot
+/// advertise legs that will never run.
+///
+/// This is the observability half of the same defect: the daemon printed the
+/// raw `CARGOLESS_LANE_PROFILE` beside the destination, so an operator saw the
+/// profile configured, saw the daemon confirm it, and reasonably concluded the
+/// legs ran. `profile()` is derived from the constructed plan instead, which
+/// makes that lie unrepresentable.
+#[test]
+fn a_dispatch_plan_reports_no_profile_so_the_boot_line_cannot_advertise_dead_legs() {
+    let plan = LegPlan::Dispatch {
+        command: vec!["bash".to_string(), "dispatch.sh".to_string()],
+        remote: "origin".to_string(),
+        ref_prefix: "refs/heads/lane-candidate".to_string(),
+    };
+    assert!(
+        plan.profile().is_empty(),
+        "a dispatcher owns its own build; cargoless reads no profile for it"
+    );
+    // In-process still does read one — the property is "derived from the plan",
+    // not "always empty".
+    let inproc = LegPlan::InProcess {
+        profile: "lane".to_string(),
+        artifact_path: None,
+    };
+    assert_eq!(inproc.profile(), "lane");
+}
+
+/// Infrastructure short-circuits too, and for a different reason than a red.
+///
+/// An `Err` from the first runner is "we could not get a verdict", which the
+/// lane treats as infra: everyone stays queued and it retries. Rolling a
+/// preview after the legs could not even be launched would spend the slot to
+/// add a second unknown, and — worse — a green preview would then be the only
+/// verdict on a candidate whose compile legs never ran.
+#[test]
+fn an_infra_failure_in_the_profile_legs_never_reaches_the_preview() {
+    struct Exploding;
+    impl LegRunner for Exploding {
+        fn run(
+            &self,
+            _root: &Path,
+            _changed: &[String],
+        ) -> std::io::Result<cargoless_core::lanedrv::LegOutcome> {
+            Err(std::io::Error::other("legs could not be launched"))
+        }
+    }
+    let (preview, preview_ran) = SpyLegs::green("preview:lane");
+    let composed = ComposedLegRunner::new(Exploding, preview);
+
+    let err = composed
+        .run(Path::new("/nonexistent"), &[])
+        .expect_err("an infra failure must propagate, never become a verdict");
+
+    assert!(err.to_string().contains("could not be launched"));
+    assert_eq!(
+        preview_ran.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a green preview must never become the only verdict on a candidate whose \
+         compile legs never ran"
+    );
+}
+
+/// The composed GREEN reports the LAST runner's artifact, not the first's.
+///
+/// `artifact` means "what this build produced for the lander to publish". A
+/// preview publishes nothing locally, so a composed preview lane must report
+/// `None` — otherwise a stale file left by the profile legs could be promoted,
+/// which is precisely what "never publish red" exists to prevent.
+#[test]
+fn the_composed_artifact_comes_from_the_last_runner() {
+    struct WithArtifact;
+    impl LegRunner for WithArtifact {
+        fn run(
+            &self,
+            _root: &Path,
+            _changed: &[String],
+        ) -> std::io::Result<cargoless_core::lanedrv::LegOutcome> {
+            Ok(cargoless_core::lanedrv::LegOutcome {
+                tree: TreeState::Green,
+                artifact: Some("STALE-FROM-THE-PROFILE-LEGS".to_string()),
+                legs: vec![cargoless_core::lanedrv::LegReport {
+                    id: "lane-ssr".to_string(),
+                    tree: TreeState::Green,
+                    required: true,
+                    duration_ms: 1,
+                }],
+                ..Default::default()
+            })
+        }
+    }
+    let (preview, _ran) = SpyLegs::green("preview:lane");
+    let outcome = ComposedLegRunner::new(WithArtifact, preview)
+        .run(Path::new("/nonexistent"), &[])
+        .expect("legs run");
+
+    assert_eq!(
+        outcome.artifact, None,
+        "the preview builds elsewhere and publishes nothing locally, so the \
+         composed outcome must not carry a file the profile legs happened to leave"
+    );
+    assert_eq!(outcome.tree, TreeState::Green);
+    assert_eq!(
+        outcome.legs.len(),
+        2,
+        "both halves still reported: {:?}",
+        outcome.legs
+    );
 }

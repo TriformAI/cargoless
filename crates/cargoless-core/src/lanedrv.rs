@@ -174,7 +174,41 @@ pub enum LegPlan {
         /// Slot that builds the BASE alone, for the base-health check. Empty
         /// disables it — see [`PreviewLegRunner::base_slot`].
         base_slot: String,
+        /// Profile whose legs run BEFORE the preview roll. Empty = preview
+        /// only, exactly as before.
+        ///
+        /// # Why this field exists at all
+        ///
+        /// A preview proves the tree BOOTS. It compiles nothing itself, so a
+        /// cfg-cone the preview's own build does not exercise is simply
+        /// unchecked — and the preview's red is free text with no file paths,
+        /// so even when it does fail the lane cannot attribute it.
+        ///
+        /// Both gaps were live. This plan was an EXCLUSIVE choice: a daemon
+        /// with `CARGOLESS_LANE_PREVIEW_SLOT` set took this arm and
+        /// `ProfileLegRunner` never ran, so `CARGOLESS_LANE_PROFILE` — set on
+        /// the same deployment — selected legs that were dead code. The three
+        /// cones they cover (`csr`, `cfg(test)`, `vsock`) had each already
+        /// caused an outage: ~6h of pinned site, 5.5 weeks of silent unit-test
+        /// rot, 8 days of frozen image bakes.
+        ///
+        /// So the two are COMPOSED rather than chosen between — see
+        /// [`ComposedLegRunner`] for the ordering and its justification.
+        profile: String,
     },
+}
+
+/// The `where=` clause for a preview plan, in ONE place.
+///
+/// [`LegPlan::describe`] logs it before the runner is built and
+/// [`LegPlan::into_runner`] returns it after; both must say the same thing, and
+/// they are the operator's only statement of what this daemon will run. Two
+/// copies of this format string is exactly how a boot line starts lying again.
+fn describe_preview(daemon: &str, slot: &str, remote: &str, profile: &str) -> String {
+    if profile.is_empty() {
+        return format!("preview:{slot} daemon={daemon} remote={remote}");
+    }
+    format!("profile:{profile} legs, then preview:{slot} daemon={daemon} remote={remote}")
 }
 
 impl LegPlan {
@@ -205,8 +239,36 @@ impl LegPlan {
                 daemon,
                 slot,
                 remote,
+                profile,
                 ..
-            } => format!("preview:{slot} daemon={daemon} remote={remote}"),
+            } => describe_preview(daemon, slot, remote, profile),
+        }
+    }
+
+    /// The `cargoless.checks.yaml` profile this plan will ACTUALLY read, or
+    /// `""` for a plan that reads none.
+    ///
+    /// # Why a caller must use this instead of the env var it came from
+    ///
+    /// The boot line used to print the raw `CARGOLESS_LANE_PROFILE` beside the
+    /// destination, and for a preview lane those two disagreed: the daemon
+    /// announced `profile=lane where=preview:lane` while running no profile leg
+    /// at all. The config was not wrong and the daemon agreed with it, so
+    /// nothing looked amiss — which is exactly why the gap survived in
+    /// production.
+    ///
+    /// Deriving the announcement from the constructed plan makes that class of
+    /// lie unrepresentable: [`LegPlan::Dispatch`] reads no profile and returns
+    /// `""`, so a boot line built from this cannot advertise legs that will
+    /// never run.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        match self {
+            LegPlan::InProcess { profile, .. } => profile,
+            // A dispatcher owns its own build entirely; cargoless hands it a ref
+            // and reads an exit code, so no profile is consulted here.
+            LegPlan::Dispatch { .. } => "",
+            LegPlan::Preview { profile, .. } => profile,
         }
     }
 
@@ -246,12 +308,21 @@ impl LegPlan {
                 remote,
                 ref_prefix,
                 base_slot,
+                profile,
             } => {
-                let what = format!("preview:{slot} daemon={daemon} remote={remote}");
+                let what = describe_preview(&daemon, &slot, &remote, &profile);
                 let mut r = PreviewLegRunner::new(daemon, token, slot, remote);
                 r.ref_prefix = ref_prefix;
                 r.base_slot = base_slot;
-                (Box::new(r), what)
+                // No profile ⇒ the bare preview runner, byte-identical to
+                // before. A config that works today must not change meaning
+                // because a field it never sets now exists.
+                let legs: Box<dyn LegRunner + Send> = if profile.is_empty() {
+                    Box::new(r)
+                } else {
+                    Box::new(ComposedLegRunner::new(ProfileLegRunner::new(profile), r))
+                };
+                (legs, what)
             }
         }
     }
@@ -287,6 +358,101 @@ impl LegPlan {
 impl LegRunner for Box<dyn LegRunner + Send> {
     fn run(&self, root: &Path, changed_files: &[String]) -> io::Result<LegOutcome> {
         (**self).run(root, changed_files)
+    }
+}
+
+/// Runs one [`LegRunner`] and then another, short-circuiting on the first red.
+///
+/// # Why compose instead of choose
+///
+/// [`LegPlan`] made its three destinations mutually exclusive, and for two of
+/// them that is right — a dispatcher and an in-process compile are the same
+/// claim made in two places. A PREVIEW is not: it proves the tree BOOTS AND
+/// ANSWERS, which is strictly stronger than compiling, but it *compiles nothing
+/// itself*. A cfg-cone the preview's own build does not exercise is unchecked
+/// no matter how green the preview goes, and the two claims are complementary
+/// rather than redundant.
+///
+/// Live consequence, which is what this type exists to fix: with
+/// `CARGOLESS_LANE_PREVIEW_SLOT` set the plan took the preview arm and
+/// `ProfileLegRunner` never ran, so six `tier: lane` legs — including the csr,
+/// `cfg(test)` and vsock cones, each added after a real outage — were dead code
+/// in production while the daemon's own boot line advertised their profile.
+///
+/// # Ordering: cheap compile legs FIRST
+///
+/// Three independent reasons, in decreasing order of how much they matter:
+///
+/// 1. **A compile red is ATTRIBUTABLE and a preview red is not.** The profile
+///    legs emit cargo JSON, so their diagnostics carry real file paths and
+///    [`crate::lane`]'s attribution ladder can name the member who broke it.
+///    The preview reports free text with no spans, which is correctly
+///    unattributable and therefore holds the WHOLE queue. Running the
+///    attributable check first means the lane learns whose fault it is whenever
+///    it possibly can.
+/// 2. **Fail fast.** The preview roll is a full app build plus a health-gated
+///    promote — 20-45 minutes observed. Spending that to re-discover a type
+///    error the compile legs found in one is pure latency for every member
+///    waiting behind this candidate.
+/// 3. **A red preview after a red compile tells you nothing new.** It cannot
+///    exonerate the compile red, and it costs a slot the next candidate needs.
+///
+/// The converse order was considered and rejected: it would make every
+/// attributable red arrive *after* the unattributable one that already held the
+/// queue, which inverts point 1 for no gain.
+///
+/// # What the composed outcome reports
+///
+/// * **First runner red** ⇒ that outcome is returned VERBATIM, diagnostics
+///   included. The second never runs. Rebuilding the outcome here would risk
+///   dropping the diagnostics that make it attributable, which is most of the
+///   value.
+/// * **First runner `Err`** ⇒ propagated. An `Err` is infrastructure, not a
+///   verdict; the lane keeps everyone queued and retries, and rolling a preview
+///   after the legs could not even be launched would only add a second unknown.
+/// * **Both run** ⇒ the SECOND runner's verdict, diagnostics and artifact, with
+///   the first's [`LegReport`]s **prepended**. Those reports are what
+///   `LaneDriver::record_legs` writes to the durable trail — today the only
+///   place per-leg evidence survives, since `LaneSnapshot` carries phase and
+///   queue state but no legs — so both halves must appear, in the order they
+///   ran. The artifact deliberately comes from the last runner only: it is
+///   "what this build produced", and a preview publishes nothing locally.
+pub struct ComposedLegRunner {
+    first: Box<dyn LegRunner + Send>,
+    then: Box<dyn LegRunner + Send>,
+}
+
+impl ComposedLegRunner {
+    /// Run `first`, then `then` only if `first` came back green.
+    pub fn new(
+        first: impl LegRunner + Send + 'static,
+        then: impl LegRunner + Send + 'static,
+    ) -> Self {
+        Self {
+            first: Box::new(first),
+            then: Box::new(then),
+        }
+    }
+}
+
+impl LegRunner for ComposedLegRunner {
+    fn run(&self, root: &Path, changed_files: &[String]) -> io::Result<LegOutcome> {
+        let first = self.first.run(root, changed_files)?;
+        if first.tree == TreeState::Red {
+            // Verbatim, including diagnostics. This is the attributable red.
+            return Ok(first);
+        }
+        let second = self.then.run(root, changed_files)?;
+        // Prepend, so the trail reads in execution order and an operator can see
+        // that the compile legs passed BEFORE the preview was rolled.
+        let mut legs = first.legs;
+        legs.extend(second.legs);
+        Ok(LegOutcome {
+            tree: second.tree,
+            diagnostics: second.diagnostics,
+            artifact: second.artifact,
+            legs,
+        })
     }
 }
 
