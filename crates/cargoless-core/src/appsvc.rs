@@ -63,6 +63,10 @@ pub struct InstanceReport {
     pub last_green: Option<String>,
     pub last_red_sha: Option<String>,
     pub last_red_reason: Option<String>,
+    /// Worktree-relative files named by ERROR diagnostics in the last red
+    /// build. The build lane's attribution evidence; empty when the red was
+    /// not a compile failure (and always empty without a `last_red_sha`).
+    pub last_red_files: Vec<String>,
     pub pending_sha: Option<String>,
     pub draining: usize,
 }
@@ -78,6 +82,14 @@ impl InstanceReport {
             last_green: inst.last_green.clone(),
             last_red_sha: inst.last_red.as_ref().map(|(s, _)| s.clone()),
             last_red_reason: inst.last_red.as_ref().map(|(_, r)| r.clone()),
+            // Gated on the red being live: a file list must never outlive the
+            // red it describes (it would attribute the next failure to the
+            // previous failure's files).
+            last_red_files: if inst.last_red.is_some() {
+                inst.last_red_files.clone()
+            } else {
+                Vec::new()
+            },
             pending_sha: inst.pending.clone(),
             draining: inst.draining.len(),
         }
@@ -230,6 +242,10 @@ impl AppServeState {
                     "last_green": r.last_green,
                     "last_red_sha": r.last_red_sha,
                     "last_red_reason": r.last_red_reason,
+                    // Attribution evidence for the build lane's leg runner.
+                    // Always present (possibly []) so a consumer can tell
+                    // "this daemon publishes evidence" from an old image.
+                    "last_red_files": r.last_red_files,
                     "pending_sha": r.pending_sha,
                     "draining": r.draining,
                     "proxy_port": route.map(|x| x.proxy_port),
@@ -328,6 +344,7 @@ mod tests {
             last_green: green.map(String::from),
             last_red_sha: None,
             last_red_reason: None,
+            last_red_files: Vec::new(),
             pending_sha: None,
             draining: 0,
         }
@@ -489,6 +506,7 @@ mod tests {
             pending: Some("p1".into()),
             last_green: Some("g1".into()),
             last_red: Some(("r1".into(), "boom".into())),
+            last_red_files: vec!["portal/src/x.rs".into()],
             draining: vec![1, 2],
             ..Default::default()
         };
@@ -499,7 +517,26 @@ mod tests {
         assert_eq!(r.pending_sha.as_deref(), Some("p1"));
         assert_eq!(r.last_green.as_deref(), Some("g1"));
         assert_eq!(r.last_red_sha.as_deref(), Some("r1"));
+        assert_eq!(r.last_red_files, vec!["portal/src/x.rs".to_string()]);
         assert_eq!(r.draining, 2);
+    }
+
+    /// A files list without a live red is suppressed at the report boundary:
+    /// stale state must never let the evidence outlive the failure and
+    /// attribute the NEXT red to the PREVIOUS red's files.
+    #[test]
+    fn red_files_are_gated_on_a_live_red() {
+        let inst = InstanceState {
+            last_red: None,
+            last_red_files: vec!["stale.rs".into()],
+            ..Default::default()
+        };
+        let r = InstanceReport::from_state("dev", &inst);
+        assert!(r.last_red_sha.is_none());
+        assert!(
+            r.last_red_files.is_empty(),
+            "no red ⇒ no evidence, whatever the state carries"
+        );
     }
 
     #[test]

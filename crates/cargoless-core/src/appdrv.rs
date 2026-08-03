@@ -1019,6 +1019,7 @@ mod tests {
                 outcome: AppBuildOutcome::Red {
                     reason: "boom".into(),
                     enospc: false,
+                    files: Vec::new(),
                 },
             },
         );
