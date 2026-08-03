@@ -173,7 +173,7 @@ impl LaneSnapshot {
         for id in accepted {
             if !self.queued.contains(id)
                 && !self.in_flight.contains(id)
-                && !self.ejections.iter().any(|e| &e.id == id)
+                && !self.ejections.iter().any(|e| e.id == *id)
             {
                 self.queued.push(id.clone());
             }

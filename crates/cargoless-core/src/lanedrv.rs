@@ -1500,8 +1500,8 @@ impl LaneLander for ReportOnlyLander {
 /// [`LaneAction::LandAndPublish`] is executed the lane has already taken its
 /// members out of `in_flight` and returned to `Idle` — the green verdict is in,
 /// and as far as the state machine is concerned the build is over. The land
-/// itself then runs for up to [`LAND_TIMEOUT_DEFAULT_SECS`] seconds with the
-/// lane reporting `idle`.
+/// itself then runs for up to the land budget (7200s by default) with the lane
+/// reporting `idle`.
 ///
 /// That is the single most destructive moment to roll the daemon, and a
 /// snapshot that says `idle` actively invites it. So the driver announces what
@@ -1675,6 +1675,23 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                 members,
             } => vec![self.run_build(*generation, members)],
             LaneAction::LandAndPublish { members, artifact } => {
+                // Announce the land BEFORE blocking on it, the same way
+                // `run_build` writes `lane-build-start` before compiling.
+                //
+                // Same defect as the `idle` snapshot, in the durable channel:
+                // without this the trail reads `outcome=green` and then nothing
+                // for up to two hours, so a daemon killed mid-land leaves a
+                // record indistinguishable from one that never tried to land.
+                // The live snapshot now says `landing`, but a snapshot dies
+                // with the pod and the trail is what is left afterwards.
+                self.trail_line(&format!(
+                    "[cargoless:obs] lane-land-start members={}",
+                    members
+                        .iter()
+                        .map(|m| format!("{}@{}", m.id, m.head))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
                 match self.lander.land(members, artifact.as_deref()) {
                     Ok(o) => {
                         // A land is the only step that moves the trunk, so it
@@ -1910,8 +1927,8 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     /// [`LaneAction::LandAndPublish`] is executed the lane has already emptied
     /// `in_flight` and returned to `Idle` — so the snapshot published for that
     /// step says `idle`, and it stays published for however long the lander
-    /// takes (up to [`LAND_TIMEOUT_DEFAULT_SECS`], and a real lander delegates
-    /// to a merge-train controller that waits on its own candidate build).
+    /// takes (up to the 7200s land budget, and a real lander delegates to a
+    /// merge-train controller that waits on its own candidate build).
     ///
     /// A snapshot reading `idle` while the trunk is being moved is not merely
     /// unhelpful: it is the single most destructive moment to roll the daemon,
