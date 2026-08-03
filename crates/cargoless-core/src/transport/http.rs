@@ -2157,6 +2157,7 @@ impl TransportClient for HttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -2177,6 +2178,71 @@ mod tests {
 
     fn client_for(s: &HttpServer) -> HttpClient {
         HttpClient::new(&format!("http://{}", s.addr())).expect("client")
+    }
+
+    #[derive(Default)]
+    struct PartialWouldBlockWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for PartialWouldBlockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            match self.writes {
+                1 => {
+                    let accepted = buf.len().min(3);
+                    self.bytes.extend_from_slice(&buf[..accepted]);
+                    Ok(accepted)
+                }
+                2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                3 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                _ => {
+                    self.bytes.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn upload_writer_retries_only_the_unwritten_suffix_after_would_block() {
+        let mut writer = PartialWouldBlockWriter::default();
+        let payload = b"generated-overlay";
+
+        write_all_with_deadline(&mut writer, payload, Duration::from_secs(1))
+            .expect("transient backpressure should recover");
+
+        assert_eq!(writer.bytes, payload);
+        assert_eq!(writer.writes, 4, "partial progress must survive retries");
+    }
+
+    struct PermanentlyBlockedWriter;
+
+    impl Write for PermanentlyBlockedWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn upload_writer_fails_closed_when_its_deadline_expires() {
+        let err = write_all_with_deadline(
+            &mut PermanentlyBlockedWriter,
+            b"overlay",
+            Duration::ZERO,
+        )
+        .expect_err("permanent backpressure must not loop forever");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
