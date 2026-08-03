@@ -304,6 +304,21 @@ impl Supervisor {
         }
     }
 
+    /// Force a transparent restart of a live but unresponsive child.
+    ///
+    /// Process-exit monitoring alone cannot detect rust-analyzer holding its
+    /// PID while no longer reading the LSP pipe. The bounded LSP transport
+    /// calls this after a write deadline so the existing monitor reaps the
+    /// whole RA process group and runs the normal spawn + handshake hook.
+    pub fn restart_now(&self) {
+        let mut st = lock(&self.shared.state);
+        if let Some(child) = st.child.as_mut() {
+            #[cfg(unix)]
+            kill_process_group(child.id() as i32);
+            let _ = child.kill();
+        }
+    }
+
     /// Stop supervising and terminate the child. Idempotent.
     pub fn shutdown(mut self) {
         self.do_shutdown();
@@ -1640,6 +1655,34 @@ mod tests {
         assert_eq!(sup.restart_count(), 0);
         assert!(sup.is_alive());
         sup.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_restart_replaces_a_live_but_unresponsive_child() {
+        let sup = Supervisor::start(|| {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        })
+        .expect("start");
+        let first_pid = sup.current_pid().expect("initial child");
+
+        sup.restart_now();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if sup.restart_count() >= 1 && sup.current_pid() != Some(first_pid) && sup.is_alive() {
+                sup.shutdown();
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        sup.shutdown();
+        panic!("an explicit liveness restart must replace the wedged child");
     }
 
     /// The live-pipeline guarantee: the post-spawn hook (where watch()
