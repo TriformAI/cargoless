@@ -1523,7 +1523,11 @@ impl LspClient {
     /// boundary even when the report is empty or unchanged on the server.
     ///
     /// `ServerCancelled` responses that ask the client to retrigger are
-    /// retried up to `max_retries` inside the single overall `timeout`.
+    /// retried up to `max_retries` inside the single overall `timeout`, but
+    /// only after RA announces the next diagnostic-refresh boundary. Retrying
+    /// immediately exhausts every attempt while the same flycheck mutation is
+    /// still invalidating reports, despite `retriggerRequest: true` promising
+    /// that a fresh snapshot will follow.
     pub fn pull_diagnostics(
         &self,
         abs_path: &str,
@@ -1533,6 +1537,7 @@ impl LspClient {
         let deadline = Instant::now() + timeout;
         let mut retries = 0usize;
         loop {
+            let refresh_before_attempt = self.diagnostic_refresh_generation();
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(DiagnosticPullError::Timeout);
@@ -1542,6 +1547,11 @@ impl LspClient {
                     if retries < max_retries =>
                 {
                     retries += 1;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(DiagnosticPullError::Timeout);
+                    }
+                    self.wait_for_diagnostic_refresh(refresh_before_attempt, remaining)?;
                 }
                 result => return result,
             }
@@ -3029,6 +3039,70 @@ mod tests {
             parse_document_diagnostic_response(&response, "file:///r/src/lib.rs"),
             Err(DiagnosticPullError::ServerCancelled { retrigger: true })
         );
+    }
+
+    #[test]
+    fn pull_diagnostic_retrigger_waits_for_next_refresh_boundary() {
+        fn take_pending(pending: &PendingResponses, id: i64, timeout: Duration) -> Sender<Value> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(sender) = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
+                    return sender;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "diagnostic request {id} was not issued before the test deadline"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        let pending: PendingResponses = Arc::new(Mutex::new(BTreeMap::new()));
+        let refresh = Arc::new(DiagnosticRefreshState::default());
+        let client = Arc::new(LspClient {
+            writer: Arc::new(Mutex::new(Box::new(Vec::<u8>::new()))),
+            next_id: AtomicI64::new(2),
+            pending_responses: Arc::clone(&pending),
+            diagnostic_refresh: Arc::clone(&refresh),
+        });
+        let worker_client = Arc::clone(&client);
+        let worker = thread::spawn(move || {
+            worker_client.pull_diagnostics("/r/src/lib.rs", Duration::from_secs(1), 1)
+        });
+
+        take_pending(&pending, 2, Duration::from_millis(200))
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32802,
+                    "message": "cancelled",
+                    "data": { "retriggerRequest": true }
+                }
+            }))
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            client.next_id.load(Ordering::SeqCst),
+            3,
+            "a retrigger must not issue another pull against the invalidated snapshot"
+        );
+
+        refresh.mark();
+        take_pending(&pending, 3, Duration::from_millis(200))
+            .send(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": { "kind": "full", "items": [] }
+            }))
+            .unwrap();
+
+        assert_eq!(worker.join().unwrap(), Ok(Vec::new()));
     }
 
     #[test]
