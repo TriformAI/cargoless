@@ -576,6 +576,11 @@ pub trait VerdictService: Send + Sync {
         Err("build lane not enabled on this daemon".to_string())
     }
 
+    /// Build lane — take a member out permanently.
+    fn lane_withdraw(&self, _id: &str) -> Result<String, String> {
+        Err("build lane not enabled on this daemon".to_string())
+    }
+
     /// Build lane — queue depth, the running build, and every live ejection
     /// with its reason. `None` ⇒ no lane on this daemon, so `GET /lane` 404s
     /// rather than reporting an empty lane that does not exist.
@@ -1004,6 +1009,30 @@ pub enum Request {
     LaneReadmit {
         id: String,
     },
+    /// Build lane — take a member OUT, permanently.
+    ///
+    /// [`crate::lane::LaneEvent::Withdraw`] has existed and been tested since
+    /// the state machine was written, but nothing ever reached it: there was no
+    /// verb, so a member could enter the lane and never leave except by
+    /// building green or being ejected by a red it caused. A PR that is closed,
+    /// superseded, or blocked on something the lane cannot see (a required
+    /// check it will never pass) therefore rebuilds forever, and on a repo where
+    /// one build costs ~45 minutes on a single preview slot that is the entire
+    /// throughput of the queue.
+    ///
+    /// Observed 2026-08-03: pr-10394 is red on a REQUIRED context, so the forge
+    /// will refuse the merge however green the candidate is. The lander said so
+    /// explicitly ("single-member train red: PR #10394 is the cause") and the
+    /// lane immediately started building it again, for the third time. There
+    /// was no way to stop it short of restarting the daemon, which discards the
+    /// whole in-memory queue.
+    ///
+    /// Distinct from [`Self::LaneReadmit`], which puts a member back IN, and
+    /// from an ejection, which the lane decides and can reverse on its own. A
+    /// withdrawal is the operator saying "this one is not the lane's problem."
+    LaneWithdraw {
+        id: String,
+    },
 }
 
 /// One candidate submitted to the build lane.
@@ -1110,6 +1139,9 @@ impl Request {
                 }))
             }
             "lane_readmit" => Some(Request::LaneReadmit {
+                id: v.get("id").and_then(serde_json::Value::as_str)?.to_string(),
+            }),
+            "lane_withdraw" => Some(Request::LaneWithdraw {
                 id: v.get("id").and_then(serde_json::Value::as_str)?.to_string(),
             }),
             _ => None,
@@ -1223,6 +1255,10 @@ impl Request {
             }),
             Request::LaneReadmit { id } => serde_json::json!({
                 "op": "lane_readmit",
+                "id": id,
+            }),
+            Request::LaneWithdraw { id } => serde_json::json!({
+                "op": "lane_withdraw",
                 "id": id,
             }),
         };

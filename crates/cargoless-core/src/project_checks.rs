@@ -11,7 +11,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,8 +20,8 @@ use cargoless_cas::sha256_hex;
 use cargoless_proto::{Diagnostic, Severity, TreeState};
 
 use crate::yamlscan::{
-    ParseError, YamlNode, get_bool, get_string, get_string_list, get_u64, parse_yaml_value,
-    reject_unknown, required_string,
+    get_bool, get_string, get_string_list, get_u64, parse_yaml_value, reject_unknown,
+    required_string, ParseError, YamlNode,
 };
 
 const MANIFEST_NAME: &str = "cargoless.checks.yaml";
@@ -30,6 +31,14 @@ const TIMEOUT_DIAGNOSTIC_CODE: &str = "project-check.timeout";
 /// Setup, pipe draining, diagnostic parsing, and cache bookkeeping happen
 /// outside that child deadline and need their own small, bounded allowance.
 const COMMAND_FINALIZATION_GRACE_MS: u64 = 30_000;
+/// A check that never ran because an earlier required check failed.
+///
+/// Deliberately its own code rather than reusing the timeout one: "we ran out
+/// of time" and "we stopped on purpose because the verdict was already decided"
+/// are different facts, and an operator reading a truncated run needs to know
+/// which happened. It is also what keeps these out of the result cache — a skip
+/// records nothing about the check itself and must never be replayed as one.
+const SKIPPED_DIAGNOSTIC_CODE: &str = "project-check.skipped";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCheckReport {
@@ -251,6 +260,19 @@ struct ProfileConfig {
     timeout_ms: u64,
     max_parallel: usize,
     on_timeout: String,
+    /// Stop the run as soon as a **required** check goes red, killing whatever
+    /// is still in flight.
+    ///
+    /// Off by default, deliberately. For a normal check profile you want the
+    /// full picture — reporting one red and hiding the other nine makes a
+    /// developer fix them one round-trip at a time. It earns its keep only
+    /// where the remaining work is expensive and certain to be discarded, which
+    /// is the build lane: once a required leg is red the candidate cannot land,
+    /// so a 25-minute release build that is already doomed is pure waste.
+    ///
+    /// Non-required checks never trip it. A red advisory is information, not a
+    /// verdict, and cancelling a build over one would be a lie about severity.
+    fail_fast: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +293,31 @@ struct CheckConfig {
     paths: Vec<String>,
     command: Vec<String>,
     read_only: bool,
+    /// Which stage this check belongs to. Stages run in ascending order, and a
+    /// stage starts only if every earlier stage was green.
+    ///
+    /// Default `0` puts every existing check in one stage, which is exactly
+    /// today's behaviour — an unstaged manifest is unaffected.
+    ///
+    /// The point is early failure on an expensive pipeline. A build lane that
+    /// runs `cargo check` in stage 1 and `cargo build --release` in stage 2
+    /// pays ~8 minutes to reject a type error instead of ~39, because the
+    /// release codegen never starts.
+    stage: u32,
+    /// Which `CARGO_TARGET_DIR` this check compiles into, when a warm target is
+    /// in play. Checks sharing a key share a dir and are serialized; checks
+    /// with different keys get different dirs and run genuinely in parallel.
+    ///
+    /// Empty (the default) means "the run's one shared target dir" — the
+    /// historical behaviour, where every command check is one serial class.
+    ///
+    /// This is not a micro-optimisation. Under a warm target every `command`
+    /// check was mutually exclusive, so declaring two compile legs in parallel
+    /// bought nothing: they serialized on cargo's own `.cargo-lock`. Distinct
+    /// keys are what make parallel legs actually parallel. The deploy this
+    /// models has always used separate target dirs for its native and wasm
+    /// builds; this closes the gap rather than opening a new risk.
+    target_key: String,
     /// How to read structured diagnostics out of a `kind: command` check.
     ///
     /// * absent / `"check-diagnostic"` — cargoless's own
@@ -483,6 +530,23 @@ pub fn load_manifest(root: &Path) -> Result<Option<ProjectChecksManifest>, Manif
 pub fn list(root: &Path) -> Result<Vec<CheckSummary>, ManifestError> {
     Ok(load_manifest(root)?
         .map(|m| m.summaries())
+        .unwrap_or_default())
+}
+
+/// Every profile the manifest declares, sorted. Empty when there is no
+/// manifest at all.
+///
+/// Exists so a caller can REFUSE an unknown profile name instead of inheriting
+/// [`profile_for`]'s fallback. That fallback synthesises `include: ["*"]` with
+/// a 12-second budget, and `"*"` matches every check regardless of tier — so a
+/// typo silently selects the entire manifest, including any 25-80 minute
+/// release build, and times almost all of it out. Tolerable for an interactive
+/// `checks run --profile x`; catastrophic for the build lane, where the
+/// resulting flood of manifest-pinned timeout diagnostics is attributable to
+/// nobody and ejects the whole queue.
+pub fn profile_names(root: &Path) -> Result<Vec<String>, ManifestError> {
+    Ok(load_manifest(root)?
+        .map(|m| m.profiles.keys().cloned().collect())
         .unwrap_or_default())
 }
 
@@ -759,12 +823,14 @@ fn run_profile_inner(
         changed_files: changed_files.map(|files| normalize_changed_files(&root, files)),
         identity,
         witness_target_dir: witness_target_dir.map(Path::to_path_buf),
+        cancel: Arc::new(AtomicBool::new(false)),
     });
     let results = run_parallel(
         ctx,
         selected,
         profile.max_parallel.max(1),
         profile.timeout_ms,
+        profile.fail_fast,
     );
     let mut diagnostics = Vec::new();
     let mut red = false;
@@ -795,6 +861,10 @@ fn profile_for(manifest: &ProjectChecksManifest, profile_name: &str) -> ProfileC
             timeout_ms: 12_000,
             max_parallel: 8,
             on_timeout: "red".to_string(),
+            // An undeclared profile never fail-fasts. It is a fallback, so the
+            // caller has not asked for anything; reporting the full picture is
+            // the safer default when we are guessing at intent.
+            fail_fast: false,
         },
     }
 }
@@ -966,18 +1036,77 @@ struct RunContext {
     /// passes `Some` when the warm-target flag is on and the dir is safely
     /// held; see `ServeVerdictState::with_project_check_scratch_overlay`.
     witness_target_dir: Option<PathBuf>,
+    /// Set when a `fail_fast` profile has already seen a required red, so the
+    /// remaining work is certain to be discarded.
+    ///
+    /// Running commands poll this on the same 20ms tick they use for their own
+    /// timeout and kill their process tree when it flips. Cancellation is
+    /// therefore cooperative and bounded, and it reuses the kill path that
+    /// timeouts already exercise rather than inventing a second one.
+    cancel: Arc<AtomicBool>,
 }
 
-/// True for checks that will compile into the SHARED warm `CARGO_TARGET_DIR`,
-/// i.e. the ones that must not run concurrently with each other.
+/// The `CARGO_TARGET_DIR` a given check compiles into.
+///
+/// Without a `target_key` this is the run's one dir — the warm dir the daemon
+/// resolved, or the per-run scratch — exactly as before. With a `target_key`
+/// it is a sibling *beside* that dir, so two legs that declare different keys
+/// never touch each other's `deps/`, `.fingerprint/` or `incremental/`.
+///
+/// The key is sanitised rather than trusted: it comes from a manifest and ends
+/// up as a path component, so `../` in a key must not be able to place a target
+/// dir outside the parent. Anything that is not `[A-Za-z0-9._-]` becomes `_`.
+fn resolve_target_dir(ctx: &RunContext, check: &CheckConfig) -> PathBuf {
+    let base = ctx
+        .witness_target_dir
+        .clone()
+        .unwrap_or_else(|| ctx.root.join(".cargoless-target"));
+    if check.target_key.is_empty() {
+        return base;
+    }
+    let safe: String = check
+        .target_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // `.` and `..` survive the char filter but are still traversal; refuse them
+    // by name rather than trying to be clever about the path.
+    if safe.is_empty() || safe == "." || safe == ".." {
+        return base;
+    }
+    let mut dir = base.clone();
+    let leaf = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cargoless-target".to_string());
+    dir.set_file_name(format!("{leaf}-{safe}"));
+    dir
+}
+
+/// True for checks that will compile into a SHARED `CARGO_TARGET_DIR` — i.e.
+/// the ones that must not run concurrently *with each other*.
 ///
 /// Only `command` checks ever inherit `CARGO_TARGET_DIR` (see `check_command`);
 /// every other kind is pure in-process analysis and is unaffected. And only a
 /// `Some` warm dir is shared — with `None` each run compiles into its own
-/// per-run `<root>/.cargoless-target`, so there is nothing to contend on and
-/// this predicate is false for everything.
-fn shares_warm_target(ctx: &RunContext, check: &CheckConfig) -> bool {
-    ctx.witness_target_dir.is_some() && check.kind == CheckKind::Command
+/// per-run `<root>/.cargoless-target`, so there is nothing to contend on.
+///
+/// Returns the dir that would be contended, so the scheduler can serialize
+/// *per dir* instead of across every command check at once. Two legs with
+/// different `target_key`s return different dirs and are free to run together;
+/// two legs with the same key still take turns, which is correct — they really
+/// would block each other on cargo's `.cargo-lock`.
+fn warm_target_class(ctx: &RunContext, check: &CheckConfig) -> Option<PathBuf> {
+    if ctx.witness_target_dir.is_none() || check.kind != CheckKind::Command {
+        return None;
+    }
+    Some(resolve_target_dir(ctx, check))
 }
 
 /// Run `checks` with at most `max_parallel` in flight — EXCEPT that checks
@@ -1016,22 +1145,97 @@ fn shares_warm_target(ctx: &RunContext, check: &CheckConfig) -> bool {
 /// the witnesses are 3 of them. Capping the profile would serialize the whole
 /// advisory governance lane. The constraint is a property of the shared target
 /// dir, not of the profile, so it belongs here where that dir is known.
+///
+/// ## Stages
+///
+/// Checks are grouped by `stage` and the groups run in ascending order. A stage
+/// starts only if every earlier stage was green on its **required** checks, so
+/// a cheap `cargo check` in stage 1 can reject a candidate before an expensive
+/// `cargo build --release` in stage 2 ever starts. An unstaged manifest has one
+/// stage and behaves exactly as before.
+///
+/// Skipped stages are still REPORTED, as reds carrying the reason. Dropping
+/// them would make a truncated run indistinguishable from a shorter pipeline —
+/// the caller would see fewer results and no explanation, and a lane deciding
+/// whom to eject would be reasoning from a silently incomplete picture.
 fn run_parallel(
     ctx: Arc<RunContext>,
     checks: Vec<CheckConfig>,
     max_parallel: usize,
     profile_timeout_ms: u64,
+    fail_fast: bool,
 ) -> Vec<ProjectCheckResult> {
     let start = Instant::now();
+    let mut out = Vec::new();
+
+    // BTreeMap so stages run in ascending numeric order regardless of the
+    // order they appear in the manifest.
+    let mut stages: BTreeMap<u32, Vec<CheckConfig>> = BTreeMap::new();
+    for check in checks {
+        stages.entry(check.stage).or_default().push(check);
+    }
+
+    let mut halted: Option<u32> = None;
+    for (stage, group) in stages {
+        if let Some(failed_at) = halted {
+            // An earlier stage failed. Report the rest rather than dropping it.
+            for check in group {
+                out.push(skipped_stage_result(
+                    &ctx.root,
+                    &check,
+                    &format!(
+                        "stage {stage} did not run: stage {failed_at} failed, \
+                         and a later stage cannot change that verdict"
+                    ),
+                ));
+            }
+            continue;
+        }
+        let results = run_stage(
+            ctx.clone(),
+            group,
+            max_parallel,
+            profile_timeout_ms,
+            start,
+            fail_fast,
+        );
+        let stage_red = results
+            .iter()
+            .any(|r| r.required && r.tree == TreeState::Red);
+        out.extend(results);
+        if stage_red {
+            halted = Some(stage);
+        }
+    }
+
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Run one stage's checks with at most `max_parallel` in flight.
+///
+/// `start` is the PROFILE's clock, not this stage's — the profile timeout
+/// bounds the whole run, so a late stage inherits whatever budget is left
+/// rather than getting a fresh one.
+fn run_stage(
+    ctx: Arc<RunContext>,
+    checks: Vec<CheckConfig>,
+    max_parallel: usize,
+    profile_timeout_ms: u64,
+    start: Instant,
+    fail_fast: bool,
+) -> Vec<ProjectCheckResult> {
     let mut pending: VecDeque<CheckConfig> = checks.into();
     let (tx, rx) = mpsc::channel();
     let mut in_flight = 0usize;
-    // Count of in-flight members of the warm-target serial class (0 or 1).
-    let mut warm_in_flight = 0usize;
+    // Target dirs currently being compiled into. A check whose dir is in here
+    // must wait — it would only park on cargo's `.cargo-lock` anyway.
+    let mut warm_in_flight: BTreeSet<PathBuf> = BTreeSet::new();
     let mut out = Vec::new();
+    let mut cancelled = false;
 
     while !pending.is_empty() || in_flight > 0 {
-        while in_flight < max_parallel && !pending.is_empty() {
+        while in_flight < max_parallel && !pending.is_empty() && !cancelled {
             if start.elapsed() >= Duration::from_millis(profile_timeout_ms) {
                 break;
             }
@@ -1041,18 +1245,17 @@ fn run_parallel(
             // serialization this design exists to avoid). Order within each
             // class is still FIFO, and `out` is sorted by id at the end, so
             // the reported result order is unaffected either way.
-            let Some(idx) = pending
-                .iter()
-                .position(|c| warm_in_flight == 0 || !shares_warm_target(&ctx, c))
-            else {
-                // Everything left is warm-class and one is already running:
-                // wait for it to finish rather than spinning.
+            let Some(idx) = pending.iter().position(|c| {
+                warm_target_class(&ctx, c).is_none_or(|dir| !warm_in_flight.contains(&dir))
+            }) else {
+                // Everything left wants a dir that is already busy: wait for
+                // one to free rather than spinning.
                 break;
             };
             let check = pending.remove(idx).expect("index from position()");
-            let warm = shares_warm_target(&ctx, &check);
-            if warm {
-                warm_in_flight += 1;
+            let warm = warm_target_class(&ctx, &check);
+            if let Some(dir) = warm.clone() {
+                warm_in_flight.insert(dir);
             }
             let tx = tx.clone();
             let ctx = ctx.clone();
@@ -1070,10 +1273,20 @@ fn run_parallel(
         }
         match rx.recv() {
             Ok((warm, result)) => {
+                let tripped = fail_fast && result.required && result.tree == TreeState::Red;
                 out.push(result);
                 in_flight -= 1;
-                if warm {
-                    warm_in_flight -= 1;
+                if let Some(dir) = warm {
+                    warm_in_flight.remove(&dir);
+                }
+                if tripped && !cancelled {
+                    // Signal the running commands to kill their process trees.
+                    // We keep draining `rx` so every in-flight check still
+                    // reports — a cancelled check that never returns a result
+                    // would leave a hole the caller cannot distinguish from a
+                    // check that was never selected.
+                    cancelled = true;
+                    ctx.cancel.store(true, Ordering::SeqCst);
                 }
             }
             Err(_) => break,
@@ -1081,13 +1294,21 @@ fn run_parallel(
     }
 
     for check in pending {
-        out.push(timeout_result(
-            &ctx.root,
-            &check,
-            "profile timeout reached before this check started",
-        ));
+        if cancelled {
+            out.push(skipped_stage_result(
+                &ctx.root,
+                &check,
+                "did not run: an earlier required check in this stage failed \
+                 and the profile is fail_fast",
+            ));
+        } else {
+            out.push(timeout_result(
+                &ctx.root,
+                &check,
+                "profile timeout reached before this check started",
+            ));
+        }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
     out
 }
 
@@ -1192,6 +1413,36 @@ fn timeout_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectChe
     }
     if check.result_protocol.is_some() {
         result.outcome = ProjectCheckOutcome::Indeterminate;
+    }
+    result
+}
+
+/// A check that never ran because the verdict was already decided.
+///
+/// Reported RED for a required check, because the honest answer to "is this
+/// check green?" is "we do not know", and a gate must not read unknown as
+/// pass. A non-required check degrades to a warning on a green tree — the same
+/// shape `timeout_result` uses, for the same reason: an advisory that did not
+/// run cannot fail a build.
+fn skipped_stage_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectCheckResult {
+    let mut result = result_from_diags(
+        check,
+        vec![diag(
+            root,
+            check,
+            MANIFEST_NAME,
+            1,
+            1,
+            SKIPPED_DIAGNOSTIC_CODE,
+            message,
+        )],
+        0,
+    );
+    if !check.required {
+        for d in &mut result.diagnostics {
+            d.severity = Severity::Warning;
+        }
+        result.tree = TreeState::Green;
     }
     result
 }
@@ -1434,7 +1685,7 @@ fn check_file_exists(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResul
 /// proven reaper in `analyzer::ReapOnDrop`. Without this, a timed-out `cargo`
 /// leaks `rustc` grandchildren that reparent to init and keep compiling past
 /// the deadline (the leak the live warn soak surfaced 2026-06-08).
-fn kill_process_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -1573,10 +1824,7 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
     // the `/workspace/target` default in `cargoless-serve.k8s.yaml`) and over
     // any workspace `.cargo/config.toml` `[build] target-dir` — cargo's
     // resolution order is env > config > default.
-    let cargo_target_dir = ctx
-        .witness_target_dir
-        .clone()
-        .unwrap_or_else(|| ctx.root.join(".cargoless-target"));
+    let cargo_target_dir = resolve_target_dir(ctx, check);
     let mut cmd = Command::new(&check.command[0]);
     cmd.args(&check.command[1..])
         .current_dir(&ctx.root)
@@ -1667,6 +1915,15 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
                 let _ = child.wait();
                 break Err("command timed out".to_string());
             }
+            Ok(None) if ctx.cancel.load(Ordering::SeqCst) => {
+                // A required check in this stage already failed and the profile
+                // is fail_fast, so this compile cannot change the verdict.
+                // Same kill path as a timeout — the reason differs, the
+                // grandchild-reaping problem does not.
+                kill_process_tree(&mut child);
+                let _ = child.wait();
+                break Err("cancelled".to_string());
+            }
             Ok(None) => thread::sleep(Duration::from_millis(20)),
             Err(e) => break Err(format!("could not wait for command: {e}")),
         }
@@ -1717,6 +1974,18 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             }
             result_from_diags(check, command_diagnostics, 0)
         }
+        // A cancelled check is NOT a timeout and must not be reported as one.
+        // We killed it on purpose because the stage's verdict was already
+        // decided; saying "timed out" would blame the check for a decision the
+        // scheduler made, and would send someone hunting a performance problem
+        // that does not exist. `skipped_stage_result` also keeps it out of the
+        // cache, so the check runs normally on the next attempt.
+        Err(message) if message == "cancelled" => skipped_stage_result(
+            &ctx.root,
+            check,
+            "cancelled: an earlier required check in this stage failed and the \
+             profile is fail_fast — this check did not finish and has no verdict",
+        ),
         Err(message) => {
             if check.result_protocol.is_some() {
                 structured_indeterminate(ctx, check, "command.timeout", &message, None)
@@ -2577,10 +2846,21 @@ fn cache_put(ctx: &RunContext, check: &CheckConfig, result: &ProjectCheckResult)
     }
 }
 
+/// True for results that describe the RUN rather than the CHECK, and so must
+/// never enter or be served from the cache.
+///
+/// A timeout says the machine was busy; a skip says we stopped early. Neither
+/// is a property of the check's inputs, so caching one would replay a transient
+/// condition as a verdict — a check that timed out once would stay red, and a
+/// check skipped behind a failure would stay skipped after the failure was
+/// fixed.
 fn has_timeout_diagnostic(diagnostics: &[Diagnostic]) -> bool {
-    diagnostics
-        .iter()
-        .any(|d| d.code.as_deref() == Some(TIMEOUT_DIAGNOSTIC_CODE))
+    diagnostics.iter().any(|d| {
+        matches!(
+            d.code.as_deref(),
+            Some(TIMEOUT_DIAGNOSTIC_CODE) | Some(SKIPPED_DIAGNOSTIC_CODE)
+        )
+    })
 }
 
 fn diagnostic_from_json(v: &serde_json::Value, root: &Path) -> Option<Diagnostic> {
@@ -2692,6 +2972,7 @@ fn parse_profiles(node: Option<&YamlNode>) -> Result<BTreeMap<String, ProfileCon
                 timeout_ms: 12_000,
                 max_parallel: 8,
                 on_timeout: "red".to_string(),
+                fail_fast: false,
             },
         );
         return Ok(out);
@@ -2700,7 +2981,13 @@ fn parse_profiles(node: Option<&YamlNode>) -> Result<BTreeMap<String, ProfileCon
         let map = profile.expect_map(&format!("profiles.{name}"))?;
         reject_unknown(
             map,
-            &["include", "timeout_ms", "max_parallel", "on_timeout"],
+            &[
+                "include",
+                "timeout_ms",
+                "max_parallel",
+                "on_timeout",
+                "fail_fast",
+            ],
             profile.line(),
         )?;
         out.insert(
@@ -2710,6 +2997,7 @@ fn parse_profiles(node: Option<&YamlNode>) -> Result<BTreeMap<String, ProfileCon
                 timeout_ms: get_u64(map, "timeout_ms")?.unwrap_or(12_000),
                 max_parallel: get_u64(map, "max_parallel")?.unwrap_or(8) as usize,
                 on_timeout: get_string(map, "on_timeout")?.unwrap_or_else(|| "red".to_string()),
+                fail_fast: get_bool(map, "fail_fast")?.unwrap_or(false),
             },
         );
     }
@@ -2744,6 +3032,8 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
                 "command",
                 "read_only",
                 "output",
+                "stage",
+                "target_key",
                 "result_protocol",
                 "on_degraded",
             ],
@@ -2789,6 +3079,18 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
             paths: get_string_list(map, "paths")?.unwrap_or_default(),
             command: get_string_list(map, "command")?.unwrap_or_default(),
             read_only: get_bool(map, "read_only")?.unwrap_or(false),
+            stage: {
+                let raw = get_u64(map, "stage")?.unwrap_or(0);
+                // Bound it rather than truncating a u64 into a u32. A manifest
+                // asking for stage 5_000_000_000 is a mistake, and silently
+                // wrapping it to some other stage would reorder the pipeline
+                // without saying so.
+                u32::try_from(raw).map_err(|_| ParseError {
+                    line: item.line(),
+                    message: format!("stage {raw} is out of range (max {})", u32::MAX),
+                })?
+            },
+            target_key: get_string(map, "target_key")?.unwrap_or_default(),
             output: {
                 let raw = get_string(map, "output")?.unwrap_or_default();
                 // An unrecognised value is an ERROR, never a silent fallback:
@@ -3200,12 +3502,10 @@ checks:
             report.results[0].outcome,
             ProjectCheckOutcome::Indeterminate
         );
-        assert!(
-            report.results[0]
-                .diagnostics
-                .iter()
-                .any(|d| { d.code.as_deref() == Some("structured.degraded.unapproved_reason") })
-        );
+        assert!(report.results[0]
+            .diagnostics
+            .iter()
+            .any(|d| { d.code.as_deref() == Some("structured.degraded.unapproved_reason") }));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3767,11 +4067,10 @@ checks:
 "#,
         )
         .unwrap();
-        let changed = vec![
-            root.join("portal/src/lib.rs")
-                .to_string_lossy()
-                .into_owned(),
-        ];
+        let changed = vec![root
+            .join("portal/src/lib.rs")
+            .to_string_lossy()
+            .into_owned()];
         let report = run_profile_with_changes(&root, "dev", None, Some(&changed)).unwrap();
         assert_eq!(report.tree, TreeState::Green);
         assert_eq!(
@@ -4113,11 +4412,9 @@ checks:
         assert_eq!(diagnostics[0].col, 3);
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert_eq!(diagnostics[0].code.as_deref(), Some("generated.drift"));
-        assert!(
-            diagnostics[0]
-                .message
-                .contains("run ./scripts/devctl codegen")
-        );
+        assert!(diagnostics[0]
+            .message
+            .contains("run ./scripts/devctl codegen"));
         assert_eq!(
             diagnostics[0].source.as_deref(),
             Some("cargoless-check:generated-fast")
@@ -4233,5 +4530,550 @@ checks:
     fn classify_exit_preserves_command_failed_for_high_nonsignal_code() {
         let (code, _) = classify_exit(exit_with_code(200), "");
         assert_eq!(code, "command.failed");
+    }
+
+    // ── stages, fail-fast, per-leg target dirs ──────────────────────────────
+    //
+    // These three features exist to make an expensive pipeline fail early
+    // without lying about what it proved. The tests below are the only thing
+    // standing between that and a lane that reports green on work it skipped.
+
+    fn result_for<'a>(report: &'a ProjectCheckReport, id: &str) -> &'a ProjectCheckResult {
+        report
+            .results
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no result for {id}; got {:?}", report.results))
+    }
+
+    fn has_code(result: &ProjectCheckResult, code: &str) -> bool {
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some(code))
+    }
+
+    /// The core promise: an expensive stage never starts once a cheap one has
+    /// failed. Without this the whole feature is decoration — the build would
+    /// still pay for codegen it is going to throw away.
+    #[test]
+    fn a_later_stage_does_not_run_after_an_earlier_stage_fails() {
+        let root = scratch("stage-halt");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  dev:
+    include: ["dev"]
+    timeout_ms: 30000
+checks:
+  - id: cheap
+    kind: command
+    read_only: true
+    stage: 1
+    command: ["bash", "-lc", "exit 1"]
+    cache: none
+  - id: expensive
+    kind: command
+    read_only: true
+    stage: 2
+    command: ["bash", "-lc", "echo ran > expensive.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(report.tree, TreeState::Red);
+        assert!(
+            !root.join("expensive.out").exists(),
+            "stage 2 must not execute after stage 1 failed"
+        );
+
+        // Reported, not silently dropped: a caller that sees fewer results
+        // than checks cannot tell a truncated run from a shorter pipeline.
+        let skipped = result_for(&report, "expensive");
+        assert_eq!(skipped.tree, TreeState::Red);
+        assert!(has_code(skipped, SKIPPED_DIAGNOSTIC_CODE));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Stage order comes from the NUMBER, not from manifest position. Relying
+    /// on declaration order would make a harmless reordering of the YAML
+    /// silently reorder the pipeline.
+    #[test]
+    fn stages_run_in_ascending_order_regardless_of_declaration_order() {
+        let root = scratch("stage-order");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  dev:
+    include: ["dev"]
+    timeout_ms: 30000
+checks:
+  - id: second
+    kind: command
+    read_only: true
+    stage: 9
+    command: ["bash", "-lc", "echo second >> trace.out"]
+    cache: none
+  - id: first
+    kind: command
+    read_only: true
+    stage: 2
+    command: ["bash", "-lc", "echo first >> trace.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(trace_of(&root), vec!["first", "second"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An unstaged manifest is one stage and behaves exactly as before. This is
+    /// the compatibility guard: every existing repo declares no `stage`, and a
+    /// default that accidentally split them would serialize whole profiles.
+    #[test]
+    fn checks_without_a_stage_all_share_stage_zero() {
+        let root = scratch("stage-default");
+        fs::write(root.join(MANIFEST_NAME), overlap_manifest(&["a", "b", "c"])).unwrap();
+
+        let report = run_dev_with_changes_in(&root, None, None).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        let trace = trace_of(&root);
+        assert_eq!(trace.len(), 6, "3 checks × enter+exit, got {trace:?}");
+        assert!(
+            !trace_is_serialized(&trace),
+            "one implicit stage ⇒ normal fan-out must be preserved; trace {trace:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Fail-fast kills the in-flight sibling rather than waiting it out, and
+    /// says so honestly: the killed check reports SKIPPED, never a red of its
+    /// own. Blaming a check we cancelled would send someone debugging a
+    /// failure that never happened.
+    #[test]
+    fn fail_fast_cancels_the_in_flight_sibling_and_does_not_blame_it() {
+        let root = scratch("fail-fast-cancel");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  lane:
+    include: ["lane"]
+    timeout_ms: 60000
+    max_parallel: 4
+    fail_fast: true
+checks:
+  - id: aa-slow
+    kind: command
+    tier: lane
+    read_only: true
+    timeout_ms: 50000
+    command: ["bash", "-lc", "sleep 30; echo finished > slow.out"]
+    cache: none
+  - id: bb-fails
+    kind: command
+    tier: lane
+    read_only: true
+    timeout_ms: 50000
+    command: ["bash", "-lc", "sleep 0.3; exit 1"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let report = run_profile(&root, "lane", None).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(report.tree, TreeState::Red);
+        // The slow leg sleeps 30s. If cancellation did not work we would sit
+        // here for all of it, so a generous 20s ceiling still proves the point
+        // without being flaky on a loaded CI box.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "fail_fast must cancel the in-flight sibling; took {elapsed:?}"
+        );
+        assert!(
+            !root.join("slow.out").exists(),
+            "the cancelled command must not have run to completion"
+        );
+
+        let slow = result_for(&report, "aa-slow");
+        assert!(
+            has_code(slow, SKIPPED_DIAGNOSTIC_CODE),
+            "a cancelled check reports SKIPPED, not a verdict of its own: {:?}",
+            slow.diagnostics
+        );
+        assert!(
+            !has_code(slow, "command.timeout"),
+            "cancellation is not a timeout — saying so blames the check for a \
+             scheduler decision: {:?}",
+            slow.diagnostics
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A NON-required red is information, not a verdict. Cancelling a build
+    /// over a failing advisory would silently promote it to a gate.
+    ///
+    /// The advisory here MUST use `output: cargo-json`, and that is the whole
+    /// reason this test has teeth. A plain `command` check routes its failure
+    /// through `diag()`, which stamps `Severity::Warning` when `required:
+    /// false` — so `result_from_diags` never sets `Red` and
+    /// `result.tree == TreeState::Red` is unreachable for an advisory. Against
+    /// that manifest the `result.required &&` clause in `run_stage` is dead
+    /// code and dropping it changes nothing, which is exactly why the mutation
+    /// harness kept reporting "SURVIVED — fail_fast trips on a non-required
+    /// red": the mutant was equivalent under the test's own fixture.
+    ///
+    /// `cargodiag::parse_cargo_json` takes severity from cargo's `level` field
+    /// and never consults `check.required`, so an advisory emitting a real
+    /// compiler error is genuinely `required: false` AND `tree == Red` — the
+    /// only state in which the clause under test does any work.
+    #[test]
+    fn a_non_required_red_never_trips_fail_fast() {
+        let root = scratch("fail-fast-advisory");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  lane:
+    include: ["lane"]
+    timeout_ms: 60000
+    max_parallel: 4
+    fail_fast: true
+checks:
+  - id: aa-advisory
+    kind: command
+    tier: lane
+    read_only: true
+    required: false
+    output: cargo-json
+    timeout_ms: 20000
+    # `echo`, NOT `printf '%s\n'`. `unquote_yaml` replaces `\n` BEFORE `\\`, so
+    # a `\\n` written here becomes a real newline rather than a literal
+    # backslash-n — which split the printf format string across two lines and
+    # emitted nothing parseable. Caught by the fixture-precondition assertion
+    # below, which is exactly the job it exists for. `echo` supplies the
+    # trailing newline anyway, so the escape was never needed.
+    command: ["bash", "-lc", "echo '{\"reason\":\"compiler-message\",\"message\":{\"level\":\"error\",\"message\":\"advisory boom\",\"spans\":[{\"file_name\":\"src/advisory.rs\",\"line_start\":1,\"column_start\":1,\"is_primary\":true}]}}'; exit 1"]
+    cache: none
+  - id: bb-real
+    kind: command
+    tier: lane
+    read_only: true
+    timeout_ms: 20000
+    command: ["bash", "-lc", "sleep 6; echo ran > real.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report = run_profile(&root, "lane", None).unwrap();
+        assert_eq!(
+            report.tree,
+            TreeState::Green,
+            "a failing advisory must not red the tree"
+        );
+
+        // GUARD THE FIXTURE, not just the behaviour. Everything below only
+        // tests anything if the advisory actually reached `tree == Red` while
+        // staying `required: false` — that pair is the sole input state in
+        // which `fail_fast && result.required && …` differs from
+        // `fail_fast && …`. If a future edit drops `output: cargo-json`, the
+        // advisory silently downgrades to a Warning, the assertions below still
+        // pass, and the test quietly stops testing. Assert the precondition so
+        // that regression fails LOUDLY here rather than showing up months later
+        // as a surviving mutant.
+        let advisory = report
+            .results
+            .iter()
+            .find(|r| r.id == "aa-advisory")
+            .expect("the advisory must appear in the report");
+        assert!(
+            !advisory.required,
+            "fixture precondition: the advisory must be non-required"
+        );
+        assert_eq!(
+            advisory.tree,
+            TreeState::Red,
+            "fixture precondition: the advisory must be genuinely RED — a plain \
+             `command` check stamps Warning when required:false, which makes \
+             the `result.required` clause unreachable and this test vacuous"
+        );
+
+        // The load-bearing assertion, and the reason `bb-real` sleeps 6s rather
+        // than 1s: the advisory exits INSTANTLY, so a `fail_fast` that wrongly
+        // counted non-required reds would fire while the required check is
+        // still running and kill it mid-sleep — leaving `real.out` unwritten.
+        //
+        // Timing alone was NOT enough. With a 1s sleep the required check
+        // finished before a wrongful cancel could reach it; lengthening it to
+        // 6s fixed that race but the mutant still survived, because the fixture
+        // could not produce a red advisory at all (see the doc comment). Both
+        // halves are needed: a reachable Red, and enough in-flight work left to
+        // cancel.
+        assert!(
+            root.join("real.out").exists(),
+            "the required check must run to COMPLETION — a failing advisory \
+             must never cancel in-flight work, or every non-required check \
+             silently becomes a gate"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Without fail-fast, everything still runs. The feature is opt-in so the
+    /// 100+ check governance profiles keep reporting a full picture.
+    #[test]
+    fn without_fail_fast_a_red_does_not_cancel_anything() {
+        let root = scratch("no-fail-fast");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  dev:
+    include: ["dev"]
+    timeout_ms: 30000
+    max_parallel: 4
+checks:
+  - id: aa-fails
+    kind: command
+    read_only: true
+    timeout_ms: 20000
+    command: ["bash", "-lc", "exit 1"]
+    cache: none
+  - id: bb-runs
+    kind: command
+    read_only: true
+    timeout_ms: 20000
+    command: ["bash", "-lc", "sleep 6; echo ran > other.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(report.tree, TreeState::Red);
+        // 6s, not 1s, for the same reason as the advisory test above: the
+        // failing check exits instantly, so a regression that made fail_fast
+        // the DEFAULT would cancel this one mid-sleep. With a 1s sleep it
+        // finishes first and the test passes either way.
+        assert!(
+            root.join("other.out").exists(),
+            "default profiles must keep running every check to completion — \
+             fail_fast is opt-in, and a profile that never asked for it must \
+             never have work cancelled underneath it"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The parallelism payoff. Two legs with DIFFERENT `target_key`s compile
+    /// into different dirs, so they may overlap even with a warm target —
+    /// where previously every command check was one serial class and declaring
+    /// them parallel bought exactly nothing.
+    #[test]
+    fn distinct_target_keys_run_concurrently_under_a_warm_target() {
+        let root = scratch("target-key-parallel");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: a
+    kind: command
+    read_only: true
+    target_key: "native"
+    command: ["bash", "-lc", "echo a+ >> trace.out; sleep 0.4; echo a- >> trace.out"]
+    cache: none
+  - id: b
+    kind: command
+    read_only: true
+    target_key: "wasm"
+    command: ["bash", "-lc", "echo b+ >> trace.out; sleep 0.4; echo b- >> trace.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+        let warm = scratch("target-key-parallel-target");
+
+        let report = run_dev_with_changes_in(&root, None, Some(&warm)).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+
+        let trace = trace_of(&root);
+        assert_eq!(trace.len(), 4, "2 checks × enter+exit, got {trace:?}");
+        assert!(
+            !trace_is_serialized(&trace),
+            "different target_key ⇒ different CARGO_TARGET_DIR ⇒ no contention, \
+             so these must overlap; trace {trace:?}"
+        );
+
+        let _ = fs::remove_dir_all(&warm);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other half: the SAME key still serializes. Two legs sharing a
+    /// target dir really would block each other on cargo's `.cargo-lock`, so
+    /// admitting both only parks a thread in the kernel.
+    #[test]
+    fn a_shared_target_key_still_serializes() {
+        let root = scratch("target-key-serial");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: a
+    kind: command
+    read_only: true
+    target_key: "native"
+    command: ["bash", "-lc", "echo a+ >> trace.out; sleep 0.4; echo a- >> trace.out"]
+    cache: none
+  - id: b
+    kind: command
+    read_only: true
+    target_key: "native"
+    command: ["bash", "-lc", "echo b+ >> trace.out; sleep 0.4; echo b- >> trace.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+        let warm = scratch("target-key-serial-target");
+
+        let report = run_dev_with_changes_in(&root, None, Some(&warm)).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+
+        let trace = trace_of(&root);
+        assert_eq!(trace.len(), 4, "2 checks × enter+exit, got {trace:?}");
+        assert!(
+            trace_is_serialized(&trace),
+            "same target_key ⇒ one dir ⇒ must not overlap; trace {trace:?}"
+        );
+
+        let _ = fs::remove_dir_all(&warm);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `target_key` becomes a path component, so a manifest must not be able
+    /// to escape the parent directory with it. Sanitised, not trusted.
+    #[test]
+    fn a_traversing_target_key_cannot_escape_the_parent_dir() {
+        let root = scratch("target-key-escape");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: escape
+    kind: command
+    read_only: true
+    target_key: "../../etc"
+    command: ["bash", "-lc", "printf '%s' \"$CARGO_TARGET_DIR\" > target-dir.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+
+        let seen = fs::read_to_string(root.join("target-dir.out")).unwrap();
+
+        // The property is CONTAINMENT, not the absence of dots. `../../etc`
+        // sanitises to the leaf `.._.._etc`, which still contains ".." as a
+        // substring while being a perfectly ordinary directory name — the dots
+        // are no longer path components, which is the whole point.
+        //
+        // An earlier version of this test asserted `!seen.contains("..")` and
+        // failed on correct output. That is the worse kind of wrong test: it
+        // reddens on a working sanitiser, so the natural "fix" is to weaken the
+        // sanitiser until the test passes.
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let resolved = Path::new(&seen);
+        assert!(
+            resolved.starts_with(&canonical_root),
+            "target dir {seen} escaped the run root {}",
+            canonical_root.display()
+        );
+        // No component may be a traversal — this is the check that actually
+        // forbids escaping, and it holds regardless of how the leaf is spelled.
+        assert!(
+            !resolved
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "no path COMPONENT may be `..`, got {seen}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A skipped result describes the RUN, not the CHECK, so it must never be
+    /// cached. Caching one would keep a check skipped after the failure that
+    /// skipped it was fixed.
+    #[test]
+    fn skipped_results_are_not_cached() {
+        let root = scratch("skip-cache");
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  dev:
+    include: ["dev"]
+    timeout_ms: 30000
+checks:
+  - id: gate
+    kind: command
+    read_only: true
+    stage: 1
+    timeout_ms: 20000
+    command: ["bash", "-lc", "test -f pass.marker"]
+  - id: later
+    kind: command
+    read_only: true
+    stage: 2
+    timeout_ms: 20000
+    command: ["bash", "-lc", "echo ran >> later.out"]
+"#,
+        )
+        .unwrap();
+
+        // First run: the gate fails, so `later` is skipped and never executes.
+        let first = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(first.tree, TreeState::Red);
+        assert!(has_code(
+            result_for(&first, "later"),
+            SKIPPED_DIAGNOSTIC_CODE
+        ));
+        assert!(!root.join("later.out").exists());
+
+        // Fix the gate. If the skip had been cached, `later` would replay as
+        // skipped and never run — the bug this guards.
+        fs::write(root.join("pass.marker"), "").unwrap();
+        let second = run_profile(&root, "dev", None).unwrap();
+        assert_eq!(second.tree, TreeState::Green);
+        assert!(
+            root.join("later.out").exists(),
+            "a skipped check must run once the earlier stage passes"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }
