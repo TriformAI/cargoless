@@ -38,6 +38,11 @@ declared checks with triggers, budgets, cache keys, and diagnostics.
 ## Manifest
 
 The implemented product manifest is `cargoless.checks.yaml` at the repo root.
+
+Command checks that need typed outcomes and exact source/base attribution may
+use [`cargoless.check-result/v1`](D-CHECK-RESULT-PROTOCOL.md). The structured
+protocol is adjacent to the historical line-diagnostic format: existing
+manifests and command checks remain unchanged.
 Cargoless parses a small owned YAML subset: maps, lists, quoted/unquoted scalar
 strings, integers, booleans, and `#` comments. This keeps the fast path
 dependency-light while still matching the way tf-multiverse already describes

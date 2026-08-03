@@ -1323,6 +1323,7 @@ fn exec(
                         root: project_root,
                         changed_files: pushed.changed_files.clone(),
                         base_ref: pushed.base_ref.clone(),
+                        base_sha: pushed.base_sha.clone(),
                         source_ref: pushed.source_ref.clone(),
                         source_sha: pushed.source_sha.clone(),
                         overlay_files: pushed.files.clone(),
@@ -2589,12 +2590,32 @@ fn run_project_checks_and_log(
     let gated_ids = context
         .as_ref()
         .and_then(|ctx| crate::serveapi::gated_witness_ids(ctx.gate, ctx.check_ids.as_ref()));
+    let identity = context.as_ref().and_then(|ctx| {
+        Some(cargoless_core::project_checks::ProjectCheckRunIdentity {
+            source_sha: ctx.source_sha.clone()?,
+            base_sha: ctx.base_sha.clone()?,
+        })
+    });
     let report = match (context.as_ref(), gated_ids.as_deref()) {
         (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_profile_with_ids_in(root, "dev", ids, None, warm)
+            cargoless_core::project_checks::run_profile_with_ids_in_at(
+                root,
+                "dev",
+                ids,
+                None,
+                warm,
+                identity.as_ref(),
+            )
         }),
         (Some(ctx), None) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_dev_with_changes_in(root, changed_files, warm)
+            cargoless_core::project_checks::run_profile_with_ids_in_at(
+                root,
+                "dev",
+                &[],
+                changed_files,
+                warm,
+                identity.as_ref(),
+            )
         }),
         (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
             root,
@@ -2637,8 +2658,18 @@ fn run_project_checks_and_log(
                 .filter(|d| d.severity == cargoless_core::Severity::Error)
                 .count() as u32;
             let tree_red = report.tree == cargoless_core::TreeState::Red;
+            let has_indeterminate = report.has_indeterminate();
+            let has_degraded = report.has_degraded();
             tracing::info!(
-                outcome = if tree_red { "red" } else { "green" },
+                outcome = if has_indeterminate {
+                    "indeterminate"
+                } else if tree_red {
+                    "red"
+                } else if has_degraded {
+                    "degraded"
+                } else {
+                    "green"
+                },
                 checks = report.results.len(),
                 skipped = report.skipped.len(),
                 cache_hits = cache_hits,
@@ -2651,7 +2682,15 @@ fn run_project_checks_and_log(
                 "[cargoless:obs] project-checks wt={} root={} verdict={} checks={} skipped={} cache_hits={} duration_ms={} error_count={} slowest={}",
                 wt.display(),
                 root.display(),
-                if tree_red { "red" } else { "green" },
+                if has_indeterminate {
+                    "unknown"
+                } else if tree_red {
+                    "red"
+                } else if has_degraded {
+                    "warn"
+                } else {
+                    "green"
+                },
                 report.results.len(),
                 report.skipped.len(),
                 cache_hits,
@@ -2674,7 +2713,29 @@ fn run_project_checks_and_log(
                     diagnostic.message.lines().next().unwrap_or("")
                 );
             }
-            if tree_red {
+            if has_indeterminate {
+                let detail = report
+                    .results
+                    .iter()
+                    .find(|result| {
+                        result.outcome
+                            == cargoless_core::project_checks::ProjectCheckOutcome::Indeterminate
+                    })
+                    .and_then(|result| result.diagnostics.first())
+                    .or_else(|| report.diagnostics.first())
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .unwrap_or_else(|| {
+                        "structured project check did not produce an authoritative result"
+                            .to_string()
+                    });
+                (
+                    ProjectCheckSummary::Indeterminate {
+                        reason: "structured_result_indeterminate",
+                        detail,
+                    },
+                    ran_check_ids,
+                )
+            } else if tree_red {
                 // Defensive: if the tree is Red the error_count should
                 // be > 0 (per `result_from_diags` in cargoless-core,
                 // which enforces it at the per-check layer). If it
@@ -3707,6 +3768,7 @@ mod tests {
                 "physics/src/runtime/wire/lib.rs".to_string(),
             ]),
             base_ref: "origin/dev".to_string(),
+            base_sha: None,
             source_ref: None,
             source_sha: None,
             overlay_files: vec![
@@ -4167,6 +4229,7 @@ checks:
             root: root.clone(),
             changed_files: Some(vec!["src/added.rs".into()]),
             base_ref: "origin/main".to_string(),
+            base_sha: None,
             source_ref: None,
             source_sha: None,
             overlay_files: vec![(
