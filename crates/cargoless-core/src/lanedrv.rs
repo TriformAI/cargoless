@@ -723,15 +723,28 @@ impl LegRunner for DispatchLegRunner {
 /// looking" is not a verdict about anyone's code.
 /// How many times to try pointing the slot before calling it infrastructure.
 ///
-/// Small on purpose: this covers a daemon that is RESTARTING (seconds), not one
-/// that is gone. A genuinely absent daemon must still surface as Infra quickly
-/// rather than hold the lane.
-const POINT_ATTEMPTS: u32 = 5;
+/// Sized to a POD REPLACEMENT, not a blip. The previous 5 × 6s ≈ 30s was
+/// calibrated against "a daemon that is RESTARTING (seconds)", and that
+/// estimate was wrong by an order of magnitude: measured 2026-08-03, a preview
+/// roll took ~4 minutes end to end (23:34 Terminating -> 23:36 Init:1/2 ->
+/// ~23:38 3/3 Running).
+///
+/// It cannot be made faster either. The preview Deployment is `Recreate` with
+/// `replicas: 1` because its 220Gi workspace PVC is ReadWriteOnce — two pods
+/// can never mount it at once, so there is no surge/handoff to hide the gap
+/// behind. Every manifest edit therefore removes the only backend for minutes.
+///
+/// 30 attempts × 10s = 5 minutes of tolerance, comfortably past the observed
+/// 4-minute replacement with headroom for a slow image pull. A genuinely
+/// absent daemon still surfaces as Infra — just 5 minutes later, which costs
+/// far less than ejecting the members of a 20-45 minute build whose code was
+/// never at fault.
+const POINT_ATTEMPTS: u32 = 30;
 
-/// Gap between point attempts. 5 × 6s ≈ 30s of tolerance, which covers the
-/// observed gap between a preview pod being killed and its replacement
-/// answering, without meaningfully delaying a real failure.
-const POINT_RETRY_DELAY: Duration = Duration::from_secs(6);
+/// Gap between point attempts. Paired with POINT_ATTEMPTS above: 30 × 10s.
+/// Ten seconds rather than six so a 5-minute window does not cost 50 curl
+/// invocations against a daemon that is provably not listening yet.
+const POINT_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// How long to wait for a busy slot before pointing anyway.
 ///
@@ -2075,5 +2088,68 @@ mod base_health_tests {
                 "unreadable base ({raw}) must not suppress the candidate's red"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod point_retry_budget_tests {
+    use super::{POINT_ATTEMPTS, POINT_RETRY_DELAY};
+    use std::time::Duration;
+
+    /// The longest preview replacement actually observed, end to end.
+    ///
+    /// Measured 2026-08-03: 23:34 Terminating -> 23:36 Init:1/2 -> ~23:38
+    /// 3/3 Running. Kept as a named constant because the whole point of this
+    /// test is that the retry budget must be checked against a MEASUREMENT,
+    /// not against an estimate of how long a restart "should" take.
+    const OBSERVED_PREVIEW_RESTART: Duration = Duration::from_secs(4 * 60);
+
+    /// The retry budget must outlast a preview pod replacement.
+    ///
+    /// This exists because the previous budget (5 x 6s = 30s) carried a comment
+    /// asserting it "covers the observed gap between a preview pod being killed
+    /// and its replacement answering" — and that was wrong by 8x. Nothing
+    /// tested it, so the claim survived until a real roll disproved it.
+    ///
+    /// The gap cannot be engineered away: the preview Deployment is `Recreate`
+    /// with `replicas: 1` because its 220Gi workspace PVC is ReadWriteOnce, so
+    /// two pods can never overlap and there is no surge to hide behind. Any
+    /// manifest edit therefore removes the only backend for minutes, and four
+    /// such rolls happened in a single day.
+    ///
+    /// Falling short does not merely delay a build — it fails the point, which
+    /// reds a 20-45 minute candidate and ejects members whose code was never
+    /// at fault.
+    #[test]
+    fn the_point_retry_budget_outlasts_a_preview_pod_replacement() {
+        let budget = POINT_RETRY_DELAY * POINT_ATTEMPTS;
+        assert!(
+            budget >= OBSERVED_PREVIEW_RESTART,
+            "point-retry budget {budget:?} is shorter than the observed \
+             preview replacement {OBSERVED_PREVIEW_RESTART:?}; a roll would \
+             red an in-flight candidate and eject innocent members"
+        );
+    }
+
+    /// ...but it must still give up. An unbounded retry would hold the lane
+    /// open against a daemon that is genuinely gone, which is the failure this
+    /// budget's original "small on purpose" instinct was right about.
+    #[test]
+    fn the_point_retry_budget_still_surfaces_a_dead_daemon() {
+        let budget = POINT_RETRY_DELAY * POINT_ATTEMPTS;
+        assert!(
+            budget <= Duration::from_secs(10 * 60),
+            "point-retry budget {budget:?} is so long that an absent daemon \
+             stops surfacing as Infra promptly"
+        );
+    }
+
+    /// A zero delay would busy-loop curl against a socket that is provably not
+    /// listening yet — the same hot-retry shape the infra backoff exists to
+    /// prevent.
+    #[test]
+    fn the_point_retry_delay_is_never_zero() {
+        assert!(POINT_RETRY_DELAY > Duration::ZERO);
+        assert!(POINT_ATTEMPTS > 0);
     }
 }
