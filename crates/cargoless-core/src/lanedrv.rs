@@ -1521,7 +1521,7 @@ pub enum LaneActivity {
     /// Inside [`LaneLander::land`] — the trunk is being moved. Carries the
     /// roster because the lane's `in_flight` is already empty here, and "who is
     /// landing" is exactly what an author polling `GET /lane` needs.
-    Landing { members: Vec<String> },
+    Landing { members: Vec<LaneMember> },
 }
 
 impl LaneActivity {
@@ -1529,7 +1529,7 @@ impl LaneActivity {
         match action {
             LaneAction::StartBuild { .. } => Self::Building,
             LaneAction::LandAndPublish { members, .. } => Self::Landing {
-                members: members.iter().map(|m| m.id.clone()).collect(),
+                members: members.clone(),
             },
             // Pure notifications — they return immediately, so there is no
             // window during which anyone could read a stale phase.

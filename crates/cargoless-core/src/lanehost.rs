@@ -73,8 +73,21 @@ pub struct LaneSnapshot {
     pub activity: &'static str,
     /// The members being landed, when `activity == "landing"`. Empty otherwise.
     pub landing: Vec<String>,
+    /// Complete reconciliation identities for every member the host owns.
+    /// The legacy id-only fields above remain for operator readability; this
+    /// list is the machine contract that lets a forge adapter prove that an
+    /// id still names the same immutable head before it withdraws or lands it.
+    pub members: Vec<MemberView>,
     /// One entry per live ejection: (id, kind, human-readable reason, files).
     pub ejections: Vec<EjectionView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberView {
+    pub id: String,
+    pub head: String,
+    /// `queued`, `building`, `landing`, or `ejected`.
+    pub state: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +110,68 @@ impl LaneSnapshot {
     /// the lane has not stepped yet — see [`LaneSnapshot::with_accepted`].
     fn of(lane: &LaneState, activity: &LaneActivity) -> Self {
         let queued: Vec<String> = lane.queued().iter().map(|m| m.id.clone()).collect();
+        let in_flight: Vec<String> = lane.in_flight().iter().map(|m| m.id.clone()).collect();
+        let landing: Vec<String> = match activity {
+            LaneActivity::Landing { members } => members.iter().map(|m| m.id.clone()).collect(),
+            _ => Vec::new(),
+        };
+        let ejections: Vec<EjectionView> = lane
+            .ejections()
+            .map(|(id, e)| {
+                let (kind, files, shared_with) = match &e.reason {
+                    EjectReason::Attributed {
+                        files, shared_with, ..
+                    } => (
+                        "attributed",
+                        files
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        shared_with.clone(),
+                    ),
+                    EjectReason::Unattributed { shared_with, .. } => {
+                        ("unattributed", Vec::new(), shared_with.clone())
+                    }
+                    EjectReason::Infrastructure { shared_with, .. } => {
+                        ("infrastructure", Vec::new(), shared_with.clone())
+                    }
+                };
+                EjectionView {
+                    id: id.clone(),
+                    head: e.head.clone(),
+                    kind,
+                    files,
+                    shared_with,
+                    expires_at_tick: e.expires_at_tick,
+                }
+            })
+            .collect();
+        let mut members = Vec::new();
+        members.extend(lane.queued().iter().map(|m| MemberView {
+            id: m.id.clone(),
+            head: m.head.clone(),
+            state: "queued",
+        }));
+        members.extend(lane.in_flight().iter().map(|m| MemberView {
+            id: m.id.clone(),
+            head: m.head.clone(),
+            state: "building",
+        }));
+        if let LaneActivity::Landing {
+            members: landing_members,
+        } = activity
+        {
+            members.extend(landing_members.iter().map(|m| MemberView {
+                id: m.id.clone(),
+                head: m.head.clone(),
+                state: "landing",
+            }));
+        }
+        members.extend(ejections.iter().map(|e| MemberView {
+            id: e.id.clone(),
+            head: e.head.clone(),
+            state: "ejected",
+        }));
         Self {
             phase: match lane.phase() {
                 LanePhase::Idle => "idle",
@@ -107,51 +182,13 @@ impl LaneSnapshot {
                 LaneActivity::Building => "building",
                 LaneActivity::Landing { .. } => "landing",
             },
-            landing: match activity {
-                LaneActivity::Landing { members } => members.clone(),
-                _ => Vec::new(),
-            },
+            landing,
+            members,
             queue_depth: queued.len(),
             queued,
             generation: lane.generation(),
-            in_flight: lane.in_flight().iter().map(|m| m.id.clone()).collect(),
-            ejections: lane
-                .ejections()
-                .map(|(id, e)| {
-                    let (kind, files, shared_with) = match &e.reason {
-                        EjectReason::Attributed {
-                            files, shared_with, ..
-                        } => (
-                            "attributed",
-                            files
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect(),
-                            shared_with.clone(),
-                        ),
-                        EjectReason::Unattributed { shared_with, .. } => {
-                            ("unattributed", Vec::new(), shared_with.clone())
-                        }
-                        // A THIRD kind, not folded into "unattributed". They
-                        // clear differently and they mean different things:
-                        // unattributed says the tree is red and the owner is
-                        // unknown, infrastructure says nothing was ever built.
-                        // An operator triaging `GET /lane` needs to tell "go
-                        // find the interaction bug" from "go fix the daemon".
-                        EjectReason::Infrastructure { shared_with, .. } => {
-                            ("infrastructure", Vec::new(), shared_with.clone())
-                        }
-                    };
-                    EjectionView {
-                        id: id.clone(),
-                        head: e.head.clone(),
-                        kind,
-                        files,
-                        shared_with,
-                        expires_at_tick: e.expires_at_tick,
-                    }
-                })
-                .collect(),
+            in_flight,
+            ejections,
         }
     }
 
@@ -169,13 +206,23 @@ impl LaneSnapshot {
     /// that has been stepped is already in `queued`/`in_flight`/`ejections`,
     /// and counting it twice would over-report the depth — the same dishonesty
     /// in the other direction.
-    fn with_accepted(mut self, accepted: &[String]) -> Self {
-        for id in accepted {
-            if !self.queued.contains(id)
-                && !self.in_flight.contains(id)
-                && !self.ejections.iter().any(|e| e.id == *id)
-            {
-                self.queued.push(id.clone());
+    fn with_accepted(mut self, accepted: &[LaneMember]) -> Self {
+        for member in accepted {
+            if !self.members.iter().any(|m| m.id == member.id) {
+                self.queued.push(member.id.clone());
+                let insert_at = self
+                    .members
+                    .iter()
+                    .position(|m| m.state != "queued")
+                    .unwrap_or(self.members.len());
+                self.members.insert(
+                    insert_at,
+                    MemberView {
+                        id: member.id.clone(),
+                        head: member.head.clone(),
+                        state: "queued",
+                    },
+                );
             }
         }
         self.queue_depth = self.queued.len();
@@ -212,7 +259,7 @@ pub struct LaneHost {
     ///
     /// Shared with the worker, which removes an id once the lane has stepped
     /// its `Enqueue` and can account for it itself.
-    accepted: Arc<Mutex<Vec<String>>>,
+    accepted: Arc<Mutex<Vec<LaneMember>>>,
     /// The most recent tick the host was given, so the driver can re-sync the
     /// lane's clock across a blocking action. See [`LaneDriver::clock`].
     ///
@@ -231,7 +278,7 @@ impl LaneHost {
         L: LaneLander + Send + 'static,
     {
         let (tx, rx): (Sender<LaneEvent>, Receiver<LaneEvent>) = channel();
-        let accepted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepted: Arc<Mutex<Vec<LaneMember>>> = Arc::new(Mutex::new(Vec::new()));
         let snapshot = Arc::new(Mutex::new(LaneSnapshot::of(&lane, &LaneActivity::Settled)));
         let running = Arc::new(AtomicBool::new(true));
         // Seeded from the lane so a host over an already-advanced lane cannot
@@ -267,8 +314,8 @@ impl LaneHost {
                     if let LaneEvent::Enqueue(m) = &event {
                         let id = m.id.clone();
                         match worker_accepted.lock() {
-                            Ok(mut a) => a.retain(|x| *x != id),
-                            Err(poisoned) => poisoned.into_inner().retain(|x| *x != id),
+                            Ok(mut a) => a.retain(|x| x.id != id),
+                            Err(poisoned) => poisoned.into_inner().retain(|x| x.id != id),
                         }
                     }
                     // Publish on EVERY transition and around every blocking
@@ -338,7 +385,7 @@ impl LaneHost {
         // there is no window in which the worker has stepped the event while
         // the host still has not counted it. The reverse order could drop a
         // member from the snapshot for exactly as long as the worker is fast.
-        self.remember_accepted(&id);
+        self.remember_accepted(&member);
         if let Err(e) = self.send(LaneEvent::Enqueue(member)) {
             self.forget_accepted(&id);
             return Err(e);
@@ -346,20 +393,22 @@ impl LaneHost {
         Ok(format!("queued `{id}`"))
     }
 
-    fn remember_accepted(&self, id: &str) {
+    fn remember_accepted(&self, member: &LaneMember) {
         let mut a = match self.accepted.lock() {
             Ok(a) => a,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if !a.iter().any(|x| x == id) {
-            a.push(id.to_string());
+        if let Some(existing) = a.iter_mut().find(|x| x.id == member.id) {
+            *existing = member.clone();
+        } else {
+            a.push(member.clone());
         }
     }
 
     fn forget_accepted(&self, id: &str) {
         match self.accepted.lock() {
-            Ok(mut a) => a.retain(|x| x != id),
-            Err(poisoned) => poisoned.into_inner().retain(|x| x != id),
+            Ok(mut a) => a.retain(|x| x.id != id),
+            Err(poisoned) => poisoned.into_inner().retain(|x| x.id != id),
         }
     }
 
@@ -615,6 +664,15 @@ mod tests {
             vec!["A".to_string()],
             "without disturbing who is actually building"
         );
+        assert_eq!(
+            snap.members
+                .iter()
+                .map(|m| (m.id.as_str(), m.head.as_str(), m.state))
+                .collect::<Vec<_>>(),
+            vec![("B", "sha-b", "queued"), ("A", "sha-a", "building")],
+            "the reconciliation surface must preserve the immutable head for \
+             both host-accepted and lane-owned members: {snap:?}"
+        );
 
         let _ = release_tx.send(());
 
@@ -733,6 +791,15 @@ mod tests {
             vec!["A".to_string()],
             "and it must name WHO is landing — `in_flight` is already empty by \
              this point, so nothing else can answer that: {snap:?}"
+        );
+        assert_eq!(
+            snap.members
+                .iter()
+                .map(|m| (m.id.as_str(), m.head.as_str(), m.state))
+                .collect::<Vec<_>>(),
+            vec![("A", "sha-a", "landing")],
+            "a landing lease must still expose the exact head after in_flight \
+             has been drained: {snap:?}"
         );
         // The lane's own phase really is idle here. That is the whole reason
         // `activity` had to be added rather than fixing `phase`: no amount of
