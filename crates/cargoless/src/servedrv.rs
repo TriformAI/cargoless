@@ -3752,6 +3752,22 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_pull_timeout_defaults_to_two_minutes_and_accepts_positive_override() {
+        assert_eq!(
+            ra_diagnostic_pull_timeout_from(None),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            ra_diagnostic_pull_timeout_from(Some(45_000)),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            ra_diagnostic_pull_timeout_from(Some(0)),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
     fn summarize_witness_input_reports_payload_shape() {
         // CGLS-23 H4: the watchdog-fire log line includes a one-line
         // summary so hung-witness post-mortems can correlate with input
