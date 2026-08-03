@@ -1038,12 +1038,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // heartbeat. Seconds since the epoch: monotonic enough for a window
         // measured in tens of seconds, and `LaneState` clamps the clock forward
         // so a wall-clock step backwards cannot resurrect a lapsed ejection.
-        api.lane_tick(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
+        //
+        // The host ALSO records the value, so the driver can re-sync the lane's
+        // clock the moment a blocking action ends. Without that the ticks below
+        // sit unread in a channel for the whole of a build or a land, and every
+        // deadline the outcome computes is anchored before the action started —
+        // an infra backoff that has already expired when it is written.
+        api.lane_tick(cargoless_core::lanedrv::unix_seconds());
 
         // Activity tick → deactivation edges (proven WtLifecycle).
         for wt in activity.tick(Instant::now()) {

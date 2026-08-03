@@ -84,6 +84,17 @@ impl CandidateTree for GitCandidateTree {
             .scratch_parent
             .join(format!("candidate-{}-{seq}", std::process::id()));
 
+        // Both fallible filesystem steps name the OPERATION and the PATH.
+        //
+        // `?` on a bare `io::Error` renders through `MaterializeError::Infra`
+        // as `candidate tree could not be materialized: No such file or
+        // directory (os error 2)` — the trail line observed on generation 13,
+        // which says nothing an operator can act on. The candidate root, the
+        // scratch parent and the repo all produce identical bytes, and the two
+        // calls below have opposite fixes: a failed remove means something is
+        // holding the old candidate, a failed create means the state dir is
+        // gone or unwritable.
+        //
         // A stale tree at this path would silently contribute its contents to
         // the build. Remove it before git ever looks at it.
         if root.exists() {
@@ -91,9 +102,21 @@ impl CandidateTree for GitCandidateTree {
                 &self.repo,
                 &["worktree", "remove", "--force", &lossy(&root)],
             );
-            std::fs::remove_dir_all(&root)?;
+            std::fs::remove_dir_all(&root).map_err(|e| {
+                MaterializeError::infra_at(
+                    "could not remove the stale candidate worktree",
+                    &root,
+                    &e,
+                )
+            })?;
         }
-        std::fs::create_dir_all(&self.scratch_parent)?;
+        std::fs::create_dir_all(&self.scratch_parent).map_err(|e| {
+            MaterializeError::infra_at(
+                "could not create the candidate scratch directory",
+                &self.scratch_parent,
+                &e,
+            )
+        })?;
 
         git(
             &self.repo,
@@ -236,7 +259,28 @@ fn unmerged_paths(root: &Path) -> Vec<PathBuf> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {
-    let out = Command::new("git").current_dir(cwd).args(args).output()?;
+    // SPAWNING git can fail too, and that failure is the one that reads worst.
+    //
+    // `Command::output()` returns a bare `No such file or directory (os error
+    // 2)` when the CWD does not exist — not only when the binary is missing —
+    // and `cwd` here is the repo or a candidate worktree, both of which have
+    // been observed to vanish under a PVC fault. Propagating it unannotated is
+    // how `outcome=infra reason=candidate tree could not be materialized: No
+    // such file or directory (os error 2)` reached the trail naming neither the
+    // path nor the step.
+    //
+    // The kind is preserved so a caller that wants to match `NotFound` still
+    // can; only the message grows.
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not run `git {:?}` in {}: {e}", args, cwd.display()),
+            )
+        })?;
     if out.status.success() {
         return Ok(());
     }
@@ -369,6 +413,93 @@ mod tests {
         tree.release(&first);
         tree.release(&second);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The exact bare line that reached the trail on generation 13. Kept as a
+    /// constant so both tests below assert against the real thing rather than a
+    /// paraphrase of it.
+    const OBSERVED_BARE: &str =
+        "candidate tree could not be materialized: No such file or directory (os error 2)";
+
+    fn scratch(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cargoless-lanetree-{tag}-{}-{}",
+            std::process::id(),
+            CANDIDATE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// DEFECT 3 — a candidate scratch dir that cannot be created must say WHERE.
+    ///
+    /// Driven through a real syscall failure, not a constructed error: the
+    /// scratch parent is placed *inside a regular file*, so `create_dir_all`
+    /// fails the way a vanished or unwritable state dir does.
+    ///
+    /// Without the annotation the whole trail line is the syscall's own words —
+    /// `outcome=infra reason=candidate tree could not be materialized: No such
+    /// file or directory (os error 2)` — and the candidate root, the scratch
+    /// parent and the repo all produce exactly those bytes with different
+    /// fixes. A verdict nobody can act on is the same as no verdict.
+    #[test]
+    fn a_scratch_dir_that_cannot_be_created_names_the_path_and_the_step() {
+        let blocker = scratch("blocked");
+        fs::write(&blocker, b"not a directory\n").expect("write blocker file");
+        // `<file>/sub` cannot be created: the parent is not a directory.
+        let scratch_parent = blocker.join("sub");
+
+        let tree = GitCandidateTree::new(scratch("repo"), &scratch_parent, "main");
+        let err = tree
+            .materialize(&[LaneMember::new("A", "deadbeef")])
+            .expect_err("a scratch dir under a regular file cannot be created");
+
+        let rendered = format!("candidate tree could not be materialized: {err}");
+        assert!(
+            rendered.contains(&scratch_parent.to_string_lossy().into_owned()),
+            "the failing PATH must appear, or an operator cannot tell which of \
+             the three candidate paths failed: {rendered}"
+        );
+        assert!(
+            rendered.contains("scratch directory"),
+            "the STEP must be named — a failed create and a failed remove have \
+             opposite fixes: {rendered}"
+        );
+        assert_ne!(
+            rendered, OBSERVED_BARE,
+            "this is the generation-13 line that named nothing"
+        );
+
+        let _ = fs::remove_file(blocker);
+    }
+
+    /// DEFECT 3 — and when `git` cannot even be SPAWNED, say where we tried.
+    ///
+    /// `Command::output()` returns a bare `os error 2` when the working
+    /// directory does not exist, not only when the binary is missing — and the
+    /// cwd here is the repo or a candidate worktree, both of which have been
+    /// observed to vanish under a PVC fault. That is the same `os error 2` with
+    /// a third meaning.
+    #[test]
+    fn a_git_that_cannot_be_spawned_names_the_directory() {
+        let missing_repo = scratch("gone-repo");
+        // Deliberately never created. The scratch parent IS creatable, so this
+        // gets past `create_dir_all` and fails at the `git worktree add` spawn.
+        let scratch_parent = scratch("gone-scratch");
+        let tree = GitCandidateTree::new(&missing_repo, &scratch_parent, "main");
+        let err = tree
+            .materialize(&[LaneMember::new("A", "deadbeef")])
+            .expect_err("git cannot run in a directory that does not exist");
+
+        let rendered = format!("candidate tree could not be materialized: {err}");
+        assert!(
+            rendered.contains(&missing_repo.to_string_lossy().into_owned()),
+            "the directory git could not run in must be named: {rendered}"
+        );
+        assert_ne!(
+            rendered, OBSERVED_BARE,
+            "a failed spawn must not render as the bare generation-13 line"
+        );
+
+        let _ = fs::remove_dir_all(scratch_parent);
     }
 
     /// An empty candidate is still a legitimate tree: it is the base. The lane

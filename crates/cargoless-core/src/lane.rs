@@ -533,9 +533,53 @@ impl LaneState {
         &self.in_flight
     }
 
+    /// The queued members, in build order.
+    ///
+    /// `queue_depth` answers "how many are waiting"; this answers "which ones",
+    /// which is what an author polling `GET /lane` actually asked. It is also
+    /// what lets a host de-duplicate its own accepted-but-not-yet-stepped
+    /// members against the lane's queue instead of double-counting them.
+    #[must_use]
+    pub fn queued(&self) -> &[LaneMember] {
+        &self.queue
+    }
+
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The lane's clock, in whatever unit the caller ticks it with.
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+
+    /// Move the clock forward WITHOUT stepping the machine.
+    ///
+    /// A `Tick` does two things: it advances `now`, and it runs the expiry +
+    /// `maybe_start_build` pipeline. The driver needs only the first, in one
+    /// specific place — immediately after a blocking action, before the outcome
+    /// event is applied.
+    ///
+    /// The driver is inside `execute` for the whole of a build or a land, so
+    /// the host's ticks sit unread in a channel and `now` is frozen at whatever
+    /// it was when the action started. Every deadline the outcome computes is
+    /// then measured from the past: an infra failure taking longer than
+    /// `infra_backoff_ticks` installs a backoff that has already expired, and
+    /// the lane retries immediately. That is the observed 30-second generation
+    /// loop against an unreachable preview daemon.
+    ///
+    /// It must NOT be a `Tick`, and that distinction is the whole reason this
+    /// exists. `Tick` ends in `maybe_start_build`, and after a failed LAND the
+    /// phase is already `Idle` with the members re-enqueued — so a Tick there
+    /// would start the next build BEFORE `LandFailed` installs the backoff,
+    /// reintroducing the exact hot loop that event was added to prevent.
+    ///
+    /// Clamped forward like `Tick`, so a clock that steps backwards cannot
+    /// resurrect a lapsed ejection.
+    pub fn advance_clock(&mut self, now: u64) {
+        self.now = self.now.max(now);
     }
 
     #[must_use]
