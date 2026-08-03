@@ -191,11 +191,17 @@ like nothing happened.
 | Route | Purpose |
 |---|---|
 | `POST /lane/enqueue` | submit a member (`id`, `head`, `changed_files`) |
-| `GET /lane` | queue depth, current build, ejections **with reasons** |
+| `GET /lane` | queue depth, current build, exact member identities, ejections **with reasons** |
 | `POST /lane/readmit` | explicit re-admission escape hatch |
 
 `GET /lane` is the product surface. An author whose change stops moving needs to
 see which errors are holding it, who else is affected, and what will clear it.
+Its `members` array is the machine contract: every live member is rendered as
+`{id, head, state}`, where state is `queued`, `building`, `landing`, or
+`ejected`. The older `queued`, `in_flight`, and `landing` arrays remain as
+id-only operator summaries; a reconciler must use `members`, because an id
+without its immutable head cannot prove it is withdrawing or landing the tree
+that was enrolled.
 
 `id` and `head` are **required** on enqueue; a request missing either is
 refused, not defaulted. A member with no identity cannot be attributed, ejected

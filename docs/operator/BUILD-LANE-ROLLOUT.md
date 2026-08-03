@@ -182,6 +182,19 @@ like a stuck lane. `GET /lane` shows the reason.
 curl -s -H "Authorization: Bearer $TOKEN" localhost:8787/lane | jq
 ```
 
+For automation, read `members`, not the legacy id-only summaries. Every entry
+is an exact reconciliation identity:
+
+```json
+{"id":"pr-123","head":"<40-hex-sha>","state":"queued"}
+```
+
+`state` is one of `queued`, `building`, `landing`, or `ejected`. The same id
+with a different head is different work: re-read the forge before withdrawing
+or landing it, and refuse a mismatch. `queued`, `in_flight`, and `landing`
+remain useful for humans, but they intentionally contain ids only and cannot
+prove that a PR still names the enrolled tree.
+
 | you see | it means |
 |---|---|
 | `404` | no lane configured on this daemon (not "an empty lane") |

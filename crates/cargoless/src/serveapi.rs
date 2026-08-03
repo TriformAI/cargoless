@@ -3819,6 +3819,11 @@ impl VerdictService for ServeVerdictState {
             "queued": s.queued,
             "generation": s.generation,
             "in_flight": s.in_flight,
+            "members": s.members.iter().map(|m| serde_json::json!({
+                "id": m.id,
+                "head": m.head,
+                "state": m.state,
+            })).collect::<Vec<_>>(),
             "ejections": s.ejections.iter().map(|e| serde_json::json!({
                 "id": e.id,
                 "head": e.head,
