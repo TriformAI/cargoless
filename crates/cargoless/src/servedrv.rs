@@ -3245,6 +3245,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diagnostic_freshness_reopens_only_zero_verb_pushed_overlays() {
+        assert!(should_force_freshness_reopen(true, true, false));
+        assert!(!should_force_freshness_reopen(false, true, false));
+        assert!(!should_force_freshness_reopen(true, false, false));
+        assert!(!should_force_freshness_reopen(true, true, true));
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // CGLS-11 forced-reopen cap
     //
