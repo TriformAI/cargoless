@@ -26,6 +26,10 @@ use crate::yamlscan::{
 const MANIFEST_NAME: &str = "cargoless.checks.yaml";
 const ENGINE_VERSION: &str = "cargoless/project-checks/v2";
 const TIMEOUT_DIAGNOSTIC_CODE: &str = "project-check.timeout";
+/// A command check enforces `timeout_ms` actively around its child process.
+/// Setup, pipe draining, diagnostic parsing, and cache bookkeeping happen
+/// outside that child deadline and need their own small, bounded allowance.
+const COMMAND_FINALIZATION_GRACE_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectCheckReport {
@@ -1094,7 +1098,7 @@ fn run_one(ctx: &RunContext, check: CheckConfig) -> ProjectCheckResult {
         return cached;
     }
 
-    let mut result = match check.kind {
+    let result = match check.kind {
         CheckKind::MirrorDrift => check_mirror_drift(ctx, &check),
         CheckKind::ForbiddenPatterns => check_forbidden_patterns(ctx, &check),
         CheckKind::RequiredPatterns => check_required_patterns(ctx, &check),
@@ -1103,18 +1107,39 @@ fn run_one(ctx: &RunContext, check: CheckConfig) -> ProjectCheckResult {
         CheckKind::FileExists => check_file_exists(ctx, &check),
         CheckKind::Command => check_command(ctx, &check),
     };
-    result.duration_ms = started.elapsed().as_millis();
-    if result.duration_ms > u128::from(check.timeout_ms) {
-        result = timeout_result(
-            &ctx.root,
-            &check,
+    let result = finalize_run_result(&ctx.root, &check, result, started.elapsed().as_millis());
+    cache_put(ctx, &check, &result);
+    result
+}
+
+fn finalize_run_result(
+    root: &Path,
+    check: &CheckConfig,
+    mut result: ProjectCheckResult,
+    duration_ms: u128,
+) -> ProjectCheckResult {
+    result.duration_ms = duration_ms;
+    let elapsed_limit_ms = u128::from(check.timeout_ms)
+        + if check.kind == CheckKind::Command {
+            u128::from(COMMAND_FINALIZATION_GRACE_MS)
+        } else {
+            0
+        };
+    if duration_ms > elapsed_limit_ms {
+        return timeout_result(
+            root,
+            check,
             &format!(
-                "check exceeded timeout: {}ms > {}ms",
-                result.duration_ms, check.timeout_ms
+                "check exceeded timeout envelope: {duration_ms}ms > {elapsed_limit_ms}ms (command timeout_ms={} + finalization grace {}ms)",
+                check.timeout_ms,
+                if check.kind == CheckKind::Command {
+                    COMMAND_FINALIZATION_GRACE_MS
+                } else {
+                    0
+                }
             ),
         );
     }
-    cache_put(ctx, &check, &result);
     result
 }
 
@@ -3405,6 +3430,53 @@ checks:
                 .unwrap_or(0),
             0,
             "repeated timeouts must leave the cache empty"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_success_is_not_reclassified_by_post_process_overhead() {
+        let root = scratch("command-finalization-timeout");
+        let manifest = parse_manifest(
+            PathBuf::from(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: command
+    kind: command
+    read_only: true
+    command: ["true"]
+    timeout_ms: 60000
+"#,
+        )
+        .unwrap();
+        let check = manifest.checks[0].clone();
+        let green = result_from_diags(&check, vec![], 0);
+
+        // The command owns an active deadline inside check_command. Once it
+        // returned success, output parsing/cache bookkeeping may take the
+        // total run above the command budget without turning that success into
+        // a synthetic timeout.
+        let command_result = finalize_run_result(&root, &check, green.clone(), 62_220);
+        assert_eq!(command_result.tree, TreeState::Green);
+        assert_eq!(command_result.duration_ms, 62_220);
+
+        let over_envelope = finalize_run_result(&root, &check, green.clone(), 90_001);
+        assert_eq!(over_envelope.tree, TreeState::Red);
+        assert_eq!(
+            over_envelope.diagnostics[0].code.as_deref(),
+            Some(TIMEOUT_DIAGNOSTIC_CODE)
+        );
+
+        // Declarative checks have no inner process deadline, so their outer
+        // elapsed-time guard remains authoritative.
+        let mut declarative = check;
+        declarative.kind = CheckKind::FileExists;
+        let declarative_result = finalize_run_result(&root, &declarative, green, 62_220);
+        assert_eq!(declarative_result.tree, TreeState::Red);
+        assert_eq!(
+            declarative_result.diagnostics[0].code.as_deref(),
+            Some(TIMEOUT_DIAGNOSTIC_CODE)
         );
         let _ = fs::remove_dir_all(root);
     }
