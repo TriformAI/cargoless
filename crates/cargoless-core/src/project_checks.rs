@@ -3020,16 +3020,26 @@ mod tests {
             ),
         )
         .unwrap();
+        // These fixtures exercise structured-result semantics, not timeout
+        // classification. Keep their budgets above loaded-runner scheduling
+        // jitter so run_one cannot replace the semantic diagnostic with the
+        // separate command-timeout outcome after the fixture has completed.
         fs::write(
             root.join(MANIFEST_NAME),
             format!(
                 r#"
 version: 1
+profiles:
+  dev:
+    include: ["reuse-semantic"]
+    timeout_ms: 30000
+    max_parallel: 1
 checks:
   - id: reuse-semantic
     kind: command
     read_only: true
     command: ["bash", "emit-result.sh"]
+    timeout_ms: 15000
     cache: none
     result_protocol: cargoless.check-result/v1
     on_degraded:
