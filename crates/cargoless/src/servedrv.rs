@@ -3340,6 +3340,16 @@ mod tests {
         assert!(!should_force_freshness_reopen(true, true, true));
     }
 
+    #[test]
+    fn diagnostic_refresh_fence_applies_only_after_a_real_overlay_mutation() {
+        assert_eq!(diagnostic_refresh_fence(41, false), Some(41));
+        assert_eq!(
+            diagnostic_refresh_fence(41, true),
+            None,
+            "an identical overlay has no new refresh boundary to await; its current open-document diagnostics must be pulled directly",
+        );
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // CGLS-11 forced-reopen cap
     //
