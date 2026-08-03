@@ -97,6 +97,10 @@ fn dispatch_oneshot(svc: &dyn VerdictService, req: &Request) -> String {
             Ok(detail) => serde_json::json!({"ok": true, "detail": detail}).to_string(),
             Err(detail) => serde_json::json!({"ok": false, "detail": detail}).to_string(),
         },
+        Request::LaneWithdraw { id } => match svc.lane_withdraw(id) {
+            Ok(detail) => serde_json::json!({"ok": true, "detail": detail}).to_string(),
+            Err(detail) => serde_json::json!({"ok": false, "detail": detail}).to_string(),
+        },
     }
 }
 

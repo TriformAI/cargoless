@@ -562,6 +562,25 @@ impl LaneState {
             LaneEvent::Withdraw { id } => {
                 self.queue.retain(|m| m.id != id);
                 self.ejected.remove(&id);
+                // ALSO drop it from the running build's roster.
+                //
+                // Withdrawing only from `queue` looks sufficient and is not: on
+                // completion `on_build_finished` takes `in_flight` and, on any
+                // non-green outcome, requeues the members it finds there. A
+                // member withdrawn mid-build would therefore come BACK when the
+                // build it was withdrawn from ends — the one moment the operator
+                // is least likely to be watching, and the exact situation the
+                // verb exists for (a ~45-minute build you have decided to stop
+                // feeding).
+                //
+                // This does NOT cancel the running build. The candidate tree is
+                // already materialised and the compile is already paying for
+                // itself; killing it would waste the work and, worse, the
+                // remaining members would lose a verdict they were about to get.
+                // The build finishes and is simply attributed to whoever is
+                // left. Removing the last member is fine: the roster empties,
+                // the outcome applies to nobody, and the lane goes idle.
+                self.in_flight.retain(|m| m.id != id);
             }
             LaneEvent::ForceReadmit { id } => self.on_force_readmit(&id, &mut actions),
             // Members are already back in the queue — the driver re-enqueues

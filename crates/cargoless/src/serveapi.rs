@@ -2694,6 +2694,24 @@ impl VerdictService for ServeVerdictState {
         lane.readmit(id)
     }
 
+    /// Take a member out of the lane permanently.
+    ///
+    /// The escape hatch for a member the lane will never finish with: a closed
+    /// or superseded PR, or one blocked on something outside the lane's view —
+    /// a required check it cannot pass, so the forge refuses the merge however
+    /// green the candidate builds. Without this the member rebuilds forever and
+    /// consumes the whole queue, because the lane's own ejection only fires on
+    /// a red the member CAUSED.
+    fn lane_withdraw(&self, id: &str) -> Result<String, String> {
+        let Some(lane) = self.lane.as_ref() else {
+            return Err("build lane not enabled on this daemon".to_string());
+        };
+        if id.trim().is_empty() {
+            return Err("`id` is required — refusing to withdraw an unnamed member".to_string());
+        }
+        lane.withdraw(id)
+    }
+
     /// The lane's product surface: queue depth, the running build, and every
     /// live ejection WITH its reason. An author whose change stopped moving
     /// needs to see which errors hold it, who else is implicated, and what

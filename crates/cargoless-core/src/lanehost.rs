@@ -191,6 +191,19 @@ impl LaneHost {
         Ok(format!("queued `{id}`"))
     }
 
+    /// Take a member out of the lane permanently.
+    ///
+    /// Unlike [`Self::readmit`] this does NOT pre-check the snapshot. The
+    /// snapshot is one pump behind, and worse, a member enqueued during a build
+    /// sits in the channel where the snapshot cannot see it at all — refusing
+    /// on "not found" would make the verb useless in exactly the situation that
+    /// motivates it (a long build you want to stop feeding). The lane itself
+    /// answers authoritatively; an unknown id is a harmless no-op there.
+    pub fn withdraw(&self, id: &str) -> Result<String, String> {
+        self.send(LaneEvent::Withdraw { id: id.to_string() })?;
+        Ok(format!("withdrew `{id}`"))
+    }
+
     /// Force a member back in, bypassing its ejection.
     ///
     /// Refuses when the member is not ejected, rather than reporting a

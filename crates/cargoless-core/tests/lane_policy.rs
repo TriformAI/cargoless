@@ -1005,6 +1005,76 @@ fn withdraw_removes_a_member_and_its_ejection() {
     assert_eq!(st.queue_depth(), 0);
 }
 
+/// A member withdrawn WHILE ITS BUILD RUNS must not come back when that build
+/// ends.
+///
+/// `Withdraw` originally cleared only `queue` and `ejected`, which reads as
+/// complete and is not: `on_build_finished` takes `in_flight` and, on any
+/// non-green outcome, requeues whatever it finds there. So the member returned
+/// at the end of the very build it was withdrawn from — minutes later, when
+/// nobody is looking, and in exactly the case the verb exists for.
+///
+/// Observed 2026-08-03: pr-10394 is red on a REQUIRED forge check, so it can
+/// never merge; the lane rebuilt it three times because there was no way to
+/// take it out.
+#[test]
+fn withdraw_during_a_build_survives_the_builds_end() {
+    let mut st = lane();
+    let build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+
+    st.step(LaneEvent::Withdraw {
+        id: "A".to_string(),
+    });
+
+    // The build is NOT cancelled — the compile is already paid for, and killing
+    // it would deny a verdict to any other member aboard.
+    assert_eq!(st.phase(), LanePhase::Building, "the build keeps running");
+
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+
+    assert_eq!(
+        st.queue_depth(),
+        0,
+        "a withdrawn member must NOT be requeued by the build it was withdrawn from"
+    );
+    assert!(
+        st.ejection("A").is_none(),
+        "nor should it acquire an ejection — it is gone, not blamed"
+    );
+}
+
+/// Withdrawing one of several keeps the rest — the build still belongs to them.
+#[test]
+fn withdraw_leaves_the_other_members_of_the_running_build() {
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/a.rs"]),
+            member("B", "b1", &["src/b.rs"]),
+        ],
+    );
+
+    st.step(LaneEvent::Withdraw {
+        id: "A".to_string(),
+    });
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/b.rs", 3, "E0425")],
+        },
+    });
+
+    // B caused the red and is ejected for it; A is simply absent.
+    assert!(st.ejection("B").is_some(), "B still owns the red it caused");
+    assert!(st.ejection("A").is_none(), "A was withdrawn, not blamed");
+}
+
 // ── attribution identity ──────────────────────────────────────────────────
 
 #[test]

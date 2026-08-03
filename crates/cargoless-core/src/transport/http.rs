@@ -729,7 +729,11 @@ fn handle(
     // Bearer-gated by the shared #14 seam above. Small bodies — a candidate is
     // (id, head, changed_files), never file content: the lane materialises the
     // candidate from the base ref itself, so nothing large crosses this wire.
-    if req.method == "POST" && (req.path == "/lane/enqueue" || req.path == "/lane/readmit") {
+    if req.method == "POST"
+        && (req.path == "/lane/enqueue"
+            || req.path == "/lane/readmit"
+            || req.path == "/lane/withdraw")
+    {
         let body = match req.content_length {
             None => {
                 write_response(
@@ -785,6 +789,12 @@ fn handle(
                 Ok(msg) => (202, "Accepted", msg),
                 Err(msg) => (409, "Conflict", msg),
             },
+            ("/lane/withdraw", Some(Request::LaneWithdraw { id })) => {
+                match svc.lane_withdraw(&id) {
+                    Ok(msg) => (202, "Accepted", msg),
+                    Err(msg) => (409, "Conflict", msg),
+                }
+            }
             _ => (
                 400,
                 "Bad Request",
