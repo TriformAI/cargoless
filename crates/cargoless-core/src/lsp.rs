@@ -3102,7 +3102,9 @@ mod tests {
             }))
             .unwrap();
 
-        assert_eq!(worker.join().unwrap(), Ok(Vec::new()));
+        let reports = worker.join().unwrap().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].total, 0);
     }
 
     #[test]
