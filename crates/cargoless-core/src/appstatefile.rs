@@ -39,6 +39,11 @@ pub struct StateSnapshot {
     pub serving_sha: Option<String>,
     pub last_green: Option<String>,
     pub last_red: Option<(String, String)>,
+    /// Files behind `last_red` (comma-joined on disk). Mirrored because the
+    /// statefile is the only red evidence that survives a daemon restart —
+    /// the same reason the reason string itself is here. Meaningless (and
+    /// left empty by `parse`) without a `last_red`.
+    pub last_red_files: Vec<String>,
     /// Daemon-written wall-clock heartbeat (unix seconds), 0 if unknown.
     pub heartbeat_unix: u64,
 }
@@ -83,6 +88,12 @@ pub fn render(inst: &InstanceState, heartbeat_unix: u64) -> String {
         // The reason can be multi-line (a build tail); collapse newlines so
         // the flat framing stays one-value-per-line and unambiguous.
         let _ = writeln!(s, "last_red_reason={}", one_line(reason));
+        // Comma-join is unambiguous here: the paths come from rustc spans,
+        // which never contain commas. Written only beside a live red, so the
+        // parse side cannot resurrect files without their red.
+        if !inst.last_red_files.is_empty() {
+            let _ = writeln!(s, "last_red_files={}", inst.last_red_files.join(","));
+        }
     }
     if let Some(pending) = &inst.pending {
         let _ = writeln!(s, "pending_sha={pending}");
@@ -124,6 +135,7 @@ pub fn parse(text: &str) -> Option<StateSnapshot> {
     let mut snap = StateSnapshot::default();
     let mut red_sha: Option<String> = None;
     let mut red_reason: Option<String> = None;
+    let mut red_files: Vec<String> = Vec::new();
     for line in lines {
         let Some((k, v)) = line.split_once('=') else {
             continue;
@@ -134,12 +146,20 @@ pub fn parse(text: &str) -> Option<StateSnapshot> {
             "last_green" => snap.last_green = Some(v.to_string()),
             "last_red_sha" => red_sha = Some(v.to_string()),
             "last_red_reason" => red_reason = Some(v.to_string()),
+            "last_red_files" => {
+                red_files = v
+                    .split(',')
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| p.trim().to_string())
+                    .collect();
+            }
             "heartbeat_unix" => snap.heartbeat_unix = v.parse().unwrap_or(0),
             _ => {}
         }
     }
     if let Some(sha) = red_sha {
         snap.last_red = Some((sha, red_reason.unwrap_or_default()));
+        snap.last_red_files = red_files;
     }
     Some(snap)
 }
@@ -181,6 +201,37 @@ mod tests {
         // The multi-line reason was flattened to one line (framing intact).
         assert!(rreason.contains("E0432"));
         assert!(!rreason.contains('\n'), "reason flattened: {rreason:?}");
+    }
+
+    /// The attribution files ride the red across a restart — and ONLY across a
+    /// red: a snapshot with no `last_red_sha` must parse to an empty list even
+    /// if a stray files line is present, so evidence can never outlive the
+    /// failure it describes.
+    #[test]
+    fn red_files_round_trip_and_never_outlive_their_red() {
+        let mut inst = serving_instance();
+        inst.last_red_files = vec![
+            "physics/src/api/handlers/activity.rs".into(),
+            "portal/src/panels/library_panel.rs".into(),
+        ];
+        let text = render(&inst, 1_700_000_000);
+        let snap = parse(&text).expect("known scheme parses");
+        assert_eq!(
+            snap.last_red_files,
+            vec![
+                "physics/src/api/handlers/activity.rs".to_string(),
+                "portal/src/panels/library_panel.rs".to_string()
+            ]
+        );
+
+        // Orphan files line (hand-edited / torn write): no red ⇒ no files.
+        let orphan = format!("{SCHEME}\nphase=idle\nheartbeat_unix=1\nlast_red_files=a.rs,b.rs\n");
+        let snap = parse(&orphan).expect("parses");
+        assert!(snap.last_red.is_none());
+        assert!(
+            snap.last_red_files.is_empty(),
+            "files must not survive without their red"
+        );
     }
 
     #[test]

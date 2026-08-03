@@ -825,6 +825,25 @@ const SLOT_FREE_POLL: Duration = Duration::from_secs(20);
 /// snapshot can never suppress a genuine verdict. Failing that direction is
 /// deliberate: a missed base-red costs one false ejection, which the lane
 /// already survives; a wrongly-suppressed red would let a broken member land.
+/// The per-file evidence a red slot published, from its `/app` instance row.
+///
+/// Every "cannot tell" shape — field absent (an older daemon), not an array,
+/// non-string or blank entries — yields EMPTY, and empty routes the red to the
+/// Unattributed path where every member is held. That is the fail-safe
+/// direction: missing evidence must widen the hold, never invent a culprit.
+fn red_files_from_instance(inst: &serde_json::Value) -> Vec<String> {
+    inst.get("last_red_files")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f.as_str())
+                .filter(|f| !f.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn base_red_reason(snapshot: &serde_json::Value, base_slot: &str) -> String {
     snapshot
         .get("instances")
@@ -1186,10 +1205,12 @@ impl LegRunner for PreviewLegRunner {
                 });
             }
             if field("last_red_sha") == sha {
-                // The preview reports a free-text reason, not cargo JSON, so
-                // this red carries no file paths and the lane will correctly
-                // decline to attribute it. That is honest: a boot failure is
-                // frequently an interaction, not one member's line.
+                // The reason is free text, but a daemon that publishes
+                // `last_red_files` gives this red REAL compiler spans (see
+                // below) — that is what lets the lane eject only the member
+                // whose change carries the failure instead of holding the
+                // whole queue. An older daemon (no field) stays honest:
+                // synthetic anchor, unattributed, everyone held.
                 let reason = field("last_red_reason");
 
                 // NOT EVERY SLOT RED IS A CODE RED.
@@ -1252,25 +1273,68 @@ impl LegRunner for PreviewLegRunner {
                         )));
                     }
                 }
+                // Per-file evidence, when the daemon publishes it. Each path
+                // came from an ERROR-severity rustc span in the failing
+                // build's own output (`appbuild::error_files`), so it is
+                // exactly as trustworthy as a compiler diagnostic — the bar
+                // `RedAttribution::ChangedFiles` requires. Absent/empty ⇒ the
+                // old contract: one synthetic anchor, explicitly Unattributed
+                // (the operator's 613f100 seam), every member held.
+                let red_files = red_files_from_instance(&inst);
+
+                let (diagnostics, red_attribution) = if red_files.is_empty() {
+                    (
+                        vec![cargoless_proto::Diagnostic {
+                            // Anchored at the manifest, like every other
+                            // build-level failure with no source span. The
+                            // explicit Unattributed marking (not the path)
+                            // is what keeps this from blaming anyone.
+                            file_path: root.join("cargoless.checks.yaml"),
+                            line: 1,
+                            col: 1,
+                            severity: cargoless_proto::Severity::Error,
+                            code: Some("preview.red".to_string()),
+                            message: format!(
+                                "preview slot {:?} rejected the candidate: {reason}",
+                                self.slot
+                            ),
+                            source: Some("cargoless-preview".to_string()),
+                        }],
+                        RedAttribution::Unattributed,
+                    )
+                } else {
+                    (
+                        red_files
+                            .iter()
+                            .map(|f| cargoless_proto::Diagnostic {
+                                // Worktree-relative from the daemon; joined
+                                // under the candidate root so member
+                                // matching (`LaneMember::touches`, which
+                                // compares suffix-wise) sees a real path.
+                                file_path: root.join(f),
+                                // The daemon publishes files, not spans;
+                                // 1:1 is the conventional whole-file anchor
+                                // and attribution never reads line/col (the
+                                // fingerprint deliberately omits them).
+                                line: 1,
+                                col: 1,
+                                severity: cargoless_proto::Severity::Error,
+                                code: Some("preview.red".to_string()),
+                                message: format!(
+                                    "preview slot {:?} rejected the candidate; \
+                                     errors in `{f}`: {reason}",
+                                    self.slot
+                                ),
+                                source: Some("cargoless-preview".to_string()),
+                            })
+                            .collect(),
+                        RedAttribution::ChangedFiles,
+                    )
+                };
                 return Ok(LegOutcome {
                     tree: TreeState::Red,
-                    diagnostics: vec![cargoless_proto::Diagnostic {
-                        // Anchored at the manifest, like every other
-                        // build-level failure with no source span. Attribution
-                        // treats a file nobody touched as unattributable, which
-                        // is the correct outcome here.
-                        file_path: root.join("cargoless.checks.yaml"),
-                        line: 1,
-                        col: 1,
-                        severity: cargoless_proto::Severity::Error,
-                        code: Some("preview.red".to_string()),
-                        message: format!(
-                            "preview slot {:?} rejected the candidate: {reason}",
-                            self.slot
-                        ),
-                        source: Some("cargoless-preview".to_string()),
-                    }],
-                    red_attribution: RedAttribution::Unattributed,
+                    diagnostics,
+                    red_attribution,
                     artifact: None,
                     legs: vec![LegReport {
                         id: format!("preview:{}", self.slot),
@@ -2528,6 +2592,47 @@ mod base_health_tests {
             assert!(
                 !same_failure(&base, REAL_CANDIDATE),
                 "unreadable base ({raw}) must not suppress the candidate's red"
+            );
+        }
+    }
+
+    /// A daemon that publishes `last_red_files` upgrades the preview red to
+    /// per-file evidence — the attribution the lane ejects by.
+    #[test]
+    fn red_files_read_from_the_instance_row() {
+        let inst: serde_json::Value = serde_json::from_str(
+            r#"{"name":"lane","last_red_reason":"boom",
+                "last_red_files":["portal/src/panels/library_panel.rs","physics/src/api/mod.rs"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            red_files_from_instance(&inst),
+            vec![
+                "portal/src/panels/library_panel.rs".to_string(),
+                "physics/src/api/mod.rs".to_string()
+            ]
+        );
+    }
+
+    /// Every "cannot tell" shape yields EMPTY — which routes the red to
+    /// Unattributed (hold everyone), never to a guessed culprit. An OLD daemon
+    /// (field absent entirely) is the most important row: rolling the lane
+    /// image before the preview image must keep today's behavior, not invent
+    /// attribution from nothing.
+    #[test]
+    fn missing_or_malformed_red_files_yield_empty() {
+        for raw in [
+            r#"{"name":"lane","last_red_reason":"x"}"#,
+            r#"{"name":"lane","last_red_files":null}"#,
+            r#"{"name":"lane","last_red_files":"not-an-array"}"#,
+            r#"{"name":"lane","last_red_files":[]}"#,
+            r#"{"name":"lane","last_red_files":["","   "]}"#,
+            r#"{"name":"lane","last_red_files":[42,null]}"#,
+        ] {
+            let inst: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                red_files_from_instance(&inst).is_empty(),
+                "({raw}) must read as no evidence, not as an accusation"
             );
         }
     }

@@ -61,6 +61,14 @@ pub enum BuildReport {
         sha: String,
         reason: String,
         enospc: bool,
+        /// Worktree-relative source files named by error-severity rustc
+        /// diagnostics in the failing step's FULL output — the attribution
+        /// evidence the build lane needs to eject only the member whose
+        /// change carries the red. Empty for every failure that is not a
+        /// compile red (checkout, manifest, timeout, spawn, harvest): those
+        /// name no member's code, and an empty list keeps the lane's
+        /// hold-everyone fallback, which is the honest outcome for them.
+        files: Vec<String>,
     },
     /// The build cannot be trusted: the worktree sha moved mid-build, or HEAD
     /// could not be re-resolved. Not a defect in `sha` — requeued once.
@@ -133,10 +141,15 @@ pub trait BuildHooks: Send + Sync {
 pub enum StepOutcome {
     Ok,
     /// Non-zero exit; `code` is the status (None if signal-killed) and `tail`
-    /// is the last few lines of combined output for the red reason.
+    /// is the last few lines of combined output for the red reason. `files`
+    /// is the worktree-relative source files named by error-severity rustc
+    /// diagnostics in the FULL output — extracted here because the tail is a
+    /// display excerpt and the rest of the output is discarded the moment
+    /// this value is constructed; there is nowhere later to recover them.
     Failed {
         code: Option<i32>,
         tail: String,
+        files: Vec<String>,
     },
     /// The step exceeded its `timeout_ms`; the process tree was SIGKILLed.
     TimedOut,
@@ -343,6 +356,7 @@ pub fn build(
             sha: sha.to_string(),
             reason: e,
             enospc,
+            files: Vec::new(),
         };
     }
 
@@ -355,6 +369,7 @@ pub fn build(
                 reason: "no cargoless.app.yaml at this sha (app-serve not configured for this ref)"
                     .to_string(),
                 enospc: false,
+                files: Vec::new(),
             };
         }
         Err(e) => {
@@ -362,6 +377,7 @@ pub fn build(
                 sha: sha.to_string(),
                 reason: format!("invalid cargoless.app.yaml: {e}"),
                 enospc: false,
+                files: Vec::new(),
             };
         }
     };
@@ -370,7 +386,7 @@ pub fn build(
     for step in &manifest.build.steps {
         match hooks.run_step(&paths.worktree, step, env) {
             StepOutcome::Ok => {}
-            StepOutcome::Failed { code, tail } => {
+            StepOutcome::Failed { code, tail, files } => {
                 let code = code
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".into());
@@ -381,6 +397,7 @@ pub fn build(
                     // the sha is retried after relief rather than latched.
                     enospc: reason_looks_like_enospc(&tail),
                     reason: format!("build step `{}` exited {code}:\n{tail}", step.id),
+                    files,
                 };
             }
             StepOutcome::TimedOut => {
@@ -391,6 +408,7 @@ pub fn build(
                         step.id, step.timeout_ms
                     ),
                     enospc: false,
+                    files: Vec::new(),
                 };
             }
             StepOutcome::SpawnError { message } => {
@@ -398,6 +416,7 @@ pub fn build(
                     sha: sha.to_string(),
                     reason: format!("build step `{}` could not start: {message}", step.id),
                     enospc: false,
+                    files: Vec::new(),
                 };
             }
         }
@@ -438,6 +457,7 @@ pub fn build(
                 sha: sha.to_string(),
                 reason: format!("bundle harvest failed: {e}"),
                 enospc,
+                files: Vec::new(),
             }
         }
     }
@@ -677,12 +697,19 @@ fn run_step_real(worktree: &Path, step: &BuildStep, env: &[(String, String)]) ->
     let stderr = err_thread.join().unwrap_or_default();
     match status {
         Ok(s) if s.success() => StepOutcome::Ok,
-        Ok(s) => StepOutcome::Failed {
-            code: s.code(),
-            // The FIRST error and what follows it — not the last 20 lines, which
-            // on a warning-heavy crate are guaranteed to contain no diagnostic.
-            tail: failure_excerpt(&format!("{stdout}\n{stderr}"), 20),
-        },
+        Ok(s) => {
+            let combined = format!("{stdout}\n{stderr}");
+            StepOutcome::Failed {
+                code: s.code(),
+                // The FIRST error and what follows it — not the last 20 lines,
+                // which on a warning-heavy crate are guaranteed to contain no
+                // diagnostic.
+                tail: failure_excerpt(&combined, 20),
+                // Attribution evidence, from the FULL output — the excerpt is
+                // for humans and can cut off later errors' spans.
+                files: error_files(&combined),
+            }
+        }
         Err(()) => StepOutcome::TimedOut,
     }
 }
@@ -749,6 +776,59 @@ fn failure_excerpt(text: &str, n: usize) -> String {
         Some(i) => lines[i..lines.len().min(i + n)].join("\n"),
         None => tail_lines(text, n),
     }
+}
+
+/// Source files named by ERROR diagnostics in a failed step's full output.
+///
+/// This is the attribution evidence the build lane consumes: it maps these
+/// paths to the member whose changed files contain them and ejects only that
+/// member, instead of holding the whole queue on every red. It must therefore
+/// be exactly as trustworthy as a compiler span, never broader:
+///
+/// * Only paths under an ERROR are taken. rustc prints `--> file:line:col`
+///   under warnings too, and on 2026-08-03 a red on dev carried 63 warnings —
+///   harvesting those spans would blame every file that merely warned, which
+///   is the false-accusation class this whole seam exists to remove.
+/// * The scan is over the FULL output, not the display excerpt: `failure_
+///   excerpt` keeps a 20-line window for humans, and errors past the window
+///   (a multi-error red) would otherwise be silently unattributable.
+/// * Sorted + deduped so equal reds serialize identically (the statefile
+///   round-trips this list, and an unstable order would read as "the red
+///   changed" when it did not).
+///
+/// rustc's human format prints the primary span as the first `--> ` line
+/// immediately under the diagnostic head; subsequent `--> `-shaped lines
+/// before the next head belong to secondary notes/help and are skipped by
+/// taking only the first one per error.
+fn error_files(text: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut in_error = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if opens_an_error(line) {
+            in_error = true;
+            continue;
+        }
+        // A new non-error diagnostic head (warning/help/note block) closes the
+        // error's span search; its own arrows must not be harvested.
+        if t.starts_with("warning") && t.contains(':') {
+            in_error = false;
+            continue;
+        }
+        if in_error {
+            if let Some(rest) = t.strip_prefix("--> ") {
+                // `path/to/file.rs:12:34` — keep the path, drop the position.
+                let path = rest.split(':').next().unwrap_or("").trim();
+                if !path.is_empty() {
+                    files.push(path.to_string());
+                }
+                in_error = false; // first span only: the primary one
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn kill_process_tree(child: &mut std::process::Child) {
@@ -977,6 +1057,7 @@ mod tests {
             StepOutcome::Failed {
                 code: Some(101),
                 tail: "error[E0432]: unresolved import".into(),
+                files: vec!["portal/src/lib.rs".into()],
             },
         );
 
@@ -986,6 +1067,7 @@ mod tests {
                 reason,
                 sha,
                 enospc,
+                files,
             } => {
                 assert_eq!(sha, "sha1");
                 assert!(reason.contains("`portal` exited 101"), "{reason}");
@@ -993,6 +1075,9 @@ mod tests {
                 // A genuine compile error is a code-red, NOT environmental:
                 // it must latch (enospc=false) so the bad sha is not retried.
                 assert!(!enospc, "compile-error red must not be classified ENOSPC");
+                // The step's attribution evidence rides the report unchanged —
+                // this is the payload the lane ejects by.
+                assert_eq!(files, vec!["portal/src/lib.rs".to_string()]);
             }
             other => panic!("expected Red, got {other:?}"),
         }
@@ -1203,9 +1288,14 @@ mod tests {
             &[],
         );
         match bad {
-            StepOutcome::Failed { code, tail } => {
+            StepOutcome::Failed { code, tail, files } => {
                 assert_eq!(code, Some(7));
                 assert!(tail.contains("boom"), "stderr tail surfaced: {tail}");
+                // A shell failure has no rustc spans — no files, no blame.
+                assert!(
+                    files.is_empty(),
+                    "non-compile failure must carry no files: {files:?}"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -1467,6 +1557,83 @@ mod worktree_recovery_tests {
             "an existing worktree must not be rebuilt out from under a build"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod error_files_tests {
+    use super::error_files;
+
+    /// The attribution payload for the incident shape: the error's own span is
+    /// harvested; the 63 warnings' spans are NOT. Blaming warned-in files is
+    /// the false-accusation class this function exists to prevent — on the
+    /// live 2026-08-03 red the warning spans named files in crates the failing
+    /// member never touched.
+    #[test]
+    fn error_span_harvested_warning_spans_ignored() {
+        let mut log = String::from("   Compiling triform-physics v0.1.0\n");
+        log.push_str("warning: unused variable: `w`\n");
+        log.push_str("   --> physics/src/infra/warned_only.rs:12:5\n");
+        log.push_str("error[E0308]: mismatched types\n");
+        log.push_str("   --> physics/src/runtime/executors/app_ops.rs:630:13\n");
+        log.push_str("630 |         let execution_id = flow_result.execution_id.clone();\n");
+        for i in 0..63 {
+            log.push_str(&format!("warning: unused variable: `v{i}`\n"));
+        }
+        log.push_str("error: could not compile `triform-physics` (lib) due to 1 previous error\n");
+        assert_eq!(
+            error_files(&log),
+            vec!["physics/src/runtime/executors/app_ops.rs".to_string()],
+            "exactly the ERROR's file — never a warning's"
+        );
+    }
+
+    /// Multiple errors each contribute their primary span, deduped + sorted —
+    /// including errors past any display-excerpt window.
+    #[test]
+    fn multiple_errors_all_files_deduped_sorted() {
+        let mut log = String::new();
+        log.push_str("error[E0432]: unresolved import `tracing::debug`\n");
+        log.push_str("   --> physics/src/api/handlers/activity.rs:9:5\n");
+        log.push_str("error[E0308]: mismatched types\n");
+        log.push_str("   --> isolator/src/terminal_vm.rs:101:1\n");
+        log.push_str("error[E0308]: mismatched types (again)\n");
+        log.push_str("   --> isolator/src/terminal_vm.rs:222:9\n");
+        assert_eq!(
+            error_files(&log),
+            vec![
+                "isolator/src/terminal_vm.rs".to_string(),
+                "physics/src/api/handlers/activity.rs".to_string(),
+            ]
+        );
+    }
+
+    /// Secondary arrows under one error (notes/help spans) are not harvested —
+    /// only the primary span identifies where the error LIVES.
+    #[test]
+    fn only_the_primary_span_per_error() {
+        let mut log = String::new();
+        log.push_str("error[E0277]: the trait bound is not satisfied\n");
+        log.push_str("   --> portal/src/panels/library_panel.rs:44:10\n");
+        log.push_str("note: required by a bound\n");
+        log.push_str("   --> portal/src/panels/other_file.rs:1:1\n");
+        assert_eq!(
+            error_files(&log),
+            vec!["portal/src/panels/library_panel.rs".to_string()]
+        );
+    }
+
+    /// A non-rustc failure (shell error, missing binary, timeout text) yields
+    /// nothing — no spans means no evidence, and no evidence must never
+    /// become an accusation.
+    #[test]
+    fn non_compiler_output_yields_no_files() {
+        assert!(error_files("sh: cargo: command not found\n").is_empty());
+        assert!(error_files("").is_empty());
+        // The bare summary line alone carries no span either.
+        assert!(
+            error_files("error: could not compile `x` (lib) due to 2 previous errors\n").is_empty()
+        );
     }
 }
 
