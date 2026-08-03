@@ -679,7 +679,9 @@ fn run_step_real(worktree: &Path, step: &BuildStep, env: &[(String, String)]) ->
         Ok(s) if s.success() => StepOutcome::Ok,
         Ok(s) => StepOutcome::Failed {
             code: s.code(),
-            tail: tail_lines(&format!("{stdout}\n{stderr}"), 20),
+            // The FIRST error and what follows it — not the last 20 lines, which
+            // on a warning-heavy crate are guaranteed to contain no diagnostic.
+            tail: failure_excerpt(&format!("{stdout}\n{stderr}"), 20),
         },
         Err(()) => StepOutcome::TimedOut,
     }
@@ -693,10 +695,60 @@ fn read_pipe(pipe: &mut Option<impl Read>) -> String {
     out
 }
 
+/// The last `n` non-blank lines — the fallback when nothing looks like an error.
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+/// True if this line opens a rustc/cargo ERROR (not a warning, not a note).
+///
+/// `error[E0308]:` and `error:` both count; `error: could not compile ...` does
+/// NOT — that is the trailing summary rustc prints after every failure, and
+/// keeping it while dropping the real diagnostic is exactly the bug this
+/// function exists to prevent.
+fn opens_an_error(line: &str) -> bool {
+    let t = line.trim_start();
+    if !t.starts_with("error") {
+        return false;
+    }
+    // `error:` or `error[E1234]:`
+    let after = t.strip_prefix("error").unwrap_or("");
+    let is_error_head = after.starts_with(':')
+        || (after.starts_with('[') && after.split(']').nth(1).is_some_and(|r| r.starts_with(':')));
+    is_error_head && !t.contains("could not compile") && !t.contains("aborting due to")
+}
+
+/// The failure excerpt for a red build: the FIRST real error and the lines that
+/// follow it, falling back to the tail when nothing matches.
+///
+/// # Why not just the tail
+///
+/// `tail_lines(.., 20)` was the whole capture, and it made real reds
+/// undiagnosable. rustc prints warnings AFTER the error that stopped the build,
+/// then a one-line summary. On 2026-08-03 a broken `triform-physics` on dev
+/// produced 63 warnings, so the last 20 lines were *guaranteed* to be warnings
+/// plus `error: could not compile ... due to 1 previous error`. The 1039-char
+/// reason stored on the slot began mid-warning at line 1587 and contained no
+/// diagnostic at all — I could see WHICH FILES were implicated but never WHAT
+/// WAS WRONG, on the one build that mattered. There is no build log on disk, the
+/// daemon log does not carry it, and no CI workflow compiles this crate, so the
+/// truncated string was the only evidence in existence — and it had thrown the
+/// error away.
+///
+/// So: anchor on the first line that OPENS an error and keep the window after
+/// it. rustc emits the diagnostic body (`-->`, source excerpt, `= help:`)
+/// immediately after that line, which is precisely what a human needs.
+///
+/// Falls back to the tail when no error line is found — a step can fail without
+/// rustc (a shell error, a missing binary), and the tail is right for those.
+fn failure_excerpt(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    match lines.iter().position(|l| opens_an_error(l)) {
+        Some(i) => lines[i..lines.len().min(i + n)].join("\n"),
+        None => tail_lines(text, n),
+    }
 }
 
 fn kill_process_tree(child: &mut std::process::Child) {
@@ -1415,5 +1467,79 @@ mod worktree_recovery_tests {
             "an existing worktree must not be rebuilt out from under a build"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod failure_excerpt_tests {
+    use super::{failure_excerpt, opens_an_error};
+
+    /// THE REGRESSION, with the real 2026-08-03 shape: rustc prints the error
+    /// FIRST, then 63 warnings, then a one-line summary. `tail_lines(_, 20)`
+    /// therefore captured only warnings + summary and threw the diagnostic away
+    /// — on a build whose log exists nowhere else.
+    #[test]
+    fn the_first_error_survives_63_trailing_warnings() {
+        let mut log = String::from("   Compiling triform-physics v0.1.0\n");
+        log.push_str("error[E0308]: mismatched types\n");
+        log.push_str("   --> physics/src/runtime/executors/app_ops.rs:630:13\n");
+        log.push_str("630 |         let execution_id = flow_result.execution_id.clone();\n");
+        for i in 0..63 {
+            log.push_str(&format!("warning: unused variable: `v{i}`\n"));
+        }
+        log.push_str("error: could not compile `triform-physics` (lib) due to 1 previous error; 63 warnings emitted\n");
+
+        let got = failure_excerpt(&log, 20);
+        assert!(got.contains("E0308"), "the real error must survive: {got}");
+        assert!(
+            got.contains("app_ops.rs:630"),
+            "and so must the file:line that locates it: {got}"
+        );
+        assert!(
+            got.starts_with("error[E0308]"),
+            "the excerpt must LEAD with the error, not bury it: {got}"
+        );
+    }
+
+    /// The trailing summary is NOT a diagnostic. Anchoring on it would keep the
+    /// exact useless line the old code kept.
+    #[test]
+    fn the_could_not_compile_summary_is_not_an_error_anchor() {
+        assert!(!opens_an_error(
+            "error: could not compile `triform-physics` (lib) due to 1 previous error"
+        ));
+        assert!(!opens_an_error("error: aborting due to 2 previous errors"));
+        assert!(opens_an_error("error[E0432]: unresolved import"));
+        assert!(opens_an_error(
+            "error: linking with `cc` failed: exit status: 1"
+        ));
+        assert!(!opens_an_error("warning: unused variable: `x`"));
+        assert!(!opens_an_error("note: `#[warn(unused)]` on by default"));
+        assert!(!opens_an_error("   = help: maybe it is overwritten"));
+    }
+
+    /// A step can fail without rustc — a missing binary, a shell error. There is
+    /// no error line to anchor on and the tail IS the right answer there, so the
+    /// fallback must still work.
+    #[test]
+    fn a_non_rustc_failure_falls_back_to_the_tail() {
+        let log = "bash: line 3: cargo: command not found\nexit status 127";
+        let got = failure_excerpt(log, 20);
+        assert!(got.contains("command not found"), "got: {got}");
+    }
+
+    /// Indented diagnostics (cargo indents sub-crate output) still anchor.
+    #[test]
+    fn an_indented_error_still_anchors() {
+        let log = "   Compiling x\n  error[E0599]: no method named `foo`\nwarning: later noise";
+        let got = failure_excerpt(log, 20);
+        assert!(got.contains("E0599"), "got: {got}");
+    }
+
+    /// Empty input must not panic (the slice arithmetic is the risk).
+    #[test]
+    fn empty_input_is_safe() {
+        assert_eq!(failure_excerpt("", 20), "");
+        assert_eq!(failure_excerpt("\n\n  \n", 20), "");
     }
 }
