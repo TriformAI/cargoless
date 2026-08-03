@@ -400,10 +400,223 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     // already resolved `--bind`/`--auth-token` into the FleetConfig and
     // ran `security_check`; THIS is #10's actual binding (the serve.rs
     // module-doc "Stream E #10 binds it; #3 only resolves+carries" seam).
-    let api = Arc::new(
-        crate::serveapi::ServeVerdictState::new()
-            .with_project_check_state_dir(scope.fleet.state_dir_abs(&scope.repo_root)),
-    );
+    // The build lane is OPT-IN and off by default. It merges candidates and
+    // publishes on green, so a daemon must never acquire one as a side effect
+    // of starting up — an operator asks for it by naming the profile whose
+    // legs are the project's own build.
+    //
+    //   CARGOLESS_LANE_PROFILE   the cargoless.checks.yaml profile to run
+    //   CARGOLESS_LANE_BASE      base ref to build candidates on (default: main)
+    //   CARGOLESS_LANE_ARTIFACT  path, relative to the candidate root, of the
+    //                            artifact to publish on green. Unset = a
+    //                            check-only lane that proves the merged tree
+    //                            compiles and deliberately leaves the pointer
+    //                            alone rather than advancing it to nothing.
+    let state_dir = scope.fleet.state_dir_abs(&scope.repo_root);
+    let mut api_state =
+        crate::serveapi::ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+    // Not a let-chain: this workspace is Edition 2024 / MSRV 1.85 and
+    // `if let ... && cond` does not compile here.
+    let lane_profile = std::env::var("CARGOLESS_LANE_PROFILE")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    if let Some(profile) = lane_profile {
+        // REFUSE an unknown profile name rather than inherit project_checks'
+        // fallback. That fallback synthesises `include: ["*"]` with a 12-second
+        // budget, and `"*"` matches every check regardless of tier — so a single
+        // typo here selects the WHOLE manifest, including any 25-80 minute
+        // release build, times nearly all of it out, and hands the lane ~130
+        // error diagnostics pinned at `cargoless.checks.yaml:1:1`. Those are
+        // attributable to nobody, so the lane ejects the entire queue as
+        // `Unattributed` on its first build — the gate appearing to decide
+        // everyone is guilty, on evidence that is a scheduler artifact.
+        //
+        // Fail closed and loud. A daemon that refuses to boot is fixed in ten
+        // seconds; one that boots with a silently-wrong lane is not.
+        match cargoless_core::project_checks::profile_names(&scope.repo_root) {
+            Ok(names) if !names.iter().any(|n| n == &profile) => {
+                eprintln!(
+                    "[cargoless] FATAL: CARGOLESS_LANE_PROFILE={profile:?} is not declared in \
+                     cargoless.checks.yaml. Declared profiles: {}",
+                    if names.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+                eprintln!(
+                    "[cargoless] Refusing to start: an unrecognised profile would run EVERY \
+                     check under a 12s budget and eject the whole lane queue."
+                );
+                std::process::exit(2);
+            }
+            Ok(_) => {}
+            // A manifest that will not parse is its own hard error elsewhere;
+            // do not let the lane be the thing that reports it, and do not
+            // silently continue into the fallback either.
+            Err(e) => {
+                // `ManifestError` has no Display impl, and `{:?}` would print a
+                // struct dump. Its three public fields already say exactly what
+                // an operator needs — file, line, and what is wrong — in the
+                // same `path:line: message` shape every other tool uses.
+                eprintln!(
+                    "[cargoless] FATAL: CARGOLESS_LANE_PROFILE is set but the \
+                     manifest could not be read: {}:{}: {}",
+                    e.path.display(),
+                    e.line,
+                    e.message
+                );
+                std::process::exit(2);
+            }
+        }
+        let base = std::env::var("CARGOLESS_LANE_BASE").unwrap_or_else(|_| "main".to_string());
+        let artifact = std::env::var("CARGOLESS_LANE_ARTIFACT")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from);
+        // WHERE the legs run. Unset = in this process, which is right for a
+        // single-developer repo and WRONG for a daemon whose container can
+        // reach a credential: `cargo` executes `build.rs` and proc-macros from
+        // the candidate, and a candidate is unreviewed code. On tf-multiverse
+        // the `serve` container can read a push-capable forge token out of
+        // `.git/config` on its shared volume (verified 2026-07-31), so that
+        // deployment MUST set this.
+        //
+        // Split on whitespace: an argv, not a shell string. Handing this to a
+        // shell would make the dispatcher command itself an injection surface,
+        // which is a strange thing to add to a feature whose entire purpose is
+        // to stop executing untrusted input.
+        let dispatch_cmd: Vec<String> = std::env::var("CARGOLESS_LANE_DISPATCH")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        // The PREVIEW slot: the strongest of the three destinations, because it
+        // proves the candidate boots and SERVES rather than merely compiles.
+        let preview_slot = std::env::var("CARGOLESS_LANE_PREVIEW_SLOT")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // The slot that builds the BASE alone, with nothing merged into it.
+        // Without it the lane cannot tell "this member broke the build" from
+        // "the trunk was already broken" — on 2026-08-03 a missing
+        // `use tracing::debug` on dev made the lane eject FOUR innocent members
+        // in 90 minutes, one of which changed only a YAML file. Unset keeps the
+        // previous behaviour, so a project with no such slot is unaffected.
+        let base_slot = std::env::var("CARGOLESS_LANE_BASE_SLOT")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let remote = std::env::var("CARGOLESS_LANE_DISPATCH_REMOTE")
+            .unwrap_or_else(|_| "origin".to_string());
+        let ref_prefix = std::env::var("CARGOLESS_LANE_DISPATCH_REF_PREFIX")
+            .unwrap_or_else(|_| "refs/heads/lane-candidate".to_string());
+
+        // Exactly one destination. Refuse an ambiguous pair rather than pick
+        // for the operator: which one won would be invisible, and the two have
+        // very different security properties.
+        if !dispatch_cmd.is_empty() && !preview_slot.is_empty() {
+            eprintln!(
+                "[cargoless] FATAL: CARGOLESS_LANE_DISPATCH and \
+                 CARGOLESS_LANE_PREVIEW_SLOT are mutually exclusive — a lane has \
+                 one destination for its legs. Unset whichever you did not mean."
+            );
+            std::process::exit(2);
+        }
+        // Both remote destinations build elsewhere and report `artifact: None`,
+        // so an artifact path would leave the lander silently publishing
+        // nothing forever. Refuse with the same fail-closed shape as the
+        // unknown-profile check above: a panic makes an operator guess, this
+        // sentence hands them the fix.
+        if artifact.is_some() && (!dispatch_cmd.is_empty() || !preview_slot.is_empty()) {
+            eprintln!(
+                "[cargoless] FATAL: CARGOLESS_LANE_ARTIFACT cannot be combined \
+                 with a remote lane destination. The build runs elsewhere, so \
+                 there is no local artifact for the lander to publish — the \
+                 pointer would silently never move."
+            );
+            eprintln!(
+                "[cargoless] Unset one: drop CARGOLESS_LANE_ARTIFACT to let the \
+                 remote builder own promotion, or drop the destination to \
+                 compile in this process."
+            );
+            std::process::exit(2);
+        }
+
+        let plan = if !preview_slot.is_empty() {
+            let daemon = std::env::var("CARGOLESS_LANE_PREVIEW_DAEMON").unwrap_or_default();
+            if daemon.trim().is_empty() {
+                eprintln!(
+                    "[cargoless] FATAL: CARGOLESS_LANE_PREVIEW_SLOT is set but \
+                     CARGOLESS_LANE_PREVIEW_DAEMON is not — there is nowhere to \
+                     roll the candidate."
+                );
+                std::process::exit(2);
+            }
+            cargoless_core::lanedrv::LegPlan::Preview {
+                daemon,
+                token: std::env::var("CARGOLESS_LANE_PREVIEW_TOKEN")
+                    .or_else(|_| std::env::var("CARGOLESS_AUTH_TOKEN"))
+                    .unwrap_or_default(),
+                slot: preview_slot,
+                remote,
+                ref_prefix,
+                base_slot,
+            }
+        } else if !dispatch_cmd.is_empty() {
+            cargoless_core::lanedrv::LegPlan::Dispatch {
+                command: dispatch_cmd,
+                remote,
+                ref_prefix,
+            }
+        } else {
+            cargoless_core::lanedrv::LegPlan::InProcess {
+                profile: profile.clone(),
+                artifact_path: artifact.clone(),
+            }
+        };
+
+        // AUTO-MERGE. Unset = the lane reports and lands nothing, which is the
+        // right default: a lane that can move the trunk should require someone
+        // to say so out loud. Set it and a GREEN candidate is handed to this
+        // command, which owns the forge semantics (lock, CAS push, PR
+        // reconcile) — cargoless does not reimplement them.
+        //
+        // argv, not a shell string, for the same reason as the dispatcher.
+        let land_cmd: Vec<String> = std::env::var("CARGOLESS_LANE_LAND")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let land_command = if land_cmd.is_empty() {
+            None
+        } else {
+            Some(land_cmd)
+        };
+
+        // Announce it. A lane that can move the trunk must be visible in the
+        // boot log, not inferred from behaviour — the same reasoning as the
+        // resolved-caps lines below. `where=` and `land=` are the load-bearing
+        // fields: the first is the difference between compiling unreviewed code
+        // in this pod and compiling it in a sandbox, the second between a lane
+        // that observes and one that MERGES. An operator must read both without
+        // inspecting behaviour.
+        eprintln!(
+            "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={} \
+             where={} land={}",
+            artifact
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none: check-only>".to_string()),
+            plan.describe(),
+            match land_command.as_ref() {
+                Some(c) => format!("AUTO-MERGE via `{}`", c.join(" ")),
+                None => "<none: reports only, lands nothing>".to_string(),
+            }
+        );
+        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, plan, land_command);
+    }
+    let api = Arc::new(api_state);
     // Path D + R3 — publish the resolved caps at startup so an operator
     // can verify what the daemon actually read from env (a knob whose
     // effect is invisible is dead machinery per the
@@ -852,6 +1065,20 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
                 route_or_defer(&mut clusters, &h, wt.clone(), &pending_batch, &api);
             }
         }
+
+        // Build-lane tick. The lane's capture window and ejection TTLs are
+        // measured in ticks and its clock advances ONLY here — without this the
+        // window never elapses and a lane that has been enqueued to just sits
+        // there, which reads as a broken transport rather than a missing
+        // heartbeat. Seconds since the epoch: monotonic enough for a window
+        // measured in tens of seconds, and `LaneState` clamps the clock forward
+        // so a wall-clock step backwards cannot resurrect a lapsed ejection.
+        api.lane_tick(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
 
         // Activity tick → deactivation edges (proven WtLifecycle).
         for wt in activity.tick(Instant::now()) {

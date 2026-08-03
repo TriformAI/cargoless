@@ -37,6 +37,13 @@ fn err(path: &str, line: u32, code: &str) -> Diagnostic {
 }
 
 const WINDOW: u64 = 60;
+/// Mirror of `LaneConfig::default()`'s infra retry policy. Kept as constants so
+/// the tests below read as "one tick before the backoff" rather than as magic
+/// arithmetic, and asserted against the real defaults in
+/// `the_infra_retry_constants_match_the_shipped_defaults` — a test that would
+/// otherwise silently start proving nothing if a default changed.
+const INFRA_BACKOFF: u64 = 30;
+const INFRA_MAX_ATTEMPTS: u32 = 5;
 
 /// A lane with the default capture window.
 fn lane() -> LaneState {
@@ -449,11 +456,236 @@ fn infra_failure_is_not_a_code_red() {
         },
     });
     assert!(ejected_ids(&actions).is_empty(), "nobody is ejected");
+    // The retry is DEFERRED, not immediate. This assertion used to require the
+    // rebuild to start in the same step; that is precisely the hot loop that
+    // shipped — see `an_infra_failure_does_not_retry_before_its_backoff`.
+    assert!(
+        started(&actions).is_none(),
+        "the retry waits for the backoff rather than restarting instantly"
+    );
+
+    // Once the backoff elapses the SAME members rebuild, in their original
+    // order. That is the half of the old assertion that was always right: an
+    // infra failure must not cost anyone their place.
+    let actions = st.step(LaneEvent::Tick {
+        now: WINDOW + INFRA_BACKOFF + 1,
+    });
     assert_eq!(
         started(&actions).as_deref(),
         Some(&["A".to_string(), "B".to_string()][..]),
-        "the same members retry, in order"
+        "the same members retry, in order, once the backoff lapses"
     );
+}
+
+#[test]
+fn the_infra_retry_constants_match_the_shipped_defaults() {
+    // The tests above hardcode the backoff and attempt cap so they can assert
+    // exact boundaries. That is only sound while the constants agree with what
+    // actually ships: if a default were raised and these were not, every
+    // "one tick before the backoff" assertion would land somewhere arbitrary
+    // and the boundary checks would stop meaning anything — passing, silently,
+    // on a policy they no longer describe.
+    let cfg = cargoless_core::lane::LaneConfig::default();
+    assert_eq!(
+        cfg.infra_backoff_ticks, INFRA_BACKOFF,
+        "INFRA_BACKOFF must track LaneConfig::default()"
+    );
+    assert_eq!(
+        cfg.infra_max_attempts, INFRA_MAX_ATTEMPTS,
+        "INFRA_MAX_ATTEMPTS must track LaneConfig::default()"
+    );
+    // A zero backoff IS the hot loop, so the default must never be zero — that
+    // is the whole point of the field existing.
+    assert!(
+        cfg.infra_backoff_ticks > 0,
+        "a zero infra backoff reintroduces the retry storm"
+    );
+    assert!(
+        cfg.infra_max_attempts > 0,
+        "a zero attempt cap would eject on the first transient failure"
+    );
+}
+
+#[test]
+fn an_infra_failure_does_not_retry_before_its_backoff() {
+    // THE HOT-LOOP REGRESSION. Without a backoff the requeued members are
+    // eligible again the instant the failure is reported, so the lane rebuilds
+    // as fast as the failure returns. Observed in the first real deployment at
+    // roughly one candidate attempt every 2.5 seconds, indefinitely, while
+    // `GET /lane` showed a steady `phase=building` — indistinguishable from a
+    // slow compile, which is why it ran unnoticed.
+    let mut st = lane();
+    let build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Infra {
+            reason: "candidate tree could not be materialized".to_string(),
+        },
+    });
+    assert!(
+        started(&actions).is_none(),
+        "a rebuild must NOT start in the same step as the failure"
+    );
+
+    // Still nothing one tick before the backoff expires. Asserting the
+    // boundary, not just "eventually", is what makes this catch a backoff that
+    // is present but effectively zero.
+    let actions = st.step(LaneEvent::Tick {
+        now: WINDOW + INFRA_BACKOFF - 1,
+    });
+    assert!(
+        started(&actions).is_none(),
+        "no rebuild before the backoff elapses"
+    );
+
+    let actions = st.step(LaneEvent::Tick {
+        now: WINDOW + INFRA_BACKOFF + 1,
+    });
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string()][..]),
+        "and it does rebuild once the backoff has elapsed"
+    );
+}
+
+#[test]
+fn a_persistent_infra_failure_stops_retrying_and_ejects() {
+    // Retrying forever assumes every infra failure is transient. Some are
+    // permanent from the lane's side — the deployment that surfaced this could
+    // not reach the members' head commits at all, so no amount of waiting would
+    // ever have produced a build. The lane must give up, say why, and let the
+    // queue move.
+    let mut st = lane();
+    let mut now = WINDOW;
+    let mut build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+
+    // One short of the cap: still retrying, nobody ejected.
+    for attempt in 1..INFRA_MAX_ATTEMPTS {
+        let actions = st.step(LaneEvent::BuildFinished {
+            generation: build_gen,
+            outcome: LaneBuildOutcome::Infra {
+                reason: "member `A` (a1) could not be merged onto the candidate".to_string(),
+            },
+        });
+        assert!(
+            ejected_ids(&actions).is_empty(),
+            "attempt {attempt} of {INFRA_MAX_ATTEMPTS} must not eject yet"
+        );
+        now += INFRA_BACKOFF + 1;
+        let actions = st.step(LaneEvent::Tick { now });
+        build_gen = st.generation();
+        assert!(
+            started(&actions).is_some(),
+            "attempt {attempt} must retry after its backoff"
+        );
+    }
+
+    // The cap. Now it ejects rather than starting an endless attempt N+1.
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Infra {
+            reason: "member `A` (a1) could not be merged onto the candidate".to_string(),
+        },
+    });
+    assert_eq!(
+        ejected_ids(&actions),
+        vec!["A".to_string()],
+        "a persistently-failing candidate is ejected once the attempt cap is reached"
+    );
+    assert!(
+        started(&actions).is_none(),
+        "and no further build is started"
+    );
+
+    // Ejected as INFRASTRUCTURE, not as Unattributed. The distinction is the
+    // product surface: unattributed says "your tree is red and we cannot tell
+    // whose change did it", which would send an author hunting a bug that was
+    // never diagnosed. Nothing compiled here, so nothing was judged.
+    let reason = eject_reason(&actions, "A");
+    assert!(
+        matches!(reason, EjectReason::Infrastructure { .. }),
+        "an infra ejection must not masquerade as a code verdict: {reason:?}"
+    );
+    // Borrow rather than destructure by value: `reason` is used again below for
+    // `describe()` and `fingerprints()`, and moving the `String` out here would
+    // leave it partially moved.
+    let EjectReason::Infrastructure {
+        reason: why,
+        attempts,
+        ..
+    } = &reason
+    else {
+        unreachable!("just asserted the variant")
+    };
+    assert_eq!(
+        *attempts, INFRA_MAX_ATTEMPTS,
+        "it reports how many it tried"
+    );
+    assert!(
+        why.contains("could not be merged"),
+        "and carries the build's own words so an operator can fix the cause: {why}"
+    );
+    assert!(
+        reason
+            .describe()
+            .contains("NOT a verdict about your change"),
+        "the author-facing sentence must say plainly that their code was not judged"
+    );
+    assert!(
+        reason.fingerprints().is_empty(),
+        "no build ran, so there are no error fingerprints to report"
+    );
+}
+
+#[test]
+fn a_green_build_clears_the_infra_failure_streak() {
+    // The counter must be about CONSECUTIVE failures. If it accumulated across
+    // a working build, a lane that hit one transient every so often would
+    // eventually eject a perfectly good member for reasons spread over hours.
+    let mut st = lane();
+    let mut now = WINDOW;
+    let mut build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+
+    for _ in 0..INFRA_MAX_ATTEMPTS - 1 {
+        st.step(LaneEvent::BuildFinished {
+            generation: build_gen,
+            outcome: LaneBuildOutcome::Infra {
+                reason: "transient".to_string(),
+            },
+        });
+        now += INFRA_BACKOFF + 1;
+        st.step(LaneEvent::Tick { now });
+        build_gen = st.generation();
+    }
+
+    // A green build in the middle of the streak.
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Green { artifact: None },
+    });
+
+    // Now the streak must start over: another near-cap run of failures still
+    // does not eject. If the counter had survived the green, this would.
+    now += 1;
+    st.step(LaneEvent::Enqueue(member("B", "b1", &["src/b.rs"])));
+    now += WINDOW + 1;
+    st.step(LaneEvent::Tick { now });
+    let mut build_gen = st.generation();
+    for attempt in 0..INFRA_MAX_ATTEMPTS - 1 {
+        let actions = st.step(LaneEvent::BuildFinished {
+            generation: build_gen,
+            outcome: LaneBuildOutcome::Infra {
+                reason: "transient".to_string(),
+            },
+        });
+        assert!(
+            ejected_ids(&actions).is_empty(),
+            "the streak restarted after the green, so attempt {attempt} must not eject"
+        );
+        now += INFRA_BACKOFF + 1;
+        st.step(LaneEvent::Tick { now });
+        build_gen = st.generation();
+    }
 }
 
 #[test]
@@ -570,6 +802,87 @@ fn re_enqueue_at_the_same_head_does_not_clear_an_ejection() {
     assert!(started(&actions).is_none());
 }
 
+/// The escape hatch. `POST /lane/readmit` exists for a fix the attribution
+/// cannot see — a dependency bump, a toolchain change, a red that was never the
+/// member's fault. It lifts the ejection without asking for evidence.
+#[test]
+fn a_forced_readmission_lifts_an_ejection_the_attribution_would_keep() {
+    let mut st = lane();
+    let build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    assert!(st.ejection("A").is_some(), "precondition: A is ejected");
+
+    let actions = st.step(LaneEvent::ForceReadmit {
+        id: "A".to_string(),
+    });
+    assert!(st.ejection("A").is_none(), "the ejection must be lifted");
+    assert_eq!(
+        started(&actions),
+        Some(vec!["A".to_string()]),
+        "and A must be back in a build"
+    );
+}
+
+/// The subtle half. A forced re-admission must restore the member's changed
+/// files, or it comes back **unattributable**: a red it causes would land as
+/// "could not attribute" and hold the whole queue instead of ejecting it again.
+/// Silently laundering a member out of accountability is worse than refusing
+/// the re-admission.
+#[test]
+fn a_forced_readmission_keeps_the_member_attributable() {
+    let mut st = lane();
+    let g1 = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+    st.step(LaneEvent::BuildFinished {
+        generation: g1,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    st.step(LaneEvent::ForceReadmit {
+        id: "A".to_string(),
+    });
+
+    // Same failure again. If the changed set survived, A owns it and is
+    // ejected as Attributed rather than sliding into Unattributed.
+    let g2 = st.generation();
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: g2,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+    assert_eq!(ejected_ids(&actions), vec!["A".to_string()]);
+    assert!(
+        matches!(eject_reason(&actions, "A"), EjectReason::Attributed { .. }),
+        "a re-admitted member must still be blameable for the file it changed"
+    );
+}
+
+/// Force-readmitting something that is not ejected reports rather than
+/// silently succeeding — an operator who typos an id must not believe they
+/// unblocked something.
+#[test]
+fn a_forced_readmission_of_an_unejected_member_says_so() {
+    let mut st = lane();
+    let actions = st.step(LaneEvent::ForceReadmit {
+        id: "nobody".to_string(),
+    });
+    assert!(started(&actions).is_none());
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            LaneAction::Report { id, state }
+                if id == "nobody" && state.contains("not ejected")
+        )),
+        "expected a Report explaining nothing was re-admitted; got {actions:?}"
+    );
+}
+
 #[test]
 fn ttl_expiry_readmits_as_a_backstop() {
     let mut st = LaneState::with_config(
@@ -601,6 +914,45 @@ fn ttl_expiry_readmits_as_a_backstop() {
             .iter()
             .any(|a| matches!(a, LaneAction::Readmit { .. })),
         "expiry is reported, never silent"
+    );
+
+    // AND THE MEMBER IS ACTUALLY BACK. Leaving `ejected` is not the same as
+    // rejoining the queue, and this test used to assert only the former —
+    // so a TTL expiry that dropped the member entirely passed it.
+    //
+    // That shipped. On 2026-08-02 three members ejected `infrastructure` by a
+    // preview outage hit their TTL and vanished: `queue_depth: 0`, nothing
+    // building, and `GET /lane` showing no trace that anything had been lost.
+    // A backstop that discards the member it was protecting is worse than no
+    // backstop, because the log says "re-admitted" either way.
+    assert_eq!(
+        st.queue_depth() + st.in_flight().len(),
+        1,
+        "a lapsed ejection must put the member BACK IN THE LANE, not merely \
+         out of `ejected`: {actions:?}"
+    );
+    // Intact, not a husk. Ticking past the capture window starts the build,
+    // which is what puts the member in `in_flight` where its fields are
+    // readable — `LaneState` deliberately exposes no `queue()`, and widening
+    // that surface for a test would be the wrong trade.
+    //
+    // This matters: without `head` the candidate cannot be built, and without
+    // `changed_files` every future red it rides is unattributable and holds
+    // the whole queue instead of ejecting one member.
+    st.step(LaneEvent::Tick {
+        now: WINDOW + 11 + WINDOW,
+    });
+    let back = st
+        .in_flight()
+        .iter()
+        .find(|m| m.id == "A")
+        .expect("the readmitted member rebuilds");
+    assert_eq!(back.head, "a1", "the readmitted member keeps its head");
+    assert_eq!(
+        back.changed_files,
+        vec!["src/a.rs".to_string()],
+        "the readmitted member keeps its changed set — losing it makes every \
+         later red it rides unattributable"
     );
 }
 
@@ -651,6 +1003,76 @@ fn withdraw_removes_a_member_and_its_ejection() {
     });
     assert!(st.ejection("A").is_none());
     assert_eq!(st.queue_depth(), 0);
+}
+
+/// A member withdrawn WHILE ITS BUILD RUNS must not come back when that build
+/// ends.
+///
+/// `Withdraw` originally cleared only `queue` and `ejected`, which reads as
+/// complete and is not: `on_build_finished` takes `in_flight` and, on any
+/// non-green outcome, requeues whatever it finds there. So the member returned
+/// at the end of the very build it was withdrawn from — minutes later, when
+/// nobody is looking, and in exactly the case the verb exists for.
+///
+/// Observed 2026-08-03: pr-10394 is red on a REQUIRED forge check, so it can
+/// never merge; the lane rebuilt it three times because there was no way to
+/// take it out.
+#[test]
+fn withdraw_during_a_build_survives_the_builds_end() {
+    let mut st = lane();
+    let build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);
+
+    st.step(LaneEvent::Withdraw {
+        id: "A".to_string(),
+    });
+
+    // The build is NOT cancelled — the compile is already paid for, and killing
+    // it would deny a verdict to any other member aboard.
+    assert_eq!(st.phase(), LanePhase::Building, "the build keeps running");
+
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/a.rs", 7, "E0308")],
+        },
+    });
+
+    assert_eq!(
+        st.queue_depth(),
+        0,
+        "a withdrawn member must NOT be requeued by the build it was withdrawn from"
+    );
+    assert!(
+        st.ejection("A").is_none(),
+        "nor should it acquire an ejection — it is gone, not blamed"
+    );
+}
+
+/// Withdrawing one of several keeps the rest — the build still belongs to them.
+#[test]
+fn withdraw_leaves_the_other_members_of_the_running_build() {
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/a.rs"]),
+            member("B", "b1", &["src/b.rs"]),
+        ],
+    );
+
+    st.step(LaneEvent::Withdraw {
+        id: "A".to_string(),
+    });
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![err("src/b.rs", 3, "E0425")],
+        },
+    });
+
+    // B caused the red and is ejected for it; A is simply absent.
+    assert!(st.ejection("B").is_some(), "B still owns the red it caused");
+    assert!(st.ejection("A").is_none(), "A was withdrawn, not blamed");
 }
 
 // ── attribution identity ──────────────────────────────────────────────────

@@ -108,6 +108,176 @@ mutate "line-sensitive ejection identity" \
   's = s.replace("let fingerprints = fingerprint_counts(&self.root, &owned);", "let mut fingerprints = fingerprint_counts(&self.root, &owned); for d in &owned { fingerprints.insert(format!(\"line:{}\", d.line), 1); }", 1)' \
   "puts line numbers back into the ejection identity, so an unrelated insertion above an error re-blames it"
 
+# 5. The infra retry has no backoff. THIS IS WHAT SHIPPED, and it reached a
+#    real deployment: every candidate failed to materialize, the requeued
+#    members were eligible again instantly, and the lane rebuilt roughly every
+#    2.5 seconds forever while `GET /lane` showed a steady `phase=building` —
+#    indistinguishable from a slow compile. No test failed, because no test
+#    asserted that a retry WAITS.
+#
+#    ANCHORED on the comment directly above the assignment, which is unique to
+#    this rung. Two earlier attempts got this wrong and are worth recording,
+#    because both LOOKED right:
+#
+#    1. A bare `replace("self.infra_retry_after =\n ... backoff_ticks));", ...)`
+#       drifted. `LandFailed` sets the same field with a byte-identical two-line
+#       statement and appears EARLIER in the file, so `replace(..., 1)` mutated
+#       that one and left this rung intact.
+#    2. Injecting `infra_retry_after = None` at the TOP of the infra arm was a
+#       no-op: the real assignment happens later in the same arm and simply
+#       overwrote it. The mutation applied cleanly and changed nothing.
+#
+#    Both reported "SURVIVED" and both blamed the tests. A mutation that edits
+#    the wrong line, or the right line at the wrong point, is worse than no
+#    mutation — it accuses the suite of a blindness it does not have. Verify a
+#    new mutation actually breaks the behaviour before trusting its verdict.
+mutate "infra retry has no backoff (the hot loop)" \
+  's = s.replace("            // failure returns.\n                self.infra_retry_after =\n                    Some(self.now.saturating_add(self.cfg.infra_backoff_ticks));", "            // failure returns.\n                self.infra_retry_after = None;", 1)' \
+  "retries an infrastructure failure instantly and forever, burning the machine while reporting a phase indistinguishable from a long build"
+
+# 5b. A lapsed TTL drops the member instead of requeueing it. THIS ALSO
+#    SHIPPED: `expire_ejections` removed the ejection and announced `Readmit`
+#    without ever calling `admit`, so the member left `ejected`, never reached
+#    `queue`, and was simply gone. Observed 2026-08-02 — three members ejected
+#    by a preview outage hit their TTL and vanished, leaving `queue_depth: 0`
+#    with nothing building and a log that said "re-admitted".
+#
+#    The TTL is the backstop for a member the attribution stranded. A backstop
+#    that discards what it was protecting is worse than none, because the
+#    reported outcome is identical either way. No test caught it: the TTL test
+#    asserted only that the ejection was gone, never that the member was back.
+mutate "TTL expiry drops the member instead of requeueing it" \
+  's = s.replace("            self.admit(\n                LaneMember {\n                    id,\n                    head: ejection.head,\n                    changed_files: ejection.changed_files,\n                },\n                actions,\n            );", "            let _ = ejection;", 1)' \
+  "silently loses a member whose ejection lapsed — it leaves \`ejected\`, never reaches \`queue\`, and the log still says re-admitted"
+
+# 6. The attempt cap never trips, so a PERMANENT infra failure retries forever.
+#    A member whose head commit the daemon cannot reach never becomes buildable
+#    by waiting; retrying it blocks every later submission behind it.
+mutate "infra attempts are unbounded" \
+  's = s.replace("if self.infra_failures >= self.cfg.infra_max_attempts {", "if false {", 1)' \
+  "never gives up on a permanently-broken candidate, so the queue is blocked indefinitely by a build that cannot succeed"
+
+# 7. The failure streak survives a good build. Then a lane hitting the odd
+#    transient over hours eventually ejects a member that never did anything
+#    wrong, for failures spread across unrelated builds.
+mutate "infra streak is not reset by a non-infra outcome" \
+  's = s.replace("if !matches!(outcome, LaneBuildOutcome::Infra { .. }) {\n            self.infra_failures = 0;\n            self.infra_retry_after = None;\n        }", "", 1)' \
+  "accumulates infra failures across successful builds, so an occasional transient eventually ejects an innocent member"
+
+# 8. An infra ejection reports as Unattributed. Those two mean opposite things
+#    to the author who reads them: unattributed says the tree is red and the
+#    owner is unknown (their code IS implicated), infrastructure says nothing
+#    was ever compiled. Conflating them sends someone hunting a bug that was
+#    never diagnosed.
+#    Swapping only the variant head works because both variants carry
+#    `shared_with` — the tail of the initialiser type-checks unchanged, so this
+#    compiles and produces exactly the wrong classification rather than a build
+#    error (a mutation that fails to compile proves nothing).
+mutate "infra ejection masquerades as an unattributed code red" \
+  's = s.replace("reason: EjectReason::Infrastructure {\n                                reason: reason.clone(),\n                                attempts,", "reason: EjectReason::Unattributed {\n                                fingerprints: Default::default(),", 1)' \
+  "reports a build that never ran as a code verdict, so an author debugs a failure that was never diagnosed"
+
+# ── the staging engine ───────────────────────────────────────────────────
+#
+# `stage` / `fail_fast` / `target_key` live in project_checks.rs, not lane.rs,
+# and their tests are unit tests in that file rather than in lane_policy.rs.
+# Same reasoning applies though: these three decide whether an expensive build
+# starts at all, so a suite that passes regardless of whether they work would
+# convert "we skip the release build on a type error" from a property into a
+# hope.
+#
+# They mutate a different file and run a different suite, so they get their own
+# backup/runner rather than being forced through the lane.rs `mutate` above.
+
+ENGINE="$ROOT/crates/cargoless-core/src/project_checks.rs"
+ENGINE_BACKUP=""
+if [ -f "$ENGINE" ]; then
+    ENGINE_BACKUP="$(mktemp)"
+    cp "$ENGINE" "$ENGINE_BACKUP"
+    # Extend the existing trap so BOTH files are restored on any exit path.
+    restore() {
+        cp "$BACKUP" "$SRC"; rm -f "$BACKUP"
+        [ -n "$ENGINE_BACKUP" ] && cp "$ENGINE_BACKUP" "$ENGINE" && rm -f "$ENGINE_BACKUP"
+    }
+    trap restore EXIT
+fi
+
+run_engine_suite() {
+    (cd "$ROOT" && cargo test -p cargoless-core --lib project_checks --locked) \
+        >/tmp/lane-mutation-engine.log 2>&1
+}
+
+# $1 = name, $2 = python mutation on project_checks.rs, $3 = what it proves
+mutate_engine() {
+    local name="$1" py="$2" proves="$3"
+    [ -n "$ENGINE_BACKUP" ] || return 0
+    cp "$ENGINE_BACKUP" "$ENGINE"
+    python3 - "$ENGINE" <<PY
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+${py}
+p.write_text(s)
+PY
+    if ! cmp -s "$ENGINE" "$ENGINE_BACKUP"; then
+        if run_engine_suite; then
+            echo "  SURVIVED — $name" >&2
+            echo "      the suite passes on code that $proves" >&2
+            survivors=$((survivors + 1))
+        else
+            echo "  ok — caught: $name"
+        fi
+    else
+        echo "  SURVIVED — $name (mutation did not apply; the pattern moved)" >&2
+        echo "      re-anchor this mutation on the current source" >&2
+        survivors=$((survivors + 1))
+    fi
+}
+
+if [ -n "$ENGINE_BACKUP" ]; then
+    echo "== staging-engine mutations =="
+
+    echo "== baseline: the engine suite must PASS on unmutated code =="
+    if ! run_engine_suite; then
+        echo "FAIL: the engine suite is red BEFORE any mutation — fix that first" >&2
+        tail -30 /tmp/lane-mutation-engine.log >&2
+        exit 1
+    fi
+    echo "  ok — baseline green"
+
+    # 5. Stages stop gating: a failed stage no longer stops the next one.
+    #    This is THE property — without it the expensive release build runs
+    #    even though the cheap check already rejected the candidate, and the
+    #    whole staging feature is decoration.
+    mutate_engine "stages do not gate (a red stage no longer halts the next)" \
+      's = s.replace("if stage_red {\n            halted = Some(stage);\n        }", "if false {\n            halted = Some(stage);\n        }", 1)' \
+      "runs a later stage after an earlier stage failed, so an expensive build is paid for a candidate already known bad"
+
+    # 6. Fail-fast never trips. The in-flight sibling runs to completion on a
+    #    candidate that cannot land — the exact waste the flag exists to stop.
+    mutate_engine "fail_fast never trips" \
+      's = s.replace("let tripped = fail_fast && result.required && result.tree == TreeState::Red;", "let tripped = false;", 1)' \
+      "never cancels in-flight work after a required check has already gone red"
+
+    # 7. Fail-fast trips on ANY red, including a non-required one. That would
+    #    silently promote every advisory into a gate.
+    mutate_engine "fail_fast trips on a non-required red" \
+      's = s.replace("let tripped = fail_fast && result.required && result.tree == TreeState::Red;", "let tripped = fail_fast && result.tree == TreeState::Red;", 1)' \
+      "cancels a build over a FAILING ADVISORY, promoting non-required checks into gates"
+
+    # 8. target_key stops separating dirs, so every command check shares one
+    #    target again and declared-parallel legs silently serialize.
+    mutate_engine "target_key ignored (all legs share one target dir)" \
+      's = s.replace("if check.target_key.is_empty() {\n        return base;\n    }", "if true {\n        return base;\n    }", 1)' \
+      "puts every leg back on one CARGO_TARGET_DIR, so legs declared parallel serialize on cargo's .cargo-lock and the parallelism is imaginary"
+
+    # 9. A skipped check is reported GREEN rather than red. Fails OPEN: a gate
+    #    would read "did not run" as "passed".
+    mutate_engine "skipped checks report green" \
+      's = s.replace("fn skipped_stage_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectCheckResult {", "fn skipped_stage_result(root: &Path, check: &CheckConfig, message: &str) -> ProjectCheckResult {\n    if true { let mut r = result_from_diags(check, Vec::new(), 0); r.tree = TreeState::Green; return r; }", 1)' \
+      "reports a check that never ran as GREEN, so a gate reads 'unknown' as 'passed'"
+fi
+
 echo
 if [ "$survivors" -ne 0 ]; then
     echo "FAIL: ${survivors} mutation(s) survived — the lane tests do not actually" >&2

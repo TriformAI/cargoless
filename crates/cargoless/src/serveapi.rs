@@ -51,6 +51,8 @@ use cargoless_core::analyzer::RaStderrSnapshot;
 use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
 use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
+use cargoless_core::lane::{LaneMember, LaneState};
+use cargoless_core::lanehost::LaneHost;
 use cargoless_core::outcome::{
     AttemptId, Authority, Component as OutcomeComponent, Conclusion, DiagnosticLocation,
     DiagnosticOrigin, DiagnosticRecord, DiagnosticSeverity, EvidenceAvailability, EvidenceRef,
@@ -61,9 +63,9 @@ use cargoless_core::outcome::{
 use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
 use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
-    AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, PushOverlayAck,
-    PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus, WorktreeSummary,
-    batchreport_to_json,
+    AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, LaneEnqueueRequest,
+    PushOverlayAck, PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus,
+    WorktreeSummary, batchreport_to_json,
 };
 use cargoless_core::{Diagnostic, Severity, TreeState};
 
@@ -732,6 +734,16 @@ pub struct ServeVerdictState {
     /// pipeline. Monotonic for the process lifetime; a restart zeroes it,
     /// which a `increase()`-style query handles correctly.
     warm_target_stats: Mutex<BTreeMap<String, u64>>,
+    /// The build lane, when this daemon runs one.
+    ///
+    /// `None` on every daemon that has not been configured for it, which is
+    /// why `GET /lane` answers **404** rather than an empty lane: "no lane
+    /// here" and "a lane with nothing in it" are different answers, and
+    /// conflating them leaves an operator waiting on a queue that does not
+    /// exist. For the same reason `lane_enqueue` on a laneless daemon returns
+    /// `Err` rather than silently accepting — a caller told "queued" would
+    /// wait forever for a build that is never going to run.
+    lane: Option<LaneHost>,
 }
 
 #[derive(Default)]
@@ -1671,7 +1683,120 @@ impl ServeVerdictState {
         }
     }
 
+    /// Turn on the build lane for `repo`, building candidates on `base_ref`
+    /// and running the named `cargoless.checks.yaml` profile as its legs.
+    ///
+    /// Opt-in, and off unless the operator asks: a lane merges and publishes,
+    /// so a daemon must never acquire one as a side effect of a default. The
+    /// caller supplies the profile because the legs are the *project's* — that
+    /// is what makes the lane reusable rather than a tf-multiverse feature.
+    ///
+    /// `artifact_path` (relative to the candidate root) is what the lander
+    /// publishes on green. `None` is a check-only lane: it proves the merged
+    /// tree compiles and deliberately leaves the pointer alone rather than
+    /// advancing it to nothing.
+    ///
+    /// `dispatch` selects WHERE the legs run. `None` compiles them in this
+    /// process; `Some((argv, remote, ref_prefix))` publishes the candidate and
+    /// hands it to an external builder.
+    ///
+    /// In-process is the default because it is the zero-config one — a single
+    /// developer's laptop has no builder to dispatch to. It is NOT the safe one
+    /// for a multi-tenant daemon: `cargo` executes `build.rs` and proc-macros
+    /// from the candidate, which is unreviewed code, so a daemon whose
+    /// container can reach a credential (tf-multiverse's can reach a
+    /// push-capable forge token via `.git/config` on its shared volume, checked
+    /// 2026-07-31) must dispatch instead. See `DispatchLegRunner`.
+    #[must_use]
+    pub fn with_lane(
+        mut self,
+        repo: &Path,
+        state_dir: &Path,
+        base_ref: &str,
+        plan: cargoless_core::lanedrv::LegPlan,
+        land_command: Option<Vec<String>>,
+    ) -> Self {
+        let tree = cargoless_core::lanetree::GitCandidateTree::new(
+            repo,
+            state_dir.join("lane-candidates"),
+            base_ref,
+        );
+        // The lander follows the PLAN, so the two cannot disagree. Only an
+        // in-process plan with an artifact path produces a local file to
+        // publish; both remote plans build elsewhere and report `artifact:
+        // None`, so pairing either with `PointerLander` would leave it taking
+        // its "green with nothing to publish" branch forever — no error, no
+        // pointer movement, and an operator watching a publishing lane publish
+        // nothing. The caller refuses that combination at boot; this makes it
+        // unrepresentable here.
+        let publishing = plan.publishes_locally();
+        // The description is the caller's to log — `servedrv` announces it in
+        // the boot line beside the profile and base, where an operator reads it.
+        let (legs, _where) = plan.into_runner();
+        // The lander follows the artifact setting so the two cannot disagree.
+        //
+        // No artifact ⇒ report-only: the lane proves the merged tree builds and
+        // ships nothing. That is the shape to shadow-run in, and it makes the
+        // safe configuration also the DEFAULT one — an operator who omits
+        // `CARGOLESS_LANE_ARTIFACT` gets a lane that cannot touch the pointer,
+        // rather than one that publishes an empty payload.
+        //
+        // Pairing them here rather than exposing two independent knobs removes
+        // the state where a check-only lane still holds a publishing lander:
+        // it would take the "green with no artifact" branch every time, which
+        // is harmless today but is one refactor away from advancing a pointer
+        // to nothing.
+        //
+        // Two spawn calls, one per LANDER. The runner is boxed above (see the
+        // `Box<dyn LegRunner>` impl) because it has two variants of its own, and
+        // monomorphising both dimensions would mean four `spawn` bodies here.
+        //
+        // The verdict trail, beside the witness's own `witness-legs.log` in the
+        // same state dir. A lane build is tens of minutes and the candidate
+        // worktree (with its target dir) is destroyed the moment it ends, so
+        // without this there is nothing left to read afterwards — measured on
+        // the first shadow run, which compiled for 76 minutes and left no
+        // recoverable verdict.
+        let trail = state_dir.join("lane-runs.log");
+        // Boxed, one `spawn` body. Three landers × three runners would be nine
+        // monomorphised branches here; landing runs once per green build, so
+        // the vtable hop costs nothing measurable.
+        let lander: Box<dyn cargoless_core::lanedrv::LaneLander + Send> = match land_command {
+            // AUTO-MERGE. Deliberately last-resort in this match order so the
+            // safe shapes win by default: an operator gets report-only unless
+            // they explicitly name a lander command.
+            Some(cmd) => Box::new(cargoless_core::lanedrv::CommandLander::new(cmd)),
+            None if publishing => Box::new(cargoless_core::lanedrv::PointerLander::new(repo)),
+            None => Box::new(cargoless_core::lanedrv::ReportOnlyLander),
+        };
+        self.lane = Some(LaneHost::spawn(
+            LaneState::new(repo),
+            cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander).with_trail(trail),
+        ));
+        self
+    }
+
     /// Test hook: set the addressing + push queue caps explicitly, without
+    /// Advance the build lane's clock. No-op when no lane is configured.
+    ///
+    /// **The lane does not run without this.** Its capture window and ejection
+    /// TTLs are both measured in ticks, and `LaneState`'s clock moves ONLY on
+    /// `LaneEvent::Tick` — so with nothing driving it `now` stays 0 forever, the
+    /// default 60-tick window never elapses, and a build only ever starts when
+    /// the queue happens to reach `max_members`. A lane that accepts
+    /// submissions, reports "queued", and silently never builds is the worst
+    /// possible failure: it looks like a transport or auth problem, not a
+    /// missing heartbeat.
+    ///
+    /// Ejection TTLs lapse on the same signal, so without it an ejection is
+    /// permanent — the backstop that is supposed to guarantee nothing is stuck
+    /// forever would itself never fire.
+    pub fn lane_tick(&self, now: u64) {
+        if let Some(lane) = self.lane.as_ref() {
+            lane.tick(now);
+        }
+    }
+
     /// mutating process env. Used by the cap unit tests so the shipped
     /// [`Self::new`] env-read path stays untouched. Retains the historical
     /// stored value for the other cap so a test only overrides what it
@@ -3612,6 +3737,82 @@ impl VerdictService for ServeVerdictState {
 
     fn get_status(&self, worktree: &str) -> Option<WorktreeStatus> {
         self.get_status_attributed(worktree, None)
+    }
+
+    /// Submit a candidate to the build lane.
+    ///
+    /// The trait default *fails* on a laneless daemon and that is preserved
+    /// here: answering "queued" when no lane exists would leave the caller
+    /// waiting forever for a build that is never going to run.
+    fn lane_enqueue(&self, request: &LaneEnqueueRequest) -> Result<String, String> {
+        let Some(lane) = self.lane.as_ref() else {
+            return Err("build lane not enabled on this daemon".to_string());
+        };
+        // `id` and `head` are required and are NOT defaulted. A member with no
+        // identity cannot be attributed, ejected or reported on, and an
+        // anonymous candidate must never enter a queue that can move the
+        // trunk. `changed_files` IS optional — a caller that cannot compute a
+        // diff still gets queued and accepts that its reds are unattributable.
+        if request.id.trim().is_empty() {
+            return Err("`id` is required — an anonymous member cannot be attributed".to_string());
+        }
+        if request.head.trim().is_empty() {
+            return Err("`head` is required — without it staleness cannot be detected".to_string());
+        }
+        lane.enqueue(
+            LaneMember::new(request.id.clone(), request.head.clone())
+                .with_changed_files(request.changed_files.clone()),
+        )
+    }
+
+    /// Lift an ejection by hand.
+    fn lane_readmit(&self, id: &str) -> Result<String, String> {
+        let Some(lane) = self.lane.as_ref() else {
+            return Err("build lane not enabled on this daemon".to_string());
+        };
+        lane.readmit(id)
+    }
+
+    /// Take a member out of the lane permanently.
+    ///
+    /// The escape hatch for a member the lane will never finish with: a closed
+    /// or superseded PR, or one blocked on something outside the lane's view —
+    /// a required check it cannot pass, so the forge refuses the merge however
+    /// green the candidate builds. Without this the member rebuilds forever and
+    /// consumes the whole queue, because the lane's own ejection only fires on
+    /// a red the member CAUSED.
+    fn lane_withdraw(&self, id: &str) -> Result<String, String> {
+        let Some(lane) = self.lane.as_ref() else {
+            return Err("build lane not enabled on this daemon".to_string());
+        };
+        if id.trim().is_empty() {
+            return Err("`id` is required — refusing to withdraw an unnamed member".to_string());
+        }
+        lane.withdraw(id)
+    }
+
+    /// The lane's product surface: queue depth, the running build, and every
+    /// live ejection WITH its reason. An author whose change stopped moving
+    /// needs to see which errors hold it, who else is implicated, and what
+    /// will clear it — so the ejections carry `kind` (attributed vs not,
+    /// because the two are cleared by different things) and the failing files.
+    fn lane_snapshot(&self) -> Option<serde_json::Value> {
+        let lane = self.lane.as_ref()?;
+        let s = lane.snapshot();
+        Some(serde_json::json!({
+            "phase": s.phase,
+            "queue_depth": s.queue_depth,
+            "generation": s.generation,
+            "in_flight": s.in_flight,
+            "ejections": s.ejections.iter().map(|e| serde_json::json!({
+                "id": e.id,
+                "head": e.head,
+                "kind": e.kind,
+                "files": e.files,
+                "shared_with": e.shared_with,
+                "expires_at_tick": e.expires_at_tick,
+            })).collect::<Vec<_>>(),
+        }))
     }
 
     /// Resolution rule (the `<absent>` fix's read half):

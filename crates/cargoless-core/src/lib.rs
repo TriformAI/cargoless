@@ -43,6 +43,8 @@ pub mod idle;
 pub mod l4proxy;
 pub mod lane;
 pub mod lanedrv;
+pub mod lanehost;
+pub mod lanetree;
 pub mod lsp;
 pub mod model;
 pub mod multiplex;

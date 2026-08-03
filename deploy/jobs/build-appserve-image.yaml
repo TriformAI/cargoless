@@ -1,0 +1,121 @@
+# Build + push the cargoless-APPSERVE image IN-CLUSTER (no Docker host needed).
+#
+# WHY THIS FILE EXISTS: it did not, and that cost six weeks. `deploy/jobs/`
+#   held only build-serve-image.yaml, while deploy/cargoless-appserve.Dockerfile
+#   and the egress NetworkPolicy (app=cargoless-appserve-image-builder) had both
+#   existed for months. With no job to render, nobody rebuilt the image: on
+#   2026-08-03 the running cargoless-preview reported
+#   `cargoless 0.4.0 built=1782303203` — 2026-06-24, SIX WEEKS STALE.
+#
+#   That is not cosmetic. app-serve is a DIFFERENT BINARY PATH from
+#   cargoless-serve: `RealHooks::checkout` (crates/cargoless-core/src/appbuild.rs)
+#   — the preview build worker — runs here, not in the lane/witness daemon. A
+#   fix shipped to cargoless-serve never reaches it. I lost a cycle rolling a
+#   worktree self-heal into the wrong image and then hand-repairing the same
+#   worktree twice.
+#
+# THE TWO CORRECTIONS THAT build-serve-image.yaml STILL LACKS — both are in this
+# file deliberately; do not "simplify" them away:
+#
+#   1. GIT CONTEXT IS FORGEJO, NOT GITHUB. The serve template still says
+#      `git://github.com/TriformAI/cargoless.git`. This repo lives on
+#      forgejo.triform.dev; a GitHub context fails to clone (and the egress
+#      NetworkPolicy only permits the forge). Use the FULL 40-char sha —
+#      resolve it with `git rev-parse`, never hand-write it.
+#
+#   2. EXCLUDE triform-1. It is the single control-plane host and
+#      `workload-triform1-exclusion-audit` is AUDIT-mode, so a 12-CPU/24Gi build
+#      will happily schedule there and only warn.
+#
+# ONE-TIME PREREQ (operator): the push-scoped `registry-push` secret must exist
+#   in this namespace — `registry-pull` is pull-only and cannot push. It already
+#   does today; see deploy/jobs/build-serve-image.yaml's header for the recipe.
+#
+# EGRESS: cargoless-builder has a namespace-wide default-deny-egress. The pod
+#   label below (app: cargoless-appserve-image-builder) is what the existing
+#   `cargoless-appserve-builder-egress` NetworkPolicy selects. RENAMING IT
+#   SILENTLY REMOVES EGRESS and kaniko then hangs on the clone with no useful
+#   error.
+#
+# USAGE (manual; BOTH placeholders must be injected — a raw apply fails closed):
+#     sed -e "s|__SOURCE_REF__|$(git rev-parse HEAD)|" \
+#         -e "s|__IMAGE_TAG__|appserve-$(git rev-parse --short=7 HEAD)|" \
+#       deploy/jobs/build-appserve-image.yaml > /tmp/j.yaml
+#     grep -oE '__[A-Z_]+__' /tmp/j.yaml   # MUST print nothing
+#     kubectl apply -f /tmp/j.yaml
+#
+#   Substituting only ONE placeholder is a real failure mode: kaniko happily
+#   pushes to a tag literally named `__IMAGE_TAG__` and reports success.
+#
+# THEN: building is NOT deploying. Roll the preview and verify the RUNNING
+#   BINARY, not the manifest you just applied:
+#     kubectl -n triform-staging exec <pod> -c app-serve -- cargoless --version
+#   If the build timestamp did not move, the roll did not take. Note
+#   cargoless-preview is Flux-managed, so a live `set image` may be reverted
+#   within ~60s — put the tag in the tf-multiverse manifest instead.
+#
+# Duration: ~10-15 min cold (the release cargo build dominates); kaniko layer
+#   cache makes warm rebuilds much faster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: build-cargoless-appserve-image
+  namespace: cargoless-builder
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        # Load-bearing: selected by the cargoless-appserve-builder-egress
+        # NetworkPolicy. See the EGRESS note in the header.
+        app: cargoless-appserve-image-builder
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # triform-1 is the control plane and the exclusion policy is
+                  # Audit-mode — without this the build schedules there anyway.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["triform-1"]
+      imagePullSecrets:
+        - name: registry-pull
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - "--context=git://forgejo.triform.dev/triform/cargoless.git#__SOURCE_REF__"
+            - "--dockerfile=deploy/cargoless-appserve.Dockerfile"
+            - "--destination=registry.triform.cloud/cargoless/cargoless-appserve:__IMAGE_TAG__"
+            - "--cache=true"
+            - "--cache-repo=registry.triform.cloud/cargoless/cargoless-appserve-cache"
+            - "--snapshot-mode=redo"
+            - "--use-new-run"
+          env:
+            # kaniko reads BOTH pull (base image) and push (destination) creds
+            # from this merged docker config.
+            - { name: DOCKER_CONFIG, value: "/kaniko/.docker" }
+            # The forge context needs credentials: this repo is not public.
+            - name: GIT_USERNAME
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: username }
+            - name: GIT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: forgejo-cargoless-auth, key: token }
+          volumeMounts:
+            - { name: docker-config, mountPath: /kaniko/.docker }
+          resources:
+            requests: { cpu: "4", memory: "8Gi" }
+            limits: { cpu: "12", memory: "24Gi" }
+      volumes:
+        - name: docker-config
+          projected:
+            sources:
+              - secret:
+                  name: registry-push
+                  items:
+                    - { key: .dockerconfigjson, path: config.json }
