@@ -523,11 +523,13 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             );
             std::process::exit(2);
         }
-        // Both remote destinations build elsewhere and report `artifact: None`,
-        // so an artifact path would leave the lander silently publishing
-        // nothing forever. Refuse with the same fail-closed shape as the
-        // unknown-profile check above: a panic makes an operator guess, this
-        // sentence hands them the fix.
+        // Both remote destinations build elsewhere, so neither can publish a
+        // LOCAL artifact path. Dispatch still carries the immutable candidate
+        // sha to CommandLander through LegOutcome.artifact; that value is an
+        // identity, not a file in this process. Preview has no equivalent
+        // identity handoff. Refuse a configured local path with the same
+        // fail-closed shape as the unknown-profile check above: a panic makes
+        // an operator guess, this sentence hands them the fix.
         if artifact.is_some() && (!dispatch_cmd.is_empty() || !preview_slot.is_empty()) {
             eprintln!(
                 "[cargoless] FATAL: CARGOLESS_LANE_ARTIFACT cannot be combined \

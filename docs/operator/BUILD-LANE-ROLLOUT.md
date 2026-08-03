@@ -53,12 +53,44 @@ a member on no evidence. Fail-safe.
    |---|---|
    | `CARGOLESS_LANE_PROFILE` | the `cargoless.checks.yaml` profile to run. Unset ⇒ no lane, and `GET /lane` 404s. |
    | `CARGOLESS_LANE_BASE` | ref candidates are built on. Default `main`. |
-   | `CARGOLESS_LANE_ARTIFACT` | path, relative to the candidate root, of the artifact to publish on green. |
+   | `CARGOLESS_LANE_ARTIFACT` | local-only path, relative to the candidate root, to publish on green. Never combine it with a remote destination. |
+   | `CARGOLESS_LANE_DISPATCH` | trusted argv that builds the candidate outside this daemon. Mutually exclusive with `CARGOLESS_LANE_PREVIEW_SLOT`. |
+   | `CARGOLESS_LANE_DISPATCH_REMOTE` | git remote used to publish the immutable candidate. Default `origin`. |
+   | `CARGOLESS_LANE_DISPATCH_REF_PREFIX` | content-addressed ref prefix. Default `refs/heads/lane-candidate`. |
+   | `CARGOLESS_LANE_LAND` | trusted argv that receives the green roster and candidate identity and performs forge-specific landing. Unset ⇒ report-only. |
 
    Leave `CARGOLESS_LANE_ARTIFACT` unset for a **check-only lane**: it proves
    the merged tree compiles and deliberately leaves `.cargoless/latest-green`
    alone. That is the safe way to start — it cannot move your pointer, so a
    wrong profile costs build minutes and nothing else.
+
+   For a shared or credentialed daemon, use `CARGOLESS_LANE_DISPATCH` rather
+   than in-process legs. Rust compilation executes candidate `build.rs` files
+   and proc macros; running that inside a pod with a push-capable checkout gives
+   unreviewed code the pod's authority. The dispatcher publishes the candidate
+   under `<ref-prefix>/<candidate-sha>`, asks an unprivileged builder to verdict
+   that exact ref, and on green carries that same SHA to `CARGOLESS_LANE_LAND`.
+   The lander must fetch the content-addressed ref and compare-and-swap that
+   candidate; it must not reconstruct or rebuild the roster.
+
+   Dispatcher and lander commands deliberately inherit the daemon's trusted
+   working directory, never the unreviewed candidate worktree. Use an absolute
+   path in the trusted base checkout in a fleet deployment, for example:
+
+   ```text
+   CARGOLESS_LANE_DISPATCH=/workspace/repo/scripts/ci/lane-dispatch.sh
+   CARGOLESS_LANE_LAND=/workspace/repo/scripts/ci/lane-land.sh
+   ```
+
+   A relative command that only works because an image happens to set `WORKDIR`
+   is deployment drift waiting to happen. A command resolved inside the
+   candidate would be a privilege escalation.
+
+   `CARGOLESS_LANE_ARTIFACT` has two intentionally different appearances in
+   this flow. As daemon configuration it names a local file and is forbidden
+   with remote destinations. As environment passed to `CARGOLESS_LANE_LAND`, it
+   carries the remote builder's immutable candidate SHA. The latter is an
+   identity, not a local artifact path.
 
    Confirm from the boot log rather than assuming:
 
@@ -109,6 +141,12 @@ not be acceptable.
 4. **Run it in shadow first** — compare its verdict against whatever builds your
    trunk today, on the same commit, before anything depends on it.
 
+5. **Arm landing only after exact identity is visible end to end.** A green
+   remote build must report the candidate SHA, the lander must receive the same
+   SHA, and the forge ref must resolve to it. If any of those identities is
+   absent or different, hold the queue as infrastructure; never rebuild and
+   call the replacement tree equivalent.
+
 ## Shadow-running before you arm it
 
 Run the lane where it cannot hurt anyone first. Not ceremony — the lane's leg
@@ -151,6 +189,11 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8787/lane | jq
 | a build with members | that set is compiling; arrivals queue, nothing preempts |
 | ejections with `Attributed` | those members own a file that carried an error |
 | ejections with `Unattributed` | the errors are in files nobody touched — **everyone** is held |
+
+For a dispatched lane, correlate the candidate SHA in the dispatcher log, the
+content-addressed forge ref, and the `CARGOLESS_LANE_ARTIFACT` received by the
+lander. These three values must be byte-identical. A green label without that
+identity chain is not permission to land.
 
 ## "My change is stuck"
 

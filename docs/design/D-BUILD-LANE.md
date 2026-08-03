@@ -35,6 +35,13 @@ This is the whole reason the lane is reusable: a Leptos app declares
 `trunk build`; a larger workspace declares `cargo build --release` plus a wasm
 target plus `wasm-bindgen`. The lane does not care which.
 
+On a shared credentialed daemon, "your build" should be a remote dispatcher,
+not an in-process command. Cargoless publishes the candidate under a
+content-addressed ref, the remote builder verdicts that exact SHA without merge
+credentials, and the green SHA is carried to the forge adapter. This preserves
+the same abstraction while keeping unreviewed `build.rs` and proc macros away
+from the daemon's credentials.
+
 ## Configuration
 
 The lane runs a named profile from `cargoless.checks.yaml`
@@ -160,10 +167,18 @@ It deliberately does **not** merge anything into git. Cargoless does not know
 what a merge means for your forge, and guessing would be worse than asking for a
 small adapter. A forge adapter typically:
 
-1. pushes the candidate with a compare-and-swap against the frozen base
+1. resolves the green candidate identity produced by the builder (for a
+   dispatched lane, `CARGOLESS_LANE_ARTIFACT` is that SHA),
+2. fetches the content-addressed candidate ref and proves it resolves to the
+   same SHA,
+3. pushes that candidate with a compare-and-swap against the frozen base
    (`git push --force-with-lease=<branch>:<base>`),
-2. reconciles each member's PR state,
-3. promotes the artifact it already built.
+4. reconciles each member's PR state,
+5. promotes the artifact it already built.
+
+The adapter must not recreate the merges or launch another build. Either action
+mints a different tree and severs the only proof that matters: the commit being
+landed is the commit that was green.
 
 If the CAS is rejected — the base moved during the build — return `Err`. The
 lane treats that as infrastructure and re-enqueues every member so the next
