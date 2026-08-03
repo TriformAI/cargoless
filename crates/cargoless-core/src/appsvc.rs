@@ -382,15 +382,34 @@ impl AppServeState {
 /// assertion (`clippy::assertions_on_constants` folds that to `assert!(true)`).
 ///
 /// One hour. The reasoning is a window, from both ends:
-/// - **Lower bound:** it must be far longer than any single build/probe cycle,
-///   or an instance merely *recovering* would be mistaken for dead. A cold
-///   Leptos build is minutes; an hour is an order of magnitude above that.
+/// - **Lower bound:** it must exceed the longest legitimate gap between two
+///   transitions, or an instance merely *recovering* would be mistaken for
+///   dead. The deployment's own cold-build budget sets that number: the
+///   `startupProbe` in `deploy/cargoless-appserve.k8s.yaml` allows
+///   `180 × 10s` ⇒ 30 minutes. An hour clears it with 2× headroom, so an
+///   instance grinding through a full cold rebuild after losing its child
+///   keeps vetoing the whole way.
 /// - **Upper bound:** while an instance is gating, the whole pod is NotReady,
 ///   which delists its *healthy* siblings too (one readinessProbe, all
 ///   endpoints). Every extra hour of that is pure collateral damage on slots
 ///   that are fine. An hour is long enough for a k8s probe (15s × 4 ⇒ ~1 min
 ///   to NotReady) to raise a loud, alertable, sustained red, and short enough
 ///   that the blast radius does not run for weeks.
+///
+/// **The one sharp edge, stated honestly:** an instance that is degraded *and*
+/// holds a single phase for over an hour — a cold rebuild past the 60-minute
+/// mark with its serving child already gone — ages out mid-recovery, so
+/// `/readyz` can flip 503 → 200 while it is still legitimately working. This
+/// is observable in production: a `lane` instance wedged in `phase=building`
+/// with `serving_sha: null` is exactly that shape. It is accepted
+/// deliberately, because the alternative is worse: a second liveness notion
+/// ("a busy pipeline always counts as live") would let a *hung* build veto
+/// forever, reintroducing precisely the wedge this exists to remove — and a
+/// build that has not emitted a transition in an hour is not distinguishable
+/// from a hung one anyway. One rule applied uniformly beats two rules where
+/// the second can wedge. The instance is never hidden: it stays on `/app`
+/// with its `last_red_reason`, `idle_secs`, and a place in
+/// `readiness.stale_degraded`.
 const STALE_AFTER_SECS: u64 = 3600;
 
 /// The staleness horizon in seconds — a fn, so tests can assert against a
