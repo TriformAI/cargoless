@@ -5943,6 +5943,11 @@ checks:
   - id: no-fail-token
     kind: forbidden_patterns
     inputs: ["src/*.rs"]
+    # The HTTP batch tests exercise attribution and corun policy, not the
+    # engine's timeout policy.  Forty no-corun members intentionally repeat
+    # this scan serially; give each tiny synthetic scan enough headroom that a
+    # loaded CI volume cannot turn this fixture into a project-check timeout.
+    timeout_ms: 12000
     patterns:
       - code: batch.fail_token
         literal: FAIL_BATCH
@@ -7810,7 +7815,11 @@ checks:
 
         let report = http_batch_check(&request);
 
-        assert_eq!(report.verdict, BatchVerdict::Green);
+        assert_eq!(
+            report.verdict,
+            BatchVerdict::Green,
+            "clean no-corun members must remain green: {report:#?}"
+        );
         assert_eq!(report.members.len(), 40);
         assert_eq!(report.combined_checks, 0);
         assert_eq!(
