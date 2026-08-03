@@ -1306,59 +1306,60 @@ fn exec(
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
-            let pairs: Vec<(String, String)> = if let Some(pushed) = api.take_overlay_for(&wt_key) {
-                if let Some(context) = pushed.semantic.as_ref() {
-                    _span.record("request_id", context.request_id.as_str());
-                    _span.record("attempt_id", context.attempt_id.as_str());
-                    _span.record("trace_id", context.trace_id.as_str());
-                    tracing::info!(
-                        request_id = %context.request_id,
-                        attempt_id = %context.attempt_id,
-                        trace_id = %context.trace_id,
-                        worktree = %wt.display(),
-                        "attempt entered rust-analyzer overlay transaction"
+            let (pairs, lsp_root): (Vec<(String, String)>, PathBuf) =
+                if let Some(pushed) = api.take_overlay_for(&wt_key) {
+                    if let Some(context) = pushed.semantic.as_ref() {
+                        _span.record("request_id", context.request_id.as_str());
+                        _span.record("attempt_id", context.attempt_id.as_str());
+                        _span.record("trace_id", context.trace_id.as_str());
+                        tracing::info!(
+                            request_id = %context.request_id,
+                            attempt_id = %context.attempt_id,
+                            trace_id = %context.trace_id,
+                            worktree = %wt.display(),
+                            "attempt entered rust-analyzer overlay transaction"
+                        );
+                    }
+                    // #A2/#A7 — stamp attribution (base_sha + receipt/consume
+                    // clocks) the instant the push is consumed, BEFORE the
+                    // partial moves below; `publish_verdict` pops it at the
+                    // sole attribution site.
+                    api.record_push_attribution(&wt_key, &pushed);
+                    pushed_check_profile = pushed.check_profile;
+                    let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
+                    let materialize_overlay = pushed.analysis_root.is_some();
+                    api.record_project_check_context(
+                        &wt_key,
+                        crate::serveapi::ProjectCheckRunContext {
+                            root: project_root.clone(),
+                            changed_files: pushed.changed_files.clone(),
+                            base_ref: pushed.base_ref.clone(),
+                            base_sha: pushed.base_sha.clone(),
+                            source_ref: pushed.source_ref.clone(),
+                            source_sha: pushed.source_sha.clone(),
+                            overlay_files: pushed.files.clone(),
+                            materialize_overlay,
+                            gate: pushed.gate,
+                            check_ids: pushed.check_ids.clone(),
+                        },
                     );
-                }
-                // #A2/#A7 — stamp attribution (base_sha + receipt/consume
-                // clocks) the instant the push is consumed, BEFORE the
-                // partial moves below; `publish_verdict` pops it at the
-                // sole attribution site.
-                api.record_push_attribution(&wt_key, &pushed);
-                pushed_check_profile = pushed.check_profile;
-                let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
-                let materialize_overlay = pushed.analysis_root.is_some();
-                api.record_project_check_context(
-                    &wt_key,
-                    crate::serveapi::ProjectCheckRunContext {
-                        root: project_root,
-                        changed_files: pushed.changed_files.clone(),
-                        base_ref: pushed.base_ref.clone(),
-                        base_sha: pushed.base_sha.clone(),
-                        source_ref: pushed.source_ref.clone(),
-                        source_sha: pushed.source_sha.clone(),
-                        overlay_files: pushed.files.clone(),
-                        materialize_overlay,
-                        gate: pushed.gate,
-                        check_ids: pushed.check_ids.clone(),
-                    },
-                );
-                pushed.files
-            } else {
-                // #A2 — this verdict cycle is FS-derived. A leftover
-                // attribution from an earlier consumed-but-never-published
-                // push (RA wedge, restart) must not stamp its base_sha
-                // onto a verdict computed from the on-disk tree.
-                let _ = api.take_push_attribution(&wt_key);
-                let mut pairs = Vec::new();
-                if let Some(files) = pending_batch.get(&wt) {
-                    for f in files {
-                        if let Ok(text) = std::fs::read_to_string(f) {
-                            pairs.push((f.to_string_lossy().into_owned(), text));
+                    (pushed.files, project_root)
+                } else {
+                    // #A2 — this verdict cycle is FS-derived. A leftover
+                    // attribution from an earlier consumed-but-never-published
+                    // push (RA wedge, restart) must not stamp its base_sha
+                    // onto a verdict computed from the on-disk tree.
+                    let _ = api.take_push_attribution(&wt_key);
+                    let mut pairs = Vec::new();
+                    if let Some(files) = pending_batch.get(&wt) {
+                        for f in files {
+                            if let Ok(text) = std::fs::read_to_string(f) {
+                                pairs.push((f.to_string_lossy().into_owned(), text));
+                            }
                         }
                     }
-                }
-                pairs
-            };
+                    (pairs, wt.clone())
+                };
             let file_count = pairs.len() as u64;
             let overlay_size_bytes: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
             _span.record("file_count", file_count);
@@ -1374,7 +1375,7 @@ fn exec(
             // document mutation. The diagnostic pull must observe a strictly
             // newer boundary before its result can settle this transaction.
             let diagnostic_refresh_generation = lsp.diagnostic_refresh_generation();
-            let lsp_pairs = lsp_source_pairs(&pairs);
+            let lsp_pairs = lsp_source_pairs(&pairs, &lsp_root);
             let target =
                 OverlaySet::from_pairs(lsp_pairs.iter().map(|(p, c)| (p.clone(), c.clone())));
             // Collect the diff verbs once so we can inspect the count and
@@ -1583,11 +1584,22 @@ fn save_trigger_path(
         .unwrap_or_else(|| wt.join("Cargo.toml"))
 }
 
-fn lsp_source_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+fn lsp_source_pairs(pairs: &[(String, String)], analysis_root: &Path) -> Vec<(String, String)> {
     pairs
         .iter()
         .filter(|(path, _)| is_rust_source_path(path))
-        .cloned()
+        .map(|(path, content)| {
+            let path = Path::new(path);
+            let absolute_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                analysis_root.join(path)
+            };
+            (
+                absolute_path.to_string_lossy().into_owned(),
+                content.clone(),
+            )
+        })
         .collect()
 }
 
@@ -3156,6 +3168,7 @@ mod tests {
 
     #[test]
     fn lsp_overlay_pairs_keep_only_rust_sources() {
+        let analysis_root = Path::new("/workspace/tf-multiverse");
         let pairs = vec![
             ("/repo/wt-01/Cargo.toml".into(), "[workspace]".into()),
             ("/repo/wt-01/Cargo.lock".into(), "# lock".into()),
@@ -3166,13 +3179,35 @@ mod tests {
             ("/repo/wt-01/.cargo/config.toml".into(), "[build]".into()),
         ];
 
-        let lsp_pairs = lsp_source_pairs(&pairs);
+        let lsp_pairs = lsp_source_pairs(&pairs, analysis_root);
 
         assert_eq!(
             lsp_pairs,
             vec![(
                 "/repo/wt-01/alchemy/src/protocols/transfer.rs".into(),
                 "pub struct TransferProtocol;".into(),
+            )]
+        );
+    }
+
+    #[test]
+    fn lsp_overlay_pairs_resolve_relative_sources_from_analysis_root() {
+        let analysis_root = Path::new("/workspace/tf-multiverse");
+        let pairs = vec![
+            (
+                "alchemy/src/telemetry.rs".into(),
+                "pub fn broken() { let _: u32 = \"wrong\"; }".into(),
+            ),
+            ("alchemy/Cargo.toml".into(), "[package]".into()),
+        ];
+
+        let lsp_pairs = lsp_source_pairs(&pairs, analysis_root);
+
+        assert_eq!(
+            lsp_pairs,
+            vec![(
+                "/workspace/tf-multiverse/alchemy/src/telemetry.rs".into(),
+                "pub fn broken() { let _: u32 = \"wrong\"; }".into(),
             )]
         );
     }
