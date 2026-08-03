@@ -86,24 +86,24 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
 use cargoless_core::activitymgr::ActivityTracker;
-use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
+use cargoless_core::analyzer::{rust_analyzer_command, Supervisor};
 use cargoless_core::cluster::{WorkspaceConfig, WorkspaceConfigHash};
 use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
-use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
+use cargoless_core::clustermgr::{read_workspace_config, ClusterLifecycle, LifecycleAction};
 use cargoless_core::lsp::{InitOpts, LspClient, LspEvent};
 use cargoless_core::multiplex::LspVerb;
 use cargoless_core::multiplex::OverlayMultiplexer;
 use cargoless_core::overlay::OverlaySet;
-use cargoless_core::repo::RepoScope;
 use cargoless_core::repo::topology::WorktreeEntry;
 use cargoless_core::repo::watch::{RepoWatchRouter, WtId, WtRouter};
+use cargoless_core::repo::RepoScope;
 
 use crate::orphan::ParentWatch;
 use crate::statusfile::{self, Status, Verdict};
@@ -3639,6 +3639,102 @@ mod tests {
             early_red_event(ev),
             LspEvent::FlycheckFailed { message } if message.contains("file:///repo/wt/src/lib.rs")
         ));
+    }
+
+    #[test]
+    fn native_verdict_events_cannot_settle_an_active_diagnostic_pull() {
+        let mut pull_active = true;
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 1,
+            total: 1,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::Diagnostics(diagnostic)),
+            )
+            .is_none(),
+            "unsolicited native diagnostics must not race the exact pull"
+        );
+        assert!(pull_active, "only the correlated pull may clear its fence");
+        assert!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::FlycheckEnded),
+            )
+            .is_none(),
+            "a native progress end must not publish before the exact pull finishes"
+        );
+        assert!(pull_active);
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::Native(LspEvent::IndexingEnded),
+            ),
+            Some(LspEvent::IndexingEnded)
+        ));
+        assert!(
+            pull_active,
+            "readiness remains observable without settling the check"
+        );
+    }
+
+    #[test]
+    fn correlated_pull_is_the_only_event_source_that_clears_its_fence() {
+        let mut pull_active = true;
+        let diagnostic = cargoless_core::lsp::PublishDiagnostics {
+            uri: "file:///workspace/src/lib.rs".into(),
+            authoritative_errors: 0,
+            advisory_errors: 0,
+            total: 0,
+            diagnostics: Vec::new(),
+        };
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull(LspEvent::Diagnostics(diagnostic)),
+            ),
+            Some(LspEvent::Diagnostics(_))
+        ));
+        assert!(
+            pull_active,
+            "diagnostic rows precede the pull's terminal boundary"
+        );
+
+        assert!(matches!(
+            correlate_lsp_event(
+                &mut pull_active,
+                LspIngressEvent::DiagnosticPull(LspEvent::FlycheckEnded),
+            ),
+            Some(LspEvent::FlycheckEnded)
+        ));
+        assert!(
+            !pull_active,
+            "the correlated terminal event releases the fence"
+        );
+    }
+
+    #[test]
+    fn correlated_pull_failure_releases_the_fence_and_fails_closed() {
+        let mut pull_active = true;
+        let event = correlate_lsp_event(
+            &mut pull_active,
+            LspIngressEvent::DiagnosticPull(LspEvent::FlycheckFailed {
+                message: "ra_diagnostic_pull:timeout".into(),
+            }),
+        );
+
+        assert!(matches!(
+            event,
+            Some(LspEvent::FlycheckFailed { message }) if message.contains("timeout")
+        ));
+        assert!(!pull_active);
     }
 
     // ────────────────────────────────────────────────────────────────────
