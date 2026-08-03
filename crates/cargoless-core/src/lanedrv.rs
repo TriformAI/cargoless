@@ -258,11 +258,9 @@ impl LegPlan {
 
     /// Does this plan produce a LOCAL artifact for a lander to publish?
     ///
-    /// Only in-process does. Both remote plans build elsewhere and report
-    /// `artifact: None`, so pairing either with a publishing lander would leave
-    /// it taking its "green with nothing to publish" branch forever: no error,
-    /// no pointer movement, and an operator watching a publishing lane publish
-    /// nothing.
+    /// Only in-process does. Remote plans may report an opaque identity to a
+    /// command lander, but they do not create a LOCAL file that PointerLander
+    /// can publish.
     #[must_use]
     pub fn publishes_locally(&self) -> bool {
         matches!(
@@ -677,10 +675,12 @@ impl LegRunner for DispatchLegRunner {
         Ok(LegOutcome {
             tree,
             diagnostics,
-            // The artifact lives wherever the external builder put it (a
-            // registry tag, a CAS handle); the dispatcher reports it, and the
-            // lander promotes it. Nothing local to publish.
-            artifact: None,
+            // This is the immutable candidate identity the external builder
+            // just verdict-ed. It is deliberately carried through the existing
+            // artifact seam to CommandLander, which exports it as
+            // CARGOLESS_LANE_ARTIFACT. Nothing local is published; the trusted
+            // lander fetches the content-addressed ref and CASes this exact sha.
+            artifact: Some(sha),
             legs: vec![LegReport {
                 id: "dispatch".to_string(),
                 tree,
