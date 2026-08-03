@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cargoless_proto::Diagnostic;
 use cargoless_proto::outcome::{AttemptId, Conclusion, OutcomeEnvelope, PROTOCOL_HEADER_VALUE};
@@ -82,6 +82,12 @@ pub const MAX_LANE_BODY_BYTES: usize = 1024 * 1024;
 /// push protocol or making small same-host requests pay gzip overhead.
 pub const HTTP_COMPRESSION_MIN_BYTES: usize = 1024 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// End-to-end deadline for writing a POST body. The socket timeout above is a
+/// per-I/O backpressure signal, not permission to abandon a partially written
+/// generated overlay. Keep the overall deadline bounded while allowing slow
+/// ingress/TLS paths to drain without replaying already accepted bytes.
+const CLIENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const CLIENT_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// TCP connect only — read/write keep [`CLIENT_IO_TIMEOUT`]. Daemon-down
 /// detection drops 10s to 2s; the gate failover ladder relies on fast
 /// connect failure.
@@ -259,6 +265,109 @@ fn configured_compression_min_bytes() -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(HTTP_COMPRESSION_MIN_BYTES)
+}
+
+fn upload_timeout_error(written: usize, total: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("upload write deadline elapsed after {written} of {total} bytes"),
+    )
+}
+
+/// Write one request without losing partial progress when a timed or TLS
+/// stream reports transient backpressure. `Write::write_all` keeps no public
+/// offset: once it returns `WouldBlock` after earlier short writes, a caller
+/// cannot safely resume. Owning the loop here lets us retry only the unwritten
+/// suffix until one bounded end-to-end deadline.
+fn write_and_flush_with_deadline(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    write_all_until(writer, bytes, deadline)?;
+    flush_until(writer, deadline)
+}
+
+fn write_all_until(
+    writer: &mut impl Write,
+    mut remaining: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let total = remaining.len();
+
+    while !remaining.is_empty() {
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining_time.is_zero() {
+            return Err(upload_timeout_error(total - remaining.len(), total));
+        }
+
+        match writer.write(remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write the complete upload request",
+                ));
+            }
+            Ok(written) if written <= remaining.len() => {
+                remaining = &remaining[written..];
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "writer reported more bytes than it was given",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let remaining_time = deadline.saturating_duration_since(Instant::now());
+                if remaining_time.is_zero() {
+                    return Err(upload_timeout_error(total - remaining.len(), total));
+                }
+                thread::sleep(CLIENT_WRITE_RETRY_INTERVAL.min(remaining_time));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn flush_until(writer: &mut impl Write, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining_time.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upload flush deadline elapsed",
+            ));
+        }
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let remaining_time = deadline.saturating_duration_since(Instant::now());
+                if remaining_time.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upload flush deadline elapsed",
+                    ));
+                }
+                thread::sleep(CLIENT_WRITE_RETRY_INTERVAL.min(remaining_time));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn decode_request_body(
@@ -1733,8 +1842,7 @@ impl HttpClient {
         req.extend_from_slice(&prepared.bytes);
 
         let mut stream = self.connect_with_read_timeout(read_timeout)?;
-        stream.write_all(&req)?;
-        stream.flush()?;
+        write_and_flush_with_deadline(&mut stream, &req, CLIENT_UPLOAD_TIMEOUT)?;
         let mut raw = String::new();
         stream.read_to_string(&mut raw)?;
         let (head, resp) = raw
@@ -2157,6 +2265,7 @@ impl TransportClient for HttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -2177,6 +2286,77 @@ mod tests {
 
     fn client_for(s: &HttpServer) -> HttpClient {
         HttpClient::new(&format!("http://{}", s.addr())).expect("client")
+    }
+
+    #[derive(Default)]
+    struct PartialWouldBlockWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for PartialWouldBlockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            match self.writes {
+                1 => {
+                    let accepted = buf.len().min(3);
+                    self.bytes.extend_from_slice(&buf[..accepted]);
+                    Ok(accepted)
+                }
+                2 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                3 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                _ => {
+                    self.bytes.extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            match self.flushes {
+                1 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn upload_writer_retries_only_the_unwritten_suffix_after_would_block() {
+        let mut writer = PartialWouldBlockWriter::default();
+        let payload = b"generated-overlay";
+
+        write_and_flush_with_deadline(&mut writer, payload, Duration::from_secs(1))
+            .expect("transient backpressure should recover");
+
+        assert_eq!(writer.bytes, payload);
+        assert_eq!(writer.writes, 4, "partial progress must survive retries");
+        assert_eq!(writer.flushes, 2, "flush backpressure must also recover");
+    }
+
+    struct PermanentlyBlockedWriter;
+
+    impl Write for PermanentlyBlockedWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn upload_writer_fails_closed_when_its_deadline_expires() {
+        let err = write_and_flush_with_deadline(
+            &mut PermanentlyBlockedWriter,
+            b"overlay",
+            Duration::ZERO,
+        )
+        .expect_err("permanent backpressure must not loop forever");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
