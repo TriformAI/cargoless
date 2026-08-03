@@ -879,7 +879,7 @@ fn slot_needs_repoint(snapshot: &str, slot: &str, sha: &str) -> bool {
 
     if ["serving_sha", "pending_sha", "last_red_sha"]
         .iter()
-        .any(|field| inst.get(field).and_then(|x| x.as_str()) == Some(sha))
+        .any(|field| inst.get(*field).and_then(|x| x.as_str()) == Some(sha))
     {
         return false;
     }
@@ -2003,6 +2003,17 @@ mod slot_free_tests {
             "lane",
             "candidate"
         ));
+    }
+
+    #[test]
+    fn a_quiescent_slot_serving_an_older_candidate_is_reasserted() {
+        let snap = r#"{"instances":[{
+            "name":"lane",
+            "phase":"serving",
+            "serving_sha":"older",
+            "pending_sha":null
+        }]}"#;
+        assert!(slot_needs_repoint(snap, "lane", "candidate"));
     }
 
     #[test]
