@@ -2073,7 +2073,8 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     /// Drive the lane until it is quiet, collecting every action for the caller
     /// to report. Bounded so a policy bug cannot spin forever.
     pub fn pump(&self, lane: &mut LaneState, event: LaneEvent) -> Vec<LaneAction> {
-        self.pump_observed(lane, event, |_, _| {})
+        self.pump_observed(lane, event, |_, _| Ok::<(), std::convert::Infallible>(()))
+            .expect("the default lane observer is infallible")
     }
 
     /// [`Self::pump`] with a callback fired after every state transition AND
@@ -2104,12 +2105,12 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
     ///
     /// The callback runs on the pump thread and must not block; it is for
     /// publishing a snapshot, not for work.
-    pub fn pump_observed(
+    pub fn pump_observed<E>(
         &self,
         lane: &mut LaneState,
         event: LaneEvent,
-        mut observe: impl FnMut(&LaneState, &LaneActivity),
-    ) -> Vec<LaneAction> {
+        mut observe: impl FnMut(&LaneState, &LaneActivity) -> Result<(), E>,
+    ) -> Result<Vec<LaneAction>, E> {
         const MAX_STEPS: usize = 64;
         let mut all = Vec::new();
         let mut pending = std::collections::VecDeque::from(vec![event]);
@@ -2126,11 +2127,11 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             // Observe the NEW state before running the actions it produced.
             // `lane.step` has already set phase/in_flight; `execute` is what
             // blocks.
-            observe(lane, &LaneActivity::Settled);
+            observe(lane, &LaneActivity::Settled)?;
             for a in &actions {
                 let activity = LaneActivity::of(a);
                 if activity.is_blocking() {
-                    observe(lane, &activity);
+                    observe(lane, &activity)?;
                 }
                 let followups = self.execute(a);
                 if activity.is_blocking() {
@@ -2164,13 +2165,13 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                     // `execute` returns NO follow-up event, so without this the
                     // snapshot would stay `landing` until the next unrelated
                     // event arrived.
-                    observe(lane, &LaneActivity::Settled);
+                    observe(lane, &LaneActivity::Settled)?;
                 }
                 pending.extend(followups);
             }
             all.extend(actions);
         }
-        all
+        Ok(all)
     }
 }
 

@@ -334,31 +334,50 @@ impl LaneHost {
         thread::Builder::new()
             .name("cargoless-lane".to_string())
             .spawn(move || {
-                let publish = |live: &LaneState, activity: &LaneActivity| {
+                let publish = |live: &LaneState, activity: &LaneActivity| -> Result<(), String> {
                     if let Some(path) = recovery_path.as_deref()
                         && let Err(e) = persist_active_build(path, live)
                     {
-                        eprintln!(
-                            "[cargoless:obs] lane-recovery-write outcome=error path={} reason={e}",
+                        return Err(format!(
+                            "lane recovery journal write failed path={} reason={e}",
                             path.display()
-                        );
+                        ));
                     }
                     let next = LaneSnapshot::of(live, activity);
                     match worker_snapshot.lock() {
                         Ok(mut s) => *s = next,
                         Err(poisoned) => *poisoned.into_inner() = next,
                     }
+                    Ok(())
+                };
+
+                let recovery_failed = |reason: &str| {
+                    eprintln!(
+                        "[cargoless:obs] lane-recovery-write outcome=blocked reason={reason}"
+                    );
                 };
 
                 // A recovered lane is already in Building phase. Nothing will
                 // arrive on the new process's channel to restart that blocking
                 // action, so replay it once before accepting fresh events.
                 if let Some(action) = lane.resume_active_build_action() {
-                    publish(&lane, &LaneActivity::Building);
-                    for event in driver.execute(&action) {
-                        driver.pump_observed(&mut lane, event, &publish);
+                    if let Err(e) = publish(&lane, &LaneActivity::Building) {
+                        recovery_failed(&e);
+                        worker_running.store(false, Ordering::SeqCst);
+                        return;
                     }
-                    publish(&lane, &LaneActivity::Settled);
+                    for event in driver.execute(&action) {
+                        if let Err(e) = driver.pump_observed(&mut lane, event, &publish) {
+                            recovery_failed(&e);
+                            worker_running.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    if let Err(e) = publish(&lane, &LaneActivity::Settled) {
+                        recovery_failed(&e);
+                        worker_running.store(false, Ordering::SeqCst);
+                        return;
+                    }
                 }
 
                 // `recv` ends when every Sender is dropped, i.e. when the host
@@ -402,10 +421,16 @@ impl LaneHost {
                     // corrupt state to inherit.
                     // The accepted set is folded in at READ time, not here — see
                     // `LaneSnapshot::with_accepted`.
-                    driver.pump_observed(&mut lane, event, &publish);
+                    if let Err(e) = driver.pump_observed(&mut lane, event, &publish) {
+                        recovery_failed(&e);
+                        break;
+                    }
                     // And once more after, so the terminal state of the last
                     // transition is visible even if the loop exits here.
-                    publish(&lane, &LaneActivity::Settled);
+                    if let Err(e) = publish(&lane, &LaneActivity::Settled) {
+                        recovery_failed(&e);
+                        break;
+                    }
                 }
                 worker_running.store(false, Ordering::SeqCst);
             })
@@ -556,9 +581,10 @@ impl LaneHost {
 
 /// Atomically journal the exact build roster before the driver blocks. The
 /// file is removed only after the lane leaves Building, so a kill at any point
-/// before `BuildFinished` is recoverable. Best-effort at runtime: observability
-/// storage must not turn a green candidate red, but a malformed file is treated
-/// fail-closed on the next boot by `LaneState::load_active_build`.
+/// before `BuildFinished` is recoverable. This is control-plane state, not
+/// observability: a write failure stops the lane worker before it can dispatch
+/// remote work, and a malformed file fails closed on the next boot through
+/// `LaneState::load_active_build`.
 fn persist_active_build(path: &Path, lane: &LaneState) -> std::io::Result<()> {
     let Some(value) = lane.active_build_recovery_value() else {
         match fs::remove_file(path) {
@@ -766,6 +792,59 @@ mod tests {
             .expect_err("a corrupt active journal must not start an empty lane");
         assert!(error.contains("parse"), "unexpected error: {error}");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unwritable_active_generation_dispatches_no_remote_work() {
+        let root = std::env::temp_dir().join(format!(
+            "cargoless-lane-unwritable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create unwritable-journal test root");
+        let not_a_directory = root.join("not-a-directory");
+        fs::write(&not_a_directory, b"block child creation")
+            .expect("create journal parent blocker");
+        let journal = not_a_directory.join("lane-active-generation.json");
+        let (started_tx, started_rx) = std_channel();
+        let (_release_tx, release_rx) = std_channel();
+        let host = LaneHost::spawn_persisted(
+            LaneState::with_config(
+                &root,
+                LaneConfig {
+                    capture_window_ticks: 0,
+                    ..Default::default()
+                },
+            ),
+            LaneDriver::new(
+                NoTree,
+                BlockingLegs {
+                    started: started_tx,
+                    release: Mutex::new(release_rx),
+                },
+                NoLander,
+            ),
+            &journal,
+        );
+
+        host.enqueue(LaneMember::new("pr-8", "head-8"))
+            .expect("the front door accepts before the worker observes the I/O error");
+        assert!(
+            until(|| !host.running.load(Ordering::SeqCst)),
+            "a journal failure must stop the lane worker"
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "remote work must not start without a durable generation journal"
+        );
+        assert!(
+            host.enqueue(LaneMember::new("pr-9", "head-9")).is_err(),
+            "later submissions must fail loudly after the worker stops"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// DEFECT 1 — a member submitted DURING a build must be visible for the
