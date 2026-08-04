@@ -77,9 +77,11 @@
 //! Both carry a TTL so nothing is ejected forever.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use cargoless_proto::{Diagnostic, Severity};
+use serde_json::{Value, json};
 
 use crate::attribution::{FingerprintCounts, fingerprint_counts};
 
@@ -121,6 +123,43 @@ impl LaneMember {
     {
         self.changed_files = files.into_iter().map(Into::into).collect();
         self
+    }
+
+    pub(crate) fn recovery_value(&self) -> Value {
+        json!({
+            "id": self.id,
+            "head": self.head,
+            "changed_files": self.changed_files,
+        })
+    }
+
+    fn from_recovery_value(value: &Value) -> Result<Self, String> {
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "lane recovery member is missing a non-empty id".to_string())?;
+        let head = value
+            .get("head")
+            .and_then(Value::as_str)
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| format!("lane recovery member `{id}` is missing a non-empty head"))?;
+        let changed_files = value
+            .get("changed_files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("lane recovery member `{id}` is missing changed_files"))?
+            .iter()
+            .map(|file| {
+                file.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("lane recovery member `{id}` has a non-string path"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            id: id.to_string(),
+            head: head.to_string(),
+            changed_files,
+        })
     }
 
     /// Does this member touch `path`?
@@ -544,6 +583,87 @@ impl LaneState {
             infra_retry_after: None,
             root: root.into(),
         }
+    }
+
+    /// Restore the one piece of lane state whose loss spends real build time:
+    /// the exact generation that was blocking when the process stopped.
+    ///
+    /// Queue membership is replayed by the forge adapter, but a running remote
+    /// build has no caller left to deliver its result after a pod replacement.
+    /// Recovering the immutable roster and generation lets the driver issue the
+    /// same `StartBuild` again; an idempotent dispatcher can then reattach to
+    /// the exact external run instead of selecting a different batch and
+    /// orphaning the first compile.
+    pub fn load_active_build(
+        root: impl Into<PathBuf>,
+        path: &Path,
+    ) -> Result<Option<Self>, String> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let value: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+        if value.get("schema").and_then(Value::as_u64) != Some(1) {
+            return Err(format!(
+                "{} has an unsupported lane recovery schema",
+                path.display()
+            ));
+        }
+        let generation = value
+            .get("generation")
+            .and_then(Value::as_u64)
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| format!("{} has no active generation", path.display()))?;
+        let members = value
+            .get("members")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{} has no active member roster", path.display()))?
+            .iter()
+            .map(LaneMember::from_recovery_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        if members.is_empty() {
+            return Err(format!(
+                "{} has an empty active member roster",
+                path.display()
+            ));
+        }
+        let mut lane = Self::new(root);
+        lane.phase = LanePhase::Building;
+        lane.in_flight = members;
+        lane.generation = generation;
+        lane.now = value.get("now").and_then(Value::as_u64).unwrap_or(0);
+        Ok(Some(lane))
+    }
+
+    /// Durable representation of the currently blocking generation.
+    /// `None` means there is no remote build to reattach after a restart.
+    #[must_use]
+    pub(crate) fn active_build_recovery_value(&self) -> Option<Value> {
+        if self.phase != LanePhase::Building || self.in_flight.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "schema": 1,
+            "generation": self.generation,
+            "now": self.now,
+            "members": self
+                .in_flight
+                .iter()
+                .map(LaneMember::recovery_value)
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Re-emit the exact action that was blocking when a durable lane snapshot
+    /// was written. This does not bump the generation or alter the roster.
+    #[must_use]
+    pub(crate) fn resume_active_build_action(&self) -> Option<LaneAction> {
+        self.active_build_recovery_value()
+            .map(|_| LaneAction::StartBuild {
+                generation: self.generation,
+                members: self.in_flight.clone(),
+            })
     }
 
     #[must_use]

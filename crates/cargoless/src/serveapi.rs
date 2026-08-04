@@ -1769,9 +1769,32 @@ impl ServeVerdictState {
             None if publishing => Box::new(cargoless_core::lanedrv::PointerLander::new(repo)),
             None => Box::new(cargoless_core::lanedrv::ReportOnlyLander),
         };
-        self.lane = Some(LaneHost::spawn(
-            LaneState::new(repo),
+        let recovery_path = state_dir.join("lane-active-generation.json");
+        let lane = match LaneState::load_active_build(repo, &recovery_path) {
+            Ok(Some(lane)) => {
+                eprintln!(
+                    "[cargoless:obs] lane-recovery outcome=reattach generation={} members={}",
+                    lane.generation(),
+                    lane.in_flight().len()
+                );
+                lane
+            }
+            Ok(None) => LaneState::new(repo),
+            Err(e) => {
+                // Starting empty would select a second batch while the first
+                // remote build may still be running. Refuse to arm the lane
+                // until an operator repairs/removes the corrupt journal.
+                eprintln!(
+                    "[cargoless:obs] lane-recovery outcome=blocked path={} reason={e}",
+                    recovery_path.display()
+                );
+                return self;
+            }
+        };
+        self.lane = Some(LaneHost::spawn_persisted(
+            lane,
             cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander).with_trail(trail),
+            recovery_path,
         ));
         self
     }
