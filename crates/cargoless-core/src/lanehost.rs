@@ -335,13 +335,13 @@ impl LaneHost {
             .name("cargoless-lane".to_string())
             .spawn(move || {
                 let publish = |live: &LaneState, activity: &LaneActivity| -> Result<(), String> {
-                    if let Some(path) = recovery_path.as_deref()
-                        && let Err(e) = persist_active_build(path, live)
-                    {
-                        return Err(format!(
-                            "lane recovery journal write failed path={} reason={e}",
-                            path.display()
-                        ));
+                    if let Some(path) = recovery_path.as_deref() {
+                        if let Err(e) = persist_active_build(path, live) {
+                            return Err(format!(
+                                "lane recovery journal write failed path={} reason={e}",
+                                path.display()
+                            ));
+                        }
                     }
                     let next = LaneSnapshot::of(live, activity);
                     match worker_snapshot.lock() {
