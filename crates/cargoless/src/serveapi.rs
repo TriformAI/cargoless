@@ -3245,11 +3245,14 @@ impl ServeVerdictState {
     pub fn drain_complete(&self) -> bool {
         let drain = poisoned(&self.drain);
         let batch_counts = self.batch_coalescer.counts();
+        let (witness_inflight, witness_waiting) = self.witness_gate.counts();
         drain.quiescing
             && drain.active_worktrees.is_empty()
             && poisoned(&self.pushed).is_empty()
             && batch_counts.waiters == 0
             && batch_counts.inflight_runs == 0
+            && witness_waiting == 0
+            && witness_inflight == 0
     }
 
     fn mark_push_active(&self, worktree: &str) -> bool {
@@ -9242,6 +9245,43 @@ checks:
             }
         );
         assert!(api.drain_complete());
+    }
+
+    #[test]
+    fn quiesce_waits_for_independently_counted_witness_workers() {
+        // Live finding, 2026-08-04: witness A reported active_worktrees=0
+        // while inflight_witness_compiles=1. The worktree tracker is a set;
+        // a same-key publish can remove its one entry while another witness
+        // worker for that key is still queued or compiling. drain_complete()
+        // must therefore consume the witness gate's independent counters,
+        // not infer worker liveness from active_worktrees.
+        let mut api = ServeVerdictState::new();
+        api.witness_gate = test_witness_gate(1, 60_000);
+        *poisoned(&api.witness_gate.state) = 1;
+        api.witness_gate.waiting.store(1, Ordering::Relaxed);
+
+        let activity = api.request_quiesce();
+        assert_eq!(
+            activity.active_worktrees, 0,
+            "reproduce the lossy set state"
+        );
+        assert_eq!(activity.inflight_witness_compiles, 1);
+        assert_eq!(activity.waiting_witness_compiles, 1);
+        assert!(
+            !api.drain_complete(),
+            "a queued or running witness is accepted work and must survive rollout"
+        );
+
+        api.witness_gate.waiting.store(0, Ordering::Relaxed);
+        assert!(
+            !api.drain_complete(),
+            "the running witness alone still keeps the daemon alive"
+        );
+        *poisoned(&api.witness_gate.state) = 0;
+        assert!(
+            api.drain_complete(),
+            "drain completes only after both counters reach zero"
+        );
     }
 
     // ──────── #A2/#A3/#A7 — verdict attribution + truncation guard ────────
