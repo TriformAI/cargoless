@@ -2144,12 +2144,35 @@ mod point_retry_budget_tests {
         );
     }
 
-    /// A zero delay would busy-loop curl against a socket that is provably not
-    /// listening yet — the same hot-retry shape the infra backoff exists to
-    /// prevent.
+    /// The budget must come from PACING, not from a single long sleep or a
+    /// tight spin.
+    ///
+    /// Two degenerate ways to satisfy the "outlasts a replacement" test above
+    /// while being useless in practice: one attempt with a 5-minute delay
+    /// (never retries — the first curl decides everything, and it runs while
+    /// the daemon is provably down), or hundreds of attempts at ~0s (busy-loops
+    /// curl against a socket that is not listening, the same hot-retry shape
+    /// the infra backoff exists to prevent).
+    ///
+    /// Asserted as a RELATION between the two constants rather than each
+    /// against a literal: `assert!(POINT_ATTEMPTS > 0)` is a comparison of two
+    /// constants that the compiler folds away, so it tests nothing and clippy
+    /// rejects it under `-D warnings`.
     #[test]
-    fn the_point_retry_delay_is_never_zero() {
-        assert!(POINT_RETRY_DELAY > Duration::ZERO);
-        assert!(POINT_ATTEMPTS > 0);
+    fn the_point_retry_budget_comes_from_pacing_not_one_long_sleep() {
+        let budget = POINT_RETRY_DELAY * POINT_ATTEMPTS;
+        assert!(
+            POINT_RETRY_DELAY * 3 <= budget,
+            "delay {POINT_RETRY_DELAY:?} against budget {budget:?} leaves too \
+             few attempts — a retry needs several chances, not one long sleep"
+        );
+        // Expressed against the budget rather than a bare literal: a
+        // const-vs-literal comparison is folded away by the compiler, tests
+        // nothing, and trips clippy::assertions_on_constants under -D warnings.
+        assert!(
+            POINT_RETRY_DELAY * 600 >= budget,
+            "delay {POINT_RETRY_DELAY:?} is so small against budget \
+             {budget:?} that this is a busy-loop, not a retry"
+        );
     }
 }
