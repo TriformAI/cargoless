@@ -1028,6 +1028,7 @@ impl LaneState {
                 self.infra_failures = 0;
 
                 let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
+                let mut survivors = Vec::new();
                 for m in members {
                     if m.id == id {
                         // Attributed, with the conflicting paths as the files
@@ -1088,9 +1089,14 @@ impl LaneState {
                                  without it"
                             ),
                         });
-                        self.queue.push(m);
+                        survivors.push(m);
                     }
                 }
+                // `queue` may already contain members accepted while this
+                // candidate was building. They arrived later than these
+                // unjudged co-riders and therefore must remain behind them.
+                // Splicing once also preserves the survivors' original order.
+                self.queue.splice(0..0, survivors);
             }
         }
     }
