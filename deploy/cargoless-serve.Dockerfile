@@ -45,6 +45,7 @@ RUN apt-get update -qq \
         pkg-config \
         python3-yaml \
         ripgrep \
+        zstd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSLo /usr/local/bin/kubectl \
