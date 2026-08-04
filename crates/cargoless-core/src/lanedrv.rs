@@ -2508,7 +2508,7 @@ mod land_timeout_tests {
 
 #[cfg(test)]
 mod base_health_tests {
-    use super::{base_red_reason, same_failure};
+    use super::{base_red_reason, red_files_from_instance, same_failure};
 
     /// The exact strings from 2026-08-03. The dev slot (base alone, no PR) and
     /// the lane slot (base + pr-10572, a YAML-ONLY change) ended byte-identical
