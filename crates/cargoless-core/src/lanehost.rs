@@ -551,6 +551,13 @@ mod tests {
         }
     }
 
+    struct FailingLander;
+    impl LaneLander for FailingLander {
+        fn land(&self, _m: &[LaneMember], _a: Option<&str>) -> io::Result<LandOutcome> {
+            Err(io::Error::other("the candidate base moved"))
+        }
+    }
+
     /// Legs that go green immediately, so a test reaches the LAND without
     /// waiting on anything.
     struct GreenLegs;
@@ -687,6 +694,92 @@ mod tests {
              {:?}",
             host.snapshot()
         );
+    }
+
+    /// A member accepted behind a long build must join the retry after a
+    /// compare-and-swap miss instead of being starved behind the old roster.
+    ///
+    /// The event order is load-bearing and mirrors the production incident:
+    /// while A builds, a timer tick is queued and THEN B is accepted. A green
+    /// build loses its landing CAS race, so A is requeued with an infrastructure
+    /// backoff. If that deadline was measured from build START, the already
+    /// queued tick clears it and starts A again before the worker reaches B.
+    /// B stays trapped in the host channel for another whole generation.
+    ///
+    /// Re-syncing the lane clock after the blocking land measures the backoff
+    /// from failure instead. The stale tick cannot expire it, the worker drains
+    /// B into the lane, and the next generation contains both members.
+    #[test]
+    fn a_stale_tick_cannot_starve_a_member_accepted_during_a_failed_land() {
+        let (started_tx, started_rx) = std_channel();
+        let (release_tx, release_rx) = std_channel();
+        let driver = LaneDriver::new(
+            NoTree,
+            BlockingLegs {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            FailingLander,
+        );
+        let host = LaneHost::spawn(
+            LaneState::with_config(
+                "/tmp/lanehost-test-land-retry-admission",
+                LaneConfig {
+                    capture_window_ticks: 0,
+                    infra_backoff_ticks: 120,
+                    ..Default::default()
+                },
+            ),
+            driver,
+        );
+
+        host.enqueue(LaneMember::new("A", "sha-a")).expect("queued");
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first build should start");
+
+        // This order reproduces the incident. Both events sit behind the
+        // blocking build, but the stale tick is ahead of B in the worker's
+        // channel.
+        host.tick(1_000);
+        host.enqueue(LaneMember::new("B", "sha-b")).expect("queued");
+        assert_eq!(
+            host.snapshot().queued,
+            vec!["B".to_string()],
+            "B must be visible while it waits in the host channel"
+        );
+
+        release_tx.send(()).expect("release the first build");
+
+        assert!(
+            until(|| {
+                let s = host.snapshot();
+                s.phase == "idle"
+                    && s.generation == 1
+                    && s.queued == vec!["A".to_string(), "B".to_string()]
+            }),
+            "the failed land must retain A AND drain B before retrying; an old \
+             tick must not start another A-only generation: {:?}",
+            host.snapshot()
+        );
+
+        // The backoff was installed at tick 1,000, so only its real deadline
+        // may start generation 2. That generation must include the member that
+        // arrived during generation 1.
+        host.tick(1_120);
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the retry should start at its deadline");
+        assert!(
+            until(|| {
+                let s = host.snapshot();
+                s.generation == 2 && s.in_flight == vec!["A".to_string(), "B".to_string()]
+            }),
+            "the retry must build the complete admitted roster: {:?}",
+            host.snapshot()
+        );
+
+        release_tx.send(()).expect("release the retry build");
     }
 
     /// DEFECT 1, the withdraw half: a member withdrawn while it is still only
