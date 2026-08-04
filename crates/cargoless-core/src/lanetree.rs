@@ -78,9 +78,19 @@ impl GitCandidateTree {
 
     fn remove_stale_candidate(&self, root: &Path) -> Result<(), MaterializeError> {
         let _ = git(&self.repo, &["worktree", "remove", "--force", &lossy(root)]);
-        std::fs::remove_dir_all(root).map_err(|e| {
-            MaterializeError::infra_at("could not remove the stale candidate worktree", root, &e)
-        })
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => Ok(()),
+            // `git worktree remove` normally deletes the directory itself.
+            // Missing here therefore means the first cleanup step succeeded,
+            // not that candidate materialization suffered an infrastructure
+            // failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(MaterializeError::infra_at(
+                "could not remove the stale candidate worktree",
+                root,
+                &e,
+            )),
+        }
     }
 }
 
