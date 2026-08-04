@@ -250,6 +250,55 @@ fn an_arrival_during_a_build_queues_and_never_preempts() {
     );
 }
 
+/// A co-rider whose candidate never compiled is older work than anything that
+/// arrived while that candidate was running.
+///
+/// The conflict branch promises to requeue unaffected members at the front,
+/// but appending them behind mid-build arrivals silently turns one unrelated
+/// merge conflict into queue starvation. This happened in the live
+/// tf-multiverse lane: the first member of a ten-PR batch was requeued at index
+/// 61 when a later member conflicted.
+#[test]
+fn a_conflict_requeues_unjudged_survivors_ahead_of_newer_arrivals() {
+    let mut st = LaneState::with_config(
+        ROOT,
+        cargoless_core::lane::LaneConfig {
+            max_members: 3,
+            capture_window_ticks: WINDOW,
+            ..Default::default()
+        },
+    );
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/a.rs"]),
+            member("B", "b1", &["src/b.rs"]),
+            member("C", "c1", &["src/c.rs"]),
+        ],
+    );
+
+    // These arrived later and must not jump ahead merely because B conflicted.
+    st.step(LaneEvent::Enqueue(member("D", "d1", &["src/d.rs"])));
+    st.step(LaneEvent::Enqueue(member("E", "e1", &["src/e.rs"])));
+
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Conflict {
+            id: "B".to_string(),
+            files: vec![PathBuf::from("src/b.rs")],
+            reason: "merge conflict".to_string(),
+        },
+    });
+
+    assert_eq!(ejected_ids(&actions), vec!["B".to_string()]);
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string(), "C".to_string(), "D".to_string()][..]),
+        "unjudged survivors keep their original priority ahead of arrivals \
+         accepted during the failed build"
+    );
+}
+
 #[test]
 fn a_stale_completion_is_ignored() {
     let mut st = lane();
