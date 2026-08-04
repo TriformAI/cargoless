@@ -61,6 +61,16 @@ spec:
       restartPolicy: Never
       # Any healthy node — do NOT pin (a pinned node in DiskPressure wedges the
       # build, the lesson from the isolation artifact Job).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  # triform-1 is the control plane and the exclusion policy is
+                  # Audit-mode — without this the build schedules there anyway.
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["triform-1"]
       imagePullSecrets:
         - name: registry-pull
       containers:
