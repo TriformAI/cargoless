@@ -105,6 +105,14 @@ jobs:
     runs-on: docker
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
+    # Runner scratch is a bounded 16 GiB ephemeral PVC. The default test
+    # profile filled it while linking the cargoless test binary (ld: No space
+    # left on device, 2026-08-04), even though the same tree's build and clippy
+    # jobs were green. CI never reuses this target, so incremental artifacts
+    # and full DWARF consume the failure domain without buying cache reuse.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - name: Setup (node for checkout + git safe.dir)
         run: |
