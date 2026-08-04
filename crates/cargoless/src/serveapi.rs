@@ -4996,6 +4996,61 @@ fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(),
     }
 }
 
+/// Reclaim project-check worktrees left by a prior daemon process.
+///
+/// This is a startup-only operation: the new process has not accepted work
+/// yet, so every directory under `project-check-runs` belongs to a dead
+/// predecessor. The warm target and durable evidence live beside this
+/// directory and are deliberately preserved.
+pub(crate) fn recover_project_check_scratch(
+    root: &Path,
+    state_dir: &Path,
+) -> Result<usize, String> {
+    let scratch_parent = state_dir.join("project-check-runs");
+    let entries = match std::fs::read_dir(&scratch_parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dead process can leave Git metadata after the directory has
+            // already disappeared. Prune that metadata even when there are no
+            // filesystem entries to iterate.
+            run_git(root, &["worktree", "prune", "--expire", "now"])?;
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect project-check scratch `{}`: {error}",
+                scratch_parent.display()
+            ));
+        }
+    };
+
+    let mut recovered = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not enumerate project-check scratch `{}`: {error}",
+                scratch_parent.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| {
+                format!(
+                    "could not inspect project-check scratch `{}`: {error}",
+                    entry.path().display()
+                )
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+        cleanup_project_check_scratch(root, &entry.path())?;
+        recovered += 1;
+    }
+    run_git(root, &["worktree", "prune", "--expire", "now"])?;
+    Ok(recovered)
+}
+
 fn materialize_overlay_files(root: &Path, files: &[(String, String)]) -> Result<(), String> {
     materialize_overlay_files_from_root(root, root, files)
 }
@@ -8939,7 +8994,10 @@ checks:
             .expect("daemon startup must reclaim scratch left by a dead predecessor");
 
         assert_eq!(recovered, 1, "one abandoned run was reclaimed");
-        assert!(!scratch.exists(), "abandoned scratch no longer consumes the PVC");
+        assert!(
+            !scratch.exists(),
+            "abandoned scratch no longer consumes the PVC"
+        );
         assert!(
             warm_marker.exists(),
             "startup recovery preserves the durable warm target"

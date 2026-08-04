@@ -413,6 +413,20 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     //                            compiles and deliberately leaves the pointer
     //                            alone rather than advancing it to nothing.
     let state_dir = scope.fleet.state_dir_abs(&scope.repo_root);
+    match crate::serveapi::recover_project_check_scratch(&scope.repo_root, &state_dir) {
+        Ok(0) => {}
+        Ok(recovered) => eprintln!(
+            "[cargoless:obs] project-check-startup-recovery root={} recovered={recovered}",
+            state_dir.join("project-check-runs").display()
+        ),
+        Err(error) => {
+            crate::ui::error(format!(
+                "project-check startup recovery failed for {}: {error}",
+                state_dir.display()
+            ));
+            return ExitCode::from(2);
+        }
+    }
     let mut api_state =
         crate::serveapi::ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
     // Not a let-chain: this workspace is Edition 2024 / MSRV 1.85 and
