@@ -2736,3 +2736,223 @@ mod point_retry_budget_tests {
         );
     }
 }
+
+/// Close any generation a previous process left open in the trail.
+///
+/// `run_build` writes `lane-build-start generation=N` BEFORE it compiles and
+/// the matching `lane-build generation=N outcome=…` only after, so a daemon
+/// killed mid-build leaves a start with no end. The replacement process starts
+/// at generation 0 and never mentions N again, which makes an abandoned build
+/// indistinguishable from one still running — the log stops being able to
+/// answer "is the lane working?" after the fact.
+///
+/// Measured 2026-08-03/04 on the shadow lane: 15 orphaned starts across 200,
+/// roughly one per pod roll, each a build that burned real minutes and reported
+/// nothing.
+///
+/// Called once at construction, before the lane accepts any work, so every
+/// start is terminated by the time the new process writes its own. The
+/// invariant this restores: **every `lane-build-start` has a terminal line.**
+///
+/// Deliberately reads the trail rather than persisting separate state — the
+/// trail already records what was in flight, so there is no second file to keep
+/// consistent. Same instinct that lets enrollment survive a restart:
+/// reconstruct rather than persist.
+///
+/// Best-effort and infallible by construction. A missing, unreadable or
+/// unwritable trail leaves the status quo; observability must never be the
+/// thing that stops the lane from starting.
+pub fn close_abandoned_generations(trail: &Path) {
+    let Ok(existing) = fs::read_to_string(trail) else {
+        return; // no trail yet (first boot) or unreadable — nothing to close
+    };
+
+    // A generation is open if it started and never reached a terminal line.
+    // Insertion order is preserved so the closes are written oldest-first,
+    // matching how they would have been written had the process survived.
+    let mut open: Vec<u64> = Vec::new();
+    for line in existing.lines() {
+        if let Some(g) = generation_after(line, "lane-build-start generation=") {
+            if !open.contains(&g) {
+                open.push(g);
+            }
+        } else if let Some(g) = generation_after(line, "lane-build generation=") {
+            open.retain(|&o| o != g);
+        }
+    }
+    if open.is_empty() {
+        return;
+    }
+
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(trail) else {
+        return;
+    };
+    for g in open {
+        let _ = writeln!(
+            f,
+            "[cargoless:obs] lane-build generation={g} outcome=abandoned \
+             reason=daemon restarted before this build reported"
+        );
+    }
+}
+
+/// Parse `…{prefix}<digits>` out of a trail line.
+///
+/// Matches on the exact prefix rather than a loose `generation=` search so that
+/// `lane-build-start generation=` and `lane-build generation=` stay distinct —
+/// the first is a prefix of neither, but a naive contains() would let
+/// `lane-leg generation=` and `lane-land …` lines through and close a build
+/// that is still running.
+fn generation_after(line: &str, prefix: &str) -> Option<u64> {
+    let rest = line.split_once(prefix)?.1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+#[cfg(test)]
+mod abandoned_generation_tests {
+    use super::{close_abandoned_generations, generation_after};
+    use std::fs;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("lane-abandoned-{name}-{}.log", std::process::id()));
+        let _ = fs::remove_file(&p);
+        p
+    }
+
+    /// THE INVARIANT: every `lane-build-start` ends up with a terminal line.
+    ///
+    /// This is the exact shape observed on the shadow lane — a start, then the
+    /// NEXT process's start, with nothing in between, because the pod rolled
+    /// mid-build.
+    #[test]
+    fn an_interrupted_build_is_closed_on_the_next_boot() {
+        let p = tmp("interrupted");
+        fs::write(
+            &p,
+            "[cargoless:obs] lane-build-start generation=9 members=pr-1@aaa\n",
+        )
+        .unwrap();
+
+        close_abandoned_generations(&p);
+
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(
+            out.contains("lane-build generation=9 outcome=abandoned"),
+            "generation 9 was left open and must be closed on boot, got:\n{out}"
+        );
+        let starts = out.matches("lane-build-start generation=").count();
+        let terminals = out
+            .lines()
+            .filter(|l| l.contains("lane-build generation=") && l.contains("outcome="))
+            .count();
+        assert_eq!(starts, terminals, "every start must have a terminal line");
+        let _ = fs::remove_file(&p);
+    }
+
+    /// A build that DID report must not be closed twice — that would invent a
+    /// second, contradictory verdict for a generation whose real outcome is
+    /// already recorded.
+    #[test]
+    fn a_completed_build_is_left_alone() {
+        let p = tmp("completed");
+        fs::write(
+            &p,
+            "[cargoless:obs] lane-build-start generation=4 members=pr-1@aaa\n\
+             [cargoless:obs] lane-build generation=4 outcome=green artifact=<none>\n",
+        )
+        .unwrap();
+
+        close_abandoned_generations(&p);
+
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(
+            !out.contains("outcome=abandoned"),
+            "generation 4 already reported green; it must not be re-closed:\n{out}"
+        );
+        let _ = fs::remove_file(&p);
+    }
+
+    /// The parser must not be fooled by the OTHER lines that carry a
+    /// `generation=`. `lane-leg` in particular appears mid-build, and treating
+    /// it as terminal would leave a genuinely abandoned build open forever.
+    #[test]
+    fn only_a_real_terminal_line_closes_a_generation() {
+        let p = tmp("legs");
+        fs::write(
+            &p,
+            "[cargoless:obs] lane-build-start generation=7 members=pr-1@aaa\n\
+             [cargoless:obs] lane-leg generation=7 id=preview:lane tree=Red required=true elapsed_ms=1\n",
+        )
+        .unwrap();
+
+        close_abandoned_generations(&p);
+
+        let out = fs::read_to_string(&p).unwrap();
+        assert!(
+            out.contains("lane-build generation=7 outcome=abandoned"),
+            "a lane-leg line is not a verdict; generation 7 must still be closed:\n{out}"
+        );
+        let _ = fs::remove_file(&p);
+    }
+
+    /// Repeated boots must converge. A crash loop would otherwise append one
+    /// `abandoned` per restart and bury the real history.
+    #[test]
+    fn closing_is_idempotent_across_repeated_boots() {
+        let p = tmp("idempotent");
+        fs::write(
+            &p,
+            "[cargoless:obs] lane-build-start generation=3 members=pr-1@aaa\n",
+        )
+        .unwrap();
+
+        close_abandoned_generations(&p);
+        close_abandoned_generations(&p);
+        close_abandoned_generations(&p);
+
+        let out = fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            out.matches("outcome=abandoned").count(),
+            1,
+            "a crash loop must not append one abandoned line per boot:\n{out}"
+        );
+        let _ = fs::remove_file(&p);
+    }
+
+    /// Observability must never be the thing that stops the lane starting.
+    #[test]
+    fn a_missing_trail_is_not_an_error() {
+        let p = tmp("missing");
+        let _ = fs::remove_file(&p);
+        close_abandoned_generations(&p); // must not panic
+        assert!(
+            !p.exists(),
+            "an absent trail must not be created just to close nothing"
+        );
+    }
+
+    #[test]
+    fn generation_after_matches_the_exact_prefix() {
+        assert_eq!(
+            generation_after(
+                "[x] lane-build-start generation=12 members=y",
+                "lane-build-start generation="
+            ),
+            Some(12)
+        );
+        // `lane-build generation=` must NOT match a start line.
+        assert_eq!(
+            generation_after(
+                "[x] lane-build-start generation=12 members=y",
+                "lane-build generation="
+            ),
+            None
+        );
+        assert_eq!(
+            generation_after("[x] unrelated line", "lane-build generation="),
+            None
+        );
+    }
+}

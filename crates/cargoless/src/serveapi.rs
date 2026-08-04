@@ -1769,6 +1769,26 @@ impl ServeVerdictState {
             None if publishing => Box::new(cargoless_core::lanedrv::PointerLander::new(repo)),
             None => Box::new(cargoless_core::lanedrv::ReportOnlyLander),
         };
+        // CLOSE ANY GENERATION THE PREVIOUS PROCESS LEFT OPEN.
+        //
+        // `run_build` writes `lane-build-start` before it compiles and the
+        // matching `lane-build … outcome=…` only after, so a daemon killed
+        // mid-build leaves a start with no end — and the next process begins at
+        // generation 0, never mentioning it again. Measured 2026-08-03/04: 15
+        // such orphans across 200 starts, one per lane-shadow roll, each one a
+        // build that burned real minutes and reported nothing. Worse, the
+        // record is INDISTINGUISHABLE from a build still running, so the log
+        // cannot answer "is the lane working?" after the fact.
+        //
+        // Deliberately NOT persisted state: the trail already records what was
+        // in flight, so reading it back is enough and there is no new file to
+        // keep consistent. Same instinct that makes enrollment survive a
+        // restart — reconstruct rather than persist.
+        //
+        // Best-effort by construction. An unreadable or absent trail must never
+        // stop the lane from starting; the worst case is the status quo.
+        cargoless_core::lanedrv::close_abandoned_generations(&trail);
+
         self.lane = Some(LaneHost::spawn(
             LaneState::new(repo),
             cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander).with_trail(trail),
