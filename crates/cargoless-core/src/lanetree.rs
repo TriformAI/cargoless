@@ -75,6 +75,13 @@ impl GitCandidateTree {
             author_email: "lane@cargoless.invalid".to_string(),
         }
     }
+
+    fn remove_stale_candidate(&self, root: &Path) -> Result<(), MaterializeError> {
+        let _ = git(&self.repo, &["worktree", "remove", "--force", &lossy(root)]);
+        std::fs::remove_dir_all(root).map_err(|e| {
+            MaterializeError::infra_at("could not remove the stale candidate worktree", root, &e)
+        })
+    }
 }
 
 impl CandidateTree for GitCandidateTree {
@@ -98,17 +105,7 @@ impl CandidateTree for GitCandidateTree {
         // A stale tree at this path would silently contribute its contents to
         // the build. Remove it before git ever looks at it.
         if root.exists() {
-            let _ = git(
-                &self.repo,
-                &["worktree", "remove", "--force", &lossy(&root)],
-            );
-            std::fs::remove_dir_all(&root).map_err(|e| {
-                MaterializeError::infra_at(
-                    "could not remove the stale candidate worktree",
-                    &root,
-                    &e,
-                )
-            })?;
+            self.remove_stale_candidate(&root)?;
         }
         std::fs::create_dir_all(&self.scratch_parent).map_err(|e| {
             MaterializeError::infra_at(
@@ -412,6 +409,41 @@ mod tests {
 
         tree.release(&first);
         tree.release(&second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Regression for the live generation-3/4 retry loop on 2026-08-04.
+    ///
+    /// `git worktree remove --force` normally removes the worktree directory
+    /// itself. Cleanup then tried `remove_dir_all` on that now-missing path and
+    /// converted successful Git cleanup into ENOENT infrastructure failure.
+    /// Every stale PID/sequence path on the durable PVC cost another backoff
+    /// generation, leaving the full landing roster queued.
+    #[test]
+    fn stale_candidate_cleanup_accepts_git_already_removing_the_directory() {
+        let root = repo("stale-cleanup");
+        let stale = root.join(".scratch").join("stale-candidate");
+        fs::create_dir_all(stale.parent().expect("scratch parent")).unwrap();
+        sh(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &stale.to_string_lossy(),
+                "main",
+            ],
+        );
+        assert!(stale.exists(), "the stale worktree fixture must exist");
+
+        let tree = GitCandidateTree::new(&root, root.join(".scratch"), "main");
+        tree.remove_stale_candidate(&stale)
+            .expect("git already removing the directory is successful cleanup");
+        assert!(
+            !stale.exists(),
+            "cleanup must leave no stale candidate path"
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
