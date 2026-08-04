@@ -2014,7 +2014,6 @@ fn spawn_ra_diagnostic_pull(
     if let Err(error) = std::thread::Builder::new()
         .name("tf-ra-diagnostic-pull".into())
         .spawn(move || {
-            const CANCEL_RETRIES: usize = 3;
             let pull_timeout = ra_diagnostic_pull_timeout();
             eprintln!(
                 "[cargoless:obs] ra-diagnostic-pull-started wt={} documents={} timeout_ms={}",
@@ -2068,7 +2067,7 @@ fn spawn_ra_diagnostic_pull(
                     ));
                     return;
                 }
-                match lsp.pull_diagnostics(&path.to_string_lossy(), remaining, CANCEL_RETRIES) {
+                match lsp.pull_diagnostics(&path.to_string_lossy(), remaining) {
                     Ok(reports) => {
                         for report in reports {
                             if tx

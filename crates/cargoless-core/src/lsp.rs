@@ -1522,20 +1522,18 @@ impl LspClient {
     /// `publishDiagnostics`, a successful response is an explicit completion
     /// boundary even when the report is empty or unchanged on the server.
     ///
-    /// `ServerCancelled` responses that ask the client to retrigger are
-    /// retried up to `max_retries` inside the single overall `timeout`, but
-    /// only after RA announces the next diagnostic-refresh boundary. Retrying
-    /// immediately exhausts every attempt while the same flycheck mutation is
-    /// still invalidating reports, despite `retriggerRequest: true` promising
-    /// that a fresh snapshot will follow.
+    /// `ServerCancelled` responses that ask the client to retrigger are retried
+    /// inside the single overall `timeout`, but only after RA announces the
+    /// next diagnostic-refresh boundary. A distinct refresh is forward
+    /// progress, so a second fixed retry budget is both redundant with the
+    /// deadline and incorrect for large overlays that legitimately invalidate
+    /// several successive reports.
     pub fn pull_diagnostics(
         &self,
         abs_path: &str,
         timeout: Duration,
-        max_retries: usize,
     ) -> Result<Vec<PublishDiagnostics>, DiagnosticPullError> {
         let deadline = Instant::now() + timeout;
-        let mut retries = 0usize;
         loop {
             let refresh_before_attempt = self.diagnostic_refresh_generation();
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1543,10 +1541,7 @@ impl LspClient {
                 return Err(DiagnosticPullError::Timeout);
             }
             match self.pull_diagnostics_once(abs_path, remaining) {
-                Err(DiagnosticPullError::ServerCancelled { retrigger: true })
-                    if retries < max_retries =>
-                {
-                    retries += 1;
+                Err(DiagnosticPullError::ServerCancelled { retrigger: true }) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(DiagnosticPullError::Timeout);
@@ -3042,7 +3037,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_diagnostic_retrigger_waits_for_next_refresh_boundary() {
+    fn pull_diagnostic_retrigger_waits_for_every_refresh_until_success() {
         fn take_pending(pending: &PendingResponses, id: i64, timeout: Duration) -> Sender<Value> {
             let deadline = Instant::now() + timeout;
             loop {
@@ -3071,7 +3066,7 @@ mod tests {
         });
         let worker_client = Arc::clone(&client);
         let worker = thread::spawn(move || {
-            worker_client.pull_diagnostics("/r/src/lib.rs", Duration::from_secs(1), 1)
+            worker_client.pull_diagnostics("/r/src/lib.rs", Duration::from_secs(1))
         });
 
         take_pending(&pending, 2, Duration::from_millis(200))
@@ -3093,11 +3088,30 @@ mod tests {
             "a retrigger must not issue another pull against the invalidated snapshot"
         );
 
+        // A large overlay can legitimately invalidate more reports than the
+        // old fixed retry budget. Every cancellation below is paired with a
+        // distinct server refresh, so it is forward progress and must remain
+        // retryable inside the overall transaction deadline.
+        for id in 3..=5 {
+            refresh.mark();
+            take_pending(&pending, id, Duration::from_millis(200))
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32802,
+                        "message": "cancelled",
+                        "data": { "retriggerRequest": true }
+                    }
+                }))
+                .unwrap();
+        }
+
         refresh.mark();
-        take_pending(&pending, 3, Duration::from_millis(200))
+        take_pending(&pending, 6, Duration::from_millis(200))
             .send(json!({
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": 6,
                 "result": { "kind": "full", "items": [] }
             }))
             .unwrap();
