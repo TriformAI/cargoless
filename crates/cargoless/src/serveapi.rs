@@ -8925,6 +8925,41 @@ checks:
     }
 
     #[test]
+    fn project_check_startup_recovery_removes_abandoned_scratch_only() {
+        let project = setup_batch_project("project-overlay-startup-recovery");
+        let state_dir = temp_root("project-overlay-startup-recovery-state");
+        let scratch = state_dir.join("project-check-runs/run-1-7");
+        let warm_marker = state_dir.join("witness-target-warm/current/keep");
+
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
+        std::fs::create_dir_all(warm_marker.parent().unwrap()).unwrap();
+        std::fs::write(&warm_marker, "warm cache is durable\n").unwrap();
+
+        let recovered = recover_project_check_scratch(&project.root, &state_dir)
+            .expect("daemon startup must reclaim scratch left by a dead predecessor");
+
+        assert_eq!(recovered, 1, "one abandoned run was reclaimed");
+        assert!(!scratch.exists(), "abandoned scratch no longer consumes the PVC");
+        assert!(
+            warm_marker.exists(),
+            "startup recovery preserves the durable warm target"
+        );
+        let registrations = Command::new("git")
+            .arg("-C")
+            .arg(&project.root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("worktree list remains readable");
+        assert!(registrations.status.success());
+        let registrations = String::from_utf8_lossy(&registrations.stdout);
+        assert!(
+            !registrations.contains(scratch.to_string_lossy().as_ref()),
+            "startup recovery removes the stale Git registration too"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn push_overlay_with_options_rejects_escaping_repo_relative_paths() {
         let api = ServeVerdictState::new();
         let files = vec![("../outside.rs".to_string(), "bad".to_string())];
