@@ -764,6 +764,16 @@ const POINT_ATTEMPTS: u32 = 5;
 /// answering, without meaningfully delaying a real failure.
 const POINT_RETRY_DELAY: Duration = Duration::from_secs(6);
 
+/// How long an acknowledged point may remain absent from `/app` before the
+/// lane reasserts it.
+///
+/// The preview daemon persists its registry, but a replacement process can
+/// restore an older snapshot after the POST was acknowledged. 30 seconds is
+/// long enough for ordinary ref discovery and state publication, while still
+/// turning that restart race into a short pause instead of the runner's 2h
+/// verdict timeout.
+const POINT_REASSERT_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How long to wait for a busy slot before pointing anyway.
 ///
 /// Generous, because the thing we are waiting on is a real tf-multiverse
@@ -876,6 +886,40 @@ fn slot_is_building(snapshot: &str, slot: &str) -> bool {
         .is_some_and(|p| matches!(p, "building" | "queued" | "probing" | "probing+serving"))
 }
 
+/// Did the preview daemon forget an acknowledged point for `sha`?
+///
+/// This deliberately requires a readable `/app` snapshot. Invalid JSON is no
+/// evidence of lost state, so the normal poll error/deadline remains in charge.
+/// Likewise, another active build is never interrupted: the reusable slot may
+/// only be re-pointed when it is absent or quiescent. Seeing our SHA anywhere
+/// in the slot is proof the point survived, including a terminal red which the
+/// caller will classify on the same snapshot.
+fn slot_needs_repoint(snapshot: &str, slot: &str, sha: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(snapshot) else {
+        return false;
+    };
+    let Some(instances) = v.get("instances").and_then(|i| i.as_array()) else {
+        return false;
+    };
+    let Some(inst) = instances
+        .iter()
+        .find(|x| x.get("name").and_then(|n| n.as_str()) == Some(slot))
+    else {
+        return true;
+    };
+
+    if ["serving_sha", "pending_sha", "last_red_sha"]
+        .iter()
+        .any(|field| inst.get(*field).and_then(|x| x.as_str()) == Some(sha))
+    {
+        return false;
+    }
+
+    inst.get("phase")
+        .and_then(|p| p.as_str())
+        .is_some_and(|phase| matches!(phase, "idle" | "serving"))
+}
+
 pub struct PreviewLegRunner {
     /// Base URL of the daemon that owns the preview slot, e.g.
     /// `http://cargoless-preview.triform-staging.svc.cluster.local:8787`.
@@ -950,6 +994,45 @@ impl PreviewLegRunner {
             )));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Point the reusable slot, tolerating a daemon that is between processes.
+    ///
+    /// Reused both for the initial registration and for repairing an
+    /// acknowledged registration lost when a replacement daemon restores an
+    /// older durable snapshot.
+    fn point_slot(&self, body: &str, refname: &str) -> io::Result<()> {
+        let mut last_err = String::new();
+        for attempt in 1..=POINT_ATTEMPTS {
+            let post = Command::new("curl")
+                .args([
+                    "-sS",
+                    "-f",
+                    "-X",
+                    "POST",
+                    "--max-time",
+                    "30",
+                    "-H",
+                    &format!("Authorization: Bearer {}", self.token),
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    body,
+                    &format!("{}/instances", self.daemon.trim_end_matches('/')),
+                ])
+                .output()?;
+            if post.status.success() {
+                return Ok(());
+            }
+            last_err = String::from_utf8_lossy(&post.stderr).trim().to_string();
+            if attempt < POINT_ATTEMPTS {
+                std::thread::sleep(POINT_RETRY_DELAY);
+            }
+        }
+        Err(io::Error::other(format!(
+            "could not point preview slot {:?} at {refname} after {} attempts: {}",
+            self.slot, POINT_ATTEMPTS, last_err
+        )))
     }
 }
 
@@ -1026,40 +1109,8 @@ impl LegRunner for PreviewLegRunner {
         // A few seconds of retry converts "the daemon was restarting" from a
         // lost build into a pause. Still bounded: a daemon that is genuinely
         // gone must still surface as Infra rather than hanging the lane.
-        let mut last_err = String::new();
-        let mut pointed = false;
-        for attempt in 1..=POINT_ATTEMPTS {
-            let post = Command::new("curl")
-                .args([
-                    "-sS",
-                    "-X",
-                    "POST",
-                    "--max-time",
-                    "30",
-                    "-H",
-                    &format!("Authorization: Bearer {}", self.token),
-                    "-H",
-                    "Content-Type: application/json",
-                    "-d",
-                    &body,
-                    &format!("{}/instances", self.daemon.trim_end_matches('/')),
-                ])
-                .output()?;
-            if post.status.success() {
-                pointed = true;
-                break;
-            }
-            last_err = String::from_utf8_lossy(&post.stderr).trim().to_string();
-            if attempt < POINT_ATTEMPTS {
-                std::thread::sleep(POINT_RETRY_DELAY);
-            }
-        }
-        if !pointed {
-            return Err(io::Error::other(format!(
-                "could not point preview slot {:?} at {refname} after {} attempts: {}",
-                self.slot, POINT_ATTEMPTS, last_err
-            )));
-        }
+        self.point_slot(&body, &refname)?;
+        let mut last_pointed = Instant::now();
 
         // Poll until the slot SERVES this sha, or reds on it.
         let deadline = Instant::now() + self.timeout;
@@ -1205,6 +1256,19 @@ impl LegRunner for PreviewLegRunner {
                         duration_ms: started.elapsed().as_millis(),
                     }],
                 });
+            }
+            // An acknowledged POST is not durable proof that the replacement
+            // daemon retained it. On 2026-08-03 the point for cace69c0 was
+            // acknowledged 11 seconds before a preview restart; the new
+            // process restored the prior registry and the lane waited forever
+            // for a candidate `/app` could no longer name. Reassert only after
+            // a grace interval and only when this readable snapshot proves the
+            // slot is quiescent or absent. An active build is never clobbered.
+            if last_pointed.elapsed() >= POINT_REASSERT_INTERVAL
+                && slot_needs_repoint(&snap, &self.slot, &sha)
+            {
+                self.point_slot(&body, &refname)?;
+                last_pointed = Instant::now();
             }
             thread::sleep(self.poll);
         }
@@ -2014,7 +2078,7 @@ pub fn unix_seconds() -> u64 {
 
 #[cfg(test)]
 mod slot_free_tests {
-    use super::{reason_is_infrastructure, slot_is_building};
+    use super::{reason_is_infrastructure, slot_is_building, slot_needs_repoint};
 
     /// The 2026-08-02 incident: the slot's worktree vanished after a PVC fault
     /// and the lane blamed the PR. A setup failure is OURS.
@@ -2121,6 +2185,79 @@ mod slot_free_tests {
             !slot_is_building(snap, "lane"),
             "dev building must not make the lane wait"
         );
+    }
+
+    /// Exact 2026-08-03 restart race: cace69c0 was acknowledged, then the
+    /// replacement daemon restored an older idle/red snapshot. The slot no
+    /// longer contained any identity for the candidate, so waiting could never
+    /// produce a verdict without reasserting the point.
+    #[test]
+    fn an_acknowledged_point_lost_across_restart_is_reasserted() {
+        let snap = r#"{"instances":[{
+            "name":"lane",
+            "phase":"idle",
+            "serving_sha":null,
+            "pending_sha":null,
+            "last_red_sha":"9717d8a0"
+        }]}"#;
+        assert!(slot_needs_repoint(snap, "lane", "cace69c0"));
+    }
+
+    #[test]
+    fn a_missing_slot_in_a_readable_snapshot_is_reasserted() {
+        assert!(slot_needs_repoint(
+            r#"{"instances":[{"name":"dev","phase":"building"}]}"#,
+            "lane",
+            "candidate"
+        ));
+    }
+
+    #[test]
+    fn a_quiescent_slot_serving_an_older_candidate_is_reasserted() {
+        let snap = r#"{"instances":[{
+            "name":"lane",
+            "phase":"serving",
+            "serving_sha":"older",
+            "pending_sha":null
+        }]}"#;
+        assert!(slot_needs_repoint(snap, "lane", "candidate"));
+    }
+
+    #[test]
+    fn candidate_identity_prevents_duplicate_repointing() {
+        for (field, phase) in [
+            ("pending_sha", "building"),
+            ("serving_sha", "serving"),
+            ("last_red_sha", "idle"),
+        ] {
+            let snap = format!(
+                r#"{{"instances":[{{"name":"lane","phase":"{phase}","{field}":"candidate"}}]}}"#
+            );
+            assert!(
+                !slot_needs_repoint(&snap, "lane", "candidate"),
+                "{field} already names the candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn another_active_build_is_never_interrupted() {
+        for phase in ["building", "queued", "probing", "probing+serving"] {
+            let snap = format!(
+                r#"{{"instances":[{{"name":"lane","phase":"{phase}","pending_sha":"other"}}]}}"#
+            );
+            assert!(
+                !slot_needs_repoint(&snap, "lane", "candidate"),
+                "active phase {phase} must not be clobbered"
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_or_schema_less_snapshots_are_not_evidence_of_loss() {
+        for snap in ["", "not json", "{}", r#"{"instances":"unknown"}"#] {
+            assert!(!slot_needs_repoint(snap, "lane", "candidate"));
+        }
     }
 }
 
