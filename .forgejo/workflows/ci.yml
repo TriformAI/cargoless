@@ -60,6 +60,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: false
 
+# Every job gets a fresh 16 GiB runner scratch volume, so incremental state is
+# never reused across runs. Full DWARF plus incremental artifacts filled that
+# volume in both `cargo build --all-targets` and `cargo test` on 2026-08-04,
+# turning a green tree into linker and tempfile ENOSPC reds. Keep source-level
+# panic locations while dropping the heavyweight build artifacts CI discards.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 # Split into one job per check. This Forgejo build does not expose run/job
 # logs over the REST API, so job *granularity* is our only failure
 # observability: a red `fmt` job vs a red `build` job is diagnosable from
