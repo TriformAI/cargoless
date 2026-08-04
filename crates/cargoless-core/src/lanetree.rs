@@ -97,19 +97,8 @@ impl CandidateTree for GitCandidateTree {
         //
         // A stale tree at this path would silently contribute its contents to
         // the build. Remove it before git ever looks at it.
-        if root.exists() {
-            let _ = git(
-                &self.repo,
-                &["worktree", "remove", "--force", &lossy(&root)],
-            );
-            std::fs::remove_dir_all(&root).map_err(|e| {
-                MaterializeError::infra_at(
-                    "could not remove the stale candidate worktree",
-                    &root,
-                    &e,
-                )
-            })?;
-        }
+        clear_stale_candidate(&self.repo, &root)?;
+
         std::fs::create_dir_all(&self.scratch_parent).map_err(|e| {
             MaterializeError::infra_at(
                 "could not create the candidate scratch directory",
@@ -258,6 +247,42 @@ fn unmerged_paths(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Clear any tree left at a candidate path, so a fresh worktree can be created
+/// there. Absence — before or after — is success.
+///
+/// `git worktree remove --force` DELETES the directory when the path is a
+/// registered worktree, which is the common case: that is how the previous
+/// generation created it. The `remove_dir_all` below is only the fallback for a
+/// directory git does not know about — a half-materialized tree, or one
+/// orphaned by a daemon killed between `create_dir_all` and `worktree add`.
+///
+/// So `NotFound` after the git call is the SUCCESS path, not a failure: the
+/// tree we were asked to clear is gone, which is the whole postcondition.
+/// Treating it as infra cost generation 4 on 2026-08-04 — `could not remove the
+/// stale candidate worktree .../lane-candidates/candidate-1-3: No such file or
+/// directory (os error 2)`, for a path that existed when the guard ran and was
+/// removed by our own `git worktree remove` one line later. A TOCTOU against
+/// ourselves.
+///
+/// Every other io error still fails loudly and named: a genuinely failed remove
+/// means something is holding the old candidate, and building on top of a stale
+/// tree would silently contaminate the verdict.
+fn clear_stale_candidate(repo: &Path, root: &Path) -> Result<(), MaterializeError> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let _ = git(repo, &["worktree", "remove", "--force", &lossy(root)]);
+    match std::fs::remove_dir_all(root) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(MaterializeError::infra_at(
+            "could not remove the stale candidate worktree",
+            root,
+            &e,
+        )),
+    }
+}
+
 fn git(cwd: &Path, args: &[&str]) -> io::Result<()> {
     // SPAWNING git can fail too, and that failure is the one that reads worst.
     //
@@ -349,6 +374,63 @@ mod tests {
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
         sh(root, &["checkout", "-q", "main"]);
         sha
+    }
+
+    /// A REGISTERED worktree left at the candidate path must not fail the next
+    /// materialize.
+    ///
+    /// This is the generation-4 bug from 2026-08-04. `git worktree remove
+    /// --force` DELETES the directory, so the `remove_dir_all` that follows it
+    /// hit a path that no longer existed and reported
+    ///
+    ///   candidate tree could not be materialized: could not remove the stale
+    ///   candidate worktree .../lane-candidates/candidate-1-3: No such file or
+    ///   directory (os error 2)
+    ///
+    /// — a TOCTOU against our own cleanup. It burned the generation and every
+    /// member aboard waited for the next one. In production the path collides
+    /// because it is `candidate-{pid}-{seq}`: pid is always 1 in the container
+    /// and `seq` restarts at 0 on every daemon boot, so a pod roll re-derives a
+    /// name a previous boot already left on the PVC.
+    ///
+    /// This drives the exact production sequence — `git worktree remove
+    /// --force` followed by `remove_dir_all` — against a REGISTERED worktree,
+    /// which is the shape that makes the two steps race. Reverting the
+    /// `ErrorKind::NotFound` arm in `clear_stale_candidate` fails it with that
+    /// same os-error-2.
+    #[test]
+    fn a_registered_stale_worktree_does_not_fail_the_next_materialize() {
+        let root = repo("stale-registered");
+        let scratch = root.join(".scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let stale = scratch.join("candidate-1-3");
+
+        // Exactly what a previous generation leaves on the PVC: a worktree git
+        // knows about, at the path the next boot's seq will re-derive.
+        sh(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &stale.to_string_lossy(),
+                "main",
+            ],
+        );
+        assert!(stale.exists(), "fixture must leave a real directory");
+
+        clear_stale_candidate(&root, &stale)
+            .expect("a stale REGISTERED worktree must not fail the clear");
+        assert!(
+            !stale.exists(),
+            "the postcondition is that the path is gone"
+        );
+
+        // Idempotent: clearing an ALREADY-absent path is also success, which is
+        // the same claim from the other side.
+        clear_stale_candidate(&root, &stale).expect("clearing an absent path is a no-op");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The core claim: the candidate contains EVERY member's changes at once.
