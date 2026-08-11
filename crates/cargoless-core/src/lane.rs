@@ -398,6 +398,13 @@ pub enum LaneBuildOutcome {
     Infra { reason: String },
 }
 
+struct NamedMemberEjection {
+    cause: EjectionCause,
+    files: Vec<PathBuf>,
+    shared_with: Vec<String>,
+    survivor_reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneEvent {
     /// Submit or re-submit a member.
@@ -1117,19 +1124,23 @@ impl LaneState {
             } => self.eject_named_member(
                 members,
                 id,
-                EjectionCause::MergeConflict,
-                files,
-                shared_with,
-                format!("could not be merged ({reason})"),
+                NamedMemberEjection {
+                    cause: EjectionCause::MergeConflict,
+                    files,
+                    shared_with,
+                    survivor_reason: format!("could not be merged ({reason})"),
+                },
                 actions,
             ),
             LaneBuildOutcome::Stale { id, head } => self.eject_named_member(
                 members,
                 id,
-                EjectionCause::AlreadyLanded,
-                Vec::new(),
-                Vec::new(),
-                format!("already landed at {head}"),
+                NamedMemberEjection {
+                    cause: EjectionCause::AlreadyLanded,
+                    files: Vec::new(),
+                    shared_with: Vec::new(),
+                    survivor_reason: format!("already landed at {head}"),
+                },
                 actions,
             ),
         }
@@ -1139,12 +1150,15 @@ impl LaneState {
         &mut self,
         members: Vec<LaneMember>,
         id: String,
-        cause: EjectionCause,
-        files: Vec<PathBuf>,
-        shared_with: Vec<String>,
-        survivor_reason: String,
+        ejection: NamedMemberEjection,
         actions: &mut Vec<LaneAction>,
     ) {
+        let NamedMemberEjection {
+            cause,
+            files,
+            shared_with,
+            survivor_reason,
+        } = ejection;
         // Git produced a named, attributable outcome, so it cannot contribute
         // to the infrastructure failure streak.
         self.infra_failures = 0;
