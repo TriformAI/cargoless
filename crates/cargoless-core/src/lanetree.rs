@@ -133,6 +133,7 @@ impl CandidateTree for GitCandidateTree {
         // Merge each member in submission order. Order is deterministic and
         // reported, which matters when a merge conflicts: "B conflicts when
         // applied after A" is actionable; "the candidate conflicted" is not.
+        let mut applied: Vec<&LaneMember> = Vec::new();
         for member in members {
             // A member can LAND between enqueue and here — someone merges the
             // PR by hand, or a previous candidate already carried it. Its head
@@ -161,6 +162,13 @@ impl CandidateTree for GitCandidateTree {
             if let Err(reason) = merge_one_raw(&root, member, &self.author_name, &self.author_email)
             {
                 let files = unmerged_paths(&root);
+                let mut shared_with: Vec<String> = applied
+                    .iter()
+                    .filter(|prior| files.iter().any(|path| prior.touches(path)))
+                    .map(|prior| prior.id.clone())
+                    .collect();
+                shared_with.sort();
+                shared_with.dedup();
                 let _ = git(&root, &["merge", "--abort"]);
                 // Leave nothing half-merged behind: a leaked conflicted
                 // worktree would poison the next candidate that reused the path.
@@ -168,9 +176,11 @@ impl CandidateTree for GitCandidateTree {
                 return Err(MaterializeError::Conflict {
                     id: member.id.clone(),
                     files,
+                    shared_with,
                     reason,
                 });
             }
+            applied.push(member);
         }
 
         Ok(root)
@@ -396,12 +406,73 @@ mod tests {
 
         let tree = GitCandidateTree::new(&root, root.join(".scratch"), "main");
         let err = tree
-            .materialize(&[LaneMember::new("A", &a), LaneMember::new("B", &b)])
+            .materialize(&[
+                LaneMember::new("A", &a).with_changed_files(["same.txt"]),
+                LaneMember::new("B", &b).with_changed_files(["same.txt"]),
+            ])
             .expect_err("conflicting members cannot produce a candidate");
 
-        let msg = err.to_string();
-        assert!(msg.contains('B'), "the failing member must be named: {msg}");
+        let MaterializeError::Conflict {
+            id,
+            files,
+            shared_with,
+            ..
+        } = err
+        else {
+            panic!("expected a named conflict")
+        };
+        assert_eq!(id, "B");
+        assert_eq!(files, vec![PathBuf::from("same.txt")]);
+        assert_eq!(shared_with, vec!["A"]);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_peers_include_only_earlier_members_touching_unmerged_paths() {
+        let root = repo("conflict-peers");
+        let a = branch(&root, "a", "same.txt", "from-a\n");
+        let unrelated = branch(&root, "unrelated", "elsewhere.txt", "u\n");
+        let b = branch(&root, "b", "same.txt", "from-b\n");
+        let later = branch(&root, "later", "same.txt", "from-later\n");
+
+        let tree = GitCandidateTree::new(&root, root.join(".scratch"), "main");
+        let err = tree
+            .materialize(&[
+                LaneMember::new("A", &a).with_changed_files(["same.txt"]),
+                LaneMember::new("U", &unrelated).with_changed_files(["elsewhere.txt"]),
+                LaneMember::new("B", &b).with_changed_files(["same.txt"]),
+                LaneMember::new("LATER", &later).with_changed_files(["same.txt"]),
+            ])
+            .expect_err("B conflicts after A");
+
+        let MaterializeError::Conflict { shared_with, .. } = err else {
+            panic!("expected conflict")
+        };
+        assert_eq!(
+            shared_with,
+            vec!["A"],
+            "unrelated earlier members and never-applied later members are not participants"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_against_base_has_no_shared_lane_member() {
+        let root = repo("base-conflict");
+        let b = branch(&root, "b", "base.txt", "from-b\n");
+        fs::write(root.join("base.txt"), "new-main\n").unwrap();
+        sh(&root, &["add", "base.txt"]);
+        sh(&root, &["commit", "-q", "-m", "main moves base"]);
+
+        let tree = GitCandidateTree::new(&root, root.join(".scratch"), "main");
+        let err = tree
+            .materialize(&[LaneMember::new("B", &b).with_changed_files(["base.txt"])])
+            .expect_err("B conflicts with base");
+        let MaterializeError::Conflict { shared_with, .. } = err else {
+            panic!("expected conflict")
+        };
+        assert!(shared_with.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

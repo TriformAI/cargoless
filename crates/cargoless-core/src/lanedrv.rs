@@ -74,6 +74,10 @@ pub enum MaterializeError {
     Conflict {
         id: String,
         files: Vec<PathBuf>,
+        /// Earlier-applied members whose declared changes overlap Git's
+        /// unmerged paths. Later members have not been applied and therefore
+        /// cannot be named as participants in this collision.
+        shared_with: Vec<String>,
         reason: String,
     },
     /// A named member is ALREADY contained in the tree being built — it landed
@@ -1939,36 +1943,39 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             // compiled, but git already told us whose fault it is — no
             // inference, no ambiguity — and the rest of the queue must not wait
             // behind it.
-            Err(MaterializeError::Conflict { id, files, reason }) => {
+            Err(MaterializeError::Conflict {
+                id,
+                files,
+                shared_with,
+                reason,
+            }) => {
                 self.trail_line(&format!(
                     "[cargoless:obs] lane-build generation={generation} outcome=conflict \
-                     member={id} files={} reason={reason}",
-                    files.len()
+                     member={id} files={} shared_with={} reason={reason}",
+                    files.len(),
+                    shared_with.join(",")
                 ));
                 return LaneEvent::BuildFinished {
                     generation,
-                    outcome: LaneBuildOutcome::Conflict { id, files, reason },
+                    outcome: LaneBuildOutcome::Conflict {
+                        id,
+                        files,
+                        shared_with,
+                        reason,
+                    },
                 };
             }
-            // The member landed while it sat in the queue. Eject it by name with
-            // NO conflicting files, which the state machine already treats as
-            // `Unattributed` — the member leaves, everyone else rebuilds without
-            // it. Reusing the Conflict outcome rather than adding a parallel one
-            // keeps a single ejection path; the trail line says `stale` so the
-            // reason is never mistaken for a genuine merge conflict.
+            // The member landed while it sat in the queue. This is deliberately
+            // NOT Conflict-shaped: the public cause is `already_landed`, so an
+            // author is never told to resolve a collision that does not exist.
             Err(MaterializeError::Stale { id, head }) => {
-                let reason = format!("member `{id}` ({head}) already landed before this build");
                 self.trail_line(&format!(
                     "[cargoless:obs] lane-build generation={generation} outcome=stale \
                      member={id} head={head}"
                 ));
                 return LaneEvent::BuildFinished {
                     generation,
-                    outcome: LaneBuildOutcome::Conflict {
-                        id,
-                        files: Vec::new(),
-                        reason,
-                    },
+                    outcome: LaneBuildOutcome::Stale { id, head },
                 };
             }
             Err(MaterializeError::Infra(e)) => {
@@ -2056,10 +2063,20 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             // future path ever produces a conflict *after* materialisation, it
             // still reaches the trail instead of being silently swallowed by a
             // `_ => {}`. The verdict outliving the tree is the point.
-            LaneBuildOutcome::Conflict { id, files, reason } => self.trail_line(&format!(
+            LaneBuildOutcome::Conflict {
+                id,
+                files,
+                shared_with,
+                reason,
+            } => self.trail_line(&format!(
                 "[cargoless:obs] lane-build generation={generation} outcome=conflict \
-                 member={id} files={} reason={reason}",
-                files.len()
+                 member={id} files={} shared_with={} reason={reason}",
+                files.len(),
+                shared_with.join(",")
+            )),
+            LaneBuildOutcome::Stale { id, head } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} outcome=stale \
+                 member={id} head={head}"
             )),
         }
 

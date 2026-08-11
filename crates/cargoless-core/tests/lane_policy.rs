@@ -12,7 +12,8 @@
 use std::path::PathBuf;
 
 use cargoless_core::lane::{
-    EjectReason, LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LanePhase, LaneState,
+    EjectReason, EjectionCause, LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LanePhase,
+    LaneState,
 };
 use cargoless_proto::{Diagnostic, Severity};
 
@@ -108,7 +109,7 @@ fn eject_reason(actions: &[LaneAction], id: &str) -> EjectReason {
     actions
         .iter()
         .find_map(|a| match a {
-            LaneAction::Eject { id: i, reason } if i == id => Some(reason.clone()),
+            LaneAction::Eject { id: i, reason, .. } if i == id => Some(reason.clone()),
             _ => None,
         })
         .unwrap_or_else(|| panic!("expected {id} to be ejected; got {actions:?}"))
@@ -286,17 +287,53 @@ fn a_conflict_requeues_unjudged_survivors_ahead_of_newer_arrivals() {
         outcome: LaneBuildOutcome::Conflict {
             id: "B".to_string(),
             files: vec![PathBuf::from("src/b.rs")],
+            shared_with: vec!["A".to_string()],
             reason: "merge conflict".to_string(),
         },
     });
 
     assert_eq!(ejected_ids(&actions), vec!["B".to_string()]);
+    let ejection = st.ejection("B").expect("B remains visibly ejected");
+    assert_eq!(ejection.cause, EjectionCause::MergeConflict);
+    assert!(matches!(
+        &ejection.reason,
+        EjectReason::Attributed { shared_with, .. } if shared_with == &vec!["A".to_string()]
+    ));
+    assert!(
+        ejection.describe().contains("A remains"),
+        "the author message says the earlier peer stays in the lane: {}",
+        ejection.describe()
+    );
     assert_eq!(
         started(&actions).as_deref(),
         Some(&["A".to_string(), "C".to_string(), "D".to_string()][..]),
         "unjudged survivors keep their original priority ahead of arrivals \
          accepted during the failed build"
     );
+}
+
+#[test]
+fn already_landed_has_a_distinct_cause_and_no_remediation() {
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("DONE", "d1", &["src/done.rs"]),
+            member("NEXT", "n1", &["src/next.rs"]),
+        ],
+    );
+    st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Stale {
+            id: "DONE".to_string(),
+            head: "d1".to_string(),
+        },
+    });
+
+    let ejection = st.ejection("DONE").expect("landed member leaves the lane");
+    assert_eq!(ejection.cause, EjectionCause::AlreadyLanded);
+    assert!(ejection.reason.fingerprints().is_empty());
+    assert!(ejection.describe().contains("no author action is required"));
 }
 
 #[test]
