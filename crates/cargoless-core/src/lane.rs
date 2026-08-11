@@ -176,12 +176,81 @@ pub enum EjectReason {
     },
 }
 
+/// The event that caused an ejection, independent of how confidently the lane
+/// can attribute files for readmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EjectionCause {
+    BuildFailure,
+    MergeConflict,
+    AlreadyLanded,
+    Infrastructure,
+}
+
+impl EjectionCause {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildFailure => "build_failure",
+            Self::MergeConflict => "merge_conflict",
+            Self::AlreadyLanded => "already_landed",
+            Self::Infrastructure => "infrastructure",
+        }
+    }
+}
+
 impl EjectReason {
     /// Operator-facing sentence. This *is* the product surface — it is what an
     /// author sees when their PR stops moving, so it says what happened, who
     /// else is affected, and what to do.
     #[must_use]
     pub fn describe(&self) -> String {
+        self.describe_for(EjectionCause::BuildFailure)
+    }
+
+    /// Cause-aware description used by lane snapshots and author reporting.
+    /// `describe()` remains the backward-compatible build-verdict rendering.
+    #[must_use]
+    pub fn describe_for(&self, cause: EjectionCause) -> String {
+        if cause == EjectionCause::AlreadyLanded {
+            return "this change already landed and was removed from the lane; no author action is required"
+                .to_string();
+        }
+        if cause == EjectionCause::MergeConflict {
+            let (files, shared_with) = match self {
+                EjectReason::Attributed {
+                    files, shared_with, ..
+                } => (files.as_slice(), shared_with.as_slice()),
+                EjectReason::Unattributed { shared_with, .. }
+                | EjectReason::Infrastructure { shared_with, .. } => {
+                    (&[][..], shared_with.as_slice())
+                }
+            };
+            let where_ = if files.is_empty() {
+                "files Git could not enumerate".to_string()
+            } else {
+                files
+                    .iter()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return if shared_with.is_empty() {
+                format!(
+                    "merge conflict with the candidate base in {where_}. This change was removed; push a resolved head to re-enter the lane."
+                )
+            } else {
+                let remain = if shared_with.len() == 1 {
+                    "remains"
+                } else {
+                    "remain"
+                };
+                format!(
+                    "merge conflict with {} in {where_}. This change was removed; {} {remain} in the lane. Push a resolved head to re-enter.",
+                    shared_with.join(", "),
+                    shared_with.join(", ")
+                )
+            };
+        }
         match self {
             EjectReason::Attributed {
                 files, shared_with, ..
@@ -254,6 +323,7 @@ impl EjectReason {
 /// A live ejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ejection {
+    pub cause: EjectionCause,
     pub reason: EjectReason,
     /// The head that was ejected. A member re-enqueued at this same head is
     /// still ejected — nothing about the candidate changed.
@@ -268,6 +338,13 @@ pub struct Ejection {
     /// Tick at which the ejection lapses regardless. The backstop against a
     /// permanently-stuck member if attribution is ever wrong.
     pub expires_at_tick: u64,
+}
+
+impl Ejection {
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.reason.describe_for(self.cause)
+    }
 }
 
 /// What a finished build reported.
@@ -306,9 +383,14 @@ pub enum LaneBuildOutcome {
         id: String,
         /// Conflicting paths, when git could report them.
         files: Vec<PathBuf>,
+        /// Earlier-applied members proven to overlap the unmerged paths.
+        shared_with: Vec<String>,
         /// git's own explanation, for the trail.
         reason: String,
     },
+    /// A queued member is already contained in the candidate base. It leaves
+    /// the lane, but this is not a merge conflict and requires no author fix.
+    Stale { id: String, head: String },
     /// Neither — the build could not be trusted to have run (runner died,
     /// timeout, cancelled). NOT a code red: members stay queued and ride the
     /// next build. Treating a transient as a red is how a fleet learns to
@@ -385,7 +467,11 @@ pub enum LaneAction {
         members: Vec<LaneMember>,
     },
     /// Hold this member out of the lane and tell them why.
-    Eject { id: String, reason: EjectReason },
+    Eject {
+        id: String,
+        cause: EjectionCause,
+        reason: EjectReason,
+    },
     /// The member is eligible again.
     Readmit { id: String, why: String },
     /// The build was green: merge these members and publish the artifact,
@@ -702,7 +788,7 @@ impl LaneState {
             if ej.head == member.head {
                 actions.push(LaneAction::Report {
                     id: member.id,
-                    state: format!("ejected: {}", ej.reason.describe()),
+                    state: format!("ejected: {}", ej.describe()),
                 });
                 return;
             }
@@ -721,7 +807,7 @@ impl LaneState {
                     let ej = &self.ejected[&member.id];
                     actions.push(LaneAction::Report {
                         id: member.id,
-                        state: format!("still ejected: {}", ej.reason.describe()),
+                        state: format!("still ejected: {}", ej.describe()),
                     });
                     return;
                 }
@@ -807,7 +893,7 @@ impl LaneState {
                 let ej = &self.ejected[id];
                 actions.push(LaneAction::Report {
                     id: id.to_string(),
-                    state: format!("still ejected: {}", ej.reason.describe()),
+                    state: format!("still ejected: {}", ej.describe()),
                 });
             }
             return;
@@ -970,6 +1056,7 @@ impl LaneState {
                     let all: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
                     for m in members {
                         let ejection = Ejection {
+                            cause: EjectionCause::Infrastructure,
                             reason: EjectReason::Infrastructure {
                                 reason: reason.clone(),
                                 attempts,
@@ -981,10 +1068,11 @@ impl LaneState {
                         };
                         actions.push(LaneAction::Report {
                             id: m.id.clone(),
-                            state: ejection.reason.describe(),
+                            state: ejection.describe(),
                         });
                         actions.push(LaneAction::Eject {
                             id: m.id.clone(),
+                            cause: ejection.cause,
                             reason: ejection.reason.clone(),
                         });
                         self.ejected.insert(m.id.clone(), ejection);
@@ -1021,84 +1109,91 @@ impl LaneState {
             LaneBuildOutcome::UnattributedRed { diagnostics } => {
                 self.eject_unattributed(&members, &diagnostics, actions);
             }
-            LaneBuildOutcome::Conflict { id, files, reason } => {
-                // The infrastructure worked — git ran and answered. Reset the
-                // consecutive-failure count so a conflict cannot creep the lane
-                // toward its infra give-up threshold.
-                self.infra_failures = 0;
+            LaneBuildOutcome::Conflict {
+                id,
+                files,
+                shared_with,
+                reason,
+            } => self.eject_named_member(
+                members,
+                id,
+                EjectionCause::MergeConflict,
+                files,
+                shared_with,
+                format!("could not be merged ({reason})"),
+                actions,
+            ),
+            LaneBuildOutcome::Stale { id, head } => self.eject_named_member(
+                members,
+                id,
+                EjectionCause::AlreadyLanded,
+                Vec::new(),
+                Vec::new(),
+                format!("already landed at {head}"),
+                actions,
+            ),
+        }
+    }
 
-                let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
-                let mut survivors = Vec::new();
-                for m in members {
-                    if m.id == id {
-                        // Attributed, with the conflicting paths as the files
-                        // that carried the failure. `readmission_decision`'s
-                        // existing gate then does the right thing without
-                        // knowing a conflict happened: a new head touching one
-                        // of those paths is a plausible fix and readmits;
-                        // anything else stays out. That is what stops the
-                        // member re-entering every candidate forever.
-                        //
-                        // When git could not report the paths, fall back to
-                        // `Unattributed`: it still ejects, and it readmits on
-                        // any new head — which is the honest answer when we
-                        // cannot say which files to watch. It does NOT reopen
-                        // the livelock, because the member is out until its
-                        // head actually moves.
-                        let eject_reason = if files.is_empty() {
-                            EjectReason::Unattributed {
-                                fingerprints: FingerprintCounts::default(),
-                                shared_with: Vec::new(),
-                            }
-                        } else {
-                            EjectReason::Attributed {
-                                files: files.clone(),
-                                fingerprints: FingerprintCounts::default(),
-                                // Nobody else is implicated: a conflict is
-                                // between this member and the base, and blaming
-                                // a co-rider for it would be the false
-                                // accusation the lane exists to avoid.
-                                shared_with: Vec::new(),
-                            }
-                        };
-                        actions.push(LaneAction::Eject {
-                            id: m.id.clone(),
-                            reason: eject_reason.clone(),
-                        });
-                        self.ejected.insert(
-                            m.id.clone(),
-                            Ejection {
-                                reason: eject_reason,
-                                head: m.head.clone(),
-                                changed_files: m.changed_files.clone(),
-                                expires_at_tick: expires,
-                            },
-                        );
-                    } else {
-                        // Everyone else was never judged — they rode a
-                        // candidate that was never built. Requeue at the front
-                        // so they rebuild immediately, WITHOUT the infra
-                        // backoff: the next attempt has the conflicting member
-                        // removed, so it is a genuinely different candidate
-                        // rather than a retry of the same broken one.
-                        actions.push(LaneAction::Report {
-                            id: m.id.clone(),
-                            state: format!(
-                                "requeued — `{id}` could not be merged onto the base \
-                                 ({reason}) and was ejected; the next candidate is built \
-                                 without it"
-                            ),
-                        });
-                        survivors.push(m);
+    fn eject_named_member(
+        &mut self,
+        members: Vec<LaneMember>,
+        id: String,
+        cause: EjectionCause,
+        files: Vec<PathBuf>,
+        shared_with: Vec<String>,
+        survivor_reason: String,
+        actions: &mut Vec<LaneAction>,
+    ) {
+        // Git produced a named, attributable outcome, so it cannot contribute
+        // to the infrastructure failure streak.
+        self.infra_failures = 0;
+        self.infra_retry_after = None;
+
+        let expires = self.now.saturating_add(self.cfg.eject_ttl_ticks);
+        let mut survivors = Vec::new();
+        for m in members {
+            if m.id == id {
+                let eject_reason = if files.is_empty() {
+                    EjectReason::Unattributed {
+                        fingerprints: FingerprintCounts::default(),
+                        shared_with: shared_with.clone(),
                     }
-                }
-                // `queue` may already contain members accepted while this
-                // candidate was building. They arrived later than these
-                // unjudged co-riders and therefore must remain behind them.
-                // Splicing once also preserves the survivors' original order.
-                self.queue.splice(0..0, survivors);
+                } else {
+                    EjectReason::Attributed {
+                        files: files.clone(),
+                        fingerprints: FingerprintCounts::default(),
+                        shared_with: shared_with.clone(),
+                    }
+                };
+                actions.push(LaneAction::Eject {
+                    id: m.id.clone(),
+                    cause,
+                    reason: eject_reason.clone(),
+                });
+                self.ejected.insert(
+                    m.id.clone(),
+                    Ejection {
+                        cause,
+                        reason: eject_reason,
+                        head: m.head.clone(),
+                        changed_files: m.changed_files.clone(),
+                        expires_at_tick: expires,
+                    },
+                );
+            } else {
+                actions.push(LaneAction::Report {
+                    id: m.id.clone(),
+                    state: format!(
+                        "requeued — `{id}` {survivor_reason} and was removed; the next candidate is built without it"
+                    ),
+                });
+                survivors.push(m);
             }
         }
+        // Members already queued while this candidate ran arrived after these
+        // unjudged co-riders, so the survivors retain priority at the front.
+        self.queue.splice(0..0, survivors);
     }
 
     /// The attribution ladder. See the module docs.
@@ -1160,6 +1255,7 @@ impl LaneState {
                 self.ejected.insert(
                     m.id.clone(),
                     Ejection {
+                        cause: EjectionCause::BuildFailure,
                         reason: reason.clone(),
                         head: m.head.clone(),
                         changed_files: m.changed_files.clone(),
@@ -1168,6 +1264,7 @@ impl LaneState {
                 );
                 actions.push(LaneAction::Eject {
                     id: m.id.clone(),
+                    cause: EjectionCause::BuildFailure,
                     reason,
                 });
             } else {
@@ -1209,6 +1306,7 @@ impl LaneState {
             self.ejected.insert(
                 m.id.clone(),
                 Ejection {
+                    cause: EjectionCause::BuildFailure,
                     reason: reason.clone(),
                     head: m.head.clone(),
                     changed_files: m.changed_files.clone(),
@@ -1217,6 +1315,7 @@ impl LaneState {
             );
             actions.push(LaneAction::Eject {
                 id: m.id.clone(),
+                cause: EjectionCause::BuildFailure,
                 reason,
             });
         }

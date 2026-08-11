@@ -94,6 +94,9 @@ pub struct MemberView {
 pub struct EjectionView {
     pub id: String,
     pub head: String,
+    /// `build_failure`, `merge_conflict`, `already_landed`, or
+    /// `infrastructure` — what happened, independent of attribution kind.
+    pub cause: &'static str,
     /// `attributed` or `unattributed` — the two are cleared by different
     /// things, so an author needs to know which they have.
     pub kind: &'static str,
@@ -139,6 +142,7 @@ impl LaneSnapshot {
                 EjectionView {
                     id: id.clone(),
                     head: e.head.clone(),
+                    cause: e.cause.as_str(),
                     kind,
                     files,
                     shared_with,

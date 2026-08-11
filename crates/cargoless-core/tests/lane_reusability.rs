@@ -254,7 +254,7 @@ fn a_preview_red_never_attributes_its_synthetic_anchor_to_a_member() {
     let ejections: Vec<(&str, &EjectReason)> = actions
         .iter()
         .filter_map(|action| match action {
-            LaneAction::Eject { id, reason } => Some((id.as_str(), reason)),
+            LaneAction::Eject { id, reason, .. } => Some((id.as_str(), reason)),
             _ => None,
         })
         .collect();

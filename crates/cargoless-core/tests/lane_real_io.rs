@@ -997,6 +997,10 @@ fn an_unmergeable_member_is_ejected_and_the_queue_keeps_moving() {
     // 2. It is ejected as a VERDICT about that member, never as infrastructure.
     //    Infra ejects nobody, which is exactly how the livelock happened.
     let (_, ejection) = lane.ejections().next().expect("`bad` is ejected");
+    assert_eq!(
+        ejection.cause,
+        cargoless_core::lane::EjectionCause::MergeConflict
+    );
     assert!(
         !matches!(
             ejection.reason,
@@ -1083,6 +1087,10 @@ fn a_member_that_already_landed_is_ejected_instead_of_merged_empty() {
     // 2. Never infrastructure. Infra ejects nobody and backs off, so a landed
     //    member would ride every future candidate forever.
     let (_, ejection) = lane.ejections().next().expect("`done` is ejected");
+    assert_eq!(
+        ejection.cause,
+        cargoless_core::lane::EjectionCause::AlreadyLanded
+    );
     assert!(
         !matches!(
             ejection.reason,

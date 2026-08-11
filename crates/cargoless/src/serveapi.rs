@@ -3850,6 +3850,7 @@ impl VerdictService for ServeVerdictState {
             "ejections": s.ejections.iter().map(|e| serde_json::json!({
                 "id": e.id,
                 "head": e.head,
+                "cause": e.cause,
                 "kind": e.kind,
                 "files": e.files,
                 "shared_with": e.shared_with,
