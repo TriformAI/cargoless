@@ -2749,7 +2749,13 @@ fn spawn_project_checks_hard_with_timeout(
     // ownership of `context`. Captured here so the watchdog-fire arm
     // can log it even though `context` is moved into the worker below.
     let input_summary = summarize_witness_input(context.as_ref());
-    let generation = api.begin_hard_witness(&wt_key, witness_base_sha.as_deref());
+    let generation = api.begin_hard_witness(
+        &wt_key,
+        witness_base_sha.as_deref(),
+        attribution
+            .as_ref()
+            .and_then(|attribution| attribution.semantic.as_ref()),
+    );
     let attribution_fallback = attribution.clone();
     let supervisor = {
         let wt = wt.clone();
