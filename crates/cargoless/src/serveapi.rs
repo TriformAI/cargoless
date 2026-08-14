@@ -81,6 +81,12 @@ static PROJECT_CHECK_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(1);
 /// recycled across worktrees, so `finish_hard_witness`'s equality check
 /// can never be fooled by a reused value.
 static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+struct HardWitnessClaim {
+    generation: u64,
+    attempt_id: Option<AttemptId>,
+}
 /// Fallback cap on the per-worktree base_sha-addressable verdict ring
 /// ([`ServeVerdictState::verdict_history`]) — used only when
 /// `CARGOLESS_WITNESS_HISTORY_CAP` is unset or unparseable. Raised from
@@ -687,7 +693,7 @@ pub struct ServeVerdictState {
     /// merit; only a *re-push of the same commit* supersedes. FS-watch /
     /// unattributed witnesses (`base_sha: None`) still share one key per
     /// worktree, matching their pre-existing semantics.
-    hard_witness_generation: Mutex<BTreeMap<(String, Option<String>), u64>>,
+    hard_witness_generation: Mutex<BTreeMap<(String, Option<String>), HardWitnessClaim>>,
     /// #A2-keystone — base_sha-addressable verdict ring per worktree. Because
     /// the witness shares one worktree key across all PRs, the single
     /// `statuses` slot can only hold the *last* publisher's verdict; a poller
@@ -2282,6 +2288,113 @@ impl ServeVerdictState {
         self.remember_outcome_v3(outcome);
     }
 
+    /// Resolve an accepted semantic attempt when a newer attempt for the
+    /// same `(worktree, base_sha)` replaces its in-flight Hard witness.
+    ///
+    /// The generation latch prevents the stale witness from publishing a
+    /// verdict, but that suppression must not leave its exact-attempt
+    /// outcome in `Pending` forever. Record the replacement as a first-class
+    /// terminal `Superseded` outcome without touching the worktree's
+    /// last-writer-wins verdict slot.
+    fn supersede_outcome_v3(
+        &self,
+        attempt_id: &AttemptId,
+        successor_attempt_id: &AttemptId,
+        worktree: &str,
+    ) {
+        let Some(mut outcome) = poisoned(&self.outcomes_v3).get(attempt_id).cloned() else {
+            return;
+        };
+        if !matches!(outcome.conclusion, Conclusion::Pending { .. }) {
+            return;
+        }
+
+        let terminal_at = now_unix_ms();
+        if let Some(active) = outcome
+            .timeline
+            .iter_mut()
+            .rev()
+            .find(|record| record.finished_at_unix_ms.is_none())
+        {
+            active.finished_at_unix_ms = Some(terminal_at);
+        }
+        poisoned(&self.ra_evidence_v3).remove(attempt_id);
+
+        let mut evidence = EvidenceBundle::default();
+        evidence.push(
+            ArtifactKind::Events,
+            serde_json::to_vec(&serde_json::json!({
+                "at_unix_ms": terminal_at,
+                "event": "witness.superseded",
+                "attempt_id": attempt_id.as_str(),
+                "successor_attempt_id": successor_attempt_id.as_str(),
+                "worktree": worktree,
+            }))
+            .expect("supersession event JSON"),
+        );
+        let reference_store = self
+            .evidence_store_v3
+            .clone()
+            .unwrap_or_else(|| EvidenceStore::new("."));
+        let Ok(evidence_ref) = reference_store.reference_for(attempt_id, &evidence) else {
+            tracing::error!(
+                attempt_id = %attempt_id,
+                successor_attempt_id = %successor_attempt_id,
+                "could not construct superseded outcome-v3 evidence reference"
+            );
+            return;
+        };
+
+        outcome.relations.push(Relation {
+            kind: RelationKind::SupersededBy,
+            attempt_id: Some(successor_attempt_id.clone()),
+            execution_id: None,
+        });
+        outcome.conclude(Conclusion::Superseded {
+            successor_attempt_id: successor_attempt_id.clone(),
+            evidence: evidence_ref,
+            summary: text_v3("a newer attempt for the same tree replaced this in-flight witness"),
+        });
+        outcome.timeline.push(PhaseRecord {
+            phase: Phase::Terminal,
+            started_at_unix_ms: terminal_at,
+            finished_at_unix_ms: Some(terminal_at),
+        });
+
+        let evidence_error = if let Some(store) = self.evidence_store_v3.as_ref() {
+            store
+                .persist(&outcome, EvidenceClass::Terminal, &evidence)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            Some("durable evidence store is not configured".to_string())
+        };
+        if let Some(error) = evidence_error {
+            mark_evidence_unavailable_v3(&mut outcome, error.clone());
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            metrics.evidence_persist_failures = metrics.evidence_persist_failures.saturating_add(1);
+            drop(metrics);
+            tracing::error!(
+                attempt_id = %attempt_id,
+                error = %error,
+                "superseded outcome-v3 durable evidence persistence failed"
+            );
+        }
+        {
+            let reaction_state = reaction_state_name(outcome.reaction.state);
+            let mut metrics = poisoned(&self.outcome_metrics_v3);
+            *metrics
+                .terminal_by_code
+                .entry(outcome.conclusion.semantic_code().to_string())
+                .or_insert(0) += 1;
+            *metrics
+                .reactions_by_state
+                .entry(reaction_state.to_string())
+                .or_insert(0) += 1;
+        }
+        self.remember_outcome_v3(outcome);
+    }
+
     /// CGLS-25 — acquire a Hard-witness compile slot from the global gate.
     /// Called at the top of the witness WORKER thread (never the serve loop
     /// or supervisor). The returned RAII guard releases the slot on drop —
@@ -2730,10 +2843,29 @@ impl ServeVerdictState {
     /// newer commit's push no longer supersedes an older commit's in-flight
     /// witness. `None` (FS-watch / unattributed) keeps the historical
     /// one-latch-per-worktree behavior.
-    pub(crate) fn begin_hard_witness(&self, wt_key: &str, base_sha: Option<&str>) -> u64 {
+    pub(crate) fn begin_hard_witness(
+        &self,
+        wt_key: &str,
+        base_sha: Option<&str>,
+        semantic: Option<&AttemptContext>,
+    ) -> u64 {
         let generation = HARD_WITNESS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         let key = (wt_key.to_string(), base_sha.map(str::to_string));
-        poisoned(&self.hard_witness_generation).insert(key, generation);
+        let attempt_id = semantic.map(|context| context.attempt_id.clone());
+        let previous = poisoned(&self.hard_witness_generation).insert(
+            key,
+            HardWitnessClaim {
+                generation,
+                attempt_id: attempt_id.clone(),
+            },
+        );
+        if let (Some(previous_attempt_id), Some(successor_attempt_id)) =
+            (previous.and_then(|claim| claim.attempt_id), attempt_id)
+        {
+            if previous_attempt_id != successor_attempt_id {
+                self.supersede_outcome_v3(&previous_attempt_id, &successor_attempt_id, wt_key);
+            }
+        }
         generation
     }
 
@@ -2749,7 +2881,10 @@ impl ServeVerdictState {
     ) -> bool {
         let key = (wt_key.to_string(), base_sha.map(str::to_string));
         let mut map = poisoned(&self.hard_witness_generation);
-        if map.get(&key) == Some(&generation) {
+        if map
+            .get(&key)
+            .is_some_and(|claim| claim.generation == generation)
+        {
             map.remove(&key);
             true
         } else {
@@ -9960,8 +10095,8 @@ checks:
         // cannot publish twice.
         let api = ServeVerdictState::new();
         let sha = Some("deadbeef");
-        let g1 = api.begin_hard_witness("/wt", sha);
-        let g2 = api.begin_hard_witness("/wt", sha);
+        let g1 = api.begin_hard_witness("/wt", sha, None);
+        let g2 = api.begin_hard_witness("/wt", sha, None);
         assert!(g2 > g1, "generations are monotonic");
         assert!(
             !api.finish_hard_witness("/wt", sha, g1),
@@ -9977,8 +10112,82 @@ checks:
         );
         // Keys are independent: a witness on another worktree is
         // unaffected by /wt's churn.
-        let g3 = api.begin_hard_witness("/other", sha);
+        let g3 = api.begin_hard_witness("/other", sha, None);
         assert!(api.finish_hard_witness("/other", sha, g3));
+    }
+
+    #[test]
+    fn same_tree_witness_replacement_terminalizes_superseded_attempt() {
+        let state_dir = temp_root("witness-superseded");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let files = vec![("src/lib.rs".to_string(), "pub fn checked() {}".to_string())];
+        let first = attempt_context("attempt-first", 1);
+        let successor = attempt_context("attempt-successor", 2);
+        let options = |semantic: AttemptContext| PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(semantic),
+            ..PushOverlayOptions::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options(first.clone())),
+            )
+            .accepted
+        );
+        let first_generation =
+            api.begin_hard_witness("/client/wt", Some("same-commit"), Some(&first));
+        assert_eq!(api.outcome_metrics_v3().unwrap()["pending_attempts"], 1);
+
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options(successor.clone())),
+            )
+            .accepted
+        );
+        let successor_generation =
+            api.begin_hard_witness("/client/wt", Some("same-commit"), Some(&successor));
+
+        let superseded = api
+            .get_outcome_v3(&first.attempt_id)
+            .expect("superseded attempt remains queryable");
+        assert!(matches!(
+            &superseded.conclusion,
+            Conclusion::Superseded {
+                successor_attempt_id,
+                ..
+            } if successor_attempt_id == &successor.attempt_id
+        ));
+        assert!(superseded.relations.iter().any(|relation| {
+            relation.kind == RelationKind::SupersededBy
+                && relation.attempt_id.as_ref() == Some(&successor.attempt_id)
+        }));
+        assert_eq!(
+            superseded.reaction.state,
+            cargoless_core::outcome::CheckState::NoUpdate
+        );
+        let metrics = api.outcome_metrics_v3().unwrap();
+        assert_eq!(
+            metrics["pending_attempts"], 1,
+            "only the successor stays pending"
+        );
+        assert_eq!(metrics["terminal_by_code"]["superseded"], 1);
+        assert!(
+            state_dir
+                .join("evidence-v3/attempt-first/outcome.json")
+                .is_file()
+        );
+        assert!(!api.finish_hard_witness("/client/wt", Some("same-commit"), first_generation,));
+        assert!(api.finish_hard_witness("/client/wt", Some("same-commit"), successor_generation,));
     }
 
     #[test]
@@ -9991,10 +10200,10 @@ checks:
         // (worktree, base_sha) makes two distinct commits independent: each
         // publishes on its own merit even though they share the worktree key.
         let api = ServeVerdictState::new();
-        let g_old = api.begin_hard_witness("/workspace/tf-multiverse", Some("aaa111"));
+        let g_old = api.begin_hard_witness("/workspace/tf-multiverse", Some("aaa111"), None);
         // A newer commit's push arrives for the SAME worktree key while the
         // older witness is still running.
-        let g_new = api.begin_hard_witness("/workspace/tf-multiverse", Some("bbb222"));
+        let g_new = api.begin_hard_witness("/workspace/tf-multiverse", Some("bbb222"), None);
         assert!(g_new > g_old, "generations stay globally monotonic");
         // The newer commit's witness finishes and publishes — fine.
         assert!(
@@ -10010,7 +10219,7 @@ checks:
         );
         // An unattributed (FS-watch) witness keeps its own one-per-worktree
         // latch, independent of either attributed commit.
-        let g_fs = api.begin_hard_witness("/workspace/tf-multiverse", None);
+        let g_fs = api.begin_hard_witness("/workspace/tf-multiverse", None, None);
         assert!(api.finish_hard_witness("/workspace/tf-multiverse", None, g_fs));
     }
 
