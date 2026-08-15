@@ -834,10 +834,15 @@ impl Default for BatchCoalesceConfig {
     }
 }
 
+#[cfg(test)]
+type AfterFastPathHook = Arc<dyn Fn(&BatchCheckRequest) + Send + Sync>;
+
 #[derive(Default)]
 struct BatchCoalescer {
     state: Mutex<BatchCoalescerState>,
     cv: Condvar,
+    #[cfg(test)]
+    after_fast_path: Option<AfterFastPathHook>,
     config: BatchCoalesceConfig,
 }
 
@@ -1105,12 +1110,27 @@ impl BatchCoalescer {
         }
 
         loop {
-            // Fast path: another leader already produced our result.
+            // Optimistic fast path: another leader already produced our result.
             if let Some(report) = poisoned(&waiter.result).clone() {
                 return report;
             }
 
+            #[cfg(test)]
+            if let Some(hook) = &self.after_fast_path {
+                hook(request);
+            }
+
             let mut state = poisoned(&self.state);
+            // Re-check while holding the queue-state lock. A leader publishes
+            // every drained waiter's result before `finish_leader` removes an
+            // empty queue and notifies followers. Without this second check, a
+            // follower can read None above, get descheduled, then acquire the
+            // lock after queue removal and wait forever on a notification that
+            // already happened.
+            if let Some(report) = poisoned(&waiter.result).clone() {
+                drop(state);
+                return report;
+            }
             let Some(queue) = state.queues.get_mut(&key) else {
                 state = self
                     .cv
@@ -6564,6 +6584,7 @@ checks:
         BatchCoalescer {
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
+            after_fast_path: None,
             config: BatchCoalesceConfig {
                 // Small cold-start grace (50ms): lets simultaneously-launched
                 // same-key submitters enqueue before the leader drains, so they
@@ -6744,6 +6765,7 @@ checks:
         let coalescer = Arc::new(BatchCoalescer {
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
+            after_fast_path: None,
             config: BatchCoalesceConfig {
                 coalesce_grace: Duration::ZERO,
                 max_wait: Duration::from_millis(300),
@@ -6814,6 +6836,66 @@ checks:
                 .iter()
                 .all(|report| report.verdict == BatchVerdict::Green && report.members.len() == 1)
         );
+    }
+
+    #[test]
+    fn batch_coalescer_completed_waiter_cannot_miss_queue_removal_notification() {
+        let (follower_arrived_tx, follower_arrived_rx) = std::sync::mpsc::channel();
+        let (release_follower_tx, release_follower_rx) = std::sync::mpsc::channel();
+        let release_follower_rx = Arc::new(Mutex::new(release_follower_rx));
+        let hook_release = Arc::clone(&release_follower_rx);
+        let coalescer = Arc::new(BatchCoalescer {
+            state: Mutex::new(BatchCoalescerState::default()),
+            cv: Condvar::new(),
+            after_fast_path: Some(Arc::new(move |request| {
+                if request.batch_id == "follower" {
+                    follower_arrived_tx
+                        .send(())
+                        .expect("announce follower fast-path pause");
+                    hook_release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release follower after leader removes queue");
+                }
+            })),
+            config: BatchCoalesceConfig {
+                coalesce_grace: Duration::ZERO,
+                max_wait: Duration::from_millis(300),
+                max_members: 40,
+                global_inflight_limit: 1,
+                eject_cooldown_rounds: 1,
+            },
+        });
+        let key = test_batch_key("missed-removal-notification");
+        let follower_request = coalescer_request("follower", "follower-member");
+        let follower_coalescer = Arc::clone(&coalescer);
+        let follower_key = key.clone();
+        let (follower_result_tx, follower_result_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let report =
+                follower_coalescer.submit(follower_key, &follower_request, green_report_for);
+            let _ = follower_result_tx.send(report);
+        });
+
+        follower_arrived_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("follower reached the pre-lock interleaving");
+
+        // The follower is already queued but paused after its optimistic result
+        // check. This submitter becomes leader, drains both waiters, publishes
+        // both results, and removes the now-empty queue before we release it.
+        let leader_request = coalescer_request("leader", "leader-member");
+        let leader_report = coalescer.submit(key, &leader_request, green_report_for);
+        assert_eq!(leader_report.members[0].worktree, "leader-member");
+
+        release_follower_tx
+            .send(())
+            .expect("release paused follower");
+        let follower_report = follower_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("completed follower must observe its published result");
+        assert_eq!(follower_report.members[0].worktree, "follower-member");
     }
 
     #[test]
@@ -6889,6 +6971,7 @@ checks:
         BatchCoalescer {
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
+            after_fast_path: None,
             config: BatchCoalesceConfig {
                 coalesce_grace: Duration::ZERO,
                 max_wait: Duration::from_millis(300),
@@ -7365,6 +7448,7 @@ checks:
         let coalescer = Arc::new(BatchCoalescer {
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
+            after_fast_path: None,
             config: BatchCoalesceConfig {
                 coalesce_grace: Duration::ZERO,
                 max_wait: Duration::from_millis(300),
@@ -7481,6 +7565,7 @@ checks:
         let coalescer = Arc::new(BatchCoalescer {
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
+            after_fast_path: None,
             config: BatchCoalesceConfig {
                 // Small cold-start grace so round-2's fresh greens batch.
                 coalesce_grace: Duration::from_millis(50),
@@ -7599,6 +7684,7 @@ checks:
         let coalescer = Arc::new(BatchCoalescer {
             state: Mutex::new(BatchCoalescerState::default()),
             cv: Condvar::new(),
+            after_fast_path: None,
             config: BatchCoalesceConfig {
                 coalesce_grace: Duration::from_millis(50),
                 max_wait: Duration::from_millis(300),

@@ -270,8 +270,12 @@ fn diagnostic_refresh_fence(generation: u64, zero_verbs: bool) -> Option<u64> {
     (!zero_verbs).then_some(generation)
 }
 
-fn should_nudge_final_pushed_content(is_from_pushed_overlay: bool, target_is_empty: bool) -> bool {
-    is_from_pushed_overlay && !target_is_empty
+fn should_nudge_final_pushed_content(
+    is_from_pushed_overlay: bool,
+    zero_verbs: bool,
+    target_is_empty: bool,
+) -> bool {
+    is_from_pushed_overlay && !zero_verbs && !target_is_empty
 }
 
 /// Control messages from the per-cluster Supervisor `on_spawn` hook to
@@ -1755,16 +1759,25 @@ fn exec(
             //   * a real content transition can produce an early refresh for
             //     the first DidOpen/DidChange before RA has analysed the final
             //     semantic snapshot;
-            //   * an identical overlay produces zero verbs, so the old path
-            //     pulled RA's cached empty report immediately.
+            //   * after a real transition, the cached report is only safe
+            //     once a refresh after the final exact buffer has completed.
             //
             // Send one final same-content DidChange for pushed Rust overlays,
             // capturing the refresh generation immediately before it. The
             // document version still advances monotonically, no intermediate
             // DidClose can release a stale empty snapshot, and the pull below
             // cannot settle until RA asks us to refresh after this exact final
-            // version. FS-watched transactions remain byte-for-byte unchanged.
-            if should_nudge_final_pushed_content(is_from_pushed_overlay, target.is_empty()) {
+            // version. An identical overlay deliberately skips this nudge:
+            // rust-analyzer emits no refresh for an identical DidChange, so
+            // fencing one would wait forever. Zero mux verbs mean the exact
+            // paths and bytes from the previously fenced transaction remain
+            // open, making a direct diagnostic pull authoritative. FS-watched
+            // transactions remain byte-for-byte unchanged.
+            if should_nudge_final_pushed_content(
+                is_from_pushed_overlay,
+                zero_verbs,
+                target.is_empty(),
+            ) {
                 if let Some((path, content)) = first_rs_in_overlay(&target) {
                     let refresh_before_nudge = lsp.diagnostic_refresh_generation();
                     let version = cs.next_ver;
@@ -3823,15 +3836,49 @@ mod tests {
     }
 
     #[test]
-    fn pushed_overlay_always_nudges_the_exact_final_rust_content() {
-        assert!(should_nudge_final_pushed_content(true, false));
+    fn changed_pushed_overlay_nudges_the_exact_final_rust_content() {
+        assert!(should_nudge_final_pushed_content(true, false, false));
         assert!(
-            !should_nudge_final_pushed_content(false, false),
+            !should_nudge_final_pushed_content(false, false, false),
             "FS-watched content must keep its existing verb and refresh behavior",
         );
         assert!(
-            !should_nudge_final_pushed_content(true, true),
+            !should_nudge_final_pushed_content(true, false, true),
             "an empty Rust target has no document that can be fenced",
+        );
+        assert!(
+            !should_nudge_final_pushed_content(true, true, false),
+            "an identical DidChange produces no refresh and must never arm a freshness fence",
+        );
+    }
+
+    #[test]
+    fn repeated_identical_push_uses_the_already_fenced_exact_snapshot() {
+        use cargoless_core::multiplex::OverlayMultiplexer;
+        use cargoless_core::overlay::OverlaySet;
+
+        let mut mux = OverlayMultiplexer::new();
+        let target = OverlaySet::from_pairs([("/repo/wt/src/lib.rs", "pub fn f() {}")]);
+
+        let first_zero_verbs = mux.switch_to(&target).is_empty();
+        assert!(!first_zero_verbs);
+        assert!(should_nudge_final_pushed_content(
+            true,
+            first_zero_verbs,
+            target.is_empty(),
+        ));
+
+        let repeated_zero_verbs = mux.switch_to(&target).is_empty();
+        assert!(repeated_zero_verbs);
+        assert!(!should_nudge_final_pushed_content(
+            true,
+            repeated_zero_verbs,
+            target.is_empty(),
+        ));
+        assert_eq!(
+            diagnostic_refresh_fence(42, repeated_zero_verbs),
+            None,
+            "the repeated exact snapshot must be pulled directly instead of waiting for an impossible refresh",
         );
     }
 
