@@ -1906,6 +1906,7 @@ fn exec(
                 project_checks_mode(),
                 gate_requested,
                 macro_blind_escalation,
+                allow_explicit_gate_when_off(),
             ) {
                 ProjectChecksMode::Off => {
                     // No project-check signal; the only input is the
@@ -2476,8 +2477,11 @@ fn project_checks_mode() -> ProjectChecksMode {
 
 /// #A4.3 — per-push Warn→Hard promotion. A `--gate` push asks for a
 /// witness-gated verdict; in Warn deployments that promotes exactly that
-/// push to Hard. `Off` stays `Off` (an operator kill-switch outranks a
-/// client request); `Hard` is already the requested strength.
+/// push to Hard. Off deployments retain their kill-switch semantics unless
+/// the operator separately enables [`allow_explicit_gate_when_off`]. That
+/// opt-in exists for fast Analyzer-only fleets which must still honor a
+/// deliberately requested compiler witness without enabling advisory checks
+/// for every ordinary push. `Hard` is already the requested strength.
 ///
 /// #A8 — `macro_blind_escalation` is the second promotion input: the
 /// consumed push touched a macro-blind path (`PushAttribution::
@@ -2485,17 +2489,35 @@ fn project_checks_mode() -> ProjectChecksMode {
 /// `CARGOLESS_MACRO_BLIND_ESCALATE=1`. Same strengthen-only semantics as
 /// the gate bit: RA-native green on a blind path is necessary-not-
 /// sufficient, so the push is promoted to the witness-gated verdict
-/// rather than publishing a green RA cannot stand behind. `Off` still
-/// outranks both (the kill-switch posture is unchanged).
+/// rather than publishing a green RA cannot stand behind. Macro-blind
+/// escalation never overrides Off; only an explicit `--gate` may do so, and
+/// only under the dedicated operator opt-in.
 fn effective_project_checks_mode(
     mode: ProjectChecksMode,
     gate_requested: bool,
     macro_blind_escalation: bool,
+    allow_explicit_gate_when_off: bool,
 ) -> ProjectChecksMode {
-    match (mode, gate_requested || macro_blind_escalation) {
-        (ProjectChecksMode::Warn, true) => ProjectChecksMode::Hard,
-        (mode, _) => mode,
+    match (
+        mode,
+        gate_requested,
+        macro_blind_escalation,
+        allow_explicit_gate_when_off,
+    ) {
+        (ProjectChecksMode::Off, true, _, true) => ProjectChecksMode::Hard,
+        (ProjectChecksMode::Warn, true, _, _) | (ProjectChecksMode::Warn, _, true, _) => {
+            ProjectChecksMode::Hard
+        }
+        (mode, _, _, _) => mode,
     }
+}
+
+/// Permit authenticated clients to request a bounded Hard witness even when
+/// the deployment's default project-check posture is Off. This does not start
+/// advisory checks and does not promote macro-blind pushes implicitly; it only
+/// makes an explicit `--gate` request truthful.
+fn allow_explicit_gate_when_off() -> bool {
+    truthy_env("CARGOLESS_ALLOW_EXPLICIT_GATE_WHEN_OFF")
 }
 
 /// #A8 — opt-in switch for macro-blind escalation. Annotation
@@ -4689,23 +4711,25 @@ mod tests {
     }
 
     #[test]
-    fn gate_promotes_warn_to_hard_only_for_that_push() {
-        // #A4.3 per-push promotion truth table: gate only ever
-        // STRENGTHENS Warn; Off (operator kill-switch) and Hard are
-        // fixed points regardless of the request bit.
+    fn gate_promotes_warn_and_operator_enabled_off_to_hard_only_for_that_push() {
+        // #A4.3 per-push promotion truth table: Warn always honors an
+        // explicit gate. Off remains a kill switch unless the operator
+        // separately enables explicit gated requests.
         use ProjectChecksMode::*;
-        for (mode, gate, want) in [
-            (Off, false, Off),
-            (Off, true, Off),
-            (Warn, false, Warn),
-            (Warn, true, Hard),
-            (Hard, false, Hard),
-            (Hard, true, Hard),
+        for (mode, gate, allow_off_gate, want) in [
+            (Off, false, false, Off),
+            (Off, true, false, Off),
+            (Off, false, true, Off),
+            (Off, true, true, Hard),
+            (Warn, false, false, Warn),
+            (Warn, true, false, Hard),
+            (Hard, false, false, Hard),
+            (Hard, true, false, Hard),
         ] {
             assert_eq!(
-                effective_project_checks_mode(mode, gate, false),
+                effective_project_checks_mode(mode, gate, false, allow_off_gate),
                 want,
-                "mode={mode:?} gate={gate}"
+                "mode={mode:?} gate={gate} allow_off_gate={allow_off_gate}"
             );
         }
     }
@@ -4718,18 +4742,20 @@ mod tests {
         // Hard stay fixed points. Either input alone suffices; the
         // caller has already ANDed the opt-in env into this bit.
         use ProjectChecksMode::*;
-        for (mode, gate, blind, want) in [
-            (Off, false, true, Off),
-            (Off, true, true, Off),
-            (Warn, false, true, Hard),
-            (Warn, true, true, Hard),
-            (Warn, false, false, Warn),
-            (Hard, false, true, Hard),
+        for (mode, gate, blind, allow_off_gate, want) in [
+            (Off, false, true, false, Off),
+            (Off, false, true, true, Off),
+            (Off, true, true, false, Off),
+            (Off, true, true, true, Hard),
+            (Warn, false, true, false, Hard),
+            (Warn, true, true, false, Hard),
+            (Warn, false, false, false, Warn),
+            (Hard, false, true, false, Hard),
         ] {
             assert_eq!(
-                effective_project_checks_mode(mode, gate, blind),
+                effective_project_checks_mode(mode, gate, blind, allow_off_gate),
                 want,
-                "mode={mode:?} gate={gate} blind={blind}"
+                "mode={mode:?} gate={gate} blind={blind} allow_off_gate={allow_off_gate}"
             );
         }
     }
