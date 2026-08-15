@@ -1337,24 +1337,16 @@ mod tests {
         let _ = filetime_set(&d, when);
     }
 
-    // std has no stable set-mtime; shell out to `touch -d` (portable enough for
-    // the test container) and fall back to leaving the natural mtime.
+    // Set the directory mtime through std so the ordering proof is identical
+    // on the Linux CI image and on BSD/macOS. GNU `touch -d @epoch` is not
+    // portable: BSD touch rejects it, all fixtures retain the same natural
+    // mtime, and the test then prunes an arbitrary lexicographic winner.
     fn filetime_set(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
-        let secs = when
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // `touch -t` wants [[CC]YY]MMDDhhmm[.ss]; use -d @epoch (GNU coreutils
-        // on the Debian CI image). Non-fatal if it fails.
-        let status = std::process::Command::new("touch")
-            .arg("-d")
-            .arg(format!("@{secs}"))
-            .arg(path)
-            .status();
-        match status {
-            Ok(s) if s.success() => Ok(()),
-            _ => Ok(()),
-        }
+        std::fs::File::open(path)?.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(when)
+                .set_modified(when),
+        )
     }
 
     #[test]
