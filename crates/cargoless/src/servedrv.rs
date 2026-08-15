@@ -270,6 +270,10 @@ fn diagnostic_refresh_fence(generation: u64, zero_verbs: bool) -> Option<u64> {
     (!zero_verbs).then_some(generation)
 }
 
+fn should_nudge_final_pushed_content(is_from_pushed_overlay: bool, target_is_empty: bool) -> bool {
+    is_from_pushed_overlay && !target_is_empty
+}
+
 /// Control messages from the per-cluster Supervisor `on_spawn` hook to
 /// the serve loop.
 enum Ctrl {
@@ -1636,6 +1640,7 @@ fn exec(
             // from "0-file no-overlay-found" (CATCH-1 from #246-L3).
             let mut pushed_check_profile = None;
             let wt_key = wt.to_string_lossy().into_owned();
+            let mut is_from_pushed_overlay = false;
             let (pairs, lsp_root): (Vec<(String, String)>, PathBuf) =
                 if let Some(pushed) = api.take_overlay_for(&wt_key) {
                     if let Some(context) = pushed.semantic.as_ref() {
@@ -1656,6 +1661,7 @@ fn exec(
                     // sole attribution site.
                     api.record_push_attribution(&wt_key, &pushed);
                     pushed_check_profile = pushed.check_profile;
+                    is_from_pushed_overlay = true;
                     let project_root = pushed.analysis_root.clone().unwrap_or_else(|| wt.clone());
                     let materialize_overlay = pushed.analysis_root.is_some();
                     api.record_project_check_context(
@@ -1740,8 +1746,47 @@ fn exec(
                     return;
                 }
             }
-            let diagnostic_refresh_fence =
+            let mut diagnostic_refresh_fence =
                 diagnostic_refresh_fence(diagnostic_refresh_generation, zero_verbs);
+            // A pull is only authoritative for the final pushed buffer if its
+            // refresh boundary occurred after that exact buffer version.
+            //
+            // The ordinary mux verbs are insufficient as a fence:
+            //   * a real content transition can produce an early refresh for
+            //     the first DidOpen/DidChange before RA has analysed the final
+            //     semantic snapshot;
+            //   * an identical overlay produces zero verbs, so the old path
+            //     pulled RA's cached empty report immediately.
+            //
+            // Send one final same-content DidChange for pushed Rust overlays,
+            // capturing the refresh generation immediately before it. The
+            // document version still advances monotonically, no intermediate
+            // DidClose can release a stale empty snapshot, and the pull below
+            // cannot settle until RA asks us to refresh after this exact final
+            // version. FS-watched transactions remain byte-for-byte unchanged.
+            if should_nudge_final_pushed_content(is_from_pushed_overlay, target.is_empty()) {
+                if let Some((path, content)) = first_rs_in_overlay(&target) {
+                    let refresh_before_nudge = lsp.diagnostic_refresh_generation();
+                    let version = cs.next_ver;
+                    cs.next_ver += 1;
+                    if let Err(error) = lsp.did_change(&path.to_string_lossy(), &content, version) {
+                        eprintln!(
+                            "[cargoless:obs] lsp-final-content-nudge-stalled wt={} error={} action=restart-ra",
+                            wt.display(),
+                            error
+                        );
+                        cs._supervisor.restart_now();
+                        return;
+                    }
+                    diagnostic_refresh_fence = Some(refresh_before_nudge);
+                    eprintln!(
+                        "[cargoless:obs] lsp-final-content-nudge wt={} path={} version={}",
+                        wt.display(),
+                        path.display(),
+                        version
+                    );
+                }
+            }
             // Cargoless replaces iterative cargo check/clippy; pushed Cargo
             // selectors are compatibility metadata, not an execution request.
             // They must not create a minute-scale direct Cargo lane inside
@@ -1981,7 +2026,6 @@ fn ra_diagnostic_pull_timeout_from(env_ms: Option<u64>) -> Duration {
 /// deterministic and reproducible across runs. Returns `None` when the
 /// overlay contains no `.rs` entries (all Cargo.toml / Cargo.lock / etc.)
 /// — in that case the guard is a no-op (nothing to nudge RA with).
-#[cfg(test)]
 fn first_rs_in_overlay(target: &OverlaySet) -> Option<(PathBuf, String)> {
     target
         .iter_rs()
@@ -3775,6 +3819,19 @@ mod tests {
             diagnostic_refresh_fence(41, true),
             None,
             "an identical overlay has no new refresh boundary to await; its current open-document diagnostics must be pulled directly",
+        );
+    }
+
+    #[test]
+    fn pushed_overlay_always_nudges_the_exact_final_rust_content() {
+        assert!(should_nudge_final_pushed_content(true, false));
+        assert!(
+            !should_nudge_final_pushed_content(false, false),
+            "FS-watched content must keep its existing verb and refresh behavior",
+        );
+        assert!(
+            !should_nudge_final_pushed_content(true, true),
+            "an empty Rust target has no document that can be fenced",
         );
     }
 
