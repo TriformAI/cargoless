@@ -39,6 +39,7 @@
 //! So the host keeps its own count of what it has ACCEPTED and not yet seen the
 //! lane step, and reports the union. See [`LaneHost::accepted`].
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -232,6 +233,28 @@ impl LaneSnapshot {
         self.queue_depth = self.queued.len();
         self
     }
+
+    /// Hide members whose withdrawal the host has accepted but the lane worker
+    /// has not stepped yet.
+    ///
+    /// A build blocks that worker for tens of minutes. During that interval a
+    /// queued member lives in the last published `LaneState` snapshot, so
+    /// removing it only from `accepted` is insufficient: `POST
+    /// /lane/withdraw` answers 202 while the next `GET /lane` still reports the
+    /// member. Reconciliation then cannot replace a superseded head. The
+    /// tombstone is folded into reads until the worker applies the real event;
+    /// a newer enqueue of the same id is added afterwards by `with_accepted`,
+    /// so its exact head remains visible.
+    fn without_pending_withdrawals(mut self, ids: &HashSet<String>) -> Self {
+        self.queued.retain(|id| !ids.contains(id));
+        self.in_flight.retain(|id| !ids.contains(id));
+        self.landing.retain(|id| !ids.contains(id));
+        self.members.retain(|member| !ids.contains(&member.id));
+        self.ejections
+            .retain(|ejection| !ids.contains(&ejection.id));
+        self.queue_depth = self.queued.len();
+        self
+    }
 }
 
 /// A lane running on its own thread.
@@ -264,6 +287,12 @@ pub struct LaneHost {
     /// Shared with the worker, which removes an id once the lane has stepped
     /// its `Enqueue` and can account for it itself.
     accepted: Arc<Mutex<Vec<LaneMember>>>,
+    /// Ids whose `Withdraw` event is queued behind a blocking lane action.
+    ///
+    /// This is a read-side tombstone, not a second lane state machine. It keeps
+    /// the accepted 202 response and the immediately following `GET /lane`
+    /// consistent until the worker applies the authoritative event.
+    pending_withdrawals: Arc<Mutex<HashSet<String>>>,
     /// The most recent tick the host was given, so the driver can re-sync the
     /// lane's clock across a blocking action. See [`LaneDriver::clock`].
     ///
@@ -283,6 +312,7 @@ impl LaneHost {
     {
         let (tx, rx): (Sender<LaneEvent>, Receiver<LaneEvent>) = channel();
         let accepted: Arc<Mutex<Vec<LaneMember>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_withdrawals: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let snapshot = Arc::new(Mutex::new(LaneSnapshot::of(&lane, &LaneActivity::Settled)));
         let running = Arc::new(AtomicBool::new(true));
         // Seeded from the lane so a host over an already-advanced lane cannot
@@ -304,12 +334,17 @@ impl LaneHost {
         let worker_snapshot = snapshot.clone();
         let worker_running = running.clone();
         let worker_accepted = accepted.clone();
+        let worker_pending_withdrawals = pending_withdrawals.clone();
         thread::Builder::new()
             .name("cargoless-lane".to_string())
             .spawn(move || {
                 // `recv` ends when every Sender is dropped, i.e. when the host
                 // goes away. No shutdown flag to get wrong.
                 while let Ok(event) = rx.recv() {
+                    let withdrawn_id = match &event {
+                        LaneEvent::Withdraw { id } => Some(id.clone()),
+                        _ => None,
+                    };
                     // The lane is about to account for this member itself, so
                     // stop counting it here. Done BEFORE the pump: the lane's
                     // `Enqueue` step is the first thing that runs, and the
@@ -362,6 +397,20 @@ impl LaneHost {
                         Ok(mut s) => *s = next,
                         Err(poisoned) => *poisoned.into_inner() = next,
                     }
+                    // The authoritative lane state now reflects this event, so
+                    // the read-side tombstone is no longer needed. Clear it
+                    // only after publishing the terminal snapshot; otherwise a
+                    // reader could briefly see the stale member reappear.
+                    if let Some(id) = withdrawn_id {
+                        match worker_pending_withdrawals.lock() {
+                            Ok(mut pending) => {
+                                pending.remove(&id);
+                            }
+                            Err(poisoned) => {
+                                poisoned.into_inner().remove(&id);
+                            }
+                        }
+                    }
                 }
                 worker_running.store(false, Ordering::SeqCst);
             })
@@ -372,6 +421,7 @@ impl LaneHost {
             snapshot,
             running,
             accepted,
+            pending_withdrawals,
             clock,
         }
     }
@@ -425,7 +475,18 @@ impl LaneHost {
     /// motivates it (a long build you want to stop feeding). The lane itself
     /// answers authoritatively; an unknown id is a harmless no-op there.
     pub fn withdraw(&self, id: &str) -> Result<String, String> {
-        self.send(LaneEvent::Withdraw { id: id.to_string() })?;
+        let mut pending = match self.pending_withdrawals.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !pending.insert(id.to_string()) {
+            return Ok(format!("withdrawal already pending for `{id}`"));
+        }
+        if let Err(error) = self.send(LaneEvent::Withdraw { id: id.to_string() }) {
+            pending.remove(id);
+            return Err(error);
+        }
+        drop(pending);
         // Also drop it from the accepted set. A member withdrawn while it is
         // still only in the channel would otherwise keep being reported as
         // waiting until the worker drained a build's worth of backlog — and
@@ -489,7 +550,13 @@ impl LaneHost {
             Ok(a) => a.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        published.with_accepted(&accepted)
+        let pending_withdrawals = match self.pending_withdrawals.lock() {
+            Ok(pending) => pending.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        published
+            .without_pending_withdrawals(&pending_withdrawals)
+            .with_accepted(&accepted)
     }
 
     fn send(&self, event: LaneEvent) -> Result<(), String> {
@@ -832,6 +899,57 @@ mod tests {
         );
 
         let _ = release_tx.send(());
+    }
+
+    /// A member can already be in the lane's published queue when an unrelated
+    /// build blocks the worker. The accepted-set fix above does not cover that
+    /// case: the old member must be hidden by the withdrawal tombstone, and a
+    /// newer exact-head enqueue of the same PR must still be shown.
+    #[test]
+    fn pending_withdrawal_hides_published_head_but_not_its_replacement() {
+        let published = LaneSnapshot {
+            phase: "building",
+            queue_depth: 1,
+            queued: vec!["B".to_string()],
+            generation: 7,
+            in_flight: vec!["A".to_string()],
+            activity: "building",
+            landing: Vec::new(),
+            members: vec![
+                MemberView {
+                    id: "B".to_string(),
+                    head: "sha-old".to_string(),
+                    state: "queued",
+                },
+                MemberView {
+                    id: "A".to_string(),
+                    head: "sha-a".to_string(),
+                    state: "building",
+                },
+            ],
+            ejections: Vec::new(),
+        };
+        let pending = HashSet::from(["B".to_string()]);
+
+        let withdrawn = published.clone().without_pending_withdrawals(&pending);
+        assert_eq!(withdrawn.queue_depth, 0);
+        assert!(!withdrawn.members.iter().any(|member| member.id == "B"));
+
+        let replacement = LaneMember::new("B", "sha-new");
+        let visible = published
+            .without_pending_withdrawals(&pending)
+            .with_accepted(&[replacement]);
+        assert_eq!(visible.queue_depth, 1);
+        assert_eq!(visible.queued, vec!["B".to_string()]);
+        assert!(visible.members.iter().any(|member| {
+            member.id == "B" && member.head == "sha-new" && member.state == "queued"
+        }));
+        assert!(
+            !visible
+                .members
+                .iter()
+                .any(|member| member.head == "sha-old")
+        );
     }
 
     /// DEFECT 2 — `GET /lane` must not report a quiet lane while the lander is

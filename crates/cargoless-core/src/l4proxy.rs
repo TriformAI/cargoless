@@ -373,6 +373,12 @@ mod tests {
                 while !stop_t.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut conn, _)) => {
+                            // BSD-derived kernels may propagate O_NONBLOCK
+                            // from the listener to accepted sockets. The toy
+                            // server is intentionally blocking; without this,
+                            // its first read after the banner sees WouldBlock
+                            // and closes before the test can send its payload.
+                            conn.set_nonblocking(false).unwrap();
                             thread::spawn(move || {
                                 let _ = conn.write_all(banner.as_bytes());
                                 let _ = conn.flush();
@@ -388,7 +394,13 @@ mod tests {
                                         Err(_) => break,
                                     }
                                 }
-                                let _ = conn.shutdown(Shutdown::Both);
+                                // Finish with an orderly write-side EOF. A
+                                // full shutdown can discard the just-written
+                                // echo on BSD/macOS before the proxy's reverse
+                                // splice drains it, making the pinning test
+                                // observe an empty response even though the
+                                // connection stayed on the correct upstream.
+                                let _ = conn.shutdown(Shutdown::Write);
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -547,7 +559,10 @@ mod tests {
         );
 
         // Close the client; both directions end and the gauge returns to 0.
-        c.shutdown(Shutdown::Both).unwrap();
+        // The peer may win the close race; NotConnected here still means the
+        // client is closed, which is exactly the condition this assertion
+        // needs before it waits for the gauge to drain.
+        let _ = c.shutdown(Shutdown::Both);
         drop(c);
         let mut drained = false;
         for _ in 0..600 {
