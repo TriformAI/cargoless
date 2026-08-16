@@ -480,6 +480,16 @@ impl LaneHost {
             Err(poisoned) => poisoned.into_inner(),
         };
         if !pending.insert(id.to_string()) {
+            // A PR can advance more than once while a long build keeps the
+            // first Withdraw event in the worker channel. In that interval a
+            // replacement Enqueue is recorded in `accepted`. A second
+            // withdrawal is still an idempotent event, but it is not an
+            // idempotent read-side operation: the newly superseded accepted
+            // head must be forgotten as well. Otherwise `snapshot()` folds it
+            // back in after applying the pending-withdrawal tombstone and the
+            // lane reports the stale head until the build ends.
+            drop(pending);
+            self.forget_accepted(id);
             return Ok(format!("withdrawal already pending for `{id}`"));
         }
         if let Err(error) = self.send(LaneEvent::Withdraw { id: id.to_string() }) {
@@ -896,6 +906,72 @@ mod tests {
             snap.queue_depth, 0,
             "a withdrawn member must leave the snapshot at once — it is exactly \
              the long build you have decided to stop feeding: {snap:?}"
+        );
+
+        let _ = release_tx.send(());
+    }
+
+    /// A single PR may be updated repeatedly while the worker is blocked. The
+    /// first withdrawal owns the queued lane event; each later withdrawal must
+    /// still remove the accepted replacement that became stale meanwhile.
+    #[test]
+    fn repeated_pending_withdrawal_removes_the_latest_accepted_head() {
+        let (started_tx, started_rx) = std_channel();
+        let (release_tx, release_rx) = std_channel();
+        let driver = LaneDriver::new(
+            NoTree,
+            BlockingLegs {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            NoLander,
+        );
+        let host = LaneHost::spawn(
+            LaneState::with_config(
+                "/tmp/lanehost-test-repeated-pending-withdrawal",
+                LaneConfig {
+                    capture_window_ticks: 0,
+                    ..Default::default()
+                },
+            ),
+            driver,
+        );
+
+        host.enqueue(LaneMember::new("A", "sha-a")).expect("queued");
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("build started");
+
+        host.enqueue(LaneMember::new("B", "sha-old"))
+            .expect("old head queued");
+        host.withdraw("B").expect("first withdrawal queued");
+        host.enqueue(LaneMember::new("B", "sha-replacement"))
+            .expect("replacement queued");
+        assert!(
+            host.snapshot()
+                .members
+                .iter()
+                .any(|member| { member.id == "B" && member.head == "sha-replacement" })
+        );
+
+        let detail = host.withdraw("B").expect("repeat withdrawal accepted");
+        assert!(detail.contains("already pending"));
+        assert!(
+            !host
+                .snapshot()
+                .members
+                .iter()
+                .any(|member| member.id == "B"),
+            "the repeated withdrawal must hide the superseded replacement"
+        );
+
+        host.enqueue(LaneMember::new("B", "sha-newest"))
+            .expect("newest head queued");
+        assert!(
+            host.snapshot()
+                .members
+                .iter()
+                .any(|member| { member.id == "B" && member.head == "sha-newest" })
         );
 
         let _ = release_tx.send(());
