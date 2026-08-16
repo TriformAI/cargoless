@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 
 use cargoless_core::activity::ActivityConfig;
 use cargoless_core::activitymgr::ActivityTracker;
-use cargoless_core::analyzer::{Supervisor, rust_analyzer_command};
+use cargoless_core::analyzer::{RaStderrSnapshot, Supervisor, rust_analyzer_command};
 use cargoless_core::cluster::{WorkspaceConfig, WorkspaceConfigHash};
 use cargoless_core::clusterdrv::{ClusterAction, ClusterDriver, DriverEvent, VerdictPolicy};
 use cargoless_core::clustermgr::{ClusterLifecycle, LifecycleAction, read_workspace_config};
@@ -162,6 +162,9 @@ struct ClusterState {
     /// retired RA instance can finish after respawn; its generation must never
     /// be mistaken for the next live transaction.
     next_diagnostic_pull_generation: u64,
+    /// Cumulative RA stderr counters at the start of the active overlay
+    /// transaction. Verdicts consume the delta, never daemon-lifetime noise.
+    active_ra_stderr_baseline: Option<RaStderrSnapshot>,
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -1340,6 +1343,7 @@ fn spawn_cluster(
             deferred: VecDeque::new(),
             active_diagnostic_pull_generation: None,
             next_diagnostic_pull_generation: 1,
+            active_ra_stderr_baseline: None,
         },
     );
     Ok(())
@@ -1402,6 +1406,7 @@ fn drain_spawned(
             }
             cs.mux.reset();
             cs.active_diagnostic_pull_generation = None;
+            cs.active_ra_stderr_baseline = None;
             cs.lsp = Some(client);
             // In pushed RA-native service mode, a request already carries the
             // concrete overlay to check and `spawn_ra_native_settle` provides
@@ -1596,6 +1601,11 @@ fn exec(
     match action {
         ClusterAction::Idle => {}
         ClusterAction::SwitchOverlay { wt } => {
+            // A ClusterDriver admits only one overlay transaction at a time.
+            // Clear any abandoned baseline before consuming the next input;
+            // the live snapshot is captured below immediately before its
+            // first LSP mutation.
+            cs.active_ra_stderr_baseline = None;
             // #246 5c KEYSTONE: `overlay.switch` span wraps the body —
             // captures wt, file_count, overlay_size_bytes. Bound via
             // `.entered()` to the arm scope so the span closes when the
@@ -1711,6 +1721,7 @@ fn exec(
                 // carries valid attrs at drop.
                 return;
             };
+            cs.active_ra_stderr_baseline = Some(cs._supervisor.stderr_snapshot());
             // Capture the last RA quiescence boundary before sending any
             // document mutation. The diagnostic pull must observe a strictly
             // newer boundary before its result can settle this transaction.
@@ -1879,12 +1890,40 @@ fn exec(
             // base_sha onto the first push's verdict — silent
             // cross-attribution, the exact failure #A2 exists to prevent.
             let attribution = api.take_push_attribution(&wt.to_string_lossy());
+            let ra_snapshot = cs._supervisor.stderr_snapshot();
+            let ra_stderr_baseline_missing = cs.active_ra_stderr_baseline.is_none();
+            let attempt_ra_snapshot = match cs.active_ra_stderr_baseline.take() {
+                Some(baseline) => ra_snapshot.delta_since(&baseline),
+                None => ra_snapshot,
+            };
+            let attempt_ra_stderr_errors = attempt_ra_snapshot.error_lines;
             api.record_ra_evidence_v3(
                 attribution
                     .as_ref()
                     .and_then(|value| value.semantic.as_ref()),
-                cs._supervisor.stderr_snapshot(),
+                attempt_ra_snapshot,
             );
+            if attempt_ra_stderr_errors > 0 {
+                eprintln!(
+                    "[cargoless:obs] attempt-local-ra-stderr-error wt={} count={} verdict=unknown reason=ra_native_attempt_stderr_error",
+                    wt.display(),
+                    attempt_ra_stderr_errors,
+                );
+            } else if attribution.is_some() && ra_stderr_baseline_missing {
+                eprintln!(
+                    "[cargoless:obs] attempt-ra-stderr-baseline-missing wt={} verdict=unknown reason=ra_native_stderr_baseline_missing",
+                    wt.display(),
+                );
+            }
+            let analysis_failure_reason = analysis_failure_reason.as_deref().or_else(|| {
+                if attempt_ra_stderr_errors > 0 {
+                    Some("ra_native_attempt_stderr_error")
+                } else if attribution.is_some() && ra_stderr_baseline_missing {
+                    Some("ra_native_stderr_baseline_missing")
+                } else {
+                    None
+                }
+            });
             // #A4.3 gate promotion: an explicit `--gate` push gets the
             // witness-gated (Hard) verdict even while the daemon-wide
             // default stays Warn — the deployed posture keeps ~2s
@@ -1920,7 +1959,7 @@ fn exec(
                         authoritative_error,
                         timer_settled_no_flycheck,
                         macro_blind_hit,
-                        analysis_failure_reason.as_deref(),
+                        analysis_failure_reason,
                     )
                 }
                 ProjectChecksMode::Warn => {
@@ -1936,7 +1975,7 @@ fn exec(
                         authoritative_error,
                         timer_settled_no_flycheck,
                         macro_blind_hit,
-                        analysis_failure_reason.as_deref(),
+                        analysis_failure_reason,
                     )
                 }
                 ProjectChecksMode::Hard => {
@@ -4656,6 +4695,16 @@ mod tests {
         let p = ra_native_payload(false, false, false, None);
         assert_eq!(p.verdict, statusfile::Verdict::Green);
         assert!(p.analysis_failure_reason.is_none());
+    }
+
+    #[test]
+    fn ra_native_payload_attempt_local_analyzer_error_is_never_green() {
+        let p = ra_native_payload(false, false, false, Some("ra_native_attempt_stderr_error"));
+        assert_eq!(p.verdict, statusfile::Verdict::Unknown);
+        assert_eq!(
+            p.analysis_failure_reason.as_deref(),
+            Some("ra_native_attempt_stderr_error")
+        );
     }
 
     #[test]
