@@ -73,6 +73,77 @@ pub struct RaStderrSnapshot {
     pub stack_captures: Vec<Vec<u8>>,
 }
 
+impl RaStderrSnapshot {
+    /// Return only stderr evidence produced after `baseline` was captured.
+    ///
+    /// Supervisor counters are cumulative for its lifetime (including RA
+    /// respawns), while a verdict must be attributed to one analysis attempt.
+    /// Subtracting the attempt-start snapshot prevents old analyzer noise from
+    /// poisoning a later clean attempt and makes fresh internal errors safe to
+    /// use as a fail-closed verdict signal.
+    pub fn delta_since(&self, baseline: &Self) -> Self {
+        let mut baseline_fingerprints: BTreeMap<(&str, &str, &str), u64> = BTreeMap::new();
+        for fingerprint in &baseline.fingerprints {
+            *baseline_fingerprints
+                .entry((
+                    fingerprint.fingerprint.as_str(),
+                    fingerprint.level.as_str(),
+                    fingerprint.sample.as_str(),
+                ))
+                .or_default() += fingerprint.count;
+        }
+        let fingerprints = self
+            .fingerprints
+            .iter()
+            .filter_map(|fingerprint| {
+                let baseline_count = baseline_fingerprints
+                    .get_mut(&(
+                        fingerprint.fingerprint.as_str(),
+                        fingerprint.level.as_str(),
+                        fingerprint.sample.as_str(),
+                    ))
+                    .map(|count| {
+                        let consumed = (*count).min(fingerprint.count);
+                        *count -= consumed;
+                        consumed
+                    })
+                    .unwrap_or(0);
+                let count = fingerprint.count.saturating_sub(baseline_count);
+                (count > 0).then(|| RaStderrFingerprint {
+                    count,
+                    ..fingerprint.clone()
+                })
+            })
+            .collect();
+        let total_lines = self.total_lines.saturating_sub(baseline.total_lines);
+        let tail_len = usize::try_from(total_lines)
+            .unwrap_or(usize::MAX)
+            .min(self.tail.len());
+        let stack_delta = self
+            .stack_captures
+            .len()
+            .saturating_sub(baseline.stack_captures.len());
+
+        Self {
+            process_generation: self.process_generation,
+            pid: self.pid,
+            total_lines,
+            error_lines: self.error_lines.saturating_sub(baseline.error_lines),
+            suppressed_lines: self
+                .suppressed_lines
+                .saturating_sub(baseline.suppressed_lines),
+            overflow_fingerprints: self
+                .overflow_fingerprints
+                .saturating_sub(baseline.overflow_fingerprints),
+            fingerprints,
+            tail: self.tail[self.tail.len().saturating_sub(tail_len)..].to_vec(),
+            stack_captures: self.stack_captures
+                [self.stack_captures.len().saturating_sub(stack_delta)..]
+                .to_vec(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct RaStderrState {
     process_generation: u64,
@@ -1271,6 +1342,80 @@ pub fn probe_abi_alignment(ra: &OsString) -> AbiAlignment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_snapshot_delta_excludes_stale_errors_and_keeps_fresh_evidence() {
+        let old = RaStderrFingerprint {
+            fingerprint: "old".into(),
+            count: 3,
+            level: "error".into(),
+            sample: "ERROR old analyzer noise".into(),
+        };
+        let baseline = RaStderrSnapshot {
+            process_generation: 1,
+            pid: Some(10),
+            total_lines: 4,
+            error_lines: 3,
+            suppressed_lines: 2,
+            overflow_fingerprints: 0,
+            fingerprints: vec![old.clone()],
+            tail: vec![
+                "old-1".into(),
+                "old-2".into(),
+                "old-3".into(),
+                "ready".into(),
+            ],
+            stack_captures: Vec::new(),
+        };
+        let current = RaStderrSnapshot {
+            process_generation: 1,
+            pid: Some(10),
+            total_lines: 7,
+            error_lines: 5,
+            suppressed_lines: 3,
+            overflow_fingerprints: 1,
+            fingerprints: vec![
+                RaStderrFingerprint { count: 4, ..old },
+                RaStderrFingerprint {
+                    fingerprint: "new".into(),
+                    count: 1,
+                    level: "error".into(),
+                    sample: "ERROR inference diagnostic in desugared expr".into(),
+                },
+            ],
+            tail: vec![
+                "old-1".into(),
+                "old-2".into(),
+                "old-3".into(),
+                "ready".into(),
+                "fresh-old".into(),
+                "fresh-new".into(),
+                "done".into(),
+            ],
+            stack_captures: vec![b"fresh stack".to_vec()],
+        };
+
+        let delta = current.delta_since(&baseline);
+        assert_eq!(delta.total_lines, 3);
+        assert_eq!(delta.error_lines, 2);
+        assert_eq!(delta.suppressed_lines, 1);
+        assert_eq!(delta.overflow_fingerprints, 1);
+        assert_eq!(delta.fingerprints.len(), 2);
+        assert!(
+            delta
+                .fingerprints
+                .iter()
+                .all(|fingerprint| fingerprint.count == 1)
+        );
+        assert_eq!(delta.tail, ["fresh-old", "fresh-new", "done"]);
+        assert_eq!(delta.stack_captures, [b"fresh stack".to_vec()]);
+
+        let no_change = baseline.delta_since(&baseline);
+        assert_eq!(no_change.total_lines, 0);
+        assert_eq!(no_change.error_lines, 0);
+        assert!(no_change.fingerprints.is_empty());
+        assert!(no_change.tail.is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

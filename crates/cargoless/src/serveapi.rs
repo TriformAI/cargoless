@@ -2052,15 +2052,18 @@ impl ServeVerdictState {
             ),
             None => (0, None, 0, 0, 0, 0, Vec::new()),
         };
-        let ra_storm = ra_snapshot.as_ref().and_then(|snapshot| {
+        let ra_internal_error = ra_snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .fingerprints
                 .iter()
                 .filter(|fingerprint| fingerprint.level == "error")
                 .max_by_key(|fingerprint| fingerprint.count)
-                .filter(|fingerprint| fingerprint.count >= 1000)
                 .cloned()
         });
+        let ra_storm = ra_internal_error
+            .as_ref()
+            .filter(|fingerprint| fingerprint.count >= 1000)
+            .cloned();
         evidence.push(
             ArtifactKind::RustAnalyzerSummary,
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -2186,7 +2189,20 @@ impl ServeVerdictState {
                     .as_deref()
                     .filter(|reason| !reason.trim().is_empty())
                     .unwrap_or("producer returned unknown without a reason");
-                let (cause, retry) = if matches!(
+                let (cause, retry) = if reason == "ra_native_attempt_stderr_error" {
+                    let (signature, repeated_events) = ra_internal_error
+                        .as_ref()
+                        .map(|fingerprint| (fingerprint.fingerprint.as_str(), fingerprint.count))
+                        .unwrap_or(("rust-analyzer-stderr-error", ra_error_lines.max(1)));
+                    (
+                        cargoless_core::outcome::IndeterminateCause::AnalyzerPathology {
+                            component: OutcomeComponent::RustAnalyzer,
+                            signature: text_v3(signature),
+                            repeated_events,
+                        },
+                        RetryDirective::OperatorRequired,
+                    )
+                } else if matches!(
                     reason,
                     "ra_blind_path_green_unwitnessed"
                         | "ra_native_timer_settled_no_flycheck_activity"
@@ -6001,6 +6017,81 @@ mod tests {
         let metrics = api.outcome_metrics_v3().unwrap();
         assert_eq!(metrics["ra_storm_outcomes"], 1);
         assert_eq!(metrics["reactions_by_state"]["error"], 1);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn outcome_v3_classes_one_attempt_local_ra_error_as_analyzer_pathology() {
+        let state_dir = temp_root("outcome-v3-one-ra-error");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let files = vec![("src/lib.rs".to_string(), "pub fn broken() {}".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("same-commit".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(attempt_context("attempt-one-ra-error", 1)),
+            ..PushOverlayOptions::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/client/wt",
+                "origin/main",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        let pushed = api.take_overlay_for("/client/wt").expect("attempt");
+        api.record_push_attribution("/client/wt", &pushed);
+        let attribution = api
+            .take_push_attribution("/client/wt")
+            .expect("attempt attribution");
+        let context = attribution.semantic.clone().expect("v3 identity");
+        api.record_ra_evidence_v3(
+            Some(&context),
+            RaStderrSnapshot {
+                process_generation: 8,
+                pid: Some(4343),
+                total_lines: 1,
+                error_lines: 1,
+                fingerprints: vec![cargoless_core::analyzer::RaStderrFingerprint {
+                    fingerprint: "attempt-error-fingerprint".into(),
+                    count: 1,
+                    level: "error".into(),
+                    sample: "ERROR inference diagnostic in desugared expr".into(),
+                }],
+                tail: vec!["ERROR inference diagnostic in desugared expr".into()],
+                ..RaStderrSnapshot::default()
+            },
+        );
+        api.publish_attributed_with_checks(
+            Path::new("/client/wt"),
+            crate::statusfile::VerdictPayload::unknown("ra_native_attempt_stderr_error"),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let outcome = api
+            .get_outcome_v3(&context.attempt_id)
+            .expect("terminal exact attempt");
+        match outcome.conclusion {
+            Conclusion::Indeterminate {
+                cause:
+                    cargoless_core::outcome::IndeterminateCause::AnalyzerPathology {
+                        component,
+                        signature,
+                        repeated_events,
+                    },
+                ..
+            } => {
+                assert_eq!(component, OutcomeComponent::RustAnalyzer);
+                assert_eq!(signature.as_str(), "attempt-error-fingerprint");
+                assert_eq!(repeated_events, 1);
+            }
+            other => panic!("expected attempt-local analyzer pathology, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
