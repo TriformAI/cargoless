@@ -657,13 +657,28 @@ fn handle(
     // #14 seam — AllowAll under #10, so this never denies today; the
     // 401 path exists so #14 is pure policy, not a structural change.
     if !auth.authorize(req.bearer.as_deref()) {
-        write_response(
-            &mut writer,
-            401,
-            "Unauthorized",
-            "text/plain",
-            "unauthorized",
-        );
+        // Name the credential and say which half is wrong. A bare
+        // "unauthorized" reads as a broken endpoint rather than a missing
+        // bearer, and the two cases have different fixes: a caller with NO
+        // header (a plain curl) has to supply one, while a caller whose token
+        // is not accepted has a stale or wrong secret. The wording that names
+        // the knob already existed on the startup guards in config.rs and
+        // appserve.rs — i.e. on the wrong side of the wire, where the client
+        // hitting the 401 could never see it.
+        let body = if req.bearer.is_none() {
+            concat!(
+                "unauthorized: this route requires `Authorization: Bearer <token>`.\n",
+                "The daemon's token comes from --auth-token or CARGOLESS_AUTH_TOKEN.\n",
+                "A plain curl sends no bearer, so a 401 here does NOT mean the daemon\n",
+                "is unhealthy — /healthz and /readyz are unauthenticated.\n",
+            )
+        } else {
+            concat!(
+                "unauthorized: the bearer token was not accepted.\n",
+                "It must match the daemon's --auth-token / CARGOLESS_AUTH_TOKEN exactly.\n",
+            )
+        };
+        write_response(&mut writer, 401, "Unauthorized", "text/plain", body);
         return;
     }
 
