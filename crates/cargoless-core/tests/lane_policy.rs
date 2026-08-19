@@ -356,7 +356,9 @@ fn a_roster_stale_member_is_removed_without_ejecting_its_peers() {
     });
 
     assert!(
-        !actions.iter().any(|a| matches!(a, LaneAction::Eject { .. })),
+        !actions
+            .iter()
+            .any(|a| matches!(a, LaneAction::Eject { .. })),
         "a moved head is obsolete, not blameworthy: {actions:?}"
     );
     assert!(st.ejection("B").is_none());
@@ -386,7 +388,9 @@ fn an_unknown_roster_stale_marker_retains_every_member() {
     });
 
     assert!(
-        !actions.iter().any(|a| matches!(a, LaneAction::Eject { .. })),
+        !actions
+            .iter()
+            .any(|a| matches!(a, LaneAction::Eject { .. })),
         "an invalid marker must never eject anyone: {actions:?}"
     );
     assert_eq!(

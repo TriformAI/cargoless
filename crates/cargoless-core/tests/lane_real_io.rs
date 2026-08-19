@@ -847,12 +847,9 @@ fn a_dispatcher_roster_stale_marker_retries_only_the_stable_peer() {
     );
     assert!(lane.ejection("b").is_none());
     let landed = actions.iter().find_map(|action| match action {
-        cargoless_core::lane::LaneAction::LandAndPublish { members, .. } => Some(
-            members
-                .iter()
-                .map(|m| m.id.as_str())
-                .collect::<Vec<_>>(),
-        ),
+        cargoless_core::lane::LaneAction::LandAndPublish { members, .. } => {
+            Some(members.iter().map(|m| m.id.as_str()).collect::<Vec<_>>())
+        }
         _ => None,
     });
     assert_eq!(
@@ -917,7 +914,10 @@ fn malformed_dispatcher_roster_stale_exit_is_infrastructure() {
         "a malformed marker must fail closed as infrastructure: {actions:?}"
     );
     assert_eq!(lane.queue_depth(), 1, "the member stays queued for retry");
-    assert!(lane.in_flight().is_empty(), "infra backoff prevents a hot loop");
+    assert!(
+        lane.in_flight().is_empty(),
+        "infra backoff prevents a hot loop"
+    );
 
     for d in [root, remote] {
         let _ = fs::remove_dir_all(d);
