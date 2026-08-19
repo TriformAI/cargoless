@@ -391,6 +391,15 @@ pub enum LaneBuildOutcome {
     /// A queued member is already contained in the candidate base. It leaves
     /// the lane, but this is not a merge conflict and requires no author fix.
     Stale { id: String, head: String },
+    /// The external exact-roster builder proved that a named member no longer
+    /// has the state, base, or head that this candidate froze.
+    ///
+    /// This is neither a code verdict nor infrastructure failure: the old
+    /// enrollment is simply obsolete. Remove only that frozen member, without
+    /// an ejection or cooldown, and retry its unjudged peers immediately. The
+    /// forge watcher will enqueue the member again if its current state still
+    /// belongs in the lane.
+    RosterStale { id: String },
     /// Neither — the build could not be trusted to have run (runner died,
     /// timeout, cancelled). NOT a code red: members stay queued and ride the
     /// next build. Treating a transient as a red is how a fleet learns to
@@ -1143,7 +1152,49 @@ impl LaneState {
                 },
                 actions,
             ),
+            LaneBuildOutcome::RosterStale { id } => {
+                self.remove_stale_roster_member(members, id, actions);
+            }
         }
+    }
+
+    fn remove_stale_roster_member(
+        &mut self,
+        members: Vec<LaneMember>,
+        id: String,
+        actions: &mut Vec<LaneAction>,
+    ) {
+        // The typed dispatcher protocol is allowed to remove only a member
+        // that actually rode this frozen candidate. A malformed or mismatched
+        // marker must fail closed by retaining the complete roster.
+        let named_member_was_present = members.iter().any(|m| m.id == id);
+        let mut survivors = Vec::new();
+        for m in members {
+            if named_member_was_present && m.id == id {
+                actions.push(LaneAction::Report {
+                    id: m.id,
+                    state: "stale candidate head removed — no author action required; the current enrollment will re-enter the lane"
+                        .to_string(),
+                });
+            } else {
+                actions.push(LaneAction::Report {
+                    id: m.id.clone(),
+                    state: if named_member_was_present {
+                        format!(
+                            "requeued — `{id}` moved after this candidate was frozen; the next candidate is built without its obsolete head"
+                        )
+                    } else {
+                        format!(
+                            "requeued — dispatcher named unknown stale member `{id}`; retaining the complete roster"
+                        )
+                    },
+                });
+                survivors.push(m);
+            }
+        }
+        // These members were accepted before anything already waiting in the
+        // queue, and none received a verdict, so they retain front priority.
+        self.queue.splice(0..0, survivors);
     }
 
     fn eject_named_member(

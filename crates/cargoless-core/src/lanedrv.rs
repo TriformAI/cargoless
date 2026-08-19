@@ -42,6 +42,12 @@
 //! can prove is at fault, and because infra ejects nobody, the member is
 //! re-included in every subsequent candidate and the queue never drains. See
 //! [`MaterializeError`].
+//!
+//! An exact external roster can also become stale while its remote build is
+//! running. A trusted dispatcher may name the one obsolete member with the
+//! versioned exit-76 protocol; that becomes [`LaneBuildOutcome::RosterStale`],
+//! removes no current enrollment, and lets the unjudged peers retry without an
+//! infrastructure cooldown.
 
 use std::fs;
 use std::io;
@@ -55,6 +61,35 @@ use cargoless_proto::TreeState;
 
 use crate::lane::{LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LaneState};
 use crate::project_checks;
+
+const EX_ROSTER_STALE: i32 = 76;
+const ROSTER_STALE_MARKER: &str = "cargoless-lane-roster-stale-v1\t";
+
+#[derive(Debug)]
+struct RosterStaleError {
+    id: String,
+}
+
+impl std::fmt::Display for RosterStaleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dispatcher reported stale roster member `{}`", self.id)
+    }
+}
+
+impl std::error::Error for RosterStaleError {}
+
+fn roster_stale_id(output: &str) -> Option<String> {
+    let mut ids = output.lines().filter_map(|line| {
+        let id = line.strip_prefix(ROSTER_STALE_MARKER)?;
+        (!id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+        .then(|| id.to_string())
+    });
+    let id = ids.next()?;
+    ids.next().is_none().then_some(id)
+}
 
 /// Why a candidate tree could not be produced.
 ///
@@ -718,6 +753,19 @@ impl LegRunner for DispatchLegRunner {
                 "dispatcher reported a transient failure (exit {EX_TEMPFAIL}); \
                  no verdict was produced"
             )));
+        }
+
+        // Versioned, fail-closed protocol for an exact remote roster that
+        // changed while its build was running. Exit 76 without exactly one
+        // well-formed marker remains infrastructure: an ambiguous string may
+        // never remove a lane member.
+        if code == Some(EX_ROSTER_STALE) {
+            let Some(id) = roster_stale_id(&text) else {
+                return Err(io::Error::other(format!(
+                    "dispatcher exited {EX_ROSTER_STALE} without exactly one valid roster-stale marker"
+                )));
+            };
+            return Err(io::Error::other(RosterStaleError { id }));
         }
 
         let diagnostics = crate::cargodiag::parse_cargo_json(root, &text);
@@ -2032,9 +2080,27 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                     },
                 }
             }
-            Err(e) => LaneBuildOutcome::Infra {
-                reason: format!("build legs could not run: {e}"),
-            },
+            Err(e) => {
+                let roster_stale = e
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<RosterStaleError>());
+                match roster_stale {
+                    Some(stale) if members.iter().any(|m| m.id == stale.id) => {
+                        LaneBuildOutcome::RosterStale {
+                            id: stale.id.clone(),
+                        }
+                    }
+                    Some(stale) => LaneBuildOutcome::Infra {
+                        reason: format!(
+                            "build dispatcher named unknown stale roster member `{}`",
+                            stale.id
+                        ),
+                    },
+                    None => LaneBuildOutcome::Infra {
+                        reason: format!("build legs could not run: {e}"),
+                    },
+                }
+            }
         };
 
         // One summary line per build, written BEFORE `release` destroys the
@@ -2077,6 +2143,10 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
             LaneBuildOutcome::Stale { id, head } => self.trail_line(&format!(
                 "[cargoless:obs] lane-build generation={generation} outcome=stale \
                  member={id} head={head}"
+            )),
+            LaneBuildOutcome::RosterStale { id } => self.trail_line(&format!(
+                "[cargoless:obs] lane-build generation={generation} outcome=roster-stale \
+                 member={id}"
             )),
         }
 
