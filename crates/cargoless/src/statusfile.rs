@@ -406,12 +406,30 @@ pub fn run_status(cfg: &Config) -> ExitCode {
     };
 
     if fresh {
-        ui::ok(format!(
-            "daemon live — pid {}, verdict {} ({}s ago)",
-            st.pid,
-            Verdict::parse(&st.verdict_str).as_str(),
-            age
-        ));
+        // An `unknown` verdict is not an `ok` outcome, and it must not be
+        // rendered as a bare word. `verdict_failure_reason` is populated
+        // whenever the verdict is unknown (INFRA-36) and is parsed into `st`
+        // a few lines above — its own doc promises this surface renders
+        // "unknown: <reason>" end-to-end. It never did, so the one sentence
+        // saying WHY the gate could not decide sat unread one field away
+        // while the reader saw a green `ok` glyph.
+        let verdict = Verdict::parse(&st.verdict_str);
+        let line = match (verdict, st.verdict_failure_reason.trim()) {
+            (Verdict::Unknown, reason) if !reason.is_empty() => format!(
+                "daemon live — pid {}, verdict unknown: {reason} ({age}s ago)",
+                st.pid
+            ),
+            _ => format!(
+                "daemon live — pid {}, verdict {} ({age}s ago)",
+                st.pid,
+                verdict.as_str()
+            ),
+        };
+        if verdict == Verdict::Unknown {
+            ui::warn(line);
+        } else {
+            ui::ok(line);
+        }
     } else if file_fresh && pid_alive == Some(false) {
         // The dogfood reproducer's exact case: file says fresh (e.g.
         // "(6s ago)"), but kill(pid, 0) says the pid doesn't exist.
@@ -541,10 +559,27 @@ pub fn run_status_remote(url: &str, worktree: Option<&str>) -> ExitCode {
                         return ExitCode::from(1);
                     }
                     Verdict::Unknown => {
-                        ui::warn(format!(
-                            "remote daemon {target} worktree {} verdict unknown",
-                            status.worktree
-                        ));
+                        // Name the classifier. `unknown` alone cannot separate
+                        // "the witness timed out" from "red was claimed without
+                        // evidence" from "the overlay failed to apply" — three
+                        // conditions with three different remedies, one of which
+                        // is not the reader's problem at all. The daemon already
+                        // sends the reason on this very payload.
+                        let why = status
+                            .verdict_failure_reason
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|r| !r.is_empty());
+                        ui::warn(match why {
+                            Some(reason) => format!(
+                                "remote daemon {target} worktree {} verdict unknown: {reason}",
+                                status.worktree
+                            ),
+                            None => format!(
+                                "remote daemon {target} worktree {} verdict unknown (no reason reported)",
+                                status.worktree
+                            ),
+                        });
                         report_build_alignment(build);
                         return ExitCode::from(3);
                     }
