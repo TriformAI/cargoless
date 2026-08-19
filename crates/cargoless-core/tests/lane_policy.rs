@@ -337,6 +337,70 @@ fn already_landed_has_a_distinct_cause_and_no_remediation() {
 }
 
 #[test]
+fn a_roster_stale_member_is_removed_without_ejecting_its_peers() {
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/a.rs"]),
+            member("B", "b1", &["src/b.rs"]),
+            member("C", "c1", &["src/c.rs"]),
+        ],
+    );
+
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::RosterStale {
+            id: "B".to_string(),
+        },
+    });
+
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, LaneAction::Eject { .. })),
+        "a moved head is obsolete, not blameworthy: {actions:?}"
+    );
+    assert!(st.ejection("B").is_none());
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string(), "C".to_string()][..]),
+        "stable peers retry immediately without the obsolete head"
+    );
+}
+
+#[test]
+fn an_unknown_roster_stale_marker_retains_every_member() {
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/a.rs"]),
+            member("B", "b1", &["src/b.rs"]),
+        ],
+    );
+
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::RosterStale {
+            id: "NOT-ABOARD".to_string(),
+        },
+    });
+
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, LaneAction::Eject { .. })),
+        "an invalid marker must never eject anyone: {actions:?}"
+    );
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["A".to_string(), "B".to_string()][..]),
+        "fail closed by rebuilding the complete roster"
+    );
+}
+
+#[test]
 fn a_stale_completion_is_ignored() {
     let mut st = lane();
     let build_gen = start_build(&mut st, vec![member("A", "a1", &["src/a.rs"])]);

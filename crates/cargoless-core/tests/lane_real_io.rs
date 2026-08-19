@@ -789,6 +789,141 @@ fn a_dispatcher_that_cannot_get_a_verdict_ejects_nobody() {
     }
 }
 
+#[test]
+fn a_dispatcher_roster_stale_marker_retries_only_the_stable_peer() {
+    let root = repo_with_legs("dispatch-roster-stale", &leg("unused", "true"));
+    let remote = scratch("dispatch-roster-stale-remote");
+    sh(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    sh(
+        &root,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    sh(&root, &["push", "-q", "origin", "main"]);
+    let a = branch(&root, "a", "a.txt", "a\n");
+    let b = branch(&root, "b", "b.txt", "b\n");
+
+    let script = scratch("dispatch-roster-stale-bin").join("d.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(
+        &script,
+        "#!/bin/sh\ncase \"$CARGOLESS_LANE_CHANGED_FILES\" in\n  *b.txt*) printf 'cargoless-lane-roster-stale-v1\\tb\\n'; exit 76 ;;\n  *) exit 0 ;;\nesac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let legs = DispatchLegRunner::new(
+        vec![script.to_string_lossy().into_owned()],
+        remote.to_string_lossy().into_owned(),
+        "refs/heads/lane-candidate",
+    );
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander);
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 5,
+            ..Default::default()
+        },
+    );
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("b", &b).with_changed_files(["b.txt"])),
+    );
+    let actions = drv.pump(&mut lane, LaneEvent::Tick { now: 5 });
+
+    assert!(
+        !actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::Eject { .. })),
+        "a stale frozen head must not eject anyone: {actions:?}"
+    );
+    assert!(lane.ejection("b").is_none());
+    let landed = actions.iter().find_map(|action| match action {
+        cargoless_core::lane::LaneAction::LandAndPublish { members, .. } => {
+            Some(members.iter().map(|m| m.id.as_str()).collect::<Vec<_>>())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        landed,
+        Some(vec!["a"]),
+        "the stable peer is rebuilt and reaches landing immediately"
+    );
+
+    for d in [root, remote] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn malformed_dispatcher_roster_stale_exit_is_infrastructure() {
+    let root = repo_with_legs("dispatch-roster-stale-malformed", &leg("unused", "true"));
+    let remote = scratch("dispatch-roster-stale-malformed-remote");
+    sh(&remote, &["init", "-q", "--bare", "-b", "main"]);
+    sh(
+        &root,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    );
+    sh(&root, &["push", "-q", "origin", "main"]);
+    let a = branch(&root, "a", "a.txt", "a\n");
+
+    let script = scratch("dispatch-roster-stale-malformed-bin").join("d.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    fs::write(
+        &script,
+        "#!/bin/sh\necho 'cargoless-lane-roster-stale-v1 missing-tab'\nexit 76\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let legs = DispatchLegRunner::new(
+        vec![script.to_string_lossy().into_owned()],
+        remote.to_string_lossy().into_owned(),
+        "refs/heads/lane-candidate",
+    );
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander);
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+    let actions = drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+
+    assert!(
+        !actions
+            .iter()
+            .any(|x| matches!(x, cargoless_core::lane::LaneAction::Eject { .. })),
+        "a malformed marker must fail closed as infrastructure: {actions:?}"
+    );
+    assert_eq!(lane.queue_depth(), 1, "the member stays queued for retry");
+    assert!(
+        lane.in_flight().is_empty(),
+        "infra backoff prevents a hot loop"
+    );
+
+    for d in [root, remote] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
 /// The runner must be selectable at RUNTIME, or the daemon cannot offer the
 /// choice without monomorphising a branch per (runner × lander) pair.
 ///
