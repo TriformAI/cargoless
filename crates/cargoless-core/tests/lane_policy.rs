@@ -548,15 +548,23 @@ fn unattributable_red_holds_everyone_and_says_so() {
         vec!["A".to_string(), "B".to_string()],
         "everyone is held"
     );
-    for who in ["A", "B"] {
+    for (who, other) in [("A", "B"), ("B", "A")] {
         let reason = eject_reason(&actions, who);
-        assert!(
-            matches!(reason, EjectReason::Unattributed { .. }),
-            "{who} must not be blamed: {reason:?}"
+        let EjectReason::Unattributed { shared_with, .. } = &reason else {
+            panic!("{who} must not be blamed: {reason:?}");
+        };
+        assert_eq!(
+            shared_with,
+            &vec![other.to_string()],
+            "shared_with names only the other held members, never the member itself"
         );
         let text = reason.describe();
         assert!(
-            text.contains("could not be attributed") && text.contains("checked properly"),
+            text.contains("could not be attributed")
+                && text.contains("checked properly")
+                && text.contains(&format!("held together with {other}"))
+                && text.contains("2 queued changes total")
+                && text.contains("Nobody was blamed"),
             "the message must be explicit that nobody was blamed and all must \
              check: {text}"
         );
@@ -581,10 +589,13 @@ fn warnings_never_eject_anyone() {
     });
     // A red with only warnings attributes to nobody — it must fall to the
     // honest "cannot attribute" path, not silently blame the only member.
-    assert!(matches!(
-        eject_reason(&actions, "A"),
-        EjectReason::Unattributed { .. }
-    ));
+    let reason = eject_reason(&actions, "A");
+    assert!(matches!(reason, EjectReason::Unattributed { .. }));
+    assert!(
+        reason.describe().contains("only queued change held"),
+        "a sole-member unattributed ejection must explain why shared_with is empty: {}",
+        reason.describe()
+    );
 }
 
 #[test]
