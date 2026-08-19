@@ -3989,9 +3989,9 @@ impl VerdictService for ServeVerdictState {
     /// `why` carries the author-facing sentence itself, not just the fields it
     /// is derived from. The enum tags alone are not readable: `files: []` means
     /// "could not identify them" for `unattributed` and "nothing was compiled"
-    /// for `infrastructure`; `shared_with` is co-owners for `attributed` and
-    /// the whole held roster otherwise; and the re-admission rule differs per
-    /// kind. The daemon already computes that sentence for its own reporting —
+    /// for `infrastructure`; `shared_with` always names other implicated
+    /// members, while their relationship differs by kind; and the re-admission
+    /// rule differs per kind. The daemon already computes that sentence —
     /// withholding it here is what forced every downstream consumer to
     /// re-derive it, and they drifted.
     ///

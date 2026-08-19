@@ -117,7 +117,8 @@ pub struct EjectionView {
     /// The membership rule DIFFERS by `kind`, which is why the sentence in
     /// `why` is the thing to read: for `attributed` these are the other
     /// co-owners of the failing files, and for `unattributed` /
-    /// `infrastructure` it is the whole held roster.
+    /// `infrastructure` they are the other held members. The current member
+    /// is never repeated in its own `shared_with` list.
     pub shared_with: Vec<String>,
     /// Unix seconds at which the ejection lapses regardless. Compare against
     /// [`LaneSnapshot::now`] — a bare deadline with no clock beside it cannot

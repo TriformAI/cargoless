@@ -14,7 +14,7 @@
 #   * `files: []`      = "could not identify them" (unattributed)
 #                      = "nothing was compiled"    (infrastructure)
 #   * `shared_with`    = the OTHER co-owners       (attributed)
-#                      = the whole held roster     (unattributed/infrastructure)
+#                      = the OTHER held members    (unattributed/infrastructure)
 #   * re-admission differs per kind, and infrastructure also lapses on TTL.
 #
 # So every consumer re-derived the sentence by hand, and they drifted. The cost
