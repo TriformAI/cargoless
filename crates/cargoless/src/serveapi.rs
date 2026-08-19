@@ -899,11 +899,12 @@ struct WitnessInflightGate {
     /// `state` under one lock. `Relaxed` suffices — nothing branches on it.
     waiting: AtomicU64,
     limit: u32,
-    /// Budget a queued witness waits for a slot before running UNGATED
-    /// (fail-OPEN: losing serialization is a resource regression, never a
-    /// correctness one — the pre-existing behavior was unbounded concurrency
-    /// and it never produced a false verdict). Well under the supervisor's
-    /// witness watchdog so a wedged holder can never deadlock the lane.
+    /// Interval after which a still-queued witness emits an observability line.
+    /// This used to be a fail-open budget. That made `limit = 1` stop being a
+    /// limit during the exact long compile it exists to protect: the waiter ran
+    /// ungated, collided with the holder's warm target, and started a full cold
+    /// compile. Holders are RAII-bounded and their compiler subprocesses have
+    /// their own deadlines, so a configured limit now remains authoritative.
     queue_budget: Duration,
 }
 
@@ -944,12 +945,12 @@ impl Drop for WitnessInflightGuard<'_> {
 }
 
 impl WitnessInflightGate {
-    /// Acquire a compile slot, waiting up to `queue_budget`. `limit == 0`
-    /// grants immediately (uncounted no-op). On budget exhaustion returns a
-    /// no-op grant too (fail-OPEN → run ungated) rather than blocking the
-    /// witness forever. Claim-under-lock: the counter is incremented in the
-    /// SAME lock hold that observed it free, so two waiters cannot both pass
-    /// (mirrors the BatchCoalescer inflight gate).
+    /// Acquire a compile slot. `limit == 0` grants immediately (uncounted
+    /// no-op). A configured positive limit never returns an uncounted grant:
+    /// the queue interval only produces a progress line, then the waiter keeps
+    /// parking until a holder releases. Claim-under-lock: the counter is
+    /// incremented in the SAME lock hold that observed it free, so two waiters
+    /// cannot both pass (mirrors the BatchCoalescer inflight gate).
     fn acquire(&self) -> WitnessInflightGuard<'_> {
         if self.limit == 0 {
             return WitnessInflightGuard {
@@ -957,13 +958,14 @@ impl WitnessInflightGate {
                 counted: false,
             };
         }
-        let deadline = Instant::now() + self.queue_budget;
+        let observation_interval = self.queue_budget.max(Duration::from_millis(1));
+        let mut deadline = Instant::now() + observation_interval;
         let mut s = poisoned(&self.state);
         // Observational only. Counted from BEFORE the first admission test so a
         // worker that parks is visible for its whole park; `WaitingTicket`'s Drop
-        // decrements on EVERY exit — immediate grant, fail-open timeout, or a
-        // panic unwinding through here — so the gauge cannot leak upward and
-        // strand a phantom queue on `/admin/active`.
+        // decrements on EVERY exit — immediate grant or a panic unwinding
+        // through here — so the gauge cannot leak upward and strand a phantom
+        // queue on `/admin/active`.
         let _waiting = WaitingTicket::new(&self.waiting);
         loop {
             if *s < self.limit {
@@ -975,17 +977,13 @@ impl WitnessInflightGate {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                // Fail-open: run ungated rather than starve the witness. The
-                // supervisor watchdog still bounds the verdict independently.
                 eprintln!(
-                    "[cargoless:obs] witness-gate-fail-open limit={} budget_ms={} — running UNGATED",
+                    "[cargoless:obs] witness-gate-still-waiting limit={} interval_ms={} — concurrency limit remains enforced",
                     self.limit,
-                    self.queue_budget.as_millis(),
+                    observation_interval.as_millis(),
                 );
-                return WitnessInflightGuard {
-                    gate: self,
-                    counted: false,
-                };
+                deadline = Instant::now() + observation_interval;
+                continue;
             }
             let (guard, timed_out) = self
                 .cv
@@ -994,14 +992,11 @@ impl WitnessInflightGate {
             s = guard;
             if timed_out.timed_out() && *s >= self.limit {
                 eprintln!(
-                    "[cargoless:obs] witness-gate-fail-open limit={} budget_ms={} — running UNGATED",
+                    "[cargoless:obs] witness-gate-still-waiting limit={} interval_ms={} — concurrency limit remains enforced",
                     self.limit,
-                    self.queue_budget.as_millis(),
+                    observation_interval.as_millis(),
                 );
-                return WitnessInflightGuard {
-                    gate: self,
-                    counted: false,
-                };
+                deadline = Instant::now() + observation_interval;
             }
         }
     }
@@ -7369,10 +7364,10 @@ checks:
     }
 
     #[test]
-    fn witness_gate_budget_exhaustion_fails_open() {
-        // A holder keeps the only slot past the queue budget; the waiter must
-        // FAIL OPEN (run ungated) rather than block forever — losing
-        // serialization is a resource regression, never a correctness one.
+    fn witness_gate_wait_interval_never_bypasses_limit() {
+        // A holder keeps the only slot past multiple queue intervals. The
+        // waiter must remain queued until release: `limit=1` is an invariant,
+        // not a best-effort hint that disappears during a slow compile.
         let gate = Arc::new(test_witness_gate(1, 50)); // 50ms budget
         let hold_start = Arc::new(Barrier::new(2));
         let gate_h = Arc::clone(&gate);
@@ -7383,16 +7378,16 @@ checks:
             thread::sleep(Duration::from_millis(300)); // hold well past budget
         });
         hold_start.wait();
-        // Waiter: acquire must return within ~budget, not block 300ms.
+        // Waiter: acquire must outlive the 50ms interval and wait for release.
         let t0 = Instant::now();
         {
-            let _slot = gate.acquire(); // fails open after ~50ms
+            let _slot = gate.acquire();
         }
         let waited = t0.elapsed();
         holder.join().expect("holder");
         assert!(
-            waited < Duration::from_millis(250),
-            "waiter must fail open near the 50ms budget, not block for the 300ms hold (waited {waited:?})"
+            waited >= Duration::from_millis(250),
+            "waiter must remain queued until the 300ms holder releases (waited {waited:?})"
         );
     }
 
@@ -7480,30 +7475,38 @@ checks:
         );
     }
 
-    /// Fail-open is the one path where a waiter leaves WITHOUT a slot. It must
-    /// still decrement the gauge, or every timed-out witness permanently
-    /// inflates the reported queue.
+    /// Crossing one or more observation intervals must not leak or temporarily
+    /// drop the waiting gauge. The waiter remains queued until a real slot is
+    /// available, then the ticket drains normally.
     #[test]
-    fn witness_gate_fail_open_still_decrements_waiting_gauge() {
+    fn witness_gate_repeated_wait_intervals_preserve_waiting_gauge() {
         let gate = Arc::new(test_witness_gate(1, 50));
         let hold_start = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
         let gate_h = Arc::clone(&gate);
         let hs = Arc::clone(&hold_start);
+        let rel = Arc::clone(&release);
         let holder = thread::spawn(move || {
             let _slot = gate_h.acquire();
             hs.wait();
-            thread::sleep(Duration::from_millis(300)); // outlast the 50ms budget
+            rel.wait();
         });
         hold_start.wait();
-        {
-            let _slot = gate.acquire(); // fails open
-        }
+
+        let gate_w = Arc::clone(&gate);
+        let waiter = thread::spawn(move || {
+            let _slot = gate_w.acquire();
+        });
+        thread::sleep(Duration::from_millis(125)); // cross two 50ms intervals
         assert_eq!(
-            gate.counts().1,
-            0,
-            "a fail-open waiter must not leak a waiting count"
+            gate.counts(),
+            (1, 1),
+            "the holder stays admitted and the waiter stays visibly queued"
         );
+
+        release.wait();
         holder.join().expect("holder");
+        waiter.join().expect("waiter");
         assert_eq!(gate.counts(), (0, 0), "gate returns fully idle");
     }
 
