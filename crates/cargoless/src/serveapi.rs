@@ -4020,6 +4020,7 @@ impl VerdictService for ServeVerdictState {
                 "kind": e.kind,
                 "files": e.files,
                 "shared_with": e.shared_with,
+                "description": e.description,
                 "expires_at_tick": e.expires_at_tick,
             })).collect::<Vec<_>>(),
         }))

@@ -106,6 +106,9 @@ pub struct EjectionView {
     pub files: Vec<String>,
     /// Other members implicated in the same failure.
     pub shared_with: Vec<String>,
+    /// Cause-aware author guidance: what happened, who else was affected, and
+    /// what action (if any) clears the ejection.
+    pub description: String,
     pub expires_at_tick: u64,
 }
 
@@ -147,6 +150,7 @@ impl LaneSnapshot {
                     kind,
                     files,
                     shared_with,
+                    description: e.describe(),
                     expires_at_tick: e.expires_at_tick,
                 }
             })
@@ -1026,6 +1030,54 @@ mod tests {
                 .iter()
                 .any(|member| member.head == "sha-old")
         );
+    }
+
+    #[test]
+    fn ejection_snapshot_explains_shared_members_without_self_inclusion() {
+        use crate::lane::LaneAction;
+
+        let mut lane = LaneState::with_config(
+            "/tmp/lanehost-test-ejection-description",
+            LaneConfig {
+                capture_window_ticks: 1,
+                ..Default::default()
+            },
+        );
+        lane.step(LaneEvent::Enqueue(LaneMember::new("A", "sha-a")));
+        lane.step(LaneEvent::Enqueue(LaneMember::new("B", "sha-b")));
+        let start = lane.step(LaneEvent::Tick(1));
+        let generation = start
+            .iter()
+            .find_map(|action| match action {
+                LaneAction::StartBuild { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .expect("the capture window starts a two-member build");
+
+        lane.step(LaneEvent::BuildFinished {
+            generation,
+            outcome: LaneBuildOutcome::UnattributedRed {
+                diagnostics: Vec::new(),
+            },
+        });
+        let snapshot = LaneSnapshot::of(&lane, &LaneActivity::Settled);
+
+        for (who, other) in [("A", "B"), ("B", "A")] {
+            let ejection = snapshot
+                .ejections
+                .iter()
+                .find(|ejection| ejection.id == who)
+                .expect("each held member remains visible");
+            assert_eq!(ejection.shared_with, vec![other.to_string()]);
+            assert!(!ejection.shared_with.contains(&who.to_string()));
+            assert!(
+                ejection
+                    .description
+                    .contains(&format!("held together with {other}"))
+            );
+            assert!(ejection.description.contains("2 queued changes total"));
+            assert!(ejection.description.contains("Nobody was blamed"));
+        }
     }
 
     /// DEFECT 2 — `GET /lane` must not report a quiet lane while the lander is
