@@ -165,6 +165,11 @@ jobs:
       - run: python3 scripts/tests/workflow-container-image-policy-test.py
       - run: bash scripts/tests/lane-attribution-mutation-test.sh
       - run: bash scripts/tests/mirror-verify-test.sh
+      # Static, <1s, no build: asserts a computed reason actually reaches the
+      # wire. --self-test first, so a guard that has quietly stopped being able
+      # to fail is caught before its PASS is believed.
+      - run: bash scripts/tests/explanation-reaches-the-wire-test.sh --self-test
+      - run: bash scripts/tests/explanation-reaches-the-wire-test.sh
 
   fmt:
     runs-on: docker
