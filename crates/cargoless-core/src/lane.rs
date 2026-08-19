@@ -154,7 +154,7 @@ pub enum EjectReason {
     /// members, or a red that was already in the base. Nobody is blamed.
     Unattributed {
         fingerprints: FingerprintCounts,
-        /// Everyone ejected alongside this member (all of them, by definition).
+        /// Other members ejected alongside this member. Empty for a one-member batch.
         shared_with: Vec<String>,
     },
     /// The build never produced a verdict: it could not be set up at all, and
@@ -171,7 +171,7 @@ pub enum EjectReason {
         reason: String,
         /// How many consecutive attempts failed before the lane gave up.
         attempts: u32,
-        /// Everyone ejected alongside this member (all of them, by definition).
+        /// Other members ejected alongside this member. Empty for a one-member batch.
         shared_with: Vec<String>,
     },
 }
@@ -276,14 +276,24 @@ impl EjectReason {
                     )
                 }
             }
-            EjectReason::Unattributed { shared_with, .. } => format!(
-                "build failed, but the errors are in files NO queued change touches, \
-                 so the cause could not be attributed. All {} queued changes have been \
-                 held and every one must be checked properly — this may be an \
-                 interaction between them or a pre-existing failure in the base. \
-                 Any new push re-enqueues you.",
-                shared_with.len().max(1)
-            ),
+            EjectReason::Unattributed { shared_with, .. } => {
+                let affected = if shared_with.is_empty() {
+                    "This was the only queued change held.".to_string()
+                } else {
+                    format!(
+                        "This change was held together with {} ({} queued changes total).",
+                        shared_with.join(", "),
+                        shared_with.len() + 1
+                    )
+                };
+                format!(
+                    "build failed, but the errors are in files NO queued change touches, \
+                     so the cause could not be attributed. {affected} Nobody was blamed; \
+                     each held change must be checked properly because this may be an \
+                     interaction between them or a pre-existing failure in the base. Any new push \
+                     re-enqueues you."
+                )
+            }
             // Says plainly that the code was never judged. An author reading
             // this should NOT go looking at their change — there is no verdict
             // about it, and the thing to fix is the lane's own environment.
@@ -1366,7 +1376,11 @@ impl LaneState {
         for m in members {
             let reason = EjectReason::Unattributed {
                 fingerprints: fingerprints.clone(),
-                shared_with: all.clone(),
+                shared_with: all
+                    .iter()
+                    .filter(|other| *other != &m.id)
+                    .cloned()
+                    .collect(),
             };
             self.ejected.insert(
                 m.id.clone(),
