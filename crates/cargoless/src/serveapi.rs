@@ -3986,6 +3986,19 @@ impl VerdictService for ServeVerdictState {
     /// will clear it — so the ejections carry `kind` (attributed vs not,
     /// because the two are cleared by different things) and the failing files.
     ///
+    /// `why` carries the author-facing sentence itself, not just the fields it
+    /// is derived from. The enum tags alone are not readable: `files: []` means
+    /// "could not identify them" for `unattributed` and "nothing was compiled"
+    /// for `infrastructure`; `shared_with` is co-owners for `attributed` and
+    /// the whole held roster otherwise; and the re-admission rule differs per
+    /// kind. The daemon already computes that sentence for its own reporting —
+    /// withholding it here is what forced every downstream consumer to
+    /// re-derive it, and they drifted.
+    ///
+    /// `now` is the lane's clock on the same scale as `expires_at_tick`. A
+    /// deadline published without the clock it is measured against cannot
+    /// answer "how long until this clears".
+    ///
     /// `queue_depth` counts members accepted by `POST /lane` that the worker
     /// has not stepped yet, as well as the lane's own queue. During a build the
     /// worker is blocked inside the compile and the lane's queue cannot grow,
@@ -4007,6 +4020,7 @@ impl VerdictService for ServeVerdictState {
             "queue_depth": s.queue_depth,
             "queued": s.queued,
             "generation": s.generation,
+            "now": s.now,
             "in_flight": s.in_flight,
             "members": s.members.iter().map(|m| serde_json::json!({
                 "id": m.id,
@@ -4021,6 +4035,7 @@ impl VerdictService for ServeVerdictState {
                 "files": e.files,
                 "shared_with": e.shared_with,
                 "expires_at_tick": e.expires_at_tick,
+                "why": e.why,
             })).collect::<Vec<_>>(),
         }))
     }
