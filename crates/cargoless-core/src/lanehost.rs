@@ -62,6 +62,14 @@ pub struct LaneSnapshot {
     /// arrival order.
     pub queued: Vec<String>,
     pub generation: u64,
+    /// The lane's clock (unix seconds), the same scale as every
+    /// `expires_at_tick`.
+    ///
+    /// Published because a deadline is not readable without the clock it is
+    /// measured against: `expires_at_tick` alone cannot answer "how long until
+    /// this ejection lapses", which is the question an author whose change
+    /// stopped moving actually has.
+    pub now: u64,
     /// Member ids in the running build, empty when idle.
     pub in_flight: Vec<String>,
     /// What the driver is blocked on, when that is not visible from `phase`.
@@ -98,15 +106,33 @@ pub struct EjectionView {
     /// `build_failure`, `merge_conflict`, `already_landed`, or
     /// `infrastructure` — what happened, independent of attribution kind.
     pub cause: &'static str,
-    /// `attributed` or `unattributed` — the two are cleared by different
-    /// things, so an author needs to know which they have.
+    /// `attributed`, `unattributed`, or `infrastructure` — each is cleared by
+    /// a different thing, so an author needs to know which they have.
     pub kind: &'static str,
     /// The files that carried the failure. Empty for an unattributed ejection,
     /// which is the point: we could not identify them.
     pub files: Vec<String>,
     /// Other members implicated in the same failure.
+    ///
+    /// The membership rule DIFFERS by `kind`, which is why the sentence in
+    /// `why` is the thing to read: for `attributed` these are the other
+    /// co-owners of the failing files, and for `unattributed` /
+    /// `infrastructure` it is the whole held roster.
     pub shared_with: Vec<String>,
+    /// Unix seconds at which the ejection lapses regardless. Compare against
+    /// [`LaneSnapshot::now`] — a bare deadline with no clock beside it cannot
+    /// be turned into "how long until this clears".
     pub expires_at_tick: u64,
+    /// The author-facing sentence, from [`Ejection::describe`].
+    ///
+    /// The fields above are the machine contract; this is the one a human — or
+    /// an agent that has never seen this system — can act on without a lookup
+    /// table. It exists because none of the above can be read alone: `files:
+    /// []` means "could not identify" for `unattributed` and "nothing was
+    /// compiled" for `infrastructure`, and the re-admission rule differs per
+    /// kind. Every consumer that had to re-derive this sentence drifted from
+    /// the daemon that owns it.
+    pub why: String,
 }
 
 impl LaneSnapshot {
@@ -148,6 +174,11 @@ impl LaneSnapshot {
                     files,
                     shared_with,
                     expires_at_tick: e.expires_at_tick,
+                    // `describe()` already folds `cause` and `reason` together,
+                    // so this is deliberately NOT a second match on the reason:
+                    // a parallel match here is exactly how the wire text would
+                    // drift from the text the lane reports internally.
+                    why: e.describe(),
                 }
             })
             .collect();
@@ -192,6 +223,7 @@ impl LaneSnapshot {
             queue_depth: queued.len(),
             queued,
             generation: lane.generation(),
+            now: lane.now(),
             in_flight,
             ejections,
         }
@@ -988,6 +1020,7 @@ mod tests {
             queue_depth: 1,
             queued: vec!["B".to_string()],
             generation: 7,
+            now: 0,
             in_flight: vec!["A".to_string()],
             activity: "building",
             landing: Vec::new(),
@@ -1290,4 +1323,145 @@ mod tests {
     // type is only referenced in doc prose above.
     #[allow(dead_code)]
     fn _outcome_type_is_used(_: LaneBuildOutcome) {}
+
+    // ── the projection must carry the SENTENCE, not just the tags ──────────
+    //
+    // `EjectReason::describe_for` is the author-facing product surface and is
+    // contract-tested in tests/lane_policy.rs. It reached `LaneAction::Report`
+    // — which `LaneDriver::execute` discards — and nothing else, so the one
+    // field that explains an ejection never left the process. Everything a
+    // reader could actually see (`kind`, `files`, `shared_with`) is ambiguous
+    // on its own: `files: []` means "could not identify them" for
+    // `unattributed` and "nothing was compiled" for `infrastructure`.
+    //
+    // These tests fail if the sentence is ever dropped from the projection
+    // again.
+
+    fn ejecting_lane(outcome: LaneBuildOutcome, changed: &[&str]) -> LaneState {
+        let mut lane = LaneState::with_config(
+            "/w",
+            LaneConfig {
+                capture_window_ticks: 0,
+                ..Default::default()
+            },
+        );
+        lane.step(LaneEvent::Enqueue(LaneMember {
+            id: "pr-1".to_string(),
+            head: "head-1".to_string(),
+            changed_files: changed.iter().map(|s| (*s).to_string()).collect(),
+        }));
+        let generation = lane.generation();
+        lane.step(LaneEvent::BuildFinished {
+            generation,
+            outcome,
+        });
+        lane
+    }
+
+    fn only_ejection(lane: &LaneState) -> EjectionView {
+        let snap = LaneSnapshot::of(lane, &LaneActivity::Settled);
+        assert_eq!(snap.ejections.len(), 1, "fixture ejects exactly one member");
+        snap.ejections
+            .into_iter()
+            .next()
+            .expect("just asserted one")
+    }
+
+    #[test]
+    fn an_attributed_ejection_publishes_the_sentence_that_names_the_files() {
+        let lane = ejecting_lane(
+            LaneBuildOutcome::Red {
+                diagnostics: vec![cargoless_proto::Diagnostic {
+                    file_path: PathBuf::from("/w/src/a.rs"),
+                    line: 1,
+                    col: 1,
+                    severity: cargoless_proto::Severity::Error,
+                    code: Some("E0308".to_string()),
+                    message: "boom".to_string(),
+                    source: Some("rustc".to_string()),
+                }],
+            },
+            &["src/a.rs"],
+        );
+        let ej = only_ejection(&lane);
+        assert_eq!(ej.kind, "attributed");
+        assert!(
+            ej.why.contains("src/a.rs"),
+            "the published sentence must name the failing file: {}",
+            ej.why
+        );
+        assert!(
+            !ej.why.is_empty(),
+            "an ejection must never be published without its reason"
+        );
+    }
+
+    #[test]
+    fn an_infrastructure_ejection_publishes_that_nothing_was_judged() {
+        // The distinction that costs the most when it is lost: `unattributed`
+        // means "your tree is red and we cannot say whose change did it";
+        // `infrastructure` means nothing compiled at all. A reader who takes
+        // the second for the first hunts a bug that does not exist — and
+        // `kind` alone, with `files: []` in both, cannot tell them apart.
+        let mut lane = LaneState::with_config(
+            "/w",
+            LaneConfig {
+                capture_window_ticks: 0,
+                infra_backoff_ticks: 0,
+                ..Default::default()
+            },
+        );
+        lane.step(LaneEvent::Enqueue(LaneMember {
+            id: "pr-1".to_string(),
+            head: "head-1".to_string(),
+            changed_files: vec!["src/a.rs".to_string()],
+        }));
+        // Fail the same way until the lane gives up and ejects.
+        for _ in 0..(LaneConfig::default().infra_max_attempts + 1) {
+            let generation = lane.generation();
+            lane.step(LaneEvent::BuildFinished {
+                generation,
+                outcome: LaneBuildOutcome::Infra {
+                    reason: "runner vanished".to_string(),
+                },
+            });
+            lane.step(LaneEvent::Tick {
+                now: lane.now() + 1,
+            });
+        }
+        let ej = only_ejection(&lane);
+        assert_eq!(ej.kind, "infrastructure");
+        assert!(
+            ej.why.contains("NOT a verdict about your change"),
+            "an infra ejection must say plainly that nothing was judged: {}",
+            ej.why
+        );
+        assert!(
+            ej.why.contains("runner vanished"),
+            "and must carry the build's own words: {}",
+            ej.why
+        );
+    }
+
+    #[test]
+    fn the_snapshot_publishes_the_clock_its_deadlines_are_measured_against() {
+        // `expires_at_tick` is a bare deadline. Without the lane's own clock
+        // beside it a reader cannot answer "how long until this clears", which
+        // is the question an author whose change stopped moving actually has.
+        let lane = ejecting_lane(
+            LaneBuildOutcome::UnattributedRed {
+                diagnostics: Vec::new(),
+            },
+            &["src/a.rs"],
+        );
+        let snap = LaneSnapshot::of(&lane, &LaneActivity::Settled);
+        assert_eq!(snap.now, lane.now(), "the published clock is the lane's");
+        let ej = &snap.ejections[0];
+        assert!(
+            ej.expires_at_tick > snap.now,
+            "a live ejection lapses in the future: {} vs {}",
+            ej.expires_at_tick,
+            snap.now
+        );
+    }
 }

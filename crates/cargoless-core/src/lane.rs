@@ -301,9 +301,16 @@ impl EjectReason {
 
     /// The error identities that caused this ejection.
     ///
-    /// Public because `GET /lane` reports them: an author whose change is held
-    /// needs to see *which* errors are holding it, and a fingerprint set that
-    /// changed between two builds is the evidence that a fix took effect.
+    /// Public so a caller can compare the error identities holding a member
+    /// across two builds: a fingerprint set that changed is the evidence that a
+    /// fix took effect.
+    ///
+    /// NOTE: `GET /lane` does NOT currently report these — [`EjectionView`]
+    /// carries `files` and `why`, not fingerprints. This comment used to claim
+    /// it did; the claim was wrong, and stating an unshipped surface as fact is
+    /// how a reader concludes the evidence is available when it is not.
+    ///
+    /// [`EjectionView`]: crate::lanehost::EjectionView
     #[must_use]
     pub fn fingerprints(&self) -> &FingerprintCounts {
         // An infrastructure ejection has no fingerprints BY CONSTRUCTION: no
