@@ -45,6 +45,26 @@
 //! change, this list must change with it, and `drift_targets_match_guard`
 //! records the pairing.
 //!
+//! ## The larger class: racing image pins
+//!
+//! Codegen is not actually the biggest source of no-author conflicts —
+//! deployment pins are (26% of conflicting paths vs 14%). A bot rewrites image
+//! tags on trunk continuously: 105 `chore(...): auto-bake <sha>` commits landed
+//! on `dev` in three days, ~35/day, and enrolled PRs carry their own bake for
+//! the same manifests. Two bakes touching the same `newTag`/`digest` lines
+//! conflict by construction, and mean PR survival (~37 min) is about the gap
+//! between bakes.
+//!
+//! These are safe to resolve NEWER-WINS rather than eject: a bake is a pure pin
+//! rewrite. Verified over 8 consecutive bake commits on `dev` — ZERO changed
+//! lines outside `newTag`, `digest`, `image:`, and artifact-URL values. Taking
+//! either side loses nothing but a stale tag, and trunk's is the one that
+//! survives anyway.
+//!
+//! The narrow rule matters: only a conflict where BOTH sides are pin lines
+//! qualifies. A PR that hand-edits a replica count in the same manifest is a
+//! real conflict and still ejects — see `is_pin_only_conflict`.
+//!
 //! ## Fail closed
 //!
 //! A conflict set is resolvable only if EVERY path in it is regenerable. One
@@ -69,6 +89,35 @@ pub const REGENERABLE_FILES: &[&str] = &["portal/src/services/optimistic_actions
 /// reader who adds `portal/src/generated/` to the prefixes above will trip the
 /// `hand_maintained_fork_is_never_resolvable` test and find this comment.
 pub const HAND_MAINTAINED: &[&str] = &["portal/src/generated/"];
+
+/// Manifest paths whose conflicts are routinely pure image-pin churn.
+///
+/// Not an allowlist by itself — `is_pin_only_conflict` must still prove that
+/// the conflicting HUNK is pins. This only says "a bake writes here".
+pub const PIN_MANIFEST_SUFFIXES: &[&str] = &["kustomization.yaml", "-app.yaml", "builder.yaml"];
+
+/// Line prefixes a bake rewrites. Measured, not guessed: 8 consecutive bake
+/// commits changed nothing else.
+pub const PIN_LINE_MARKERS: &[&str] = &["newTag:", "digest:", "image:", "value: \"http"];
+
+/// Does every conflicting line in this hunk look like an image pin?
+///
+/// `lines` are the changed lines from BOTH sides of the conflict, already
+/// stripped of their leading `+`/`-`. Empty input is NOT pin-only: an
+/// unreadable hunk must eject, not be waved through.
+pub fn is_pin_only_conflict(path: &Path, lines: &[String]) -> bool {
+    if lines.is_empty() {
+        return false;
+    }
+    let Some(p) = path.to_str() else { return false };
+    if !PIN_MANIFEST_SUFFIXES.iter().any(|s| p.ends_with(s)) {
+        return false;
+    }
+    lines.iter().all(|l| {
+        let t = l.trim();
+        t.is_empty() || PIN_LINE_MARKERS.iter().any(|m| t.starts_with(m))
+    })
+}
 
 /// Why a conflict set could not be auto-resolved. Carried into the ejection so
 /// the reason reaches the PR comment instead of being re-derived by a human.
@@ -235,5 +284,46 @@ mod tests {
             REGENERABLE_FILES,
             &["portal/src/services/optimistic_actions.rs"]
         );
+    }
+
+    #[test]
+    fn a_pure_pin_hunk_is_resolvable_newer_wins() {
+        let lines = vec![
+            "newTag: \"dev-d7afba13-2026-08-20\"".to_string(),
+            "digest: \"sha256:af8a4c7a\"".to_string(),
+        ];
+        assert!(is_pin_only_conflict(
+            &p("deployment/isolation/staging/kustomization.yaml"),
+            &lines
+        ));
+    }
+
+    #[test]
+    fn a_hand_edit_in_the_same_manifest_still_ejects() {
+        // The known-negative for the pin rule. Someone changing replicas in a
+        // manifest a bake also touches is a REAL conflict.
+        let lines = vec![
+            "newTag: \"dev-d7afba13\"".to_string(),
+            "replicas: 3".to_string(),
+        ];
+        assert!(!is_pin_only_conflict(
+            &p("deployment/admin/base/admin-app.yaml"),
+            &lines
+        ));
+    }
+
+    #[test]
+    fn an_empty_hunk_is_not_pin_only() {
+        // Unreadable hunk ⇒ eject. Fail closed.
+        assert!(!is_pin_only_conflict(
+            &p("deployment/x/kustomization.yaml"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn pin_lines_outside_a_manifest_do_not_qualify() {
+        let lines = vec!["image: foo:1".to_string()];
+        assert!(!is_pin_only_conflict(&p("README.md"), &lines));
     }
 }
