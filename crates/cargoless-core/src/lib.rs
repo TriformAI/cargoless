@@ -39,6 +39,7 @@ pub mod corun;
 pub mod diagnostics_store;
 pub mod evidence;
 pub use cargoless_proto::outcome;
+pub mod generated_resolve;
 pub mod idle;
 pub mod l4proxy;
 pub mod lane;
