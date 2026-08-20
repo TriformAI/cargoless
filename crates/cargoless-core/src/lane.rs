@@ -147,7 +147,9 @@ pub enum EjectReason {
     Attributed {
         files: Vec<PathBuf>,
         fingerprints: FingerprintCounts,
-        /// Other members implicated by the same build. Empty ⇒ sole owner.
+        /// Other members that own at least one of this member's failing files.
+        /// Empty ⇒ this member is the sole owner of its failing files, even
+        /// when unrelated members own other errors from the same build.
         shared_with: Vec<String>,
     },
     /// The errors landed in files no member touched — an interaction between
@@ -1322,13 +1324,27 @@ impl LaneState {
         // that arrived meanwhile.
         for m in members {
             if owners.contains(&m.id) {
-                let mut shared_with: Vec<String> =
-                    owners.iter().filter(|o| **o != m.id).cloned().collect();
-                shared_with.sort();
-                let files: Vec<PathBuf> = owned_files
+                let member_files = owned_files
                     .get(&m.id)
-                    .map(|s| s.iter().cloned().collect())
-                    .unwrap_or_default();
+                    .expect("every attributed owner has at least one failing file");
+                // `shared_with` is a FILE-COLLISION relationship, not a batch
+                // roster. A candidate can contain independent errors owned by
+                // independent PRs; naming all owners on every ejection makes a
+                // sole-owner failure look shared and sends authors to inspect
+                // unrelated changes. Include another owner only when the two
+                // members actually overlap on at least one failing file.
+                let mut shared_with: Vec<String> = owners
+                    .iter()
+                    .filter(|other| {
+                        **other != m.id
+                            && owned_files
+                                .get(*other)
+                                .is_some_and(|other_files| !member_files.is_disjoint(other_files))
+                    })
+                    .cloned()
+                    .collect();
+                shared_with.sort();
+                let files: Vec<PathBuf> = member_files.iter().cloned().collect();
                 let reason = EjectReason::Attributed {
                     files,
                     fingerprints: fingerprints.clone(),
