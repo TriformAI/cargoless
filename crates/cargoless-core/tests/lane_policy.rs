@@ -523,6 +523,58 @@ fn multi_owner_red_ejects_all_implicated_and_tells_each_it_is_shared() {
 }
 
 #[test]
+fn shared_with_names_only_members_colliding_on_the_same_failing_file() {
+    // One build can expose several independent reds. `shared_with` must encode
+    // the ownership collision for THIS member's failing file, not repeat the
+    // complete set of owners from the batch on every ejection.
+    let mut st = lane();
+    let build_gen = start_build(
+        &mut st,
+        vec![
+            member("A", "a1", &["src/shared.rs"]),
+            member("B", "b1", &["src/shared.rs"]),
+            member("C", "c1", &["src/independent.rs"]),
+            member("D", "d1", &["src/survivor.rs"]),
+        ],
+    );
+    let actions = st.step(LaneEvent::BuildFinished {
+        generation: build_gen,
+        outcome: LaneBuildOutcome::Red {
+            diagnostics: vec![
+                err("src/shared.rs", 3, "E0425"),
+                err("src/independent.rs", 8, "E0382"),
+            ],
+        },
+    });
+
+    let mut ejected = ejected_ids(&actions);
+    ejected.sort();
+    assert_eq!(
+        ejected,
+        vec!["A".to_string(), "B".to_string(), "C".to_string()]
+    );
+
+    for (who, expected) in [
+        ("A", vec!["B".to_string()]),
+        ("B", vec!["A".to_string()]),
+        ("C", Vec::new()),
+    ] {
+        let EjectReason::Attributed { shared_with, .. } = eject_reason(&actions, who) else {
+            panic!("{who} must be attributed");
+        };
+        assert_eq!(
+            shared_with, expected,
+            "{who} must name only co-owners of its own failing file"
+        );
+    }
+    assert_eq!(
+        started(&actions).as_deref(),
+        Some(&["D".to_string()][..]),
+        "the member that owns no failing file rebuilds immediately"
+    );
+}
+
+#[test]
 fn unattributable_red_holds_everyone_and_says_so() {
     // Errors in a file nobody touched: an interaction, or a base red. Picking a
     // culprit here would eject someone innocent.
