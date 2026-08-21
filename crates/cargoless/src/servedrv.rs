@@ -165,6 +165,29 @@ struct ClusterState {
     /// Cumulative RA stderr counters at the start of the active overlay
     /// transaction. Verdicts consume the delta, never daemon-lifetime noise.
     active_ra_stderr_baseline: Option<RaStderrSnapshot>,
+    /// Monotonic stderr watermark consumed by the most recently emitted
+    /// verdict. This is a second fence around the attempt-start snapshot:
+    /// an older observation from the same supervised RA generation must not
+    /// make already-attributed analyzer noise look fresh on the next attempt.
+    last_emitted_ra_stderr_snapshot: RaStderrSnapshot,
+}
+
+fn ra_stderr_attempt_baseline(
+    observed: RaStderrSnapshot,
+    last_emitted: &RaStderrSnapshot,
+) -> RaStderrSnapshot {
+    let same_process_generation =
+        observed.process_generation == last_emitted.process_generation;
+    let observed_is_behind = same_process_generation
+        && (observed.total_lines < last_emitted.total_lines
+            || observed.error_lines < last_emitted.error_lines
+            || observed.suppressed_lines < last_emitted.suppressed_lines
+            || observed.overflow_fingerprints < last_emitted.overflow_fingerprints);
+    if observed_is_behind {
+        last_emitted.clone()
+    } else {
+        observed
+    }
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -1385,6 +1408,7 @@ fn spawn_cluster(
             active_diagnostic_pull_generation: None,
             next_diagnostic_pull_generation: 1,
             active_ra_stderr_baseline: None,
+            last_emitted_ra_stderr_snapshot: RaStderrSnapshot::default(),
         },
     );
     Ok(())
@@ -1762,7 +1786,21 @@ fn exec(
                 // carries valid attrs at drop.
                 return;
             };
-            cs.active_ra_stderr_baseline = Some(cs._supervisor.stderr_snapshot());
+            let observed_ra_stderr_baseline = cs._supervisor.stderr_snapshot();
+            let active_ra_stderr_baseline = ra_stderr_attempt_baseline(
+                observed_ra_stderr_baseline.clone(),
+                &cs.last_emitted_ra_stderr_snapshot,
+            );
+            if active_ra_stderr_baseline != observed_ra_stderr_baseline {
+                eprintln!(
+                    "[cargoless:obs] ra-stderr-baseline-floor wt={} observed_lines={} emitted_lines={} generation={}",
+                    wt.display(),
+                    observed_ra_stderr_baseline.total_lines,
+                    cs.last_emitted_ra_stderr_snapshot.total_lines,
+                    observed_ra_stderr_baseline.process_generation,
+                );
+            }
+            cs.active_ra_stderr_baseline = Some(active_ra_stderr_baseline);
             // Capture the last RA quiescence boundary before sending any
             // document mutation. The diagnostic pull must observe a strictly
             // newer boundary before its result can settle this transaction.
@@ -1935,8 +1973,9 @@ fn exec(
             let ra_stderr_baseline_missing = cs.active_ra_stderr_baseline.is_none();
             let attempt_ra_snapshot = match cs.active_ra_stderr_baseline.take() {
                 Some(baseline) => ra_snapshot.delta_since(&baseline),
-                None => ra_snapshot,
+                None => ra_snapshot.clone(),
             };
+            cs.last_emitted_ra_stderr_snapshot = ra_snapshot.clone();
             let attempt_ra_stderr_errors = attempt_ra_snapshot.error_lines;
             api.record_ra_evidence_v3(
                 attribution
@@ -3484,6 +3523,35 @@ mod tests {
         );
         assert!(lane_intergeneration_yield_from(Some("ninety")).is_err());
         assert!(lane_intergeneration_yield_from(Some("3601")).is_err());
+    }
+
+    #[test]
+    fn stderr_attempt_baseline_never_reuses_an_emitted_error_storm() {
+        let emitted = RaStderrSnapshot {
+            process_generation: 1,
+            pid: Some(42),
+            total_lines: 845,
+            error_lines: 845,
+            ..RaStderrSnapshot::default()
+        };
+        // Regression for the live failure: the next exact attempt observed an
+        // older same-process baseline and attributed all 845 already-emitted
+        // rust-analyzer errors to itself.
+        let observed = RaStderrSnapshot {
+            process_generation: 1,
+            pid: Some(42),
+            ..RaStderrSnapshot::default()
+        };
+        let baseline = ra_stderr_attempt_baseline(observed, &emitted);
+        assert_eq!(baseline, emitted);
+        assert_eq!(emitted.delta_since(&baseline).error_lines, 0);
+
+        let fresh = RaStderrSnapshot {
+            total_lines: 846,
+            error_lines: 846,
+            ..emitted.clone()
+        };
+        assert_eq!(fresh.delta_since(&baseline).error_lines, 1);
     }
 
     fn temp_root(label: &str) -> PathBuf {
