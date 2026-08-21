@@ -180,6 +180,24 @@ fn truthy_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn lane_intergeneration_yield_from(raw: Option<&str>) -> Result<Duration, String> {
+    const MAX_SECONDS: u64 = 3_600;
+    let seconds = match raw {
+        None => 0,
+        Some(value) => value.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "CARGOLESS_LANE_INTERGENERATION_YIELD_SECONDS={value:?} is not an unsigned integer"
+            )
+        })?,
+    };
+    if seconds > MAX_SECONDS {
+        return Err(format!(
+            "CARGOLESS_LANE_INTERGENERATION_YIELD_SECONDS={seconds} exceeds the {MAX_SECONDS}s safety cap"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 fn push_only_mode() -> bool {
     truthy_env("CARGOLESS_PUSH_ONLY") || truthy_env("TF_FS_WATCH_DISABLED")
 }
@@ -418,6 +436,10 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     //
     //   CARGOLESS_LANE_PROFILE   the cargoless.checks.yaml profile to run
     //   CARGOLESS_LANE_BASE      base ref to build candidates on (default: main)
+    //   CARGOLESS_LANE_INTERGENERATION_YIELD_SECONDS
+    //                            settled hand-off after each build/land so a
+    //                            cooperative external base writer cannot starve
+    //                            behind a permanently nonempty queue (default 0)
     //   CARGOLESS_LANE_ARTIFACT  path, relative to the candidate root, of the
     //                            artifact to publish on green. Unset = a
     //                            check-only lane that proves the merged tree
@@ -446,6 +468,17 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         .ok()
         .filter(|p| !p.trim().is_empty());
     if let Some(profile) = lane_profile {
+        let intergeneration_yield = match lane_intergeneration_yield_from(
+            std::env::var("CARGOLESS_LANE_INTERGENERATION_YIELD_SECONDS")
+                .ok()
+                .as_deref(),
+        ) {
+            Ok(duration) => duration,
+            Err(error) => {
+                eprintln!("[cargoless] FATAL: {error}");
+                return ExitCode::from(2);
+            }
+        };
         // REFUSE an unknown profile name rather than inherit project_checks'
         // fallback. That fallback synthesises `include: ["*"]` with a 12-second
         // budget, and `"*"` matches every check regardless of tier — so a single
@@ -630,7 +663,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
         // inspecting behaviour.
         eprintln!(
             "[cargoless:obs] build-lane enabled profile={profile} base={base} artifact={} \
-             where={} land={}",
+             where={} land={} intergeneration_yield_s={}",
             artifact
                 .as_ref()
                 .map(|p| p.display().to_string())
@@ -639,9 +672,17 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             match land_command.as_ref() {
                 Some(c) => format!("AUTO-MERGE via `{}`", c.join(" ")),
                 None => "<none: reports only, lands nothing>".to_string(),
-            }
+            },
+            intergeneration_yield.as_secs()
         );
-        api_state = api_state.with_lane(&scope.repo_root, &state_dir, &base, plan, land_command);
+        api_state = api_state.with_lane(
+            &scope.repo_root,
+            &state_dir,
+            &base,
+            plan,
+            land_command,
+            intergeneration_yield,
+        );
     }
     let api = Arc::new(api_state);
     // Path D + R3 — publish the resolved caps at startup so an operator
@@ -3430,6 +3471,20 @@ fn slowest_project_checks(
 mod tests {
     use super::*;
     use cargoless_core::transport::{PushOverlayOptions, VerdictService};
+
+    #[test]
+    fn lane_intergeneration_yield_is_bounded_and_defaults_off() {
+        assert_eq!(
+            lane_intergeneration_yield_from(None).unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            lane_intergeneration_yield_from(Some("90")).unwrap(),
+            Duration::from_secs(90)
+        );
+        assert!(lane_intergeneration_yield_from(Some("ninety")).is_err());
+        assert!(lane_intergeneration_yield_from(Some("3601")).is_err());
+    }
 
     fn temp_root(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()

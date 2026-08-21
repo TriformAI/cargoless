@@ -1721,6 +1721,10 @@ impl ServeVerdictState {
     /// process; `Some((argv, remote, ref_prefix))` publishes the candidate and
     /// hands it to an external builder.
     ///
+    /// `intergeneration_yield` keeps the lane observably idle after a blocking
+    /// generation so a cooperative external trunk writer cannot be starved by
+    /// an always-nonempty queue. It delays no in-flight build or land.
+    ///
     /// In-process is the default because it is the zero-config one — a single
     /// developer's laptop has no builder to dispatch to. It is NOT the safe one
     /// for a multi-tenant daemon: `cargo` executes `build.rs` and proc-macros
@@ -1736,6 +1740,7 @@ impl ServeVerdictState {
         base_ref: &str,
         plan: cargoless_core::lanedrv::LegPlan,
         land_command: Option<Vec<String>>,
+        intergeneration_yield: Duration,
     ) -> Self {
         let tree = cargoless_core::lanetree::GitCandidateTree::new(
             repo,
@@ -1810,9 +1815,10 @@ impl ServeVerdictState {
         // stop the lane from starting; the worst case is the status quo.
         cargoless_core::lanedrv::close_abandoned_generations(&trail);
 
-        self.lane = Some(LaneHost::spawn(
+        self.lane = Some(LaneHost::spawn_with_intergeneration_yield(
             LaneState::new(repo),
             cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander).with_trail(trail),
+            intergeneration_yield,
         ));
         self
     }
