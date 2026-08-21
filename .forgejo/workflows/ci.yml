@@ -75,6 +75,12 @@ env:
 # observability: a red `fmt` job vs a red `build` job is diagnosable from
 # /api/v1/.../actions/tasks alone.
 #
+# These jobs use the dedicated `cargoless-ci` runner label. Forgejo schedules
+# strict FIFO per shared label; a large tf-multiverse fan-out can otherwise
+# leave this repository waiting behind hundreds of unrelated `docker` jobs.
+# The GitOps-managed FSN ordinal for this label is deliberately separate from
+# tf-multiverse's thin-poller `witness` and operator-only `priority` lanes.
+#
 # Every job repeats a setup step that installs nodejs BEFORE actions/checkout
 # runs: checkout@v4 is a JS action executed inside `container:`, and the
 # rust-1.85-bookworm image ships no node. The image is always addressed through
@@ -96,7 +102,7 @@ env:
 
 jobs:
   build:
-    runs-on: docker
+    runs-on: cargoless-ci
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
     steps:
@@ -112,7 +118,7 @@ jobs:
       - run: cargo build --workspace --all-targets --locked
 
   test:
-    runs-on: docker
+    runs-on: cargoless-ci
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
     steps:
@@ -150,7 +156,7 @@ jobs:
   # verdict on it.
   lane-mutation:
     name: lane policy mutation proof
-    runs-on: docker
+    runs-on: cargoless-ci
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
     steps:
@@ -172,7 +178,7 @@ jobs:
       - run: bash scripts/tests/explanation-reaches-the-wire-test.sh
 
   fmt:
-    runs-on: docker
+    runs-on: cargoless-ci
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
     steps:
@@ -188,7 +194,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: docker
+    runs-on: cargoless-ci
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
     steps:
@@ -205,7 +211,7 @@ jobs:
 
   bench:
     name: rust-analyzer latency harness (S1 / AC#2)
-    runs-on: docker
+    runs-on: cargoless-ci
     container:
       image: registry.triform.cloud/mirror/rust-1.85-bookworm:latest
     if: ${{ github.ref == 'refs/heads/main' }}
