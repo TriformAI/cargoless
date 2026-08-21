@@ -44,8 +44,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use crate::lane::{EjectReason, LaneEvent, LaneMember, LanePhase, LaneState};
+use crate::lane::{EjectReason, LaneAction, LaneEvent, LaneMember, LanePhase, LaneState};
 use crate::lanedrv::{CandidateTree, LaneActivity, LaneDriver, LaneLander, LegRunner};
 
 /// What `GET /lane` reports. Cheap to clone; never holds a lock.
@@ -337,7 +338,32 @@ pub struct LaneHost {
 
 impl LaneHost {
     /// Start the worker. The lane runs until the host is dropped.
-    pub fn spawn<T, R, L>(mut lane: LaneState, driver: LaneDriver<T, R, L>) -> Self
+    pub fn spawn<T, R, L>(lane: LaneState, driver: LaneDriver<T, R, L>) -> Self
+    where
+        T: CandidateTree + Send + 'static,
+        R: LegRunner + Send + 'static,
+        L: LaneLander + Send + 'static,
+    {
+        Self::spawn_with_intergeneration_yield(lane, driver, Duration::ZERO)
+    }
+
+    /// Start the worker and expose a bounded settled window after each build.
+    ///
+    /// The lane normally consumes the next queued event immediately after a
+    /// blocking build/land returns. With a non-empty queue that leaves only a
+    /// few milliseconds of observable `idle` state, so another trunk writer
+    /// that correctly refuses to invalidate an in-flight candidate can starve
+    /// forever. During this delay the snapshot is deliberately `idle` /
+    /// `settled` while retaining the queued roster; no candidate or lander is
+    /// running, so an external compare-and-swap writer may safely advance the
+    /// base. The next generation then materializes against that new base.
+    ///
+    /// Zero preserves the historical behavior for embedded/test callers.
+    pub fn spawn_with_intergeneration_yield<T, R, L>(
+        mut lane: LaneState,
+        driver: LaneDriver<T, R, L>,
+        intergeneration_yield: Duration,
+    ) -> Self
     where
         T: CandidateTree + Send + 'static,
         R: LegRunner + Send + 'static,
@@ -416,7 +442,7 @@ impl LaneHost {
                     // corrupt state to inherit.
                     // The accepted set is folded in at READ time, not here — see
                     // `LaneSnapshot::with_accepted`.
-                    driver.pump_observed(&mut lane, event, |live, activity| {
+                    let actions = driver.pump_observed(&mut lane, event, |live, activity| {
                         let next = LaneSnapshot::of(live, activity);
                         match worker_snapshot.lock() {
                             Ok(mut s) => *s = next,
@@ -443,6 +469,21 @@ impl LaneHost {
                                 poisoned.into_inner().remove(&id);
                             }
                         }
+                    }
+                    if !intergeneration_yield.is_zero()
+                        && actions.iter().any(|action| {
+                            matches!(
+                                action,
+                                LaneAction::StartBuild { .. } | LaneAction::LandAndPublish { .. }
+                            )
+                        })
+                    {
+                        eprintln!(
+                            "[cargoless:obs] lane-writer-yield generation={} duration_ms={}",
+                            lane.generation(),
+                            intergeneration_yield.as_millis()
+                        );
+                        thread::sleep(intergeneration_yield);
                     }
                 }
                 worker_running.store(false, Ordering::SeqCst);
@@ -808,6 +849,68 @@ mod tests {
              {:?}",
             host.snapshot()
         );
+    }
+
+    /// A saturated ordinary lane must expose a real writer hand-off between
+    /// generations. Without this window the worker consumes B immediately
+    /// after A settles, so a cooperative external writer that polls once per
+    /// minute sees only `building` forever and can never advance the base.
+    #[test]
+    fn an_intergeneration_yield_is_idle_with_the_next_member_still_queued() {
+        let (started_tx, started_rx) = std_channel();
+        let (release_tx, release_rx) = std_channel();
+        let driver = LaneDriver::new(
+            NoTree,
+            BlockingLegs {
+                started: started_tx,
+                release: Mutex::new(release_rx),
+            },
+            NoLander,
+        );
+        let host = LaneHost::spawn_with_intergeneration_yield(
+            LaneState::with_config(
+                "/tmp/lanehost-test-writer-yield",
+                LaneConfig {
+                    capture_window_ticks: 0,
+                    ..Default::default()
+                },
+            ),
+            driver,
+            Duration::from_millis(500),
+        );
+
+        host.enqueue(LaneMember::new("A", "sha-a")).expect("queued");
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("A should start");
+        host.enqueue(LaneMember::new("B", "sha-b")).expect("queued");
+        release_tx.send(()).expect("release A");
+
+        assert!(
+            until(|| {
+                let snapshot = host.snapshot();
+                snapshot.generation == 1
+                    && snapshot.phase == "idle"
+                    && snapshot.activity == "settled"
+                    && snapshot.queued == vec!["B".to_string()]
+                    && snapshot.in_flight.is_empty()
+            }),
+            "the hand-off must be observably safe while preserving B: {:?}",
+            host.snapshot()
+        );
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "B started inside the configured writer hand-off window"
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("B should start after the bounded yield");
+        assert!(
+            until(|| host.snapshot().in_flight == vec!["B".to_string()]),
+            "B must remain queued work, not be dropped by the yield: {:?}",
+            host.snapshot()
+        );
+        release_tx.send(()).expect("release B");
     }
 
     /// A member accepted behind a long build must join the retry after a

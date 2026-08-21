@@ -53,6 +53,7 @@ a member on no evidence. Fail-safe.
    |---|---|
    | `CARGOLESS_LANE_PROFILE` | the `cargoless.checks.yaml` profile to run. Unset ⇒ no lane, and `GET /lane` 404s. |
    | `CARGOLESS_LANE_BASE` | ref candidates are built on. Default `main`. |
+   | `CARGOLESS_LANE_INTERGENERATION_YIELD_SECONDS` | bounded `idle`/`settled` hand-off after a build or land. Use when another cooperative writer must occasionally advance the base despite a continuously nonempty queue. Default `0` (disabled), maximum `3600`. |
    | `CARGOLESS_LANE_ARTIFACT` | local-only path, relative to the candidate root, to publish on green. Never combine it with a remote destination. |
    | `CARGOLESS_LANE_DISPATCH` | trusted argv that builds the candidate outside this daemon. Mutually exclusive with `CARGOLESS_LANE_PREVIEW_SLOT`. |
    | `CARGOLESS_LANE_DISPATCH_REMOTE` | git remote used to publish the immutable candidate. Default `origin`. |
