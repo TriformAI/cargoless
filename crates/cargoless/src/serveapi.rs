@@ -15464,7 +15464,7 @@ checks:
     }
 
     #[test]
-    fn exact_git_replay_after_restart_skips_external_git_and_dispatch() {
+    fn pending_exact_git_attempt_fails_closed_after_restart() {
         let root = temp_root("exact-git-replay");
         let remote = temp_root("exact-git-replay-remote");
         let state_dir = temp_root("exact-git-replay-state");
@@ -15526,18 +15526,80 @@ checks:
             None,
             Some(&options),
         );
+        assert!(!ack.accepted);
+        assert_eq!(ack.reject_code.as_deref(), Some("attempt.dispatch_lost"));
         assert!(
-            ack.accepted,
-            "exact replay must not touch the removed Git checkout"
+            direct_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "lost same-id work is never redispatched without a durable outbox"
         );
-        assert!(direct_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        assert!(matches!(
-            reopened
-                .get_outcome_v3(&context.attempt_id)
-                .unwrap()
-                .conclusion,
-            Conclusion::Pending { .. }
-        ));
+        assert!(
+            reopened.get_outcome_v3(&context.attempt_id).is_none(),
+            "a lost dispatch is not fabricated into a terminal outcome without evidence"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn pending_queue_attempt_requires_a_successor_after_restart() {
+        let state_dir = temp_root("attempt-queue-recovery");
+        let context = attempt_context("attempt-queue-lost", 1);
+        let files = vec![("src/lib.rs".to_string(), "pub fn queued() {}".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("same-base".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+        {
+            let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+            assert!(
+                api.push_overlay_with_options(
+                    "/wt-queue-recovery",
+                    "origin/main",
+                    &files,
+                    None,
+                    Some(&options),
+                )
+                .accepted
+            );
+            assert!(api.peek_overlay_for("/wt-queue-recovery").is_some());
+        }
+
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let (tx, rx) = channel::<String>();
+        reopened.attach_push_signal(tx);
+        let lost = reopened.push_overlay_with_options(
+            "/wt-queue-recovery",
+            "origin/main",
+            &files,
+            None,
+            Some(&options),
+        );
+        assert!(!lost.accepted);
+        assert_eq!(lost.reject_code.as_deref(), Some("attempt.dispatch_lost"));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(reopened.peek_overlay_for("/wt-queue-recovery").is_none());
+
+        let mut successor = options.clone();
+        successor.semantic = Some(AttemptContext {
+            request_id: context.request_id.clone(),
+            attempt_id: cargoless_core::outcome::AttemptId::new("attempt-queue-successor").unwrap(),
+            trace_id: context.trace_id.clone(),
+            previous_attempt_id: Some(context.attempt_id.clone()),
+            attempt_number: 2,
+            maximum_attempts: context.maximum_attempts,
+            retry_after_ms: context.retry_after_ms,
+        });
+        let ack = reopened.push_overlay_with_options(
+            "/wt-queue-recovery",
+            "origin/main",
+            &files,
+            None,
+            Some(&successor),
+        );
+        assert!(ack.accepted);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(reopened.peek_overlay_for("/wt-queue-recovery").is_some());
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
