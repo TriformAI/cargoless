@@ -5042,7 +5042,7 @@ checks:
             lines[0]
         );
         assert_eq!(lines[1], "denied");
-        assert_eq!(lines[2], "stable=yes");
+        assert_eq!(lines[2], "yes");
         assert_eq!(lines[3], context.snapshot_digest);
         assert_eq!(lines[4], context.comparison_base_sha);
         assert_eq!(
