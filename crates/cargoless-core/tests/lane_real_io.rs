@@ -1316,3 +1316,67 @@ fn a_failing_lander_backs_off_instead_of_spinning() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// An ejection must survive the process that made it.
+///
+/// Every other lane decision writes a `[cargoless:obs] lane-*` trail line, but
+/// an EJECTION — the one outcome an author is asked to act on — wrote nothing.
+/// The sentence existed only in `GET /lane`, which reports LIVE ejections and
+/// forgets them the moment they lapse or the member is re-admitted, so after a
+/// pod restart "who was ejected and why" was unrecoverable. Measured in
+/// production 2026-08-22: reds at generations 70/191/202/276 left no readable
+/// record of who they held.
+#[test]
+fn an_ejection_is_recorded_in_the_durable_trail_with_its_sentence() {
+    let root = repo_with_legs("eject-trail", "alpha");
+    let a = branch(&root, "a", "a.txt", "a\n");
+    let trail = root.with_extension("trail.log");
+
+    let tree = GitCandidateTree::new(&root, root.join(".cargoless/lane-candidates"), "main");
+    let legs = ProfileLegRunner::new("lane");
+    let drv = LaneDriver::new(tree, legs, ReportOnlyLander).with_trail(trail.clone());
+
+    let mut lane = LaneState::with_config(
+        &root,
+        cargoless_core::lane::LaneConfig {
+            capture_window_ticks: 0,
+            ..Default::default()
+        },
+    );
+
+    // Enqueue the member, then enqueue it AGAIN at a head that is already in
+    // the base: the lane ejects it as `already_landed`, which needs no compile
+    // and so keeps this test fast and hermetic.
+    drv.pump(
+        &mut lane,
+        LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
+    );
+    drv.pump(
+        &mut lane,
+        LaneEvent::BuildFinished {
+            generation: lane.generation(),
+            outcome: cargoless_core::lane::LaneBuildOutcome::Stale {
+                id: "a".to_string(),
+                head: a.clone(),
+            },
+        },
+    );
+
+    let log = fs::read_to_string(&trail).expect("a trail must exist");
+    assert!(
+        log.contains("lane-eject id=a"),
+        "the ejection must name the member it held: {log}"
+    );
+    assert!(
+        log.contains("cause=already_landed"),
+        "and the cause, so a reader knows whether code was judged: {log}"
+    );
+    assert!(
+        log.contains("no author action is required"),
+        "and the AUTHOR-FACING SENTENCE itself — the whole point is that the \
+         durable record says what the wire said, not just an enum tag: {log}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_file(&trail);
+}

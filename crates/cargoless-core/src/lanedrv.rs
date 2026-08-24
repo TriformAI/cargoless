@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 
 use cargoless_proto::TreeState;
 
-use crate::lane::{LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LaneState};
+use crate::lane::{EjectReason, LaneAction, LaneBuildOutcome, LaneEvent, LaneMember, LaneState};
 use crate::project_checks;
 
 const EX_ROSTER_STALE: i32 = 76;
@@ -1959,9 +1959,36 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
                     }
                 }
             }
-            LaneAction::Eject { .. } | LaneAction::Readmit { .. } | LaneAction::Report { .. } => {
+            // An ejection is the one lane decision an author is asked to ACT
+            // on, and it was the only one absent from the durable trail: every
+            // other outcome writes `[cargoless:obs] lane-*`, so after a pod
+            // restart "who was ejected, and why" was unrecoverable — the
+            // sentence lived only in `GET /lane`, which reports LIVE ejections
+            // and forgets them once they lapse or readmit.
+            //
+            // Written here rather than in `LaneState` so the state machine
+            // stays free of IO, and it reuses `describe_for` so the durable
+            // record cannot drift from what the wire and the forge publish.
+            LaneAction::Eject { id, cause, reason } => {
+                self.trail_line(&format!(
+                    "[cargoless:obs] lane-eject id={id} cause={} kind={} why={}",
+                    cause.as_str(),
+                    // Same three-way mapping `LaneSnapshot::of` publishes as
+                    // `kind`, so the trail and the wire agree.
+                    match reason {
+                        EjectReason::Attributed { .. } => "attributed",
+                        EjectReason::Unattributed { .. } => "unattributed",
+                        EjectReason::Infrastructure { .. } => "infrastructure",
+                    },
+                    reason.describe_for(*cause),
+                ));
                 Vec::new()
             }
+            LaneAction::Readmit { id, why } => {
+                self.trail_line(&format!("[cargoless:obs] lane-readmit id={id} why={why}"));
+                Vec::new()
+            }
+            LaneAction::Report { .. } => Vec::new(),
         }
     }
 
