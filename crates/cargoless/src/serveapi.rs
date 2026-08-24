@@ -50,7 +50,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cargoless_core::analyzer::RaStderrSnapshot;
 use cargoless_core::batch::{BatchChecker, BatchMember, BatchReport, BatchVerdict, run_batch};
 use cargoless_core::corun::CorunPolicy;
-use cargoless_core::evidence::{ArtifactKind, EvidenceBundle, EvidenceClass, EvidenceStore};
+use cargoless_core::evidence::{
+    ArtifactKind, AttemptAdmissionDecision, AttemptAdmissionIdentity, AttemptAdmissionReservation,
+    EvidenceBundle, EvidenceClass, EvidenceStore,
+};
 use cargoless_core::lane::{LaneMember, LaneState};
 use cargoless_core::lanehost::LaneHost;
 use cargoless_core::outcome::{
@@ -95,6 +98,16 @@ static CANDIDATE_EXECUTION_SEQ: AtomicU64 = AtomicU64::new(0);
 struct HardWitnessClaim {
     generation: u64,
     attempt_id: Option<AttemptId>,
+}
+
+enum AttemptReservationV3 {
+    Memory(AttemptAdmissionIdentity),
+    Durable(AttemptAdmissionReservation),
+}
+
+enum AttemptReservationDecisionV3 {
+    New(Box<AttemptReservationV3>),
+    Replay,
 }
 /// Fallback cap on the per-worktree base_sha-addressable verdict ring
 /// ([`ServeVerdictState::verdict_history`]) — used only when
@@ -465,25 +478,32 @@ fn overlay_subject_v3(
         "profile={profile:?};gate={};check_ids={:?}",
         options.gate, options.check_ids
     );
-    let overlay_digest = match options.candidate_snapshot.as_ref() {
-        Some(manifest) => {
-            let legacy_digest = canonical_pairs_digest(files);
-            let mut preimage = b"cargoless-overlay-subject\0v1\0".to_vec();
-            for value in [
-                legacy_digest.as_str(),
-                manifest.manifest_digest.as_str(),
-                manifest.candidate.snapshot_digest(),
-                manifest.candidate.tree_oid(),
-            ] {
-                preimage.extend_from_slice(value.len().to_string().as_bytes());
-                preimage.push(0);
-                preimage.extend_from_slice(value.as_bytes());
-                preimage.push(0);
-            }
-            sha256_hex(&preimage)
-        }
-        None => canonical_pairs_digest(files),
-    };
+    // Bind every option that can change what tree is evaluated. Length framing
+    // keeps absent and concatenated values unambiguous; the v2 domain tag makes
+    // the private identity change explicit.
+    let legacy_digest = canonical_pairs_digest(files);
+    let mut preimage = b"cargoless-overlay-subject\0v2\0".to_vec();
+    let manifest = options.candidate_snapshot.as_ref();
+    for value in [
+        legacy_digest.as_str(),
+        if options.repo_relative {
+            "true"
+        } else {
+            "false"
+        },
+        options.source_ref.as_deref().unwrap_or(""),
+        options.source_sha.as_deref().unwrap_or(""),
+        options.comparison_base_sha.as_deref().unwrap_or(""),
+        manifest.map_or("", |manifest| manifest.manifest_digest.as_str()),
+        manifest.map_or("", |manifest| manifest.candidate.snapshot_digest()),
+        manifest.map_or("", |manifest| manifest.candidate.tree_oid()),
+    ] {
+        preimage.extend_from_slice(value.len().to_string().as_bytes());
+        preimage.push(0);
+        preimage.extend_from_slice(value.as_bytes());
+        preimage.push(0);
+    }
+    let overlay_digest = sha256_hex(&preimage);
     Ok(Subject::Overlay {
         repository: text_v3(repository),
         worktree_key: text_v3(worktree),
@@ -768,6 +788,15 @@ pub struct ServeVerdictState {
     /// of the last-writer-wins worktree status slot.
     outcomes_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, OutcomeEnvelope>>,
     outcome_order_v3: Mutex<VecDeque<cargoless_core::outcome::AttemptId>>,
+    /// Serializes semantic attempt reservation through accepted dispatch. The
+    /// durable create-new record protects restarts; this short process lock
+    /// makes simultaneous identical retries wait for the owning submission to
+    /// either accept or roll back instead of observing an incomplete record.
+    attempt_admission_lock_v3: Mutex<()>,
+    /// In-memory counterpart for embedded/test callers without a configured
+    /// daemon state directory. Durable daemons use the evidence store's
+    /// versioned private admission records.
+    attempt_admissions_v3: Mutex<BTreeMap<AttemptId, AttemptAdmissionIdentity>>,
     /// Durable proof store, configured alongside the daemon state directory.
     evidence_store_v3: Option<EvidenceStore>,
     ra_evidence_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, RaStderrSnapshot>>,
@@ -2075,6 +2104,110 @@ impl ServeVerdictState {
         self.evidence_store_v3 = Some(EvidenceStore::new(&state_dir));
         self.project_check_state_dir = Some(state_dir);
         self
+    }
+
+    fn attempt_admission_identity_v3(
+        context: &AttemptContext,
+        subject: Subject,
+    ) -> AttemptAdmissionIdentity {
+        AttemptAdmissionIdentity {
+            request_id: context.request_id.clone(),
+            attempt_id: context.attempt_id.clone(),
+            trace_id: context.trace_id.clone(),
+            previous_attempt_id: context.previous_attempt_id.clone(),
+            attempt_number: context.attempt_number,
+            maximum_attempts: context.maximum_attempts,
+            retry_after_ms: context.retry_after_ms,
+            surface: Surface::Overlay,
+            subject,
+        }
+    }
+
+    fn reserve_attempt_admission_v3(
+        &self,
+        identity: &AttemptAdmissionIdentity,
+    ) -> Result<AttemptReservationDecisionV3, String> {
+        if let Some(store) = self.evidence_store_v3.as_ref() {
+            return match store.reserve_attempt_admission(identity) {
+                Ok(AttemptAdmissionDecision::Reserved(reservation)) => {
+                    Ok(AttemptReservationDecisionV3::New(Box::new(
+                        AttemptReservationV3::Durable(reservation),
+                    )))
+                }
+                Ok(AttemptAdmissionDecision::Existing(existing)) => {
+                    if existing.identity() != identity {
+                        return Err("attempt.identity_conflict".to_string());
+                    }
+                    if !existing.is_accepted() {
+                        return Err("attempt.admission_incomplete".to_string());
+                    }
+                    let outcome = store
+                        .read_outcome(&identity.attempt_id)
+                        .map_err(|error| format!("attempt.admission_unavailable: {error}"))?
+                        .or_else(|| existing.pending_outcome().cloned())
+                        .ok_or_else(|| {
+                            "attempt.admission_corrupt: accepted record has no outcome".to_string()
+                        })?;
+                    self.remember_outcome_v3(outcome);
+                    Ok(AttemptReservationDecisionV3::Replay)
+                }
+                Err(error) => Err(format!("attempt.admission_unavailable: {error}")),
+            };
+        }
+
+        let mut admissions = poisoned(&self.attempt_admissions_v3);
+        if let Some(existing) = admissions.get(&identity.attempt_id) {
+            if existing != identity {
+                return Err("attempt.identity_conflict".to_string());
+            }
+            if !poisoned(&self.outcomes_v3).contains_key(&identity.attempt_id) {
+                return Err("attempt.admission_incomplete".to_string());
+            }
+            return Ok(AttemptReservationDecisionV3::Replay);
+        }
+        admissions.insert(identity.attempt_id.clone(), identity.clone());
+        Ok(AttemptReservationDecisionV3::New(Box::new(
+            AttemptReservationV3::Memory(identity.clone()),
+        )))
+    }
+
+    fn accept_attempt_admission_v3(
+        &self,
+        reservation: &AttemptReservationV3,
+        pending_outcome: &OutcomeEnvelope,
+    ) -> Result<(), String> {
+        match reservation {
+            AttemptReservationV3::Memory(_) => Ok(()),
+            AttemptReservationV3::Durable(reservation) => self
+                .evidence_store_v3
+                .as_ref()
+                .ok_or_else(|| "attempt.admission_unavailable: evidence store missing".to_string())?
+                .accept_attempt_admission(reservation, pending_outcome)
+                .map_err(|error| format!("attempt.admission_unavailable: {error}")),
+        }
+    }
+
+    fn rollback_attempt_admission_v3(
+        &self,
+        reservation: &AttemptReservationV3,
+    ) -> Result<(), String> {
+        match reservation {
+            AttemptReservationV3::Memory(identity) => {
+                let mut admissions = poisoned(&self.attempt_admissions_v3);
+                if admissions.get(&identity.attempt_id) == Some(identity) {
+                    admissions.remove(&identity.attempt_id);
+                    Ok(())
+                } else {
+                    Err("attempt admission rollback lost ownership".to_string())
+                }
+            }
+            AttemptReservationV3::Durable(reservation) => self
+                .evidence_store_v3
+                .as_ref()
+                .ok_or_else(|| "attempt admission evidence store missing".to_string())?
+                .rollback_attempt_admission(reservation)
+                .map_err(|error| error.to_string()),
+        }
     }
 
     fn remember_outcome_v3(&self, outcome: OutcomeEnvelope) {
@@ -4756,32 +4889,6 @@ impl VerdictService for ServeVerdictState {
             if let Err(reason) = context.validate() {
                 return rejected_push(worktree, reason);
             }
-            if poisoned(&self.outcomes_v3).contains_key(&context.attempt_id) {
-                // Attempt submission is idempotent. A network retry must not
-                // enqueue the same execution twice or overwrite its terminal
-                // result; callers poll the existing exact attempt.
-                return PushOverlayAck {
-                    worktree: worktree.to_string(),
-                    accepted: true,
-                    applied_files: files.len() as u32,
-                    ..Default::default()
-                };
-            }
-        }
-        let semantic_subject = match (semantic.as_ref(), options) {
-            (Some(_), Some(options)) => {
-                match overlay_subject_v3(worktree, base_ref, files, check_profile, options) {
-                    Ok(subject) => Some(subject),
-                    Err(reason) => return rejected_push(worktree, reason),
-                }
-            }
-            (Some(_), None) => {
-                return rejected_push(worktree, "v3 overlay requires semantic options");
-            }
-            (None, _) => None,
-        };
-        if self.quiescing() {
-            return rejected_push(worktree, "daemon is quiescing");
         }
         let mut mapped_files = files.to_vec();
         let mut analysis_root = None;
@@ -4836,7 +4943,7 @@ impl VerdictService for ServeVerdictState {
                 );
             }
             if let Some(source_ref) = source_ref.as_deref() {
-                if let Err(e) = validate_source_ref(source_ref) {
+                if let Err(e) = validate_source_ref_syntax(source_ref) {
                     return rejected_push(worktree, &e);
                 }
             }
@@ -4913,40 +5020,102 @@ impl VerdictService for ServeVerdictState {
                     );
                 }
             }
+        }
 
-            if let Some(root) = analysis_root.as_ref() {
-                if let Some(manifest) = candidate_snapshot.as_ref() {
+        // Pure candidate/exact-Git/legacy validation and canonical subject
+        // construction are complete before the replay decision. A malformed
+        // candidate therefore retains its candidate_snapshot.* rejection even
+        // when it reuses an existing attempt id.
+        let semantic_subject = match (semantic.as_ref(), options) {
+            (Some(_), Some(options)) => {
+                match overlay_subject_v3(worktree, base_ref, files, check_profile, options) {
+                    Ok(subject) => Some(subject),
+                    Err(reason) => return rejected_push(worktree, reason),
+                }
+            }
+            (Some(_), None) => {
+                return rejected_push(worktree, "v3 overlay requires semantic options");
+            }
+            (None, _) => None,
+        };
+        let applied_files = candidate_snapshot
+            .as_ref()
+            .map(|manifest| manifest.candidate.operation_count())
+            .unwrap_or(files.len() as u64) as u32;
+
+        // Keep the reservation lock through accepted queue/dispatch. Identical
+        // concurrent retries wait and then observe the accepted record; they
+        // can never both create an execution side effect.
+        let _attempt_admission_guard = semantic
+            .as_ref()
+            .map(|_| poisoned(&self.attempt_admission_lock_v3));
+        let mut attempt_reservation = None;
+        if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject.as_ref()) {
+            let identity = Self::attempt_admission_identity_v3(context, subject.clone());
+            match self.reserve_attempt_admission_v3(&identity) {
+                Ok(AttemptReservationDecisionV3::Replay) => {
+                    return PushOverlayAck {
+                        worktree: worktree.to_string(),
+                        accepted: true,
+                        applied_files,
+                        ..Default::default()
+                    };
+                }
+                Ok(AttemptReservationDecisionV3::New(reservation)) => {
+                    attempt_reservation = Some(reservation);
+                }
+                Err(reason) => return rejected_push(worktree, &reason),
+            }
+        }
+
+        let rollback_attempt = |reason: &str| {
+            if let Some(reservation) = attempt_reservation.as_ref()
+                && let Err(error) = self.rollback_attempt_admission_v3(reservation)
+            {
+                tracing::error!(
+                    worktree,
+                    error = %error,
+                    "failed to roll back owned attempt admission"
+                );
+            }
+            rejected_push(worktree, reason)
+        };
+
+        if self.quiescing() {
+            return rollback_attempt("daemon is quiescing");
+        }
+
+        // External Git/base checks run only for a newly-reserved submission.
+        // Exact replay returns above without fetching, resetting, queueing, or
+        // touching evidence.
+        if let Some(root) = analysis_root.as_ref() {
+            if let Some(manifest) = candidate_snapshot.as_ref() {
+                let _guard = poisoned(&self.sync_lock);
+                if let Err(error) = ensure_candidate_snapshot_base(root, base_ref, manifest) {
+                    return rollback_attempt(&error);
+                }
+            } else if let (Some(source_ref), Some(source_sha)) =
+                (source_ref.as_deref(), source_sha.as_deref())
+            {
+                let _guard = poisoned(&self.sync_lock);
+                if let Err(error) = fetch_verified_source(root, source_ref, source_sha) {
+                    return rollback_attempt(&error);
+                }
+            } else {
+                let base = base_ref.trim();
+                if !base.is_empty() {
                     let _guard = poisoned(&self.sync_lock);
-                    if let Err(error) = ensure_candidate_snapshot_base(root, base_ref, manifest) {
-                        return rejected_push(worktree, &error);
-                    }
-                } else if let (Some(source_ref), Some(source_sha)) =
-                    (source_ref.as_deref(), source_sha.as_deref())
-                {
-                    let _guard = poisoned(&self.sync_lock);
-                    if let Err(e) = fetch_verified_source(root, source_ref, source_sha) {
-                        return rejected_push(worktree, &e);
-                    }
-                } else {
-                    let base = base_ref.trim();
-                    if !base.is_empty() {
-                        let _guard = poisoned(&self.sync_lock);
-                        if let Err(e) = ensure_analysis_root(root, base, base_sha.as_deref()) {
-                            return rejected_push(worktree, &e);
-                        }
+                    if let Err(error) = ensure_analysis_root(root, base, base_sha.as_deref()) {
+                        return rollback_attempt(&error);
                     }
                 }
             }
         }
 
         if !self.mark_push_active(worktree) {
-            return rejected_push(worktree, "daemon is quiescing");
+            return rollback_attempt("daemon is quiescing");
         }
 
-        let applied_files = candidate_snapshot
-            .as_ref()
-            .map(|manifest| manifest.candidate.operation_count())
-            .unwrap_or(files.len() as u64) as u32;
         let pushed = PushedOverlay {
             base_ref: base_ref.to_string(),
             files: mapped_files,
@@ -4965,7 +5134,7 @@ impl VerdictService for ServeVerdictState {
         if pushed.gate {
             let Some(tx) = poisoned(&self.direct_gate_signal).as_ref().cloned() else {
                 self.mark_worktree_published(worktree);
-                return rejected_push(worktree, "direct gate dispatcher is unavailable");
+                return rollback_attempt("direct gate dispatcher is unavailable");
             };
             let now = crate::statusfile::now_unix();
             let attribution = PushAttribution {
@@ -5006,21 +5175,30 @@ impl VerdictService for ServeVerdictState {
                 },
                 attribution,
             };
-            if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
-                self.begin_outcome_v3(
+            if let (Some(context), Some(subject), Some(reservation)) = (
+                semantic.as_ref(),
+                semantic_subject.as_ref(),
+                attempt_reservation.as_ref(),
+            ) {
+                let pending = self.begin_outcome_v3(
                     context,
                     Surface::Overlay,
-                    subject,
+                    subject.clone(),
                     Phase::Queued,
                     "gated overlay accepted and queued for compiler witness",
                 );
+                if let Err(error) = self.accept_attempt_admission_v3(reservation, &pending) {
+                    self.forget_outcome_v3(&context.attempt_id);
+                    self.mark_worktree_published(worktree);
+                    return rollback_attempt(&error);
+                }
             }
             if tx.send(request).is_err() {
                 if let Some(context) = semantic.as_ref() {
                     self.forget_outcome_v3(&context.attempt_id);
                 }
                 self.mark_worktree_published(worktree);
-                return rejected_push(worktree, "direct gate dispatcher disconnected");
+                return rollback_attempt("direct gate dispatcher disconnected");
             }
             eprintln!(
                 "[cargoless:obs] witness-direct-dispatch wt={} source_sha={} files={}",
@@ -5034,6 +5212,27 @@ impl VerdictService for ServeVerdictState {
                 applied_files,
                 ..Default::default()
             };
+        }
+        // Publish and durably bind the pending identity before the overlay can
+        // enter the queue. The serve loop may consume immediately after the
+        // queue mutation, so admission cannot safely happen later.
+        if let (Some(context), Some(subject), Some(reservation)) = (
+            semantic.as_ref(),
+            semantic_subject.as_ref(),
+            attempt_reservation.as_ref(),
+        ) {
+            let pending = self.begin_outcome_v3(
+                context,
+                Surface::Overlay,
+                subject.clone(),
+                Phase::Queued,
+                "overlay accepted and queued for analysis",
+            );
+            if let Err(error) = self.accept_attempt_admission_v3(reservation, &pending) {
+                self.forget_outcome_v3(&context.attempt_id);
+                self.mark_worktree_published(worktree);
+                return rollback_attempt(&error);
+            }
         }
         // CGLS-25 — base_sha-keyed enqueue: a concurrent PR pushing on the
         // same hardcoded worktree key must not destroy this one's pending
@@ -5075,24 +5274,24 @@ impl VerdictService for ServeVerdictState {
                         let depth = queue.len();
                         let cap = self.pushed_max_per_wt;
                         drop(store);
+                        if let Some(context) = semantic.as_ref() {
+                            self.forget_outcome_v3(&context.attempt_id);
+                        }
+                        if let Some(reservation) = attempt_reservation.as_ref()
+                            && let Err(error) = self.rollback_attempt_admission_v3(reservation)
+                        {
+                            tracing::error!(
+                                worktree,
+                                error = %error,
+                                "failed to roll back queue-rejected attempt admission"
+                            );
+                        }
+                        self.mark_worktree_published(worktree);
                         return rejected_push_queue_full(worktree, cap, depth);
                     }
                     queue.push_back(pushed);
                 }
             }
-        }
-        // Publish the pending identity before waking the serve loop. The loop
-        // can fail an initial rust-analyzer spawn immediately; waking first
-        // lets that failure race ahead of the accepted outcome and strand the
-        // later pending record forever.
-        if let (Some(context), Some(subject)) = (semantic.as_ref(), semantic_subject) {
-            self.begin_outcome_v3(
-                context,
-                Surface::Overlay,
-                subject,
-                Phase::Queued,
-                "overlay accepted and queued for analysis",
-            );
         }
         // Wake the serve loop (best-effort — see attach_push_signal doc).
         if let Some(tx) = poisoned(&self.push_signal).as_ref() {
@@ -5468,8 +5667,15 @@ fn rejected_push(worktree: &str, why: &str) -> PushOverlayAck {
         accepted: false,
         applied_files: 0,
         reject_http_status: Some(409),
+        reject_code: stable_push_reject_code(why),
         reject_body: Some(why.to_string()),
     }
+}
+
+fn stable_push_reject_code(why: &str) -> Option<String> {
+    let code = why.split_once(':').map_or(why, |(code, _)| code).trim();
+    (code.starts_with("candidate_snapshot.") || code.starts_with("attempt."))
+        .then(|| code.to_string())
 }
 
 /// R3 mitigation — pushed-queue-full backpressure. Distinct from
@@ -5490,6 +5696,7 @@ fn rejected_push_queue_full(worktree: &str, cap: usize, depth: usize) -> PushOve
         accepted: false,
         applied_files: 0,
         reject_http_status: Some(429),
+        reject_code: None,
         reject_body: Some(body),
     }
 }
@@ -5636,12 +5843,34 @@ fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
 }
 
 fn validate_source_ref(source_ref: &str) -> Result<(), String> {
+    validate_source_ref_syntax(source_ref)?;
+    let valid = Command::new("git")
+        .args(["check-ref-format", source_ref])
+        .status()
+        .map_err(|e| format!("failed to validate source_ref with git: {e}"))?
+        .success();
+    if !valid {
+        return Err(format!("source_ref `{source_ref}` is not a valid Git ref"));
+    }
+    Ok(())
+}
+
+/// Pure subset of exact-Git ref validation. Admission runs this before replay
+/// identity comparison; the external `git check-ref-format` probe remains on
+/// the new-submission path so an exact retry never launches Git.
+fn validate_source_ref_syntax(source_ref: &str) -> Result<(), String> {
     let allowed_namespace =
         source_ref.starts_with("refs/heads/") || source_ref.starts_with("refs/pull/");
     if !allowed_namespace
+        || source_ref == "@"
         || source_ref.contains("..")
+        || source_ref.contains("//")
         || source_ref.contains("@{")
         || source_ref.ends_with('/')
+        || source_ref.ends_with('.')
+        || source_ref.split('/').any(|component| {
+            component.is_empty() || component.starts_with('.') || component.ends_with(".lock")
+        })
         || source_ref.bytes().any(|b| {
             b.is_ascii_control()
                 || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
@@ -5650,14 +5879,6 @@ fn validate_source_ref(source_ref: &str) -> Result<(), String> {
         return Err(format!(
             "source_ref `{source_ref}` is not an allowed heads/pull ref"
         ));
-    }
-    let valid = Command::new("git")
-        .args(["check-ref-format", source_ref])
-        .status()
-        .map_err(|e| format!("failed to validate source_ref with git: {e}"))?
-        .success();
-    if !valid {
-        return Err(format!("source_ref `{source_ref}` is not a valid Git ref"));
     }
     Ok(())
 }
@@ -14917,7 +15138,8 @@ checks:
 
     #[test]
     fn disconnected_gate_dispatcher_does_not_strand_a_pending_outcome() {
-        let api = ServeVerdictState::new();
+        let state_dir = temp_root("attempt-disconnected-gate");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
         let (direct_tx, direct_rx) = channel();
         drop(direct_rx);
         api.attach_direct_gate_signal(direct_tx);
@@ -14942,6 +15164,21 @@ checks:
             api.get_outcome_v3(&context.attempt_id).is_none(),
             "a rejected dispatch must be retryable with the same attempt id"
         );
+
+        drop(api);
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let (direct_tx, direct_rx) = channel();
+        reopened.attach_direct_gate_signal(direct_tx);
+        let ack = reopened.push_overlay_with_options(
+            "/wt-disconnected-gate",
+            "origin/main",
+            &[("src/lib.rs".to_string(), "pub fn x() {}".to_string())],
+            None,
+            Some(&options),
+        );
+        assert!(ack.accepted, "owned rollback makes the attempt retryable");
+        direct_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
@@ -14973,6 +15210,10 @@ checks:
         let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&invalid));
 
         assert!(!ack.accepted);
+        assert_eq!(
+            ack.reject_code.as_deref(),
+            Some("candidate_snapshot.manifest_missing")
+        );
         assert_eq!(
             ack.reject_body.as_deref(),
             Some("candidate_snapshot.manifest_missing: comparison base requires a typed manifest"),
@@ -15014,6 +15255,10 @@ checks:
         );
         assert!(!ack.accepted);
         assert_eq!(
+            ack.reject_code.as_deref(),
+            Some("attempt.identity_conflict")
+        );
+        assert_eq!(
             ack.reject_body.as_deref(),
             Some("attempt.identity_conflict")
         );
@@ -15027,6 +15272,10 @@ checks:
             Some(&options),
         );
         assert!(!ack.accepted);
+        assert_eq!(
+            ack.reject_code.as_deref(),
+            Some("attempt.identity_conflict")
+        );
         assert_eq!(
             ack.reject_body.as_deref(),
             Some("attempt.identity_conflict")
@@ -15289,6 +15538,67 @@ checks:
                 .conclusion,
             Conclusion::Pending { .. }
         ));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn incomplete_or_corrupt_durable_admission_fails_closed() {
+        let state_dir = temp_root("attempt-incomplete-admission");
+        let context = attempt_context("attempt-incomplete-admission", 1);
+        let files = vec![("src/lib.rs".to_string(), "pub fn pending() {}".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("same-base".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+        let subject =
+            overlay_subject_v3("/wt-incomplete", "origin/main", &files, None, &options).unwrap();
+        let identity = ServeVerdictState::attempt_admission_identity_v3(&context, subject);
+        let store = EvidenceStore::new(&state_dir);
+        assert!(matches!(
+            store.reserve_attempt_admission(&identity).unwrap(),
+            AttemptAdmissionDecision::Reserved(_)
+        ));
+
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+        let ack = api.push_overlay_with_options(
+            "/wt-incomplete",
+            "origin/main",
+            &files,
+            None,
+            Some(&options),
+        );
+        assert!(!ack.accepted);
+        assert_eq!(
+            ack.reject_code.as_deref(),
+            Some("attempt.admission_incomplete")
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        let admission_path = std::fs::read_dir(state_dir.join("evidence-v3/.admissions"))
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .unwrap()
+            .path();
+        std::fs::write(admission_path, b"not-json").unwrap();
+        let corrupt = ServeVerdictState::new()
+            .with_project_check_state_dir(state_dir.clone())
+            .push_overlay_with_options(
+                "/wt-incomplete",
+                "origin/main",
+                &files,
+                None,
+                Some(&options),
+            );
+        assert!(!corrupt.accepted);
+        assert_eq!(
+            corrupt.reject_code.as_deref(),
+            Some("attempt.admission_unavailable")
+        );
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
