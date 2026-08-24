@@ -2357,6 +2357,65 @@ mod tests {
     use super::*;
     use crate::config::FleetConfig;
 
+    fn candidate_manifest_fixture() -> CandidateSnapshotManifest {
+        let base = crate::GitTreeRef {
+            commit_sha: "de16c5f7dd233165813ffa72719869e3181c554b".into(),
+            tree_oid: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+        };
+        let entry = crate::SnapshotEntry {
+            path: "empty.bin".into(),
+            mode: "100644".into(),
+            blob_oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into(),
+            size: 0,
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        };
+        let mut manifest = CandidateSnapshotManifest {
+            schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1.into(),
+            git_object_format: crate::GitObjectFormat::Sha1,
+            comparison_base: base.clone(),
+            candidate: crate::CandidateSnapshot::Overlay {
+                base,
+                tree_oid: String::new(),
+                entry_count: 1,
+                entries: vec![entry.clone()],
+                snapshot_digest: String::new(),
+                operation_count: 1,
+                operations: vec![crate::OverlayOperation::Upsert {
+                    path: entry.path,
+                    mode: entry.mode,
+                    blob_oid: entry.blob_oid,
+                    size: entry.size,
+                    sha256: entry.sha256,
+                    payload: crate::OverlayPayload {
+                        encoding: "base64".into(),
+                        data: String::new(),
+                    },
+                }],
+            },
+            manifest_digest: String::new(),
+        };
+        let tree_oid = crate::compute_candidate_tree_oid(&manifest).unwrap();
+        let crate::CandidateSnapshot::Overlay {
+            tree_oid: advertised_tree,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture is an overlay")
+        };
+        *advertised_tree = tree_oid;
+        let snapshot_digest = crate::compute_snapshot_digest(&manifest).unwrap();
+        let crate::CandidateSnapshot::Overlay {
+            snapshot_digest: advertised_snapshot,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture is an overlay")
+        };
+        *advertised_snapshot = snapshot_digest;
+        manifest.manifest_digest = crate::compute_manifest_digest(&manifest).unwrap();
+        manifest
+    }
+
     // ───────────────────────── #14 auth ─────────────────────────
 
     #[test]
@@ -2968,61 +3027,7 @@ mod tests {
 
     #[test]
     fn push_overlay_v2_preserves_typed_candidate_snapshot_and_comparison_base() {
-        let base = crate::GitTreeRef {
-            commit_sha: "de16c5f7dd233165813ffa72719869e3181c554b".into(),
-            tree_oid: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
-        };
-        let entry = crate::SnapshotEntry {
-            path: "empty.bin".into(),
-            mode: "100644".into(),
-            blob_oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into(),
-            size: 0,
-            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
-        };
-        let mut manifest = CandidateSnapshotManifest {
-            schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1.into(),
-            git_object_format: crate::GitObjectFormat::Sha1,
-            comparison_base: base.clone(),
-            candidate: crate::CandidateSnapshot::Overlay {
-                base,
-                tree_oid: String::new(),
-                entry_count: 1,
-                entries: vec![entry.clone()],
-                snapshot_digest: String::new(),
-                operation_count: 1,
-                operations: vec![crate::OverlayOperation::Upsert {
-                    path: entry.path,
-                    mode: entry.mode,
-                    blob_oid: entry.blob_oid,
-                    size: entry.size,
-                    sha256: entry.sha256,
-                    payload: crate::OverlayPayload {
-                        encoding: "base64".into(),
-                        data: String::new(),
-                    },
-                }],
-            },
-            manifest_digest: String::new(),
-        };
-        let tree_oid = crate::compute_candidate_tree_oid(&manifest).unwrap();
-        let crate::CandidateSnapshot::Overlay {
-            tree_oid: advertised_tree,
-            ..
-        } = &mut manifest.candidate
-        else {
-            unreachable!("fixture is an overlay")
-        };
-        *advertised_tree = tree_oid;
-        let snapshot_digest = crate::compute_snapshot_digest(&manifest).unwrap();
-        let crate::CandidateSnapshot::Overlay {
-            snapshot_digest: advertised_snapshot,
-            ..
-        } = &mut manifest.candidate
-        else {
-            unreachable!("fixture is an overlay")
-        };
-        *advertised_snapshot = snapshot_digest;
-        manifest.manifest_digest = crate::compute_manifest_digest(&manifest).unwrap();
+        let manifest = candidate_manifest_fixture();
         let manifest_json = crate::canonical_manifest_json(&manifest).unwrap();
         let wire = format!(
             r#"{{
@@ -3054,6 +3059,95 @@ mod tests {
             encoded["candidate_snapshot"]["candidate"]["kind"],
             "overlay"
         );
+    }
+
+    #[test]
+    fn candidate_push_accepts_flat_and_nested_authority_roundtrips() {
+        let manifest = candidate_manifest_fixture();
+        let manifest_json = crate::canonical_manifest_json(&manifest).unwrap();
+        for authority in [
+            format!(
+                r#""comparison_base_sha":"{}","candidate_snapshot":{manifest_json}"#,
+                manifest.comparison_base.commit_sha
+            ),
+            format!(
+                r#""options":{{"comparison_base_sha":"{}","candidate_snapshot":{manifest_json}}}"#,
+                manifest.comparison_base.commit_sha
+            ),
+        ] {
+            let wire = format!(
+                r#"{{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],{authority}}}"#
+            );
+            let parsed = Request::try_from_json(&wire)
+                .expect("valid authority location")
+                .expect("candidate push parses");
+            let Request::PushOverlayV2 { options, .. } = &parsed else {
+                panic!("candidate push must retain V2 authority")
+            };
+            assert_eq!(options.candidate_snapshot.as_ref(), Some(&manifest));
+            assert_eq!(
+                options.comparison_base_sha.as_deref(),
+                Some(manifest.comparison_base.commit_sha.as_str())
+            );
+            let reparsed = Request::try_from_json(&parsed.to_json())
+                .expect("encoded authority is valid")
+                .expect("encoded candidate push parses");
+            assert_eq!(reparsed, parsed);
+        }
+    }
+
+    #[test]
+    fn candidate_push_rejects_scope_grafting_and_ambiguous_authority() {
+        let cases = [
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"metadata":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{}},"options":{}}"#,
+                "candidate_snapshot.json_duplicate_key",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{},"comparison_base_sha":"a","comparison_base_sha":"b"}}"#,
+                "candidate_snapshot.json_duplicate_key",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"comparison_base_sha":"a","options":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.pairing_invalid",
+            ),
+            (
+                r#"{"op":"batch_check","batch_id":"b","base_ref":"main","members":[],"candidate_snapshot":{},"options":{}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
+                r#"{"op":"batch_check","batch_id":"b","base_ref":"main","members":[],"comparison_base_sha":"a","options":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.pairing_invalid",
+            ),
+        ];
+
+        for (wire, expected_code) in cases {
+            let error = Request::try_from_json(wire)
+                .expect_err("ambiguous candidate authority must fail closed");
+            assert_eq!(error.code, expected_code, "wire: {wire}");
+        }
+    }
+
+    #[test]
+    fn candidate_batch_preserves_nested_authority_roundtrip() {
+        let manifest = candidate_manifest_fixture();
+        let request = BatchCheckRequest {
+            options: PushOverlayOptions {
+                comparison_base_sha: Some(manifest.comparison_base.commit_sha.clone()),
+                candidate_snapshot: Some(manifest),
+                ..PushOverlayOptions::default()
+            },
+            ..BatchCheckRequest::new("batch", "origin/main")
+        };
+        let wire = Request::BatchCheck(request.clone()).to_json();
+        let parsed = Request::try_from_json(&wire)
+            .expect("nested batch authority is valid")
+            .expect("candidate batch parses");
+        assert_eq!(parsed, Request::BatchCheck(request));
     }
 
     #[test]

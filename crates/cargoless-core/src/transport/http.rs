@@ -3771,6 +3771,97 @@ mod tests {
     }
 
     #[test]
+    fn post_overlay_rejects_candidate_scope_grafting_before_service_mutation() {
+        struct CountingPushService {
+            pushes: Arc<AtomicUsize>,
+        }
+
+        impl VerdictService for CountingPushService {
+            fn get_status(&self, _worktree: &str) -> Option<WorktreeStatus> {
+                None
+            }
+
+            fn get_verdict(&self, _worktree: &str) -> Option<String> {
+                None
+            }
+
+            fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+
+            fn push_overlay_with_options(
+                &self,
+                worktree: &str,
+                _base_ref: &str,
+                _files: &[(String, String)],
+                _check_profile: Option<&CheckProfile>,
+                _options: Option<&PushOverlayOptions>,
+            ) -> PushOverlayAck {
+                self.pushes.fetch_add(1, Ordering::SeqCst);
+                PushOverlayAck {
+                    worktree: worktree.to_string(),
+                    accepted: false,
+                    applied_files: 0,
+                    reject_http_status: Some(409),
+                    reject_body: Some("invalid candidate reached service".into()),
+                }
+            }
+        }
+
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let server = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(CountingPushService {
+                pushes: pushes.clone(),
+            }),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let cases = [
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"metadata":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{}},"options":{}}"#,
+                "candidate_snapshot.json_duplicate_key",
+            ),
+        ];
+        for (body, expected_code) in cases {
+            let (status, response) = raw_post(
+                server.addr(),
+                "/overlay",
+                body,
+                Some(&body.len().to_string()),
+            );
+            assert_eq!(status, 400, "scope graft must fail closed: {response}");
+            let error: serde_json::Value =
+                serde_json::from_str(&response).expect("typed parse rejection is JSON");
+            assert_eq!(
+                error.get("code").and_then(serde_json::Value::as_str),
+                Some(expected_code),
+                "wire: {body}; response: {response}"
+            );
+            assert_eq!(
+                pushes.load(Ordering::SeqCst),
+                0,
+                "invalid candidate authority must be rejected before service mutation"
+            );
+        }
+        drop(server);
+    }
+
+    #[test]
     fn post_attempt_v3_preserves_candidate_snapshot_error_before_service_mutation() {
         struct CountingAttemptService {
             pushes: Arc<AtomicUsize>,
