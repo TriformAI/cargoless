@@ -2507,13 +2507,15 @@ fn publish_verdict(
         .and_then(|attribution| attribution.candidate.clone());
     api.publish_attributed_with_candidate_checks(
         wt,
-        payload,
-        attribution.as_ref().and_then(|a| a.base_sha.clone()),
-        candidate,
-        ra_blind_paths,
-        gated_checks_ran,
-        verified_project_checks,
-        attribution.and_then(|a| a.semantic),
+        crate::serveapi::VerdictPublication {
+            payload,
+            base_sha: attribution.as_ref().and_then(|a| a.base_sha.clone()),
+            candidate,
+            ra_blind_paths,
+            gated_checks_ran,
+            verified_project_checks,
+            semantic: attribution.and_then(|a| a.semantic),
+        },
     );
 }
 

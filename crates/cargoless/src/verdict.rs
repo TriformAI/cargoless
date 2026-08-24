@@ -145,7 +145,6 @@ struct VerdictCandidateSubmission {
 struct LegacyVerdictSubmission {
     changed: Vec<String>,
     payload: PushPayload,
-    options: PushOverlayOptions,
     body: String,
 }
 
@@ -197,7 +196,6 @@ fn build_legacy_verdict_submission(
     LegacyVerdictSubmission {
         changed,
         payload,
-        options,
         body,
     }
 }
@@ -545,7 +543,6 @@ fn run_legacy_verdict(opts: &VerdictOpts, headers: &[(String, String)]) -> ExitC
     let LegacyVerdictSubmission {
         changed,
         payload,
-        options: _,
         body,
     } = build_legacy_verdict_submission(opts, &resolved_sha, &semantic, changed, payload);
 
@@ -2192,12 +2189,7 @@ mod tests {
 
         assert_eq!(submission.changed, expected_changed);
         assert_eq!(submission.payload, expected_payload);
-        assert_eq!(submission.options, expected_options);
         assert_eq!(submission.body, expected_body);
-        assert!(submission.options.candidate_snapshot.is_none());
-        assert!(submission.options.comparison_base_sha.is_none());
-        assert!(submission.options.source_ref.is_none());
-        assert!(submission.options.source_sha.is_none());
     }
 
     #[test]

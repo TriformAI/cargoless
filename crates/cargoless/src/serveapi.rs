@@ -230,6 +230,20 @@ pub(crate) struct CandidateVerdictIdentity {
     pub execution_id: u64,
 }
 
+/// One atomic terminal publication into status, history, diagnostics, and
+/// outcome-v3 evidence. Keeping these related values named prevents candidate
+/// identity or verified evidence from being swapped across positional call
+/// sites as the publication contract evolves.
+pub(crate) struct VerdictPublication {
+    pub payload: crate::statusfile::VerdictPayload,
+    pub base_sha: Option<String>,
+    pub candidate: Option<CandidateVerdictIdentity>,
+    pub ra_blind_paths: bool,
+    pub gated_checks_ran: Vec<String>,
+    pub verified_project_checks: Vec<VerifiedProjectCheckEvidence>,
+    pub semantic: Option<AttemptContext>,
+}
+
 impl CandidateVerdictIdentity {
     fn from_manifest(manifest: &CandidateSnapshotManifest) -> Self {
         Self {
@@ -2732,13 +2746,15 @@ impl ServeVerdictState {
     ) {
         self.publish_attributed_with_candidate_checks(
             wt,
-            payload,
-            base_sha,
-            None,
-            ra_blind_paths,
-            gated_checks_ran,
-            Vec::new(),
-            semantic,
+            VerdictPublication {
+                payload,
+                base_sha,
+                candidate: None,
+                ra_blind_paths,
+                gated_checks_ran,
+                verified_project_checks: Vec::new(),
+                semantic,
+            },
         );
     }
 
@@ -2747,14 +2763,17 @@ impl ServeVerdictState {
     pub(crate) fn publish_attributed_with_candidate_checks(
         &self,
         wt: &Path,
-        payload: crate::statusfile::VerdictPayload,
-        base_sha: Option<String>,
-        candidate: Option<CandidateVerdictIdentity>,
-        ra_blind_paths: bool,
-        gated_checks_ran: Vec<String>,
-        verified_project_checks: Vec<VerifiedProjectCheckEvidence>,
-        semantic: Option<AttemptContext>,
+        publication: VerdictPublication,
     ) {
+        let VerdictPublication {
+            payload,
+            base_sha,
+            candidate,
+            ra_blind_paths,
+            gated_checks_ran,
+            verified_project_checks,
+            semantic,
+        } = publication;
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
         let red_diagnostics = payload.red_diagnostics;
@@ -2962,16 +2981,18 @@ impl ServeVerdictState {
         );
         self.publish_attributed_with_candidate_checks(
             Path::new(wt_key),
-            crate::statusfile::VerdictPayload::unknown(reason),
-            pushed.base_sha,
-            pushed
-                .candidate_snapshot
-                .as_ref()
-                .map(CandidateVerdictIdentity::from_manifest),
-            macro_blind_hit,
-            Vec::new(),
-            Vec::new(),
-            pushed.semantic,
+            VerdictPublication {
+                payload: crate::statusfile::VerdictPayload::unknown(reason),
+                base_sha: pushed.base_sha,
+                candidate: pushed
+                    .candidate_snapshot
+                    .as_ref()
+                    .map(CandidateVerdictIdentity::from_manifest),
+                ra_blind_paths: macro_blind_hit,
+                gated_checks_ran: Vec::new(),
+                verified_project_checks: Vec::new(),
+                semantic: pushed.semantic,
+            },
         );
         true
     }
@@ -5912,6 +5933,7 @@ fn reset_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare_project_check_scratch(
     root: &Path,
     scratch_root: &Path,
@@ -6040,18 +6062,6 @@ fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(),
 /// `candidate-project-check-runs` namespaces belongs to a dead predecessor.
 /// The warm target and durable evidence live beside these directories and are
 /// deliberately preserved.
-pub(crate) fn recover_project_check_scratch(
-    root: &Path,
-    state_dir: &Path,
-) -> Result<usize, String> {
-    let source = if state_dir.starts_with(root) {
-        cargoless_core::config::Source::Default
-    } else {
-        cargoless_core::config::Source::Cli
-    };
-    recover_project_check_scratch_for_source(root, state_dir, source)
-}
-
 pub(crate) fn recover_project_check_scratch_for_source(
     root: &Path,
     state_dir: &Path,
@@ -6957,61 +6967,6 @@ fn effective_user_id() -> u32 {
     // SAFETY: geteuid(2) has no arguments or failure mode and only returns
     // the effective process identity used by filesystem permission checks.
     unsafe { geteuid() }
-}
-
-fn cleanup_candidate_manifest_run(candidate_run_dir: &Path) -> Result<(), String> {
-    let Some(parent) = candidate_run_dir.parent() else {
-        return Err(candidate_environment_unsafe(
-            "candidate run directory has no cleanup parent",
-        ));
-    };
-    match std::fs::symlink_metadata(parent) {
-        Ok(_) => validate_candidate_directory(parent, Some(0o700))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(candidate_environment_unsafe(format!(
-                "could not inspect manifest namespace `{}` during cleanup: {error}",
-                parent.display()
-            )));
-        }
-    }
-    match std::fs::symlink_metadata(candidate_run_dir) {
-        Ok(_) => validate_candidate_directory(candidate_run_dir, Some(0o700))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(candidate_environment_unsafe(format!(
-                "could not inspect run directory `{}` during cleanup: {error}",
-                candidate_run_dir.display()
-            )));
-        }
-    }
-    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
-        candidate_environment_unsafe(format!(
-            "could not resolve manifest namespace `{}` during cleanup: {error}",
-            parent.display()
-        ))
-    })?;
-    let canonical_run = std::fs::canonicalize(candidate_run_dir).map_err(|error| {
-        candidate_environment_unsafe(format!(
-            "could not resolve run directory `{}` during cleanup: {error}",
-            candidate_run_dir.display()
-        ))
-    })?;
-    if canonical_run.parent() != Some(canonical_parent.as_path()) {
-        return Err(candidate_environment_unsafe(format!(
-            "run directory `{}` escaped manifest namespace `{}` during cleanup",
-            canonical_run.display(),
-            canonical_parent.display()
-        )));
-    }
-    match std::fs::remove_dir_all(candidate_run_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "remove candidate manifest run `{}`: {error}",
-            candidate_run_dir.display()
-        )),
-    }
 }
 
 fn cleanup_protected_candidate_manifest_run(
@@ -8244,29 +8199,33 @@ mod tests {
 
         api.publish_attributed_with_candidate_checks(
             Path::new("/client/candidate"),
-            crate::statusfile::VerdictPayload::green(),
-            Some(comparison_base_sha.clone()),
-            Some(candidate(1)),
-            false,
-            vec!["candidate-policy".to_string()],
-            vec![VerifiedProjectCheckEvidence {
-                check_id: "candidate-policy".to_string(),
-                bytes: first_bytes.clone(),
-            }],
-            Some(first.clone()),
+            VerdictPublication {
+                payload: crate::statusfile::VerdictPayload::green(),
+                base_sha: Some(comparison_base_sha.clone()),
+                candidate: Some(candidate(1)),
+                ra_blind_paths: false,
+                gated_checks_ran: vec!["candidate-policy".to_string()],
+                verified_project_checks: vec![VerifiedProjectCheckEvidence {
+                    check_id: "candidate-policy".to_string(),
+                    bytes: first_bytes.clone(),
+                }],
+                semantic: Some(first.clone()),
+            },
         );
         api.publish_attributed_with_candidate_checks(
             Path::new("/client/candidate"),
-            crate::statusfile::VerdictPayload::green(),
-            Some(comparison_base_sha),
-            Some(candidate(2)),
-            false,
-            vec!["candidate-policy".to_string()],
-            vec![VerifiedProjectCheckEvidence {
-                check_id: "candidate-policy".to_string(),
-                bytes: second_bytes.clone(),
-            }],
-            Some(second.clone()),
+            VerdictPublication {
+                payload: crate::statusfile::VerdictPayload::green(),
+                base_sha: Some(comparison_base_sha),
+                candidate: Some(candidate(2)),
+                ra_blind_paths: false,
+                gated_checks_ran: vec!["candidate-policy".to_string()],
+                verified_project_checks: vec![VerifiedProjectCheckEvidence {
+                    check_id: "candidate-policy".to_string(),
+                    bytes: second_bytes.clone(),
+                }],
+                semantic: Some(second.clone()),
+            },
         );
 
         assert_eq!(
@@ -8799,7 +8758,7 @@ mod tests {
         let removed_blob = git_capture(root, &["rev-parse", "HEAD:remove.txt"]);
         let binary = [0_u8, 0xff, 0x80, b'\n'];
         let script = b"#!/bin/sh\nexit 0\n";
-        let entries = vec![
+        let upsert_entries = vec![
             SnapshotEntry {
                 path: "binary.bin".into(),
                 mode: "100644".into(),
@@ -8826,9 +8785,9 @@ mod tests {
             OverlayOperation::Upsert {
                 path: "binary.bin".into(),
                 mode: "100644".into(),
-                blob_oid: entries[0].blob_oid.clone(),
+                blob_oid: upsert_entries[0].blob_oid.clone(),
                 size: binary.len() as u64,
-                sha256: entries[0].sha256.clone(),
+                sha256: upsert_entries[0].sha256.clone(),
                 payload: OverlayPayload {
                     encoding: "base64".into(),
                     data: "AP+ACg==".into(),
@@ -8837,9 +8796,9 @@ mod tests {
             OverlayOperation::Upsert {
                 path: "empty.bin".into(),
                 mode: "100644".into(),
-                blob_oid: entries[1].blob_oid.clone(),
+                blob_oid: upsert_entries[1].blob_oid.clone(),
                 size: 0,
-                sha256: entries[1].sha256.clone(),
+                sha256: upsert_entries[1].sha256.clone(),
                 payload: OverlayPayload {
                     encoding: "base64".into(),
                     data: String::new(),
@@ -8853,15 +8812,24 @@ mod tests {
             OverlayOperation::Upsert {
                 path: "script.sh".into(),
                 mode: "100755".into(),
-                blob_oid: entries[2].blob_oid.clone(),
+                blob_oid: upsert_entries[2].blob_oid.clone(),
                 size: script.len() as u64,
-                sha256: entries[2].sha256.clone(),
+                sha256: upsert_entries[2].sha256.clone(),
                 payload: OverlayPayload {
                     encoding: "base64".into(),
                     data: "IyEvYmluL3NoCmV4aXQgMAo=".into(),
                 },
             },
         ];
+        let mut entries =
+            crate::candidate_snapshot_git::resolve_commit_snapshot(root, &base_commit)
+                .unwrap()
+                .entries;
+        entries.remove("remove.txt");
+        for entry in upsert_entries {
+            entries.insert(entry.path.clone(), entry);
+        }
+        let entries = entries.into_values().collect::<Vec<_>>();
         let base = GitTreeRef {
             commit_sha: base_commit,
             tree_oid: base_tree,
@@ -11921,7 +11889,8 @@ checks:
     #[test]
     fn candidate_backed_batch_is_rejected_before_analysis_root_touch() {
         let api = ServeVerdictState::new();
-        let forbidden_root = temp_root("candidate-batch-must-not-touch");
+        let fixture = temp_root("candidate-batch-must-not-touch");
+        let forbidden_root = fixture.join("analysis-root");
         assert!(!forbidden_root.exists());
 
         let manifest = candidate_snapshot_golden();
@@ -11971,6 +11940,7 @@ checks:
             counts.inflight_runs, 0,
             "candidate-backed batches may never enter the coalescer"
         );
+        let _ = std::fs::remove_dir_all(fixture);
     }
 
     #[test]
@@ -12156,24 +12126,28 @@ checks:
         api.retain_candidate_diagnostics("/shared", &first, vec![diagnostic("first")]);
         api.publish_attributed_with_candidate_checks(
             Path::new("/shared"),
-            crate::statusfile::VerdictPayload::red(1),
-            Some("same-base".to_string()),
-            Some(first.clone()),
-            false,
-            Vec::new(),
-            Vec::new(),
-            None,
+            VerdictPublication {
+                payload: crate::statusfile::VerdictPayload::red(1),
+                base_sha: Some("same-base".to_string()),
+                candidate: Some(first.clone()),
+                ra_blind_paths: false,
+                gated_checks_ran: Vec::new(),
+                verified_project_checks: Vec::new(),
+                semantic: None,
+            },
         );
         api.retain_candidate_diagnostics("/shared", &second, vec![diagnostic("second")]);
         api.publish_attributed_with_candidate_checks(
             Path::new("/shared"),
-            crate::statusfile::VerdictPayload::red(1),
-            Some("same-base".to_string()),
-            Some(second.clone()),
-            false,
-            Vec::new(),
-            Vec::new(),
-            None,
+            VerdictPublication {
+                payload: crate::statusfile::VerdictPayload::red(1),
+                base_sha: Some("same-base".to_string()),
+                candidate: Some(second.clone()),
+                ra_blind_paths: false,
+                gated_checks_ran: Vec::new(),
+                verified_project_checks: Vec::new(),
+                semantic: None,
+            },
         );
 
         let first_status = api
@@ -12794,7 +12768,7 @@ checks:
         );
         std::fs::remove_dir_all(&replacement).unwrap();
         std::fs::rename(original.unwrap(), &replacement).unwrap();
-        cleanup_candidate_manifest_run(&replacement).unwrap();
+        std::fs::remove_dir_all(&replacement).unwrap();
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(state_dir);
     }
@@ -13263,8 +13237,12 @@ checks:
         }
         std::fs::write(candidate_run.join("manifest.json"), "abandoned sidecar\n").unwrap();
 
-        let recovered = recover_project_check_scratch(&project.root, &state_dir)
-            .expect("daemon startup must reclaim scratch left by a dead predecessor");
+        let recovered = recover_project_check_scratch_for_source(
+            &project.root,
+            &state_dir,
+            cargoless_core::config::Source::Cli,
+        )
+        .expect("daemon startup must reclaim scratch left by a dead predecessor");
 
         assert_eq!(recovered, 2, "both abandoned run artifacts were reclaimed");
         assert!(
@@ -13428,8 +13406,12 @@ checks:
         )
         .unwrap();
 
-        let recovered = recover_project_check_scratch(&project.root, &state_dir)
-            .expect("legacy exact-Git recovery remains available");
+        let recovered = recover_project_check_scratch_for_source(
+            &project.root,
+            &state_dir,
+            cargoless_core::config::Source::Default,
+        )
+        .expect("legacy exact-Git recovery remains available");
 
         assert_eq!(recovered, 1, "only the exact-Git scratch is recovered");
         assert!(!scratch.exists());
@@ -13494,8 +13476,12 @@ checks:
         prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
         symlink(&outside, state_dir.join("candidate-snapshots")).unwrap();
 
-        let error = recover_project_check_scratch(&project.root, &state_dir)
-            .expect_err("an unsafe external namespace must fail closed");
+        let error = recover_project_check_scratch_for_source(
+            &project.root,
+            &state_dir,
+            cargoless_core::config::Source::Cli,
+        )
+        .expect_err("an unsafe external namespace must fail closed");
 
         assert!(
             error.starts_with("candidate_snapshot.environment_unsafe:"),
