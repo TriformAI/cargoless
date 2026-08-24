@@ -2170,6 +2170,12 @@ pub struct PushOverlayAck {
     /// backpressure; `Some(<other>)` reserved for future use. Absent on
     /// the JSON wire so pre-existing pollers/tests are byte-identical.
     pub reject_http_status: Option<u16>,
+    /// Stable machine-branchable rejection code supplied by the service.
+    /// `None` preserves the legacy `submission.rejected` outcome-v3 code.
+    /// Unlike the HTTP-only status/body metadata, a non-empty value is
+    /// carried by the acknowledgement JSON codec so transport boundaries do
+    /// not erase `candidate_snapshot.*` or `attempt.*` taxonomy.
+    pub reject_code: Option<String>,
     /// R3 mitigation — structured reject payload paired with
     /// [`Self::reject_http_status`]. When set, the HTTP layer serves it
     /// as the response body verbatim (application/json). `None` ⇒ fall
@@ -2178,14 +2184,29 @@ pub struct PushOverlayAck {
 }
 
 /// Serialise a [`PushOverlayAck`] to wire JSON
-/// (`{"worktree":..,"accepted":..,"applied_files":..}`).
+/// (`{"worktree":..,"accepted":..,"applied_files":..}` plus optional
+/// `reject_code`).
 pub fn pushoverlayack_to_json(a: &PushOverlayAck) -> String {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "worktree": a.worktree,
         "accepted": a.accepted,
         "applied_files": a.applied_files,
-    })
-    .to_string()
+    });
+    if let Some(code) = a
+        .reject_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        value
+            .as_object_mut()
+            .expect("push overlay ack codec constructs an object")
+            .insert(
+                "reject_code".to_string(),
+                serde_json::Value::String(code.to_string()),
+            );
+    }
+    value.to_string()
 }
 
 /// Parse a [`PushOverlayAck`] from wire JSON (best-effort: a missing
@@ -2203,10 +2224,14 @@ pub fn pushoverlayack_from_json(text: &str) -> Option<PushOverlayAck> {
             .get("applied_files")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
-        // Reject metadata is HTTP-side (status + body), never on the wire
-        // ack JSON — mirrors the "absent on the JSON wire" contract at
-        // the struct definition.
+        // Status/body metadata remains HTTP-side, never on the ack JSON.
         reject_http_status: None,
+        reject_code: v
+            .get("reject_code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_string),
         reject_body: None,
     })
 }

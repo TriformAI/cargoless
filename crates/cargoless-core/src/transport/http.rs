@@ -915,6 +915,11 @@ fn handle(
                             ),
                         }
                     } else {
+                        let rejection_code = ack
+                            .reject_code
+                            .filter(|code| !code.trim().is_empty())
+                            .map(|code| code.trim().to_string())
+                            .unwrap_or_else(|| "submission.rejected".to_string());
                         write_v3_response(
                             &mut writer,
                             ack.reject_http_status.unwrap_or(409),
@@ -922,7 +927,7 @@ fn handle(
                             &serde_json::json!({
                                 "schema": "cargoless.submission-rejection/v3",
                                 "state": "rejected",
-                                "code": "submission.rejected",
+                                "code": rejection_code,
                                 "request_id": context.request_id.as_str(),
                                 "attempt_id": context.attempt_id.as_str(),
                                 "trace_id": context.trace_id.as_str(),
@@ -2386,6 +2391,7 @@ impl TransportClient for HttpClient {
                 accepted: false,
                 applied_files: 0,
                 reject_http_status: Some(429),
+                reject_code: None,
                 reject_body: Some(resp.trim().to_string()),
             }),
             c => Err(TransportError::Protocol(format!(
@@ -3811,6 +3817,7 @@ mod tests {
                     accepted: false,
                     applied_files: 0,
                     reject_http_status: Some(409),
+                    reject_code: None,
                     reject_body: Some("invalid candidate reached service".into()),
                 }
             }
@@ -3987,6 +3994,7 @@ mod tests {
                     accepted: false,
                     applied_files: 0,
                     reject_http_status: Some(409),
+                    reject_code: None,
                     reject_body: Some("test service must not receive invalid candidate".into()),
                 }
             }
