@@ -5846,6 +5846,7 @@ mod git_bounds_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -5856,6 +5857,12 @@ mod tests {
     use cargoless_core::transport::{
         AllowAll, AttemptContext, BatchCheckRequest, CargoSubcommand, PushOverlayOptions,
         TransportClient, VerdictService,
+    };
+    use cargoless_core::{
+        CandidateSnapshot, CandidateSnapshotManifest, GitObjectFormat, GitTreeRef,
+        OverlayOperation, OverlayPayload, SnapshotEntry, compute_candidate_tree_oid,
+        compute_manifest_digest, compute_snapshot_digest, parse_and_validate_manifest_json,
+        sha256_hex,
     };
 
     use super::*;
@@ -5872,6 +5879,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    const CANDIDATE_SNAPSHOT_GOLDEN: &str = r#"{
+      "schema":"cargoless-candidate-snapshot/1",
+      "git_object_format":"sha1",
+      "comparison_base":{"commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b","tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+      "candidate":{"kind":"overlay","base":{"commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b","tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"},"tree_oid":"08d60034cad9ce340c4d42748bf0bc1b2e34d830","entry_count":2,"entries":[{"path":"empty.bin","mode":"100644","blob_oid":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391","size":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},{"path":"script.sh","mode":"100755","blob_oid":"9766475a4185a151dc9d56d614ffb9aaea3bfd42","size":3,"sha256":"dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"}],"snapshot_digest":"sha256:365cc276607bc3209bd7346f8de4f765e42e68bba8fdaf1b22687b6a169118ed","operation_count":2,"operations":[{"op":"upsert","path":"empty.bin","mode":"100644","blob_oid":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391","size":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","payload":{"encoding":"base64","data":""}},{"op":"upsert","path":"script.sh","mode":"100755","blob_oid":"9766475a4185a151dc9d56d614ffb9aaea3bfd42","size":3,"sha256":"dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22","payload":{"encoding":"base64","data":"b2sK"}}]},
+      "manifest_digest":"sha256:a363a22a9ab3317a8d7d616ecb4ac66ef7d0f2d7dd46d8a1010f44a601b8377c"
+    }"#;
+
+    fn candidate_snapshot_golden() -> CandidateSnapshotManifest {
+        parse_and_validate_manifest_json(CANDIDATE_SNAPSHOT_GOLDEN).unwrap()
     }
 
     fn attempt_context(id: &str, attempt_number: u32) -> AttemptContext {
@@ -6335,6 +6354,133 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_hash_blob(root: &Path, bytes: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git hash-object --stdin failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn overlay_manifest_with_delete_empty_executable_and_binary(
+        root: &Path,
+    ) -> CandidateSnapshotManifest {
+        let base_commit = git_capture(root, &["rev-parse", "HEAD"]);
+        let base_tree = git_capture(root, &["rev-parse", "HEAD^{tree}"]);
+        let removed_blob = git_capture(root, &["rev-parse", "HEAD:remove.txt"]);
+        let binary = [0_u8, 0xff, 0x80, b'\n'];
+        let script = b"#!/bin/sh\nexit 0\n";
+        let entries = vec![
+            SnapshotEntry {
+                path: "binary.bin".into(),
+                mode: "100644".into(),
+                blob_oid: git_hash_blob(root, &binary),
+                size: binary.len() as u64,
+                sha256: sha256_hex(&binary),
+            },
+            SnapshotEntry {
+                path: "empty.bin".into(),
+                mode: "100644".into(),
+                blob_oid: git_hash_blob(root, b""),
+                size: 0,
+                sha256: sha256_hex(b""),
+            },
+            SnapshotEntry {
+                path: "script.sh".into(),
+                mode: "100755".into(),
+                blob_oid: git_hash_blob(root, script),
+                size: script.len() as u64,
+                sha256: sha256_hex(script),
+            },
+        ];
+        let operations = vec![
+            OverlayOperation::Upsert {
+                path: "binary.bin".into(),
+                mode: "100644".into(),
+                blob_oid: entries[0].blob_oid.clone(),
+                size: binary.len() as u64,
+                sha256: entries[0].sha256.clone(),
+                payload: OverlayPayload {
+                    encoding: "base64".into(),
+                    data: "AP+ACg==".into(),
+                },
+            },
+            OverlayOperation::Upsert {
+                path: "empty.bin".into(),
+                mode: "100644".into(),
+                blob_oid: entries[1].blob_oid.clone(),
+                size: 0,
+                sha256: entries[1].sha256.clone(),
+                payload: OverlayPayload {
+                    encoding: "base64".into(),
+                    data: String::new(),
+                },
+            },
+            OverlayOperation::Delete {
+                path: "remove.txt".into(),
+                base_mode: "100644".into(),
+                base_blob_oid: removed_blob,
+            },
+            OverlayOperation::Upsert {
+                path: "script.sh".into(),
+                mode: "100755".into(),
+                blob_oid: entries[2].blob_oid.clone(),
+                size: script.len() as u64,
+                sha256: entries[2].sha256.clone(),
+                payload: OverlayPayload {
+                    encoding: "base64".into(),
+                    data: "IyEvYmluL3NoCmV4aXQgMAo=".into(),
+                },
+            },
+        ];
+        let base = GitTreeRef {
+            commit_sha: base_commit,
+            tree_oid: base_tree,
+        };
+        let mut manifest = CandidateSnapshotManifest {
+            schema: "cargoless-candidate-snapshot/1".into(),
+            git_object_format: GitObjectFormat::Sha1,
+            comparison_base: base.clone(),
+            candidate: CandidateSnapshot::Overlay {
+                base,
+                tree_oid: "0".repeat(40),
+                entry_count: entries.len() as u64,
+                entries,
+                snapshot_digest: format!("sha256:{}", "0".repeat(64)),
+                operation_count: operations.len() as u64,
+                operations,
+            },
+            manifest_digest: format!("sha256:{}", "0".repeat(64)),
+        };
+        let tree_oid = compute_candidate_tree_oid(&manifest).unwrap();
+        let CandidateSnapshot::Overlay {
+            tree_oid: advertised_tree,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!()
+        };
+        *advertised_tree = tree_oid;
+        let snapshot_digest = compute_snapshot_digest(&manifest).unwrap();
+        let CandidateSnapshot::Overlay {
+            snapshot_digest: advertised_snapshot,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!()
+        };
+        *advertised_snapshot = snapshot_digest;
+        manifest.manifest_digest = compute_manifest_digest(&manifest).unwrap();
+        manifest
     }
 
     /// Build a repo whose `origin` remote advertises only `main`, but which
@@ -9173,6 +9319,180 @@ checks:
                 "{invalid} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn candidate_snapshot_pairing_rejects_missing_or_mismatched_manifest_before_materialization() {
+        let api = ServeVerdictState::new();
+        let state = temp_root("candidate-pre-materialize");
+        let forbidden_root = state.join("must-not-be-created");
+        let comparison_base = "f".repeat(40);
+
+        let missing = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(forbidden_root.to_string_lossy().into_owned()),
+            comparison_base_sha: Some(comparison_base.clone()),
+            candidate_snapshot: None,
+            ..Default::default()
+        };
+        let ack = api.push_overlay_with_options(
+            "/client/candidate-missing",
+            "origin/main",
+            &[],
+            None,
+            Some(&missing),
+        );
+        assert!(!ack.accepted);
+        assert!(
+            ack.reject_body
+                .as_deref()
+                .is_some_and(|body| body.contains("candidate_snapshot.manifest_missing")),
+            "comparison_base_sha without a typed manifest must fail with stable taxonomy: {ack:?}"
+        );
+        assert!(
+            !forbidden_root.exists(),
+            "pairing validation must run before repository sync or materialization"
+        );
+
+        let mismatched = PushOverlayOptions {
+            candidate_snapshot: Some(candidate_snapshot_golden()),
+            ..missing
+        };
+        let ack = api.push_overlay_with_options(
+            "/client/candidate-mismatch",
+            "origin/main",
+            &[],
+            None,
+            Some(&mismatched),
+        );
+        assert!(!ack.accepted);
+        assert!(
+            ack.reject_body
+                .as_deref()
+                .is_some_and(|body| body.contains("candidate_snapshot.comparison_base_mismatch")),
+            "transport comparison base must equal the manifest authority: {ack:?}"
+        );
+        assert!(
+            !forbidden_root.exists(),
+            "mismatch rejection must remain pre-materialization"
+        );
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn candidate_backed_project_checks_are_never_coalesced() {
+        let project = setup_batch_project("candidate-no-coalesce");
+        let context = ProjectCheckRunContext {
+            root: project.root.clone(),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            base_ref: "origin/main".into(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(candidate_snapshot_golden()),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: Some(vec!["no-fail-token".into()]),
+        };
+
+        assert!(
+            ServeVerdictState::new()
+                .coalesced_project_check(Path::new("/client/candidate"), &context)
+                .is_none(),
+            "a digest-bound candidate must retain its own materialization and cannot join a union overlay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_snapshot_materializes_delete_empty_mode_and_binary_then_scopes_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_root("candidate-materialize");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(root.join("remove.txt"), b"remove me\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate base"]);
+        let manifest = overlay_manifest_with_delete_empty_executable_and_binary(&root);
+        let state_dir = temp_root("candidate-materialize-state");
+        std::fs::write(state_dir.join("keep.sentinel"), b"unrelated state\n").unwrap();
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec![
+                "binary.bin".into(),
+                "empty.bin".into(),
+                "remove.txt".into(),
+                "script.sh".into(),
+            ]),
+            base_ref: manifest.comparison_base.commit_sha.clone(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(manifest.clone()),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: None,
+        };
+
+        let (scratch, manifest_path) = api
+            .with_project_check_overlay(&context, |scratch, _warm| {
+                assert!(
+                    !scratch.join("remove.txt").exists(),
+                    "typed delete is not an empty-file upsert"
+                );
+                assert_eq!(std::fs::read(scratch.join("empty.bin")).unwrap(), b"");
+                assert_eq!(
+                    std::fs::read(scratch.join("binary.bin")).unwrap(),
+                    [0_u8, 0xff, 0x80, b'\n'],
+                    "candidate payloads are arbitrary bytes, not UTF-8 strings"
+                );
+                assert_eq!(
+                    std::fs::metadata(scratch.join("script.sh"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0o111,
+                    "mode 100755 must remain executable"
+                );
+                let manifest_path = scratch.join(".cargoless/candidate-snapshot.json");
+                let per_run = parse_and_validate_manifest_json(
+                    &std::fs::read_to_string(&manifest_path).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(per_run, manifest, "the per-run file is the bound manifest");
+                (scratch.to_path_buf(), manifest_path)
+            })
+            .unwrap();
+
+        assert!(
+            !scratch.exists(),
+            "only the completed run scratch is removed"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "the per-run manifest is not retained"
+        );
+        assert_eq!(
+            std::fs::read(state_dir.join("keep.sentinel")).unwrap(),
+            b"unrelated state\n",
+            "cleanup must not sweep sibling daemon state"
+        );
+        assert_eq!(
+            std::fs::read(root.join("remove.txt")).unwrap(),
+            b"remove me\n",
+            "candidate operations never mutate the shared analysis root"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
