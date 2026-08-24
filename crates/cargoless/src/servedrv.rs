@@ -176,8 +176,7 @@ fn ra_stderr_attempt_baseline(
     observed: RaStderrSnapshot,
     last_emitted: &RaStderrSnapshot,
 ) -> RaStderrSnapshot {
-    let same_process_generation =
-        observed.process_generation == last_emitted.process_generation;
+    let same_process_generation = observed.process_generation == last_emitted.process_generation;
     let observed_is_behind = same_process_generation
         && (observed.total_lines < last_emitted.total_lines
             || observed.error_lines < last_emitted.error_lines
