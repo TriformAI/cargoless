@@ -1,5 +1,529 @@
 //! Git-backed construction of complete candidate-snapshot manifests.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fmt;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use cargoless_core::{
+    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotError,
+    CandidateSnapshotManifest, GitObjectFormat, GitTreeRef, OverlayOperation, OverlayPayload,
+    SnapshotEntry, canonical_manifest_json, compute_candidate_tree_oid, compute_manifest_digest,
+    compute_snapshot_digest, parse_and_validate_manifest_json, sha256_hex,
+    validate_manifest_against_entry_maps,
+};
+
+const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+static TEMP_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub(crate) struct CandidateSnapshotGitError {
+    message: String,
+}
+
+impl CandidateSnapshotGitError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CandidateSnapshotGitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CandidateSnapshotGitError {}
+
+impl From<std::io::Error> for CandidateSnapshotGitError {
+    fn from(error: std::io::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<CandidateSnapshotError> for CandidateSnapshotGitError {
+    fn from(error: CandidateSnapshotError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+type Result<T> = std::result::Result<T, CandidateSnapshotGitError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedGitTree {
+    pub(crate) tree_oid: String,
+    pub(crate) entries: BTreeMap<String, SnapshotEntry>,
+    pub(crate) blobs: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedCommitSnapshot {
+    pub(crate) git_object_format: GitObjectFormat,
+    pub(crate) reference: GitTreeRef,
+    pub(crate) entries: BTreeMap<String, SnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuiltCandidateOverlay {
+    pub(crate) manifest: CandidateSnapshotManifest,
+}
+
+struct TemporaryIndex {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl TemporaryIndex {
+    fn create() -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| CandidateSnapshotGitError::new(error.to_string()))?
+            .as_nanos();
+        for _ in 0..128 {
+            let sequence = TEMP_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "cargoless-candidate-index-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: directory.join("index"),
+                        directory,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(CandidateSnapshotGitError::new(
+            "could not allocate a unique temporary Git index directory",
+        ))
+    }
+}
+
+impl Drop for TemporaryIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// Resolve a revision once to an immutable commit/tree and its complete entry map.
+pub(crate) fn resolve_commit_snapshot(
+    repo: &Path,
+    revision: &str,
+) -> Result<ResolvedCommitSnapshot> {
+    let git_object_format = git_object_format(repo)?;
+    let commit_sha = git_text(
+        repo,
+        None,
+        ["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+    )?;
+    let tree_oid = git_text(
+        repo,
+        None,
+        ["rev-parse", "--verify", &format!("{commit_sha}^{{tree}}")],
+    )?;
+    let tree = resolve_tree_snapshot(repo, git_object_format, &tree_oid)?;
+    Ok(ResolvedCommitSnapshot {
+        git_object_format,
+        reference: GitTreeRef {
+            commit_sha,
+            tree_oid: tree.tree_oid,
+        },
+        entries: tree.entries,
+    })
+}
+
+/// Resolve one immutable tree object to canonical entries and blob bytes.
+pub(crate) fn resolve_tree_snapshot(
+    repo: &Path,
+    git_object_format: GitObjectFormat,
+    tree_oid: &str,
+) -> Result<ResolvedGitTree> {
+    if tree_oid.len() != git_object_format.oid_hex_len()
+        || !tree_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.oid_invalid: invalid {} tree object id {tree_oid:?}",
+            git_object_format.as_str()
+        )));
+    }
+    let output = git_output(
+        repo,
+        None,
+        ["ls-tree", "-rz", "--full-tree", "-l", tree_oid],
+    )?;
+    let mut raw_entries = Vec::new();
+    let mut blob_oids = BTreeSet::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| {
+                CandidateSnapshotGitError::new("git ls-tree returned a record without a path")
+            })?;
+        let metadata = std::str::from_utf8(&record[..tab]).map_err(|error| {
+            CandidateSnapshotGitError::new(format!(
+                "git ls-tree returned non-UTF-8 metadata: {error}"
+            ))
+        })?;
+        let mut fields = metadata.split_ascii_whitespace();
+        let mode = fields
+            .next()
+            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted entry mode"))?;
+        let object_type = fields
+            .next()
+            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object type"))?;
+        let blob_oid = fields
+            .next()
+            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object id"))?;
+        let _advertised_size = fields
+            .next()
+            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object size"))?;
+        if fields.next().is_some() {
+            return Err(CandidateSnapshotGitError::new(
+                "git ls-tree returned unexpected entry metadata",
+            ));
+        }
+        if object_type != "blob" {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.gitlink_unsupported: Git entry mode {mode} has object type {object_type}"
+            )));
+        }
+        let path = String::from_utf8(record[tab + 1..].to_vec()).map_err(|error| {
+            CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.path_noncanonical: Git path is not UTF-8: {error}"
+            ))
+        })?;
+        raw_entries.push((path, mode.to_string(), blob_oid.to_string()));
+        blob_oids.insert(blob_oid.to_string());
+    }
+
+    let blobs = load_blobs(repo, &blob_oids)?;
+    let mut entries = BTreeMap::new();
+    for (path, mode, blob_oid) in raw_entries {
+        let bytes = blobs.get(&blob_oid).ok_or_else(|| {
+            CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.blob_missing: cat-file omitted {blob_oid}"
+            ))
+        })?;
+        let entry = SnapshotEntry {
+            path: path.clone(),
+            mode,
+            blob_oid,
+            size: u64::try_from(bytes.len()).map_err(|_| {
+                CandidateSnapshotGitError::new("candidate_snapshot.limit_exceeded: blob too large")
+            })?,
+            sha256: sha256_hex(bytes),
+        };
+        if entries.insert(path.clone(), entry).is_some() {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.entry_duplicate: duplicate Git path {path:?}"
+            )));
+        }
+    }
+
+    Ok(ResolvedGitTree {
+        tree_oid: tree_oid.to_string(),
+        entries,
+        blobs,
+    })
+}
+
+/// Build the complete worktree candidate through an isolated temporary index.
+pub(crate) fn build_overlay_manifest(
+    repo: &Path,
+    comparison_base: &str,
+) -> Result<Option<BuiltCandidateOverlay>> {
+    let base = resolve_commit_snapshot(repo, comparison_base)?;
+    let temporary_index = TemporaryIndex::create()?;
+    git_output(
+        repo,
+        Some(&temporary_index.path),
+        ["read-tree", base.reference.commit_sha.as_str()],
+    )?;
+    git_output(repo, Some(&temporary_index.path), ["add", "-A", "--", "."])?;
+    let candidate_tree_oid = git_text(repo, Some(&temporary_index.path), ["write-tree"])?;
+    let candidate = resolve_tree_snapshot(repo, base.git_object_format, &candidate_tree_oid)?;
+    let operations = overlay_operations(&base, &candidate)?;
+    if operations.is_empty() {
+        return Ok(None);
+    }
+
+    let entries: Vec<SnapshotEntry> = candidate.entries.values().cloned().collect();
+    let mut manifest = CandidateSnapshotManifest {
+        schema: CANDIDATE_SNAPSHOT_SCHEMA_V1.to_string(),
+        git_object_format: base.git_object_format,
+        comparison_base: base.reference.clone(),
+        candidate: CandidateSnapshot::Overlay {
+            base: base.reference.clone(),
+            tree_oid: candidate_tree_oid.clone(),
+            entry_count: entries.len() as u64,
+            entries,
+            snapshot_digest: ZERO_DIGEST.to_string(),
+            operation_count: operations.len() as u64,
+            operations,
+        },
+        manifest_digest: ZERO_DIGEST.to_string(),
+    };
+
+    let computed_tree_oid = compute_candidate_tree_oid(&manifest)?;
+    if computed_tree_oid != candidate_tree_oid {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.tree_oid_mismatch: Git wrote {candidate_tree_oid}, core computed {computed_tree_oid}"
+        )));
+    }
+    let snapshot_digest = compute_snapshot_digest(&manifest)?;
+    let CandidateSnapshot::Overlay {
+        snapshot_digest: advertised,
+        ..
+    } = &mut manifest.candidate
+    else {
+        unreachable!("builder creates an overlay candidate")
+    };
+    *advertised = snapshot_digest;
+    manifest.manifest_digest = compute_manifest_digest(&manifest)?;
+    validate_manifest_against_entry_maps(&manifest, Some(&base.entries), &candidate.entries)?;
+    let canonical = canonical_manifest_json(&manifest)?;
+    let manifest = parse_and_validate_manifest_json(&canonical)?;
+
+    Ok(Some(BuiltCandidateOverlay { manifest }))
+}
+
+fn overlay_operations(
+    base: &ResolvedCommitSnapshot,
+    candidate: &ResolvedGitTree,
+) -> Result<Vec<OverlayOperation>> {
+    let paths: BTreeSet<&String> = base
+        .entries
+        .keys()
+        .chain(candidate.entries.keys())
+        .collect();
+    let mut operations = Vec::new();
+    for path in paths {
+        match (base.entries.get(path), candidate.entries.get(path)) {
+            (Some(base_entry), None) => operations.push(OverlayOperation::Delete {
+                path: path.clone(),
+                base_mode: base_entry.mode.clone(),
+                base_blob_oid: base_entry.blob_oid.clone(),
+            }),
+            (base_entry, Some(candidate_entry))
+                if base_entry.is_none_or(|base_entry| {
+                    base_entry.mode != candidate_entry.mode
+                        || base_entry.blob_oid != candidate_entry.blob_oid
+                }) =>
+            {
+                let bytes = candidate
+                    .blobs
+                    .get(&candidate_entry.blob_oid)
+                    .ok_or_else(|| {
+                        CandidateSnapshotGitError::new(format!(
+                            "candidate_snapshot.blob_missing: missing candidate blob {}",
+                            candidate_entry.blob_oid
+                        ))
+                    })?;
+                operations.push(OverlayOperation::Upsert {
+                    path: path.clone(),
+                    mode: candidate_entry.mode.clone(),
+                    blob_oid: candidate_entry.blob_oid.clone(),
+                    size: candidate_entry.size,
+                    sha256: candidate_entry.sha256.clone(),
+                    payload: OverlayPayload {
+                        encoding: "base64".to_string(),
+                        data: encode_base64(bytes),
+                    },
+                });
+            }
+            (Some(_), Some(_)) => {}
+            (None, None) => unreachable!("path originated in one entry map"),
+        }
+    }
+    Ok(operations)
+}
+
+fn git_object_format(repo: &Path) -> Result<GitObjectFormat> {
+    match git_text(repo, None, ["rev-parse", "--show-object-format"])?.as_str() {
+        "sha1" => Ok(GitObjectFormat::Sha1),
+        "sha256" => Ok(GitObjectFormat::Sha256),
+        format => Err(CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.object_format_unsupported: unsupported Git object format {format:?}"
+        ))),
+    }
+}
+
+fn git_command(repo: &Path, index: Option<&Path>) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo);
+    command.env("LC_ALL", "C");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("GIT_CONFIG_KEY_") || key_text.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(key);
+        }
+    }
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    command
+}
+
+fn git_output<I, S>(repo: &Path, index: Option<&Path>, args: I) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = git_command(repo, index);
+    command.args(args);
+    let debug = format!("{command:?}");
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "{debug} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn git_text<I, S>(repo: &Path, index: Option<&Path>, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = git_output(repo, index, args)?;
+    Ok(String::from_utf8(output)
+        .map_err(|error| CandidateSnapshotGitError::new(error.to_string()))?
+        .trim()
+        .to_string())
+}
+
+fn load_blobs(repo: &Path, blob_oids: &BTreeSet<String>) -> Result<BTreeMap<String, Vec<u8>>> {
+    if blob_oids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut child = git_command(repo, None)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CandidateSnapshotGitError::new("git cat-file stdin unavailable"))?;
+        for oid in blob_oids {
+            writeln!(stdin, "{oid}")?;
+        }
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git cat-file stdout unavailable"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut blobs = BTreeMap::new();
+    for expected_oid in blob_oids {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.blob_missing: cat-file ended before {expected_oid}"
+            )));
+        }
+        let fields: Vec<&str> = header.split_ascii_whitespace().collect();
+        if fields.len() != 3 || fields[0] != expected_oid || fields[1] != "blob" {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.blob_missing: unexpected cat-file response {:?} for {expected_oid}",
+                header.trim_end()
+            )));
+        }
+        let size: usize = fields[2].parse().map_err(|error| {
+            CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.blob_missing: invalid cat-file size for {expected_oid}: {error}"
+            ))
+        })?;
+        let mut bytes = vec![0; size];
+        reader.read_exact(&mut bytes)?;
+        let mut delimiter = [0];
+        reader.read_exact(&mut delimiter)?;
+        if delimiter != [b'\n'] {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.blob_missing: invalid cat-file delimiter for {expected_oid}"
+            )));
+        }
+        blobs.insert(expected_oid.clone(), bytes);
+    }
+
+    let status = child.wait()?;
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    if !status.success() {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "git cat-file exited {:?}: {}",
+            status.code(),
+            stderr.trim()
+        )));
+    }
+    Ok(blobs)
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

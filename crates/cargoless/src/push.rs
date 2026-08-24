@@ -44,6 +44,9 @@ use std::process::{Command, ExitCode};
 
 use cargoless_core::transport::http::{HttpClient, MAX_OVERLAY_BYTES, prepare_json_body};
 use cargoless_core::transport::{CheckProfile, PushOverlayOptions, Request, TransportClient};
+use cargoless_core::{
+    CandidateSnapshot, CandidateSnapshotManifest, OverlayOperation, decode_overlay_payload,
+};
 
 const WORKSPACE_CONFIG_FILES: &[&str] = &[
     "Cargo.toml",
@@ -114,18 +117,25 @@ impl AwaitFreshness {
 /// convention: 0 = success (ack.accepted=true), 1 = rejected / transport
 /// error, 2 = setup / config error.
 pub fn run(opts: &PushOpts) -> ExitCode {
-    // 1. Enumerate changed files via git.
-    let changed = match git_changed_files(&opts.repo, &opts.base) {
-        Ok(files) => files,
-        Err(e) => {
-            crate::ui::error(format!(
-                "push: git diff against `{}` in `{}` failed: {e}",
-                opts.base,
-                opts.repo.display()
-            ));
-            return ExitCode::from(2);
-        }
-    };
+    // 1. Capture the complete candidate through a temporary Git index. The
+    //    resulting manifest, changed-path triggers, and compatibility text
+    //    overlays all derive from this one immutable tree.
+    let candidate_overlay =
+        match crate::candidate_snapshot_git::build_overlay_manifest(&opts.repo, &opts.base) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                crate::ui::error(format!(
+                    "push: candidate snapshot against `{}` in `{}` failed: {error}",
+                    opts.base,
+                    opts.repo.display()
+                ));
+                return ExitCode::from(2);
+            }
+        };
+    let changed = candidate_overlay
+        .as_ref()
+        .map(|candidate| candidate_changed_paths(&candidate.manifest))
+        .unwrap_or_default();
     if changed.is_empty() && !opts.await_verdict {
         eprintln!(
             "[cargoless:push] no changes vs {} in {} — nothing to push",
@@ -135,20 +145,23 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         return ExitCode::from(0);
     }
 
-    // 2. Build the minimal overlay payload from exactly the git diff paths.
-    //    Changed source/text/config files are read as content or fail setup;
-    //    unsupported artifact extensions remain metadata-only for trigger
-    //    selection. Hard-excluded runtime/cache paths do not enter the sent
-    //    request at all. Deleted content files are carried deliberately as
-    //    empty overlays, preserving the existing push/delete representation
-    //    rather than silently dropping them.
+    // 2. Derive the legacy RA text overlays from the typed operations. Binary
+    //    upserts remain complete in the manifest and changed_files, but are
+    //    intentionally absent from the UTF-8-only compatibility projection.
     let repo_relative = opts.server_root.is_some();
-    let mut payload = match build_push_payload(&opts.repo, &changed, repo_relative) {
-        Ok(payload) => payload,
-        Err(e) => {
-            crate::ui::error(e.to_string());
-            return ExitCode::from(2);
-        }
+    let mut payload = match candidate_overlay.as_ref() {
+        Some(candidate) => match push_payload_from_candidate_snapshot(
+            &opts.repo,
+            &candidate.manifest,
+            repo_relative,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                crate::ui::error(error);
+                return ExitCode::from(2);
+            }
+        },
+        None => PushPayload::new(),
     };
     if payload.files.is_empty() && payload.trigger_paths.is_empty() && !opts.await_verdict {
         eprintln!(
@@ -176,10 +189,16 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         gate: opts.gate,
         ..PushOverlayOptions::default()
     };
+    if let Some(candidate) = candidate_overlay.as_ref() {
+        apply_candidate_snapshot_options(&mut options, &candidate.manifest);
+    }
     if let Some(root) = opts.server_root.as_ref() {
         options.repo_relative = true;
         options.analysis_root = Some(root.to_string_lossy().into_owned());
-        options.base_sha = git_resolve_ref(&opts.repo, &opts.base).ok();
+        options.base_sha = candidate_overlay
+            .as_ref()
+            .map(|candidate| candidate.manifest.comparison_base.commit_sha.clone())
+            .or_else(|| git_resolve_ref(&opts.repo, &opts.base).ok());
     }
     let options = if options.is_empty() {
         None
@@ -416,6 +435,7 @@ struct MetadataOnlyPath {
 enum MetadataOnlyReason {
     HardExcluded,
     UnsupportedPath,
+    TypedBinary,
 }
 
 impl MetadataOnlyReason {
@@ -423,6 +443,7 @@ impl MetadataOnlyReason {
         match self {
             MetadataOnlyReason::HardExcluded => "excluded",
             MetadataOnlyReason::UnsupportedPath => "metadata-only",
+            MetadataOnlyReason::TypedBinary => "typed-binary",
         }
     }
 }
@@ -580,6 +601,86 @@ pub(crate) fn build_push_payload(
     } else {
         Err(PushPayloadError { failures })
     }
+}
+
+fn candidate_changed_paths(manifest: &CandidateSnapshotManifest) -> Vec<String> {
+    manifest
+        .candidate
+        .operations()
+        .iter()
+        .map(|operation| operation.path().to_string())
+        .collect()
+}
+
+fn legacy_projection(
+    repo: &Path,
+    manifest: &CandidateSnapshotManifest,
+    repo_relative: bool,
+) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
+        return Err("push: typed candidate must be an overlay".to_string());
+    };
+    let mut files = Vec::new();
+    let mut omitted_binary_paths = Vec::new();
+    for operation in operations {
+        match operation {
+            OverlayOperation::Delete { path, .. } => {
+                files.push((payload_path(repo, path, repo_relative), String::new()));
+            }
+            OverlayOperation::Upsert { path, payload, .. } => {
+                let bytes = decode_overlay_payload(payload)
+                    .map_err(|error| format!("push: invalid typed payload at {path:?}: {error}"))?;
+                match String::from_utf8(bytes) {
+                    Ok(content) => files.push((payload_path(repo, path, repo_relative), content)),
+                    Err(_) => omitted_binary_paths.push(path.clone()),
+                }
+            }
+        }
+    }
+    Ok((files, omitted_binary_paths))
+}
+
+#[cfg(test)]
+fn legacy_files_from_candidate_snapshot(
+    repo: &Path,
+    manifest: &CandidateSnapshotManifest,
+    repo_relative: bool,
+) -> Result<Vec<(String, String)>, String> {
+    legacy_projection(repo, manifest, repo_relative).map(|(files, _)| files)
+}
+
+fn push_payload_from_candidate_snapshot(
+    repo: &Path,
+    manifest: &CandidateSnapshotManifest,
+    repo_relative: bool,
+) -> Result<PushPayload, String> {
+    let (files, omitted_binary_paths) = legacy_projection(repo, manifest, repo_relative)?;
+    let mut payload = PushPayload::new();
+    payload.content_stats = files
+        .iter()
+        .map(|(path, content)| ContentFileStat {
+            path: path.clone(),
+            bytes: content.len(),
+        })
+        .collect();
+    payload.files = files;
+    payload.trigger_paths = candidate_changed_paths(manifest);
+    payload.metadata_only_paths = omitted_binary_paths
+        .into_iter()
+        .map(|path| MetadataOnlyPath {
+            path,
+            reason: MetadataOnlyReason::TypedBinary,
+        })
+        .collect();
+    Ok(payload)
+}
+
+fn apply_candidate_snapshot_options(
+    options: &mut PushOverlayOptions,
+    manifest: &CandidateSnapshotManifest,
+) {
+    options.comparison_base_sha = Some(manifest.comparison_base.commit_sha.clone());
+    options.candidate_snapshot = Some(manifest.clone());
 }
 
 pub(crate) fn push_overlay_request_body(
