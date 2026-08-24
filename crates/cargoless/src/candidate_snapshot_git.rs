@@ -540,6 +540,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_repo(tag: &str) -> PathBuf {
+        temp_repo_with_object_format(tag, None)
+    }
+
+    fn temp_repo_with_object_format(tag: &str, object_format: Option<&str>) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -549,7 +553,18 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        git(&root, &["init", "-q"]);
+        let mut init = Command::new("git");
+        init.arg("-C").arg(&root).arg("init").arg("-q");
+        if let Some(object_format) = object_format {
+            init.arg(format!("--object-format={object_format}"));
+        }
+        let output = init.env("LC_ALL", "C").output().unwrap();
+        assert!(
+            output.status.success(),
+            "fixture Git must support object format {:?}; git init failed: {}",
+            object_format,
+            String::from_utf8_lossy(&output.stderr)
+        );
         git(&root, &["config", "user.name", "Candidate Snapshot Test"]);
         git(
             &root,
@@ -560,6 +575,15 @@ mod tests {
         git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "core.filemode", "true"]);
         root
+    }
+
+    fn metadata(path: &str, oid: &str, advertised_size: u64) -> TreeEntryMetadata {
+        TreeEntryMetadata {
+            path: path.to_string(),
+            mode: "100644".to_string(),
+            blob_oid: oid.to_string(),
+            advertised_size,
+        }
     }
 
     fn write(root: &Path, rel: &str, bytes: impl AsRef<[u8]>) {
@@ -599,6 +623,158 @@ mod tests {
             .iter()
             .find(|operation| operation.path() == path)
             .unwrap_or_else(|| panic!("missing operation for {path}"))
+    }
+
+    #[test]
+    fn changed_payload_plan_rejects_oversized_single_before_payload_allocation() {
+        let base = BTreeMap::new();
+        let candidate = BTreeMap::from([(
+            "too-large.bin".to_string(),
+            metadata(
+                "too-large.bin",
+                &"a".repeat(40),
+                MAX_UPSERT_BYTES as u64 + 1,
+            ),
+        )]);
+
+        let error = plan_changed_payloads(&base, &candidate).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("candidate_snapshot.limit_exceeded")
+        );
+        assert!(error.to_string().contains("32 MiB"));
+    }
+
+    #[test]
+    fn changed_payload_plan_rejects_aggregate_before_payload_allocation() {
+        let base = BTreeMap::new();
+        let candidate = BTreeMap::from([
+            (
+                "first.bin".to_string(),
+                metadata("first.bin", &"a".repeat(40), MAX_UPSERT_BYTES as u64),
+            ),
+            (
+                "second.bin".to_string(),
+                metadata("second.bin", &"b".repeat(40), MAX_UPSERT_BYTES as u64),
+            ),
+            (
+                "overflow.bin".to_string(),
+                metadata("overflow.bin", &"c".repeat(40), 1),
+            ),
+        ]);
+
+        let error = plan_changed_payloads(&base, &candidate).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("candidate_snapshot.limit_exceeded")
+        );
+        assert!(error.to_string().contains("64 MiB"));
+    }
+
+    #[test]
+    fn unchanged_large_blob_is_streamed_but_not_retained_as_overlay_payload() {
+        let root = temp_repo("unchanged-large");
+        let large_path = root.join("unchanged-large.bin");
+        let large = std::fs::File::create(&large_path).unwrap();
+        large.set_len(MAX_UPSERT_BYTES as u64 + 1).unwrap();
+        write(&root, "changed.txt", b"base\n");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+        write(&root, "changed.txt", b"candidate\n");
+
+        let base_tree = git_text(&root, &["rev-parse", "HEAD^{tree}"]);
+        let resolved = resolve_tree_snapshot(&root, GitObjectFormat::Sha1, &base_tree).unwrap();
+        assert!(resolved.entries.contains_key("unchanged-large.bin"));
+        assert!(
+            resolved.blobs.is_empty(),
+            "tree resolution must retain no payloads"
+        );
+
+        let built = build_overlay_manifest(&root, "HEAD")
+            .unwrap()
+            .expect("small changed file creates an overlay");
+        let CandidateSnapshot::Overlay { operations, .. } = &built.manifest.candidate else {
+            panic!("producer must emit an overlay")
+        };
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].path(), "changed.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sha256_git_repository_produces_a_valid_complete_overlay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_repo_with_object_format("sha256-roundtrip", Some("sha256"));
+        write(&root, "delete.txt", b"delete\n");
+        write(&root, "mode.sh", b"#!/bin/sh\necho base\n");
+        write(&root, "unchanged.txt", b"unchanged\n");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+
+        std::fs::remove_file(root.join("delete.txt")).unwrap();
+        write(&root, "added.bin", [0, 1, 2, 0xff]);
+        let mode_path = root.join("mode.sh");
+        let mut permissions = std::fs::metadata(&mode_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&mode_path, permissions).unwrap();
+
+        let built = build_overlay_manifest(&root, "HEAD")
+            .unwrap()
+            .expect("SHA-256 fixture has a delta");
+        assert_eq!(built.manifest.git_object_format, GitObjectFormat::Sha256);
+        assert_eq!(built.manifest.comparison_base.commit_sha.len(), 64);
+        assert_eq!(built.manifest.comparison_base.tree_oid.len(), 64);
+
+        let CandidateSnapshot::Overlay {
+            tree_oid,
+            entries,
+            operations,
+            snapshot_digest,
+            ..
+        } = &built.manifest.candidate
+        else {
+            panic!("producer must emit an overlay")
+        };
+        assert_eq!(tree_oid.len(), 64);
+        assert!(entries.iter().all(|entry| entry.blob_oid.len() == 64));
+        assert!(operations.iter().all(|operation| match operation {
+            OverlayOperation::Delete { base_blob_oid, .. } => base_blob_oid.len() == 64,
+            OverlayOperation::Upsert { blob_oid, .. } => blob_oid.len() == 64,
+        }));
+        assert!(matches!(
+            operation(operations, "delete.txt"),
+            OverlayOperation::Delete { .. }
+        ));
+        assert!(matches!(
+            operation(operations, "added.bin"),
+            OverlayOperation::Upsert { .. }
+        ));
+        assert!(matches!(
+            operation(operations, "mode.sh"),
+            OverlayOperation::Upsert { .. }
+        ));
+        assert_eq!(
+            compute_candidate_tree_oid(&built.manifest).unwrap(),
+            *tree_oid
+        );
+        assert_eq!(
+            compute_snapshot_digest(&built.manifest).unwrap(),
+            *snapshot_digest
+        );
+        assert_eq!(
+            compute_manifest_digest(&built.manifest).unwrap(),
+            built.manifest.manifest_digest
+        );
+        let canonical = canonical_manifest_json(&built.manifest).unwrap();
+        assert_eq!(
+            parse_and_validate_manifest_json(&canonical).unwrap(),
+            built.manifest
+        );
     }
 
     #[cfg(unix)]
