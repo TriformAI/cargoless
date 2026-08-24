@@ -2141,15 +2141,24 @@ impl ServeVerdictState {
                     if !existing.is_accepted() {
                         return Err("attempt.admission_incomplete".to_string());
                     }
-                    let outcome = store
+                    let terminal = store
                         .read_outcome(&identity.attempt_id)
-                        .map_err(|error| format!("attempt.admission_unavailable: {error}"))?
-                        .or_else(|| existing.pending_outcome().cloned())
-                        .ok_or_else(|| {
-                            "attempt.admission_corrupt: accepted record has no outcome".to_string()
-                        })?;
-                    self.remember_outcome_v3(outcome);
-                    Ok(AttemptReservationDecisionV3::Replay)
+                        .map_err(|error| format!("attempt.admission_unavailable: {error}"))?;
+                    if let Some(outcome) = terminal {
+                        self.remember_outcome_v3(outcome);
+                        return Ok(AttemptReservationDecisionV3::Replay);
+                    }
+                    if poisoned(&self.outcomes_v3).contains_key(&identity.attempt_id) {
+                        return Ok(AttemptReservationDecisionV3::Replay);
+                    }
+                    // The daemon durably accepted this identity but no terminal
+                    // evidence exists and this process has no live outcome. A
+                    // crash can occur after admission and before queue/send;
+                    // redispatching the same AttemptId without a durable outbox
+                    // could execute twice. Preserve the record and require a
+                    // successor AttemptId instead of false-acknowledging lost
+                    // work or overwriting its eventual evidence.
+                    Err("attempt.dispatch_lost".to_string())
                 }
                 Err(error) => Err(format!("attempt.admission_unavailable: {error}")),
             };
