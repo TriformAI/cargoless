@@ -15338,6 +15338,112 @@ checks:
         );
     }
 
+    #[test]
+    fn pending_attempt_survives_outcome_cache_churn_and_can_complete() {
+        let state_dir = temp_root("pending-outcome-cache-churn");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+        let context = attempt_context("attempt-pending-cache-original", 1);
+        let files = vec![(
+            "src/lib.rs".to_string(),
+            "pub fn pending_survives() {}".to_string(),
+        )];
+        let options = PushOverlayOptions {
+            base_sha: Some("pending-cache-base".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+
+        assert!(
+            api.push_overlay_with_options(
+                "/wt-pending-cache",
+                "origin/main",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        for index in 0..=OUTCOME_V3_MEMORY_CAP {
+            let churn_context = attempt_context(&format!("attempt-pending-cache-churn-{index}"), 1);
+            api.begin_outcome_v3(
+                &churn_context,
+                Surface::Overlay,
+                Subject::Overlay {
+                    repository: text_v3("/repo"),
+                    worktree_key: text_v3(format!("/cache/{index}")),
+                    base_ref: text_v3("origin/main"),
+                    base_sha: text_v3("cache-base"),
+                    overlay_digest: text_v3(format!("overlay-{index}")),
+                    changed_files_digest: text_v3("changed-files"),
+                    check_plan_digest: text_v3("check-plan"),
+                },
+                Phase::Queued,
+                "cache churn",
+            );
+        }
+
+        assert!(matches!(
+            api.get_outcome_v3(&context.attempt_id)
+                .expect("a live pending attempt must not be evicted")
+                .conclusion,
+            Conclusion::Pending { .. }
+        ));
+
+        let replay = api.push_overlay_with_options(
+            "/wt-pending-cache",
+            "origin/main",
+            &files,
+            None,
+            Some(&options),
+        );
+        assert!(
+            replay.accepted,
+            "same-process pending replay stays accepted"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "same-process pending replay must not dispatch again"
+        );
+        assert_eq!(
+            poisoned(&api.pushed)
+                .get("/wt-pending-cache")
+                .map(VecDeque::len),
+            Some(1)
+        );
+
+        let pushed = api.take_overlay_for("/wt-pending-cache").unwrap();
+        api.record_push_attribution("/wt-pending-cache", &pushed);
+        let attribution = api.take_push_attribution("/wt-pending-cache").unwrap();
+        api.publish_attributed_with_checks(
+            Path::new("/wt-pending-cache"),
+            crate::statusfile::VerdictPayload::green(),
+            attribution.base_sha,
+            false,
+            Vec::new(),
+            Some(context.clone()),
+        );
+
+        let terminal = api
+            .get_outcome_v3(&context.attempt_id)
+            .expect("completion must retain the terminal outcome");
+        assert!(matches!(terminal.conclusion, Conclusion::Passed { .. }));
+        let persisted = api
+            .evidence_store_v3
+            .as_ref()
+            .unwrap()
+            .read_outcome(&context.attempt_id)
+            .unwrap()
+            .expect("completion must persist terminal evidence");
+        assert_eq!(persisted, terminal);
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     fn evidence_directory_bytes(path: &Path) -> BTreeMap<String, Vec<u8>> {
         std::fs::read_dir(path)
             .unwrap()
