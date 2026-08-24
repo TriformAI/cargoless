@@ -455,13 +455,31 @@ impl<B: BuildBackend, L: ChildLauncher, S: EventSink> Driver<B, L, S> {
     /// red invariant is untouched. The protected set keeps every live, probing,
     /// draining, and recovery bundle, so no in-use bundle is ever deleted.
     pub fn pressure_prune_bundles(&self) -> Vec<String> {
+        self.pressure_prune_bundles_inner(None)
+    }
+
+    /// Disk-pressure relief immediately after `finished_instance` emitted a
+    /// `BuildFinished` event. The worker and its harvest are complete at that
+    /// point, even though the single-threaded driver has not consumed the event
+    /// yet and still reports the pipeline as `Building`.
+    ///
+    /// The ordinary pressure prune must keep skipping every in-flight build.
+    /// This narrow entry point lets the event loop name the one build it has
+    /// just joined, so ENOSPC can reclaim that instance's stale bundles before
+    /// the state machine queues the retry.
+    pub fn pressure_prune_bundles_after_build(&self, finished_instance: &str) -> Vec<String> {
+        self.pressure_prune_bundles_inner(Some(finished_instance))
+    }
+
+    fn pressure_prune_bundles_inner(&self, finished_instance: Option<&str>) -> Vec<String> {
         let mut removed = Vec::new();
         let names: Vec<String> = self.runtimes.keys().cloned().collect();
         for instance in &names {
             if matches!(
                 self.state.instance(instance).map(|s| &s.pipeline),
                 Some(crate::appstate::Pipeline::Building { .. })
-            ) {
+            ) && finished_instance != Some(instance.as_str())
+            {
                 continue; // a live harvest owns a tmp dir we must not sweep
             }
             let Some(rt) = self.runtimes.get(instance) else {
@@ -975,6 +993,52 @@ mod tests {
             bundle_shas(&d, "dev"),
             vec!["stale1", "stale2"],
             "a live harvest's bundle dir is left wholly untouched"
+        );
+    }
+
+    /// `appserve` observes `BuildFinished(ENOSPC)` before calling `drive`, so
+    /// the driver still says `Building` while the worker has actually exited.
+    /// The event-scoped prune must reclaim that finished instance without
+    /// weakening the ordinary mid-build safety guard above.
+    #[test]
+    fn pressure_prune_reclaims_the_instance_that_just_finished_building() {
+        let rec = Arc::new(Recorder {
+            spawn_ok: true,
+            ..Default::default()
+        });
+        let ports = Arc::new(PortAllocator::new(9040, 9049));
+        let mut d = driver(&["dev", "other"], rec, ports);
+
+        d.drive(
+            "dev",
+            Event::HeadAdvanced {
+                sha: "current".into(),
+            },
+        );
+        d.drive(
+            "other",
+            Event::HeadAdvanced {
+                sha: "other-current".into(),
+            },
+        );
+        plant_bundle(&d, "dev", "current");
+        plant_bundle(&d, "dev", "stale1");
+        plant_bundle(&d, "dev", "stale2");
+        plant_bundle(&d, "other", "other-stale");
+
+        let mut removed = d.pressure_prune_bundles_after_build("dev");
+        removed.sort();
+
+        assert_eq!(
+            bundle_shas(&d, "dev"),
+            vec!["current"],
+            "the finished build's protected sha survives while stale bundles are reclaimed"
+        );
+        assert_eq!(removed, vec!["dev/stale1", "dev/stale2"]);
+        assert_eq!(
+            bundle_shas(&d, "other"),
+            vec!["other-stale"],
+            "an unrelated in-flight build remains wholly untouched"
         );
     }
 

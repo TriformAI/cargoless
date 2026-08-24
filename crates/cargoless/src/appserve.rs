@@ -924,7 +924,13 @@ fn serve_loop(
                         ..
                     }
                 ) {
-                    let removed = driver.pressure_prune_bundles();
+                    // The worker that emitted this BuildFinished event has
+                    // exited, but `drive` has not consumed the event yet, so
+                    // the state snapshot still labels this instance Building.
+                    // Name that completed instance explicitly; otherwise the
+                    // ordinary mid-build guard skips the only bundle directory
+                    // that can relieve this ENOSPC and every retry removes 0.
+                    let removed = driver.pressure_prune_bundles_after_build(&instance);
                     // Surface the relief on `/app` (climbing count = PVC full +
                     // self-relieving) so the wedge is observable, not silent.
                     svc.set_pressure_prune(removed.len());
