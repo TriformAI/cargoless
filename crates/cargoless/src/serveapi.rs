@@ -4305,10 +4305,10 @@ impl VerdictService for ServeVerdictState {
         let mut check_ids = None;
         if let Some(options) = options {
             match typed_candidate_overlay(options, files) {
-                Ok(Some((manifest, derived_changed_files, projection))) => {
-                    candidate_snapshot = Some(manifest);
-                    changed_files = Some(derived_changed_files);
-                    typed_legacy_files = Some(projection);
+                Ok(Some(candidate)) => {
+                    candidate_snapshot = Some(candidate.manifest);
+                    changed_files = Some(candidate.changed_files);
+                    typed_legacy_files = Some(candidate.legacy_files);
                 }
                 Ok(None) => changed_files = options.changed_files.clone(),
                 Err(error) => return rejected_push(worktree, &error),
@@ -5015,17 +5015,16 @@ fn map_repo_relative_files(
         .collect()
 }
 
+struct TypedCandidateOverlay {
+    manifest: CandidateSnapshotManifest,
+    changed_files: Vec<String>,
+    legacy_files: Vec<(String, String)>,
+}
+
 fn typed_candidate_overlay(
     options: &PushOverlayOptions,
     legacy_files: &[(String, String)],
-) -> Result<
-    Option<(
-        CandidateSnapshotManifest,
-        Vec<String>,
-        Vec<(String, String)>,
-    )>,
-    String,
-> {
+) -> Result<Option<TypedCandidateOverlay>, String> {
     let comparison_base_sha = options
         .comparison_base_sha
         .as_deref()
@@ -5123,7 +5122,11 @@ fn typed_candidate_overlay(
                 .to_string(),
         );
     }
-    Ok(Some((manifest.clone(), changed_files, projection)))
+    Ok(Some(TypedCandidateOverlay {
+        manifest: manifest.clone(),
+        changed_files,
+        legacy_files: projection,
+    }))
 }
 
 fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
