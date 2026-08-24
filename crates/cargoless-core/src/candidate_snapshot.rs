@@ -855,7 +855,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
         let b = b.unwrap_or_default();
         let c_pad = chunk[2] == b'=';
         let d_pad = chunk[3] == b'=';
-        if (!last && (c_pad || d_pad)) || (c_pad && !d_pad) {
+        if (!last && d_pad) || (c_pad && !d_pad) {
             return base64_error();
         }
         let c = if c_pad {
@@ -974,7 +974,7 @@ impl TreeNode {
                 }),
             }
         }
-        items.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        items.sort_by_key(TreeItem::sort_key);
 
         let mut body = Vec::new();
         for item in items {
