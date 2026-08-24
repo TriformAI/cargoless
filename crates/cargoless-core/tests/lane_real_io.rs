@@ -1351,10 +1351,14 @@ fn an_ejection_is_recorded_in_the_durable_trail_with_its_sentence() {
         &mut lane,
         LaneEvent::Enqueue(LaneMember::new("a", &a).with_changed_files(["a.txt"])),
     );
+    // Read the generation BEFORE the `&mut lane` borrow: calling
+    // `lane.generation()` inside the argument list is an immutable borrow
+    // while the mutable one is live (E0502).
+    let generation = lane.generation();
     drv.pump(
         &mut lane,
         LaneEvent::BuildFinished {
-            generation: lane.generation(),
+            generation,
             outcome: cargoless_core::lane::LaneBuildOutcome::Stale {
                 id: "a".to_string(),
                 head: a.clone(),
