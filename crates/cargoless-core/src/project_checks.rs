@@ -60,7 +60,7 @@ pub struct ProjectCheckResult {
     /// evidence must use this field rather than re-deriving from `tree`.
     pub outcome: ProjectCheckOutcome,
     pub diagnostics: Vec<Diagnostic>,
-    /// Present only for `cargoless.check-result/v1` command checks.
+    /// Present only for `cargoless.check-result/v1` or `/v2` command checks.
     pub structured: Option<StructuredCheckDetails>,
     pub duration_ms: u128,
     pub cache_hit: bool,
@@ -104,10 +104,222 @@ pub struct ProjectCheckRunIdentity {
     pub base_sha: String,
 }
 
+/// Immutable candidate identity exported to every command check in one run.
+/// The daemon owns the lifecycle sidecar and records its original identity;
+/// project-checks reopens and verifies that evidence before deriving the
+/// descriptor-backed authority exposed to each child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateSnapshotCheckContext {
+    pub manifest_path: PathBuf,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_dev: u64,
+    pub manifest_ino: u64,
+    pub candidate_kind: String,
+    pub snapshot_digest: String,
+    pub candidate_tree_oid: String,
+    pub candidate_sha: Option<String>,
+    pub manifest_digest: String,
+    pub comparison_base_sha: String,
+}
+
+#[derive(Debug)]
+struct CandidateManifestAuthority {
+    _file: fs::File,
+    child_path: PathBuf,
+}
+
+impl CandidateManifestAuthority {
+    #[cfg(target_os = "linux")]
+    fn prepare(candidate: &CandidateSnapshotCheckContext) -> Result<Self, String> {
+        Self::prepare_with_after_open(candidate, || {})
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_with_after_open(
+        candidate: &CandidateSnapshotCheckContext,
+        after_open: impl FnOnce(),
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        const O_NOFOLLOW: core::ffi::c_int = 0x0002_0000;
+        let mut persisted = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(&candidate.manifest_path)
+            .map_err(|error| {
+                format!(
+                    "could not safely open persisted candidate manifest `{}`: {error}",
+                    candidate.manifest_path.display()
+                )
+            })?;
+        let opened_metadata = persisted.metadata().map_err(|error| {
+            format!(
+                "could not inspect opened candidate manifest `{}`: {error}",
+                candidate.manifest_path.display()
+            )
+        })?;
+        if !opened_metadata.is_file() {
+            return Err(format!(
+                "persisted candidate manifest `{}` is not a real regular file",
+                candidate.manifest_path.display()
+            ));
+        }
+        if opened_metadata.dev() != candidate.manifest_dev
+            || opened_metadata.ino() != candidate.manifest_ino
+        {
+            return Err(format!(
+                "persisted candidate manifest `{}` changed file identity before child spawn",
+                candidate.manifest_path.display()
+            ));
+        }
+        if opened_metadata.nlink() != 1 || opened_metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(format!(
+                "persisted candidate manifest `{}` has unsafe links or mode",
+                candidate.manifest_path.display()
+            ));
+        }
+        after_open();
+        let mut current = Vec::new();
+        persisted.read_to_end(&mut current).map_err(|error| {
+            format!(
+                "could not read opened candidate manifest `{}`: {error}",
+                candidate.manifest_path.display()
+            )
+        })?;
+        if current != candidate.manifest_bytes {
+            return Err(format!(
+                "persisted candidate manifest `{}` changed bytes before child spawn",
+                candidate.manifest_path.display()
+            ));
+        }
+        let final_opened_metadata = persisted.metadata().map_err(|error| {
+            format!(
+                "could not re-inspect opened candidate manifest `{}`: {error}",
+                candidate.manifest_path.display()
+            )
+        })?;
+        if final_opened_metadata.dev() != candidate.manifest_dev
+            || final_opened_metadata.ino() != candidate.manifest_ino
+            || final_opened_metadata.nlink() != 1
+            || final_opened_metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(format!(
+                "persisted candidate manifest `{}` changed opened-file identity or protection",
+                candidate.manifest_path.display()
+            ));
+        }
+        let current_path = fs::symlink_metadata(&candidate.manifest_path).map_err(|error| {
+            format!(
+                "could not re-inspect persisted candidate manifest path `{}`: {error}",
+                candidate.manifest_path.display()
+            )
+        })?;
+        if current_path.file_type().is_symlink()
+            || !current_path.is_file()
+            || current_path.dev() != candidate.manifest_dev
+            || current_path.ino() != candidate.manifest_ino
+        {
+            return Err(format!(
+                "persisted candidate manifest `{}` changed file identity after safe open",
+                candidate.manifest_path.display()
+            ));
+        }
+        sealed_candidate_manifest(&candidate.manifest_bytes)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn prepare(candidate: &CandidateSnapshotCheckContext) -> Result<Self, String> {
+        sealed_candidate_manifest(&candidate.manifest_bytes)
+    }
+
+    #[cfg(unix)]
+    fn raw_fd(&self) -> core::ffi::c_int {
+        use std::os::fd::AsRawFd as _;
+        self._file.as_raw_fd()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_candidate_manifest(bytes: &[u8]) -> Result<CandidateManifestAuthority, String> {
+    use std::ffi::CString;
+    use std::io::{Seek as _, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    const MFD_CLOEXEC: core::ffi::c_uint = 0x0001;
+    const MFD_ALLOW_SEALING: core::ffi::c_uint = 0x0002;
+    const F_ADD_SEALS: core::ffi::c_int = 1033;
+    const F_GET_SEALS: core::ffi::c_int = 1034;
+    const F_SEAL_SEAL: core::ffi::c_int = 0x0001;
+    const F_SEAL_SHRINK: core::ffi::c_int = 0x0002;
+    const F_SEAL_GROW: core::ffi::c_int = 0x0004;
+    const F_SEAL_WRITE: core::ffi::c_int = 0x0008;
+    const REQUIRED_SEALS: core::ffi::c_int =
+        F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+
+    unsafe extern "C" {
+        fn memfd_create(
+            name: *const core::ffi::c_char,
+            flags: core::ffi::c_uint,
+        ) -> core::ffi::c_int;
+        fn fcntl(fd: core::ffi::c_int, command: core::ffi::c_int, ...) -> core::ffi::c_int;
+    }
+
+    let name =
+        CString::new("cargoless-candidate-snapshot").expect("static memfd name contains no NUL");
+    // SAFETY: name is a live NUL-terminated C string and the flag is the
+    // Linux memfd_create(2) flags. CLOEXEC keeps unrelated concurrent daemon
+    // spawns from inheriting the authority; the intended child clears that
+    // flag only in its post-fork pre_exec hook below.
+    let raw_fd = unsafe { memfd_create(name.as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING) };
+    if raw_fd < 0 {
+        return Err(format!(
+            "could not create sealed candidate manifest memfd: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: memfd_create returned a new owned descriptor on success.
+    let mut file = unsafe { fs::File::from_raw_fd(raw_fd) };
+    file.write_all(bytes)
+        .map_err(|error| format!("could not write candidate manifest memfd: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("could not sync candidate manifest memfd: {error}"))?;
+    // SAFETY: fcntl operates on the live memfd and REQUIRED_SEALS is the
+    // documented bitset. No pointers cross the FFI boundary.
+    if unsafe { fcntl(file.as_raw_fd(), F_ADD_SEALS, REQUIRED_SEALS) } < 0 {
+        return Err(format!(
+            "could not seal candidate manifest memfd: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: F_GET_SEALS takes no variadic argument and returns the bitset.
+    let seals = unsafe { fcntl(file.as_raw_fd(), F_GET_SEALS) };
+    if seals < 0 || seals & REQUIRED_SEALS != REQUIRED_SEALS {
+        return Err(format!(
+            "candidate manifest memfd did not retain every required seal: {}",
+            if seals < 0 {
+                io::Error::last_os_error().to_string()
+            } else {
+                format!("got 0x{seals:x}, required 0x{REQUIRED_SEALS:x}")
+            }
+        ));
+    }
+    file.rewind()
+        .map_err(|error| format!("could not rewind candidate manifest memfd: {error}"))?;
+    let child_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    Ok(CandidateManifestAuthority {
+        _file: file,
+        child_path,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sealed_candidate_manifest(_bytes: &[u8]) -> Result<CandidateManifestAuthority, String> {
+    Err("candidate snapshot child authority requires native sealed descriptors".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredCheckSubject {
-    pub source_sha: String,
-    pub base_sha: String,
+    pub identity: StructuredCheckIdentity,
     pub engine: String,
     pub engine_version: String,
     pub policy_hash: String,
@@ -115,6 +327,25 @@ pub struct StructuredCheckSubject {
     pub model: Option<String>,
     pub model_revision: Option<String>,
     pub dimensions: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuredCheckIdentity {
+    ExactGit {
+        source_sha: String,
+        base_sha: String,
+    },
+    Candidate(StructuredCandidateSubject),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredCandidateSubject {
+    pub kind: String,
+    pub snapshot_digest: String,
+    pub tree_oid: String,
+    pub candidate_sha: Option<String>,
+    pub comparison_base_sha: String,
+    pub manifest_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +370,16 @@ pub struct StructuredCheckDegradation {
     pub detail: Option<String>,
 }
 
+/// Producer-independent semantic portion of a structured check result.
+/// Candidate consumers and the project-check runner share this type and its
+/// validator so status/finding/degradation consistency cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredCheckSemantics {
+    pub outcome: ProjectCheckOutcome,
+    pub findings: Vec<StructuredCheckFinding>,
+    pub degradation: Option<StructuredCheckDegradation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredCheckDetails {
     pub summary: String,
@@ -147,6 +388,10 @@ pub struct StructuredCheckDetails {
     pub degradation: Option<StructuredCheckDegradation>,
     pub metrics: Option<serde_json::Value>,
     pub artifacts: Vec<serde_json::Value>,
+    /// Exact producer bytes retained only after v2 schema and subject
+    /// verification succeeds. Durable evidence persists these bytes instead
+    /// of reconstructing a lossy JSON approximation from the typed fields.
+    pub verified_result_bytes: Vec<u8>,
 }
 
 impl ProjectCheckReport {
@@ -680,6 +925,7 @@ pub fn run_profile_with_changes_at(
         changed_files,
         None,
         identity.cloned(),
+        None,
     )
 }
 
@@ -701,6 +947,7 @@ pub fn run_profile_with_changes_in(
         changed_files,
         witness_target_dir,
         None,
+        None,
     )
 }
 
@@ -721,7 +968,7 @@ pub fn run_profile_with_ids(
     ids: &[String],
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
-    run_profile_inner(root, profile_name, ids, changed_files, None, None)
+    run_profile_inner(root, profile_name, ids, changed_files, None, None, None)
 }
 
 /// CGLS-26 — [`run_profile_with_ids`] with an optional WARM shared
@@ -740,6 +987,7 @@ pub fn run_profile_with_ids_in(
         ids,
         changed_files,
         witness_target_dir,
+        None,
         None,
     )
 }
@@ -760,6 +1008,30 @@ pub fn run_profile_with_ids_in_at(
         changed_files,
         witness_target_dir,
         identity.cloned(),
+        None,
+    )
+}
+
+/// Candidate-bound form used by typed overlay checks. Unlike the legacy
+/// changed-files hint, this context identifies the complete immutable tree
+/// and is exported to every child check.
+pub fn run_profile_with_ids_in_at_candidate(
+    root: &Path,
+    profile_name: &str,
+    ids: &[String],
+    changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
+    identity: Option<&ProjectCheckRunIdentity>,
+    candidate_snapshot: Option<&CandidateSnapshotCheckContext>,
+) -> io::Result<ProjectCheckReport> {
+    run_profile_inner(
+        root,
+        profile_name,
+        ids,
+        changed_files,
+        witness_target_dir,
+        identity.cloned(),
+        candidate_snapshot.cloned(),
     )
 }
 
@@ -775,6 +1047,7 @@ fn run_profile_inner(
     changed_files: Option<&[String]>,
     witness_target_dir: Option<&Path>,
     identity: Option<ProjectCheckRunIdentity>,
+    candidate_snapshot: Option<CandidateSnapshotCheckContext>,
 ) -> io::Result<ProjectCheckReport> {
     let started = Instant::now();
     let root = fs::canonicalize(root)?;
@@ -822,6 +1095,7 @@ fn run_profile_inner(
         profile_name: profile_name.to_string(),
         changed_files: changed_files.map(|files| normalize_changed_files(&root, files)),
         identity,
+        candidate_snapshot,
         witness_target_dir: witness_target_dir.map(Path::to_path_buf),
         cancel: Arc::new(AtomicBool::new(false)),
     });
@@ -1026,6 +1300,7 @@ struct RunContext {
     profile_name: String,
     changed_files: Option<Vec<String>>,
     identity: Option<ProjectCheckRunIdentity>,
+    candidate_snapshot: Option<CandidateSnapshotCheckContext>,
     /// CGLS-26 — optional WARM, persistent, shared `CARGO_TARGET_DIR` for the
     /// witness compile. `None` (the default and every non-witness caller)
     /// keeps the historical per-run `ctx.root/.cargoless-target`, byte-for-
@@ -1766,23 +2041,63 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         );
     }
     let structured_result_path = if check.result_protocol.is_some() {
-        let Some(identity) = ctx.identity.as_ref() else {
-            return structured_indeterminate(
-                ctx,
-                check,
-                "structured.identity.missing",
-                "structured result check requires exact source_sha and base_sha attribution",
-                None,
-            );
-        };
-        if identity.source_sha.trim().is_empty() || identity.base_sha.trim().is_empty() {
-            return structured_indeterminate(
-                ctx,
-                check,
-                "structured.identity.missing",
-                "structured result identity contains an empty source_sha or base_sha",
-                None,
-            );
+        match check.result_protocol.as_deref() {
+            Some("cargoless.check-result/v1") => {
+                let Some(identity) = ctx.identity.as_ref() else {
+                    return structured_indeterminate(
+                        ctx,
+                        check,
+                        "structured.identity.missing",
+                        "structured v1 result requires exact source_sha and base_sha attribution",
+                        None,
+                    );
+                };
+                if identity.source_sha.trim().is_empty() || identity.base_sha.trim().is_empty() {
+                    return structured_indeterminate(
+                        ctx,
+                        check,
+                        "structured.identity.missing",
+                        "structured v1 identity contains an empty source_sha or base_sha",
+                        None,
+                    );
+                }
+            }
+            Some("cargoless.check-result/v2") => {
+                let Some(candidate) = ctx.candidate_snapshot.as_ref() else {
+                    return structured_indeterminate(
+                        ctx,
+                        check,
+                        "structured.identity.missing",
+                        "structured v2 result requires verified candidate identity",
+                        None,
+                    );
+                };
+                let required = [
+                    candidate.candidate_kind.as_str(),
+                    candidate.snapshot_digest.as_str(),
+                    candidate.candidate_tree_oid.as_str(),
+                    candidate.comparison_base_sha.as_str(),
+                    candidate.manifest_digest.as_str(),
+                ];
+                let candidate_sha_valid = match candidate.candidate_kind.as_str() {
+                    "tree" => candidate
+                        .candidate_sha
+                        .as_deref()
+                        .is_some_and(|sha| !sha.trim().is_empty()),
+                    "index" | "overlay" => candidate.candidate_sha.is_none(),
+                    _ => false,
+                };
+                if required.iter().any(|value| value.trim().is_empty()) || !candidate_sha_valid {
+                    return structured_indeterminate(
+                        ctx,
+                        check,
+                        "structured.identity.missing",
+                        "structured v2 candidate identity is incomplete or inconsistent with kind",
+                        None,
+                    );
+                }
+            }
+            Some(_) | None => unreachable!("manifest validation closes result_protocol"),
         }
         let dir = ctx.root.join(".cargoless").join("check-results");
         if let Err(error) = fs::create_dir_all(&dir) {
@@ -1825,6 +2140,22 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
     // any workspace `.cargo/config.toml` `[build] target-dir` — cargo's
     // resolution order is env > config > default.
     let cargo_target_dir = resolve_target_dir(ctx, check);
+    let candidate_authority = if let Some(candidate) = ctx.candidate_snapshot.as_ref() {
+        match CandidateManifestAuthority::prepare(candidate) {
+            Ok(authority) => Some(authority),
+            Err(error) => {
+                return structured_indeterminate(
+                    ctx,
+                    check,
+                    "candidate_snapshot.environment_unsafe",
+                    &error,
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut cmd = Command::new(&check.command[0]);
     cmd.args(&check.command[1..])
         .current_dir(&ctx.root)
@@ -1842,10 +2173,37 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let (Some(path), Some(identity)) = (&structured_result_path, &ctx.identity) {
-        cmd.env("CARGOLESS_CHECK_RESULT_PATH", path)
-            .env("CARGOLESS_SOURCE_SHA", &identity.source_sha)
+    if let Some(candidate) = ctx.candidate_snapshot.as_ref() {
+        cmd.env(
+            "CARGOLESS_CANDIDATE_SNAPSHOT_PATH",
+            &candidate_authority
+                .as_ref()
+                .expect("candidate context has a sealed authority")
+                .child_path,
+        )
+        .env(
+            "CARGOLESS_CANDIDATE_SNAPSHOT_DIGEST",
+            &candidate.snapshot_digest,
+        )
+        .env(
+            "CARGOLESS_COMPARISON_BASE_SHA",
+            &candidate.comparison_base_sha,
+        );
+    }
+    if let Some(path) = &structured_result_path {
+        cmd.env("CARGOLESS_CHECK_RESULT_PATH", path);
+    }
+    if let Some(identity) = &ctx.identity {
+        cmd.env("CARGOLESS_SOURCE_SHA", &identity.source_sha)
             .env("CARGOLESS_BASE_SHA", &identity.base_sha);
+    }
+    if let Some(candidate_sha) = ctx
+        .candidate_snapshot
+        .as_ref()
+        .filter(|candidate| candidate.candidate_kind == "tree")
+        .and_then(|candidate| candidate.candidate_sha.as_deref())
+    {
+        cmd.env("CARGOLESS_SOURCE_SHA", candidate_sha);
     }
     // Run the command (e.g. `cargo check`) as the leader of its own process
     // GROUP + SESSION so a timeout can SIGKILL the WHOLE tree, not just the
@@ -1856,14 +2214,32 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
+        let candidate_authority_fd = candidate_authority
+            .as_ref()
+            .map(CandidateManifestAuthority::raw_fd);
         cmd.process_group(0);
         // SAFETY: pre_exec runs post-fork/pre-exec in a single-threaded child;
-        // setsid(2) is async-signal-safe. EPERM (already a session leader) is
-        // swallowed — process_group(0) above is the load-bearing line.
+        // fcntl(2) and setsid(2) are async-signal-safe. Clearing CLOEXEC here
+        // affects only the intended forked child, while the daemon's original
+        // descriptor stays CLOEXEC so unrelated concurrent spawns cannot
+        // inherit this authority. EPERM from setsid (already a session leader)
+        // is swallowed — process_group(0) above is the load-bearing line.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 unsafe extern "C" {
+                    fn fcntl(
+                        fd: core::ffi::c_int,
+                        command: core::ffi::c_int,
+                        ...
+                    ) -> core::ffi::c_int;
                     fn setsid() -> i32;
+                }
+                const F_SETFD: core::ffi::c_int = 2;
+                match candidate_authority_fd {
+                    Some(fd) if fcntl(fd, F_SETFD, 0) < 0 => {
+                        return Err(io::Error::last_os_error());
+                    }
+                    _ => {}
                 }
                 let _ = setsid();
                 Ok(())
@@ -1897,6 +2273,9 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
             );
         }
     };
+    // The descriptor must survive through exec so the child inherits the
+    // exact sealed authority. Once spawn succeeds the child owns its copy.
+    drop(candidate_authority);
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let out_thread = thread::spawn(move || read_pipe(&mut stdout));
@@ -2066,10 +2445,161 @@ fn read_structured_result(
             );
         }
     };
+    if check.result_protocol.as_deref() == Some("cargoless.check-result/v2") {
+        if let Err((code, message)) = validate_closed_v2_value(&value) {
+            return structured_indeterminate(ctx, check, code, &message, None);
+        }
+        if let Err(error) = serde_json::from_str::<ClosedV2Result>(&text) {
+            return structured_indeterminate(
+                ctx,
+                check,
+                "structured.result.malformed",
+                &format!("structured v2 result contains a duplicate key: {error}"),
+                None,
+            );
+        }
+    }
     match parse_structured_result(ctx, check, &value) {
-        Ok(result) => result,
+        Ok(mut result) => {
+            if check.result_protocol.as_deref() == Some("cargoless.check-result/v2") {
+                if let Some(structured) = result.structured.as_mut() {
+                    structured.verified_result_bytes = text.into_bytes();
+                }
+            }
+            result
+        }
         Err((code, message)) => structured_indeterminate(ctx, check, code, &message, None),
     }
+}
+
+const V2_ROOT_FIELDS: &[&str] = &[
+    "schema",
+    "check_id",
+    "status",
+    "summary",
+    "subject",
+    "findings",
+    "degradation",
+    "metrics",
+    "artifacts",
+];
+const V2_SUBJECT_FIELDS: &[&str] = &[
+    "candidate_kind",
+    "candidate_snapshot_digest",
+    "candidate_tree_oid",
+    "candidate_sha",
+    "comparison_base_sha",
+    "manifest_digest",
+    "engine",
+    "engine_version",
+    "policy_hash",
+    "provider",
+    "model",
+    "model_revision",
+    "dimensions",
+];
+
+fn validate_closed_v2_value(value: &serde_json::Value) -> Result<(), (&'static str, String)> {
+    let object = value.as_object().ok_or((
+        "structured.result.invalid",
+        "structured result root must be an object".to_string(),
+    ))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !V2_ROOT_FIELDS.contains(&field.as_str()))
+    {
+        return Err((
+            "structured.result.invalid",
+            format!("unknown structured v2 root field {field:?}"),
+        ));
+    }
+    let subject = object
+        .get("subject")
+        .and_then(serde_json::Value::as_object)
+        .ok_or((
+            "structured.result.invalid",
+            "subject must be an object".to_string(),
+        ))?;
+    if let Some(field) = subject
+        .keys()
+        .find(|field| !V2_SUBJECT_FIELDS.contains(&field.as_str()))
+    {
+        return Err((
+            "structured.result.invalid",
+            format!("unknown structured v2 subject field {field:?}"),
+        ));
+    }
+    if subject
+        .get("candidate_sha")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        return Err((
+            "structured.result.invalid",
+            "candidate_sha is conditional: omit it for index/overlay and provide a string for tree"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A permissively typed but structurally closed v2 envelope. The ordinary
+/// parser below retains semantic validation; this deserialize pass exists to
+/// make serde reject duplicate keys at the root and subject levels before a
+/// last-value-wins `serde_json::Value` could erase them.
+#[allow(dead_code)]
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClosedV2Result {
+    #[serde(default)]
+    schema: serde_json::Value,
+    #[serde(default)]
+    check_id: serde_json::Value,
+    #[serde(default)]
+    status: serde_json::Value,
+    #[serde(default)]
+    summary: serde_json::Value,
+    #[serde(default)]
+    subject: ClosedV2Subject,
+    #[serde(default)]
+    findings: serde_json::Value,
+    #[serde(default)]
+    degradation: serde_json::Value,
+    #[serde(default)]
+    metrics: serde_json::Value,
+    #[serde(default)]
+    artifacts: serde_json::Value,
+}
+
+#[allow(dead_code)]
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClosedV2Subject {
+    #[serde(default)]
+    candidate_kind: serde_json::Value,
+    #[serde(default)]
+    candidate_snapshot_digest: serde_json::Value,
+    #[serde(default)]
+    candidate_tree_oid: serde_json::Value,
+    #[serde(default)]
+    candidate_sha: serde_json::Value,
+    #[serde(default)]
+    comparison_base_sha: serde_json::Value,
+    #[serde(default)]
+    manifest_digest: serde_json::Value,
+    #[serde(default)]
+    engine: serde_json::Value,
+    #[serde(default)]
+    engine_version: serde_json::Value,
+    #[serde(default)]
+    policy_hash: serde_json::Value,
+    #[serde(default)]
+    provider: serde_json::Value,
+    #[serde(default)]
+    model: serde_json::Value,
+    #[serde(default)]
+    model_revision: serde_json::Value,
+    #[serde(default)]
+    dimensions: serde_json::Value,
 }
 
 fn parse_structured_result(
@@ -2082,10 +2612,22 @@ fn parse_structured_result(
         "structured result root must be an object".to_string(),
     ))?;
     let schema = required_json_string(object, "schema")?;
-    if schema != "cargoless.check-result/v1" {
+    if !matches!(
+        schema.as_str(),
+        "cargoless.check-result/v1" | "cargoless.check-result/v2"
+    ) {
         return Err((
             "structured.result.invalid",
             format!("unsupported structured result schema {schema:?}"),
+        ));
+    }
+    if check.result_protocol.as_deref() != Some(schema.as_str()) {
+        return Err((
+            "structured.result.invalid",
+            format!(
+                "structured result schema {schema:?} does not match configured protocol {:?}",
+                check.result_protocol
+            ),
         ));
     }
     let check_id = required_json_string(object, "check_id")?;
@@ -2098,10 +2640,6 @@ fn parse_structured_result(
             ),
         ));
     }
-    let status = ProjectCheckOutcome::parse(&required_json_string(object, "status")?).ok_or((
-        "structured.result.invalid",
-        "status must be passed, failed, degraded, skipped, or indeterminate".to_string(),
-    ))?;
     let summary = required_json_string(object, "summary")?;
     let subject_value = object
         .get("subject")
@@ -2110,12 +2648,87 @@ fn parse_structured_result(
             "structured.result.invalid",
             "subject must be an object".to_string(),
         ))?;
+    let engine = required_json_string(subject_value, "engine")?;
+    let engine_version = required_json_string(subject_value, "engine_version")?;
+    let policy_hash = required_json_string(subject_value, "policy_hash")?;
+    let identity = if schema == "cargoless.check-result/v1" {
+        let source_sha = required_json_string(subject_value, "source_sha")?;
+        let base_sha = required_json_string(subject_value, "base_sha")?;
+        let identity = ctx.identity.as_ref().ok_or((
+            "structured.identity.missing",
+            "structured v1 result check ran without exact source/base identity".to_string(),
+        ))?;
+        if source_sha != identity.source_sha || base_sha != identity.base_sha {
+            return Err((
+                "structured.subject.mismatch",
+                format!(
+                    "structured subject source/base ({source_sha}/{base_sha}) does not match requested identity ({}/{})",
+                    identity.source_sha, identity.base_sha
+                ),
+            ));
+        }
+        StructuredCheckIdentity::ExactGit {
+            source_sha,
+            base_sha,
+        }
+    } else {
+        let candidate = StructuredCandidateSubject {
+            kind: required_json_string(subject_value, "candidate_kind")?,
+            snapshot_digest: required_json_string(subject_value, "candidate_snapshot_digest")?,
+            tree_oid: required_json_string(subject_value, "candidate_tree_oid")?,
+            candidate_sha: optional_json_string(subject_value, "candidate_sha")?,
+            comparison_base_sha: required_json_string(subject_value, "comparison_base_sha")?,
+            manifest_digest: required_json_string(subject_value, "manifest_digest")?,
+        };
+        for (name, value) in [
+            ("candidate_kind", candidate.kind.as_str()),
+            (
+                "candidate_snapshot_digest",
+                candidate.snapshot_digest.as_str(),
+            ),
+            ("candidate_tree_oid", candidate.tree_oid.as_str()),
+            (
+                "comparison_base_sha",
+                candidate.comparison_base_sha.as_str(),
+            ),
+            ("manifest_digest", candidate.manifest_digest.as_str()),
+            ("engine", engine.as_str()),
+            ("engine_version", engine_version.as_str()),
+            ("policy_hash", policy_hash.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err((
+                    "structured.result.invalid",
+                    format!("structured v2 subject field {name} must be non-empty"),
+                ));
+            }
+        }
+        let expected = ctx.candidate_snapshot.as_ref().ok_or((
+            "structured.identity.missing",
+            "structured v2 result check ran without verified candidate identity".to_string(),
+        ))?;
+        if candidate.kind != expected.candidate_kind
+            || candidate.snapshot_digest != expected.snapshot_digest
+            || candidate.tree_oid != expected.candidate_tree_oid
+            || candidate.candidate_sha != expected.candidate_sha
+            || candidate.comparison_base_sha != expected.comparison_base_sha
+            || candidate.manifest_digest != expected.manifest_digest
+        {
+            return Err((
+                "structured.subject.mismatch",
+                format!(
+                    "structured candidate subject {:?} does not match verified candidate {:?}",
+                    candidate, expected
+                ),
+            ));
+        }
+        StructuredCheckIdentity::Candidate(candidate)
+    };
     let subject = StructuredCheckSubject {
-        source_sha: required_json_string(subject_value, "source_sha")?,
-        base_sha: required_json_string(subject_value, "base_sha")?,
-        engine: required_json_string(subject_value, "engine")?,
-        engine_version: required_json_string(subject_value, "engine_version")?,
-        policy_hash: required_json_string(subject_value, "policy_hash")?,
+        identity,
+        engine,
+        engine_version,
+        policy_hash,
         provider: optional_json_string(subject_value, "provider")?,
         model: optional_json_string(subject_value, "model")?,
         model_revision: optional_json_string(subject_value, "model_revision")?,
@@ -2123,35 +2736,12 @@ fn parse_structured_result(
             .get("dimensions")
             .and_then(serde_json::Value::as_u64),
     };
-    let identity = ctx.identity.as_ref().ok_or((
-        "structured.identity.missing",
-        "structured result check ran without exact identity".to_string(),
-    ))?;
-    if subject.source_sha != identity.source_sha || subject.base_sha != identity.base_sha {
-        return Err((
-            "structured.subject.mismatch",
-            format!(
-                "structured subject source/base ({}/{}) does not match requested identity ({}/{})",
-                subject.source_sha, subject.base_sha, identity.source_sha, identity.base_sha
-            ),
-        ));
-    }
 
-    let findings = object
-        .get("findings")
-        .and_then(serde_json::Value::as_array)
-        .ok_or((
-            "structured.result.invalid",
-            "findings must be an array".to_string(),
-        ))?
-        .iter()
-        .map(parse_structured_finding)
-        .collect::<Result<Vec<_>, _>>()?;
-    let degradation = object
-        .get("degradation")
-        .filter(|value| !value.is_null())
-        .map(parse_structured_degradation)
-        .transpose()?;
+    let StructuredCheckSemantics {
+        outcome: semantic_outcome,
+        findings,
+        degradation,
+    } = validate_structured_check_result_semantics(value)?;
     let details = StructuredCheckDetails {
         summary: summary.clone(),
         subject,
@@ -2163,6 +2753,7 @@ fn parse_structured_result(
             .and_then(serde_json::Value::as_array)
             .cloned()
             .unwrap_or_default(),
+        verified_result_bytes: Vec::new(),
     };
     let mut diagnostics = details
         .findings
@@ -2170,30 +2761,14 @@ fn parse_structured_result(
         .map(|finding| structured_finding_diagnostic(ctx, check, finding))
         .collect::<Vec<_>>();
 
-    let (outcome, tree) = match status {
-        ProjectCheckOutcome::Passed => {
-            if details.findings.iter().any(|finding| finding.blocking) {
-                return Err((
-                    "structured.result.inconsistent",
-                    "status passed cannot contain a blocking finding".to_string(),
-                ));
-            }
-            (ProjectCheckOutcome::Passed, TreeState::Green)
-        }
-        ProjectCheckOutcome::Failed => {
-            if !details.findings.iter().any(|finding| finding.blocking) {
-                return Err((
-                    "structured.result.inconsistent",
-                    "status failed requires at least one blocking finding".to_string(),
-                ));
-            }
-            (ProjectCheckOutcome::Failed, TreeState::Red)
-        }
+    let (outcome, tree) = match semantic_outcome {
+        ProjectCheckOutcome::Passed => (ProjectCheckOutcome::Passed, TreeState::Green),
+        ProjectCheckOutcome::Failed => (ProjectCheckOutcome::Failed, TreeState::Red),
         ProjectCheckOutcome::Degraded => {
-            let degradation = details.degradation.as_ref().ok_or((
-                "structured.result.inconsistent",
-                "status degraded requires a degradation object".to_string(),
-            ))?;
+            let degradation = details
+                .degradation
+                .as_ref()
+                .expect("shared structured semantics require degraded detail");
             let policy = check
                 .on_degraded
                 .get(&degradation.reason)
@@ -2366,14 +2941,79 @@ fn parse_structured_degradation(
         "structured.result.invalid",
         "degradation must be an object".to_string(),
     ))?;
+    let retryable = match object.get("retryable") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err((
+                "structured.result.invalid",
+                "degradation retryable must be a boolean".to_string(),
+            ));
+        }
+    };
     Ok(StructuredCheckDegradation {
         reason: required_json_string(object, "reason")?,
         dependency: optional_json_string(object, "dependency")?,
-        retryable: object
-            .get("retryable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
+        retryable,
         detail: optional_json_string(object, "detail")?,
+    })
+}
+
+/// Parse and validate the shared status/finding/degradation contract for a
+/// structured result. Authority fields remain the caller's responsibility.
+pub fn validate_structured_check_result_semantics(
+    value: &serde_json::Value,
+) -> Result<StructuredCheckSemantics, (&'static str, String)> {
+    let object = value.as_object().ok_or((
+        "structured.result.invalid",
+        "structured result root must be an object".to_string(),
+    ))?;
+    let outcome = ProjectCheckOutcome::parse(&required_json_string(object, "status")?).ok_or((
+        "structured.result.invalid",
+        "status must be passed, failed, degraded, skipped, or indeterminate".to_string(),
+    ))?;
+    let findings = object
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or((
+            "structured.result.invalid",
+            "findings must be an array".to_string(),
+        ))?
+        .iter()
+        .map(parse_structured_finding)
+        .collect::<Result<Vec<_>, _>>()?;
+    let degradation = object
+        .get("degradation")
+        .filter(|value| !value.is_null())
+        .map(parse_structured_degradation)
+        .transpose()?;
+
+    match outcome {
+        ProjectCheckOutcome::Passed if findings.iter().any(|finding| finding.blocking) => {
+            return Err((
+                "structured.result.inconsistent",
+                "status passed cannot contain a blocking finding".to_string(),
+            ));
+        }
+        ProjectCheckOutcome::Failed if !findings.iter().any(|finding| finding.blocking) => {
+            return Err((
+                "structured.result.inconsistent",
+                "status failed requires at least one blocking finding".to_string(),
+            ));
+        }
+        ProjectCheckOutcome::Degraded if degradation.is_none() => {
+            return Err((
+                "structured.result.inconsistent",
+                "status degraded requires a degradation object".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(StructuredCheckSemantics {
+        outcome,
+        findings,
+        degradation,
     })
 }
 
@@ -3046,14 +3686,16 @@ fn parse_checks(node: Option<&YamlNode>) -> Result<Vec<CheckConfig>, ParseError>
             message: format!("unknown check kind `{kind_text}`"),
         })?;
         let result_protocol = get_string(map, "result_protocol")?;
-        if result_protocol
-            .as_deref()
-            .is_some_and(|value| value != "cargoless.check-result/v1")
-        {
+        if result_protocol.as_deref().is_some_and(|value| {
+            !matches!(
+                value,
+                "cargoless.check-result/v1" | "cargoless.check-result/v2"
+            )
+        }) {
             return Err(ParseError {
                 line: item.line(),
                 message: format!(
-                    "unknown result_protocol {:?}; expected cargoless.check-result/v1",
+                    "unknown result_protocol {:?}; expected cargoless.check-result/v1 or /v2",
                     result_protocol.as_deref().unwrap_or_default()
                 ),
             });
@@ -3384,6 +4026,113 @@ checks:
         }
     }
 
+    const CANDIDATE_MANIFEST_BYTES: &[u8] = br#"{"schema":"cargoless-candidate-snapshot/1"}"#;
+
+    fn candidate_check_context_at(
+        manifest_path: PathBuf,
+        manifest_dev: u64,
+        manifest_ino: u64,
+    ) -> CandidateSnapshotCheckContext {
+        CandidateSnapshotCheckContext {
+            manifest_path,
+            manifest_bytes: CANDIDATE_MANIFEST_BYTES.to_vec(),
+            manifest_dev,
+            manifest_ino,
+            candidate_kind: "overlay".to_string(),
+            snapshot_digest:
+                "sha256:365cc276607bc3209bd7346f8de4f765e42e68bba8fdaf1b22687b6a169118ed"
+                    .to_string(),
+            candidate_tree_oid: "08d60034cad9ce340c4d42748bf0bc1b2e34d830".to_string(),
+            candidate_sha: None,
+            comparison_base_sha: "de16c5f7dd233165813ffa72719869e3181c554b".to_string(),
+            manifest_digest:
+                "sha256:a363a22a9ab3317a8d7d616ecb4ac66ef7d0f2d7dd46d8a1010f44a601b8377c"
+                    .to_string(),
+        }
+    }
+
+    fn candidate_check_context(root: &Path) -> CandidateSnapshotCheckContext {
+        let candidate_dir = root.join(".cargoless");
+        fs::create_dir_all(&candidate_dir).unwrap();
+        let manifest_path = candidate_dir.join("candidate-snapshot.json");
+        fs::write(&manifest_path, CANDIDATE_MANIFEST_BYTES).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let metadata = fs::metadata(&manifest_path).unwrap();
+        #[cfg(unix)]
+        let (manifest_dev, manifest_ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (manifest_dev, manifest_ino) = (0, 0);
+        candidate_check_context_at(
+            fs::canonicalize(manifest_path).unwrap(),
+            manifest_dev,
+            manifest_ino,
+        )
+    }
+
+    fn write_candidate_structured_check_fixture(root: &Path, payload: &str) {
+        fs::write(
+            root.join("emit-result.sh"),
+            format!(
+                "#!/usr/bin/env bash\nset -eu\ncat > \"$CARGOLESS_CHECK_RESULT_PATH\" <<JSON\n{payload}\nJSON\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+profiles:
+  dev:
+    include: ["candidate-policy"]
+    timeout_ms: 30000
+    max_parallel: 1
+checks:
+  - id: candidate-policy
+    kind: command
+    read_only: true
+    command: ["bash", "emit-result.sh"]
+    timeout_ms: 15000
+    cache: none
+    result_protocol: cargoless.check-result/v2
+"#,
+        )
+        .unwrap();
+    }
+
+    fn candidate_structured_payload(overrides: &[(&str, &str)]) -> String {
+        let context =
+            candidate_check_context_at(PathBuf::from("/verified/candidate-snapshot.json"), 0, 0);
+        let mut subject = serde_json::json!({
+            "candidate_kind": context.candidate_kind,
+            "candidate_snapshot_digest": context.snapshot_digest,
+            "candidate_tree_oid": context.candidate_tree_oid,
+            "comparison_base_sha": context.comparison_base_sha,
+            "manifest_digest": context.manifest_digest,
+            "engine": "migration-burndown",
+            "engine_version": "1",
+            "policy_hash": "policy-1"
+        });
+        for (key, value) in overrides {
+            subject[*key] = serde_json::Value::String((*value).to_string());
+        }
+        serde_json::json!({
+            "schema": "cargoless.check-result/v2",
+            "check_id": "candidate-policy",
+            "status": "passed",
+            "summary": "candidate policy satisfied",
+            "subject": subject,
+            "findings": []
+        })
+        .to_string()
+    }
+
     #[test]
     fn structured_command_result_passes_with_exact_subject_and_exports_identity() {
         let root = scratch("structured-pass");
@@ -3422,6 +4171,186 @@ checks:
             "policy-1"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_structured_v2_requires_and_retains_every_verified_identity() {
+        let root = scratch("candidate-structured-pass");
+        let context = candidate_check_context(&root);
+        let payload = candidate_structured_payload(&[]);
+        write_candidate_structured_check_fixture(&root, &payload);
+
+        let report =
+            run_profile_inner(&root, "dev", &[], None, None, None, Some(context.clone())).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        assert_eq!(report.results[0].outcome, ProjectCheckOutcome::Passed);
+        let structured = report.results[0]
+            .structured
+            .as_ref()
+            .expect("v2 result retains structured evidence");
+        assert_eq!(
+            structured.verified_result_bytes,
+            format!("{payload}\n").as_bytes(),
+            "the verified result must retain the producer's exact bytes, including whitespace"
+        );
+        let identity = &structured.subject.identity;
+        let StructuredCheckIdentity::Candidate(candidate) = identity else {
+            panic!("v2 result must retain candidate identity without fake source/base fields")
+        };
+        assert_eq!(candidate.kind, context.candidate_kind);
+        assert_eq!(candidate.snapshot_digest, context.snapshot_digest);
+        assert_eq!(candidate.tree_oid, context.candidate_tree_oid);
+        assert_eq!(candidate.candidate_sha, None);
+        assert_eq!(candidate.comparison_base_sha, context.comparison_base_sha);
+        assert_eq!(candidate.manifest_digest, context.manifest_digest);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_structured_v2_fails_closed_on_identity_mismatch_or_overlay_sha() {
+        for (tag, overrides) in [
+            ("kind", vec![("candidate_kind", "tree")]),
+            (
+                "snapshot",
+                vec![(
+                    "candidate_snapshot_digest",
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )],
+            ),
+            (
+                "tree",
+                vec![(
+                    "candidate_tree_oid",
+                    "1111111111111111111111111111111111111111",
+                )],
+            ),
+            (
+                "comparison",
+                vec![(
+                    "comparison_base_sha",
+                    "2222222222222222222222222222222222222222",
+                )],
+            ),
+            (
+                "manifest",
+                vec![(
+                    "manifest_digest",
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )],
+            ),
+            (
+                "overlay-sha",
+                vec![("candidate_sha", "3333333333333333333333333333333333333333")],
+            ),
+        ] {
+            let root = scratch(&format!("candidate-structured-{tag}"));
+            write_candidate_structured_check_fixture(
+                &root,
+                &candidate_structured_payload(&overrides),
+            );
+            let report = run_profile_inner(
+                &root,
+                "dev",
+                &[],
+                None,
+                None,
+                None,
+                Some(candidate_check_context(&root)),
+            )
+            .unwrap();
+            assert_eq!(report.tree, TreeState::Red, "{tag}");
+            assert_eq!(
+                report.results[0].outcome,
+                ProjectCheckOutcome::Indeterminate,
+                "{tag}"
+            );
+            assert!(
+                report.results[0]
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code.as_deref()
+                        == Some("structured.subject.mismatch")),
+                "{tag}: {:?}",
+                report.results[0].diagnostics
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn candidate_structured_v2_is_closed_and_candidate_sha_is_absent_only() {
+        let valid = candidate_structured_payload(&[]);
+        let duplicate_root = valid.replacen(
+            "\"schema\":\"cargoless.check-result/v2\"",
+            "\"schema\":\"cargoless.check-result/v2\",\"schema\":\"cargoless.check-result/v2\"",
+            1,
+        );
+        let duplicate_subject = valid.replacen(
+            "\"candidate_kind\":\"overlay\"",
+            "\"candidate_kind\":\"overlay\",\"candidate_kind\":\"overlay\"",
+            1,
+        );
+        let unknown_root = valid.replacen(
+            "\"findings\":[]",
+            "\"unknown_root\":true,\"findings\":[]",
+            1,
+        );
+        let unknown_subject = valid.replacen(
+            "\"engine\":\"migration-burndown\"",
+            "\"unknown_subject\":true,\"engine\":\"migration-burndown\"",
+            1,
+        );
+        let mut null_sha: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        null_sha["subject"]["candidate_sha"] = serde_json::Value::Null;
+        let null_sha = null_sha.to_string();
+
+        for (tag, payload, code) in [
+            (
+                "duplicate-root",
+                duplicate_root,
+                "structured.result.malformed",
+            ),
+            (
+                "duplicate-subject",
+                duplicate_subject,
+                "structured.result.malformed",
+            ),
+            ("unknown-root", unknown_root, "structured.result.invalid"),
+            (
+                "unknown-subject",
+                unknown_subject,
+                "structured.result.invalid",
+            ),
+            ("null-candidate-sha", null_sha, "structured.result.invalid"),
+        ] {
+            let root = scratch(&format!("candidate-structured-closed-{tag}"));
+            write_candidate_structured_check_fixture(&root, &payload);
+            let report = run_profile_inner(
+                &root,
+                "dev",
+                &[],
+                None,
+                None,
+                None,
+                Some(candidate_check_context(&root)),
+            )
+            .unwrap();
+            assert_eq!(report.tree, TreeState::Red, "{tag}");
+            assert_eq!(
+                report.results[0].outcome,
+                ProjectCheckOutcome::Indeterminate,
+                "{tag}"
+            );
+            assert!(
+                report.results[0]
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code.as_deref() == Some(code)),
+                "{tag}: {:?}",
+                report.results[0].diagnostics
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -4080,6 +5009,152 @@ checks:
             fs::read_to_string(root.join("changed.out")).unwrap(),
             "portal/src/lib.rs"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_snapshot_identity_is_a_sealed_memfd_for_every_command_check() {
+        let root = scratch("candidate-snapshot-sealed-env");
+        let context = candidate_check_context(&root);
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: candidate-env
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "p=$CARGOLESS_CANDIDATE_SNAPSHOT_PATH; cp \"$p\" candidate-before; if printf attacker > \"$p\" 2>/dev/null; then overwrite=allowed; else overwrite=denied; fi; cp \"$p\" candidate-after; if cmp -s candidate-before candidate-after; then stable=yes; else stable=no; fi; printf '%s\n%s\n%s\n%s\n%s' \"$p\" \"$overwrite\" \"$stable\" \"$CARGOLESS_CANDIDATE_SNAPSHOT_DIGEST\" \"$CARGOLESS_COMPARISON_BASE_SHA\" > candidate-env.out"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report =
+            run_profile_inner(&root, "dev", &[], None, None, None, Some(context.clone())).unwrap();
+        assert_eq!(report.tree, TreeState::Green);
+        let output = fs::read_to_string(root.join("candidate-env.out")).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with("/proc/self/fd/"),
+            "the child authority must not be a mutable named path: {}",
+            lines[0]
+        );
+        assert_eq!(lines[1], "denied");
+        assert_eq!(lines[2], "yes");
+        assert_eq!(lines[3], context.snapshot_digest);
+        assert_eq!(lines[4], context.comparison_base_sha);
+        assert_eq!(
+            fs::read(root.join("candidate-before")).unwrap(),
+            context.manifest_bytes
+        );
+        assert_eq!(
+            fs::read(root.join("candidate-after")).unwrap(),
+            context.manifest_bytes,
+            "the child must re-read the same sealed bytes after a denied overwrite"
+        );
+        assert_eq!(
+            fs::read(&context.manifest_path).unwrap(),
+            context.manifest_bytes,
+            "the persisted lifecycle sidecar remains the same exact evidence"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_snapshot_rejects_deterministic_named_sidecar_replacement_before_spawn() {
+        let root = scratch("candidate-snapshot-named-replacement");
+        let context = candidate_check_context(&root);
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: candidate-env
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf spawned > child-spawned"]
+    cache: none
+"#,
+        )
+        .unwrap();
+        let replacement = context.manifest_path.with_extension("replacement");
+        fs::write(&replacement, &context.manifest_bytes).unwrap();
+        fs::rename(&replacement, &context.manifest_path).unwrap();
+
+        let report = run_profile_inner(&root, "dev", &[], None, None, None, Some(context)).unwrap();
+
+        assert_eq!(report.tree, TreeState::Red);
+        assert!(
+            report.results[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("candidate_snapshot.environment_unsafe")),
+            "named-sidecar replacement must fail with stable taxonomy: {:?}",
+            report.results[0].diagnostics
+        );
+        assert!(
+            !root.join("child-spawned").exists(),
+            "sidecar mismatch must be rejected before child spawn"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_snapshot_rejects_identical_path_swap_after_authority_open() {
+        let root = scratch("candidate-snapshot-open-swap");
+        let context = candidate_check_context(&root);
+        let replacement = context.manifest_path.with_extension("replacement");
+        fs::write(&replacement, &context.manifest_bytes).unwrap();
+
+        let error = CandidateManifestAuthority::prepare_with_after_open(&context, || {
+            fs::rename(&replacement, &context.manifest_path).unwrap();
+        })
+        .expect_err("the named lifecycle artifact changed identity after its safe open");
+
+        assert!(
+            error.contains("changed opened-file identity or protection"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn candidate_snapshot_fails_closed_without_a_native_sealed_descriptor() {
+        let root = scratch("candidate-snapshot-native-seal-required");
+        let context = candidate_check_context(&root);
+        fs::write(
+            root.join(MANIFEST_NAME),
+            r#"
+version: 1
+checks:
+  - id: candidate-env
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "printf spawned > child-spawned"]
+    cache: none
+"#,
+        )
+        .unwrap();
+
+        let report = run_profile_inner(&root, "dev", &[], None, None, None, Some(context)).unwrap();
+
+        assert_eq!(report.tree, TreeState::Red);
+        assert!(
+            report.results[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("candidate_snapshot.environment_unsafe")),
+            "platforms without native sealing must fail closed: {:?}",
+            report.results[0].diagnostics
+        );
+        assert!(!root.join("child-spawned").exists());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -50,10 +50,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use cargoless_proto::candidate_snapshot::CandidateSnapshotManifest;
 use cargoless_proto::outcome::{AttemptId, OutcomeEnvelope, RequestId, TraceId};
 use cargoless_proto::{Diagnostic, Severity};
 
 use crate::batch::{BatchMember, BatchMemberResult, BatchProvenance, BatchReport, BatchVerdict};
+use crate::candidate_snapshot::CandidateSnapshotError;
 use crate::config::{FleetConfig, FleetConfigError};
 
 pub mod discovery;
@@ -151,6 +153,13 @@ pub struct PushOverlayOptions {
     /// Exact candidate commit to check. When paired with `source_ref`, the
     /// daemon verifies reachability and checks this Git tree directly.
     pub source_sha: Option<String>,
+    /// Exact immutable comparison base used by candidate-bound checks. This
+    /// is independent from the legacy diagnostics-only `base_sha` field.
+    pub comparison_base_sha: Option<String>,
+    /// Closed, digest-bound snapshot manifest for the complete candidate.
+    /// Legacy pushes omit it; candidate-backed checks must validate it before
+    /// materializing or executing any check.
+    pub candidate_snapshot: Option<CandidateSnapshotManifest>,
     /// Repo-relative files changed by the client diff. These are distinct
     /// from `files`: the overlay payload also includes workspace config files
     /// needed for cluster routing, while project-check triggers should see
@@ -187,6 +196,13 @@ impl PushOverlayOptions {
             && self.base_sha.as_deref().unwrap_or("").trim().is_empty()
             && self.source_ref.as_deref().unwrap_or("").trim().is_empty()
             && self.source_sha.as_deref().unwrap_or("").trim().is_empty()
+            && self
+                .comparison_base_sha
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && self.candidate_snapshot.is_none()
             && self
                 .changed_files
                 .as_ref()
@@ -291,6 +307,15 @@ pub struct WorktreeStatus {
     /// verdicts) — pollers treat absence as "unattributed", never as a
     /// match. Additive wire key; absent on the wire when `None`.
     pub base_sha: Option<String>,
+    /// Exact typed-candidate request identity. Unlike `base_sha`, this commits
+    /// both the immutable comparison base and the complete candidate. Typed
+    /// pollers address status/history by this value and require an exact echo.
+    /// Legacy and exact-Git verdicts leave it absent.
+    pub candidate_manifest_digest: Option<String>,
+    /// Complete candidate content identity returned as result evidence.
+    pub candidate_snapshot_digest: Option<String>,
+    /// Git-native root tree identity returned as result evidence.
+    pub candidate_tree_oid: Option<String>,
     /// **#A8 macro-blind annotation** — `true` iff the consumed push's
     /// `changed_files` matched the daemon's configured proc-macro-blind
     /// path globs (`CARGOLESS_MACRO_BLIND_PATHS`). On those paths the
@@ -352,6 +377,12 @@ pub struct TransitionEvent {
     /// be able to discard another branch's verdict without a status
     /// round-trip (the round-trip is exactly the race window).
     pub base_sha: Option<String>,
+    /// See [`WorktreeStatus::candidate_manifest_digest`].
+    pub candidate_manifest_digest: Option<String>,
+    /// See [`WorktreeStatus::candidate_snapshot_digest`].
+    pub candidate_snapshot_digest: Option<String>,
+    /// See [`WorktreeStatus::candidate_tree_oid`].
+    pub candidate_tree_oid: Option<String>,
     /// See [`WorktreeStatus::ra_blind_paths`] (#A8) — mirrored so a
     /// subscribe-driven gate consumer can see "this green is RA-blind"
     /// on the event itself and demand a witness without a status
@@ -454,6 +485,17 @@ pub trait VerdictService: Send + Sync {
         self.get_status(worktree)
     }
 
+    /// Status addressed by the typed candidate's manifest digest. The default
+    /// keeps legacy service implementations source-compatible; authoritative
+    /// servers override it with a manifest-digest history lookup.
+    fn get_status_candidate_attributed(
+        &self,
+        worktree: &str,
+        _manifest_digest: &str,
+    ) -> Option<WorktreeStatus> {
+        self.get_status(worktree)
+    }
+
     /// Just the verdict string (light — no per-crate, no heartbeat).
     /// `None` ⇒ unknown worktree.
     fn get_verdict(&self, worktree: &str) -> Option<String>;
@@ -494,6 +536,16 @@ pub trait VerdictService: Send + Sync {
         &self,
         worktree: &str,
         _base_sha: Option<&str>,
+    ) -> Vec<Diagnostic> {
+        self.get_diagnostics(worktree)
+    }
+
+    /// Diagnostics addressed by the same manifest digest as
+    /// [`Self::get_status_candidate_attributed`].
+    fn get_diagnostics_candidate_attributed(
+        &self,
+        worktree: &str,
+        _manifest_digest: &str,
     ) -> Vec<Diagnostic> {
         self.get_diagnostics(worktree)
     }
@@ -731,8 +783,27 @@ pub trait TransportClient {
     ) -> Result<Option<WorktreeStatus>, TransportError> {
         self.get_status(worktree)
     }
+    /// Poll for the verdict belonging to one exact typed candidate. The
+    /// returned status must echo the requested manifest digest before a caller
+    /// accepts it; default-compatible adapters can only return their latest.
+    fn get_status_candidate_attributed(
+        &self,
+        worktree: &str,
+        _manifest_digest: &str,
+    ) -> Result<Option<WorktreeStatus>, TransportError> {
+        self.get_status(worktree)
+    }
     fn get_verdict(&self, worktree: &str) -> Result<Option<String>, TransportError>;
     fn get_diagnostics(&self, worktree: &str) -> Result<Vec<Diagnostic>, TransportError>;
+    /// Fetch diagnostics for one exact typed candidate. Default-compatible
+    /// adapters fall back to the latest worktree diagnostics.
+    fn get_diagnostics_candidate_attributed(
+        &self,
+        worktree: &str,
+        _manifest_digest: &str,
+    ) -> Result<Vec<Diagnostic>, TransportError> {
+        self.get_diagnostics(worktree)
+    }
     fn list_worktrees(&self) -> Result<Vec<WorktreeSummary>, TransportError>;
     /// Subscribe to transitions. Returns a `Receiver` so all three
     /// transports present the same pull interface (in-proc hands the
@@ -1052,12 +1123,451 @@ pub struct LaneEnqueueRequest {
     pub changed_files: Vec<String>,
 }
 
+#[derive(Debug)]
+struct RawJsonObjectMember {
+    key: String,
+    key_start: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
+const CANDIDATE_AUTHORITY_KEYS: &[&str] = &[
+    "repo_relative",
+    "analysis_root",
+    "base_sha",
+    "source_ref",
+    "source_sha",
+    "comparison_base_sha",
+    "candidate_snapshot",
+    "changed_files",
+    "gate",
+    "check_ids",
+    "semantic",
+];
+const PUSH_REQUEST_ENVELOPE_KEYS: &[&str] =
+    &["op", "worktree", "base_ref", "files", "check_profile"];
+
+fn candidate_snapshot_error(
+    code: &'static str,
+    message: impl Into<String>,
+) -> CandidateSnapshotError {
+    CandidateSnapshotError {
+        code,
+        message: message.into(),
+    }
+}
+
+fn raw_json_object_members(
+    bytes: &[u8],
+    start: usize,
+) -> Result<Vec<RawJsonObjectMember>, CandidateSnapshotError> {
+    if bytes.get(start) != Some(&b'{') {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.json_invalid",
+            "candidate-bearing request authority container must be a JSON object",
+        ));
+    }
+
+    let mut members = Vec::new();
+    let mut index = skip_json_whitespace(bytes, start + 1);
+    if bytes.get(index) == Some(&b'}') {
+        return Ok(members);
+    }
+    loop {
+        let key_start = index;
+        let key_end = json_string_end(bytes, key_start).ok_or_else(|| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                "invalid JSON object key while locating candidate authority",
+            )
+        })?;
+        let key: String = serde_json::from_slice(&bytes[key_start..key_end]).map_err(|error| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("invalid JSON object key while locating candidate authority: {error}"),
+            )
+        })?;
+        index = skip_json_whitespace(bytes, key_end);
+        if bytes.get(index) != Some(&b':') {
+            return Err(candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("field {key} is missing its JSON value separator"),
+            ));
+        }
+        let value_start = skip_json_whitespace(bytes, index + 1);
+        let value_end = json_value_end(bytes, value_start).ok_or_else(|| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("field {key} does not contain a valid JSON value"),
+            )
+        })?;
+        members.push(RawJsonObjectMember {
+            key,
+            key_start,
+            value_start,
+            value_end,
+        });
+
+        index = skip_json_whitespace(bytes, value_end);
+        match bytes.get(index) {
+            Some(b',') => index = skip_json_whitespace(bytes, index + 1),
+            Some(b'}') => return Ok(members),
+            _ => {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.json_invalid",
+                    "candidate authority object has an invalid member separator",
+                ));
+            }
+        }
+    }
+}
+
+fn candidate_snapshot_value_spans(
+    text: &str,
+) -> Result<Vec<(usize, usize, usize)>, CandidateSnapshotError> {
+    let bytes = text.as_bytes();
+    let mut value_spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let key_start = index;
+        let string_end = json_string_end(bytes, index).ok_or_else(|| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                "unterminated JSON string while locating candidate_snapshot",
+            )
+        })?;
+        let decoded: String =
+            serde_json::from_slice(&bytes[index..string_end]).map_err(|error| {
+                candidate_snapshot_error(
+                    "candidate_snapshot.json_invalid",
+                    format!("invalid JSON string while locating candidate_snapshot: {error}"),
+                )
+            })?;
+        let mut colon = skip_json_whitespace(bytes, string_end);
+        if decoded == "candidate_snapshot" && bytes.get(colon) == Some(&b':') {
+            colon += 1;
+            let value_start = skip_json_whitespace(bytes, colon);
+            let value_end = json_value_end(bytes, value_start).ok_or_else(|| {
+                candidate_snapshot_error(
+                    "candidate_snapshot.json_invalid",
+                    "candidate_snapshot value is not valid JSON",
+                )
+            })?;
+            value_spans.push((key_start, value_start, value_end));
+        }
+        index = string_end;
+    }
+    Ok(value_spans)
+}
+
+fn duplicate_json_member_key(members: &[RawJsonObjectMember]) -> Option<&str> {
+    members.iter().find_map(|candidate| {
+        (members
+            .iter()
+            .filter(|member| member.key == candidate.key)
+            .count()
+            > 1)
+        .then_some(candidate.key.as_str())
+    })
+}
+
+fn has_candidate_authority_key(members: &[RawJsonObjectMember]) -> bool {
+    members.iter().any(|member| {
+        CANDIDATE_AUTHORITY_KEYS
+            .iter()
+            .any(|key| member.key == *key)
+    })
+}
+
+fn unknown_candidate_authority_key(
+    members: &[RawJsonObjectMember],
+    flat_push: bool,
+) -> Option<&str> {
+    members.iter().find_map(|member| {
+        let known_authority = CANDIDATE_AUTHORITY_KEYS
+            .iter()
+            .any(|key| member.key == *key);
+        let known_envelope = flat_push
+            && PUSH_REQUEST_ENVELOPE_KEYS
+                .iter()
+                .any(|key| member.key == *key);
+        (!known_authority && !known_envelope).then_some(member.key.as_str())
+    })
+}
+
+fn candidate_snapshot_manifest_from_request_json(
+    text: &str,
+    op: &str,
+) -> Result<Option<CandidateSnapshotManifest>, CandidateSnapshotError> {
+    let candidate_spans = candidate_snapshot_value_spans(text)?;
+    if candidate_spans.is_empty() {
+        // The strict authority-location contract is additive. Legacy requests
+        // with no typed candidate retain serde_json::Value's historical
+        // best-effort duplicate/unknown-field behaviour.
+        return Ok(None);
+    }
+
+    let bytes = text.as_bytes();
+    let root_start = skip_json_whitespace(bytes, 0);
+    let root_members = raw_json_object_members(bytes, root_start)?;
+    let root_options: Vec<_> = root_members
+        .iter()
+        .filter(|member| member.key == "options")
+        .collect();
+    if root_options.len() > 1 {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.json_duplicate_key",
+            "duplicate field options in candidate-bearing request",
+        ));
+    }
+
+    let options_members = root_options
+        .first()
+        .filter(|member| bytes.get(member.value_start) == Some(&b'{'))
+        .map(|member| raw_json_object_members(bytes, member.value_start))
+        .transpose()?
+        .unwrap_or_default();
+    let root_candidates: Vec<_> = root_members
+        .iter()
+        .filter(|member| member.key == "candidate_snapshot")
+        .collect();
+    let options_candidates: Vec<_> = options_members
+        .iter()
+        .filter(|member| member.key == "candidate_snapshot")
+        .collect();
+    let direct_candidate_key_starts: Vec<_> = root_candidates
+        .iter()
+        .chain(options_candidates.iter())
+        .map(|member| member.key_start)
+        .collect();
+    if candidate_spans.iter().any(|(key_start, _, _)| {
+        !direct_candidate_key_starts
+            .iter()
+            .any(|direct| direct == key_start)
+    }) {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.location_invalid",
+            "candidate_snapshot must be a direct member of the selected push authority container or batch options",
+        ));
+    }
+
+    let (selected_members, flat_push) = match op {
+        "push_overlay" => {
+            if !root_candidates.is_empty() && !options_candidates.is_empty() {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.pairing_invalid",
+                    "candidate authority is split across flat and nested push containers",
+                ));
+            }
+            if root_candidates.len() > 1 || options_candidates.len() > 1 {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.json_duplicate_key",
+                    "duplicate field candidate_snapshot in selected push authority container",
+                ));
+            }
+            if !root_candidates.is_empty() {
+                if !root_options.is_empty() {
+                    return Err(candidate_snapshot_error(
+                        "candidate_snapshot.pairing_invalid",
+                        "flat candidate authority cannot be combined with a nested options container",
+                    ));
+                }
+                (&root_members, true)
+            } else if !options_candidates.is_empty() {
+                if has_candidate_authority_key(&root_members) {
+                    return Err(candidate_snapshot_error(
+                        "candidate_snapshot.pairing_invalid",
+                        "candidate authority fields are split across flat and nested push containers",
+                    ));
+                }
+                (&options_members, false)
+            } else {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.location_invalid",
+                    "push_overlay candidate_snapshot is not in a supported direct authority container",
+                ));
+            }
+        }
+        "batch_check" => {
+            if !root_candidates.is_empty() {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.location_invalid",
+                    "batch_check candidate_snapshot must be a direct member of options",
+                ));
+            }
+            if options_candidates.len() > 1 {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.json_duplicate_key",
+                    "duplicate field candidate_snapshot in batch options",
+                ));
+            }
+            if options_candidates.is_empty() {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.location_invalid",
+                    "batch_check candidate_snapshot is not a direct member of options",
+                ));
+            }
+            if has_candidate_authority_key(&root_members) {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.pairing_invalid",
+                    "candidate authority fields are split across batch root and options",
+                ));
+            }
+            (&options_members, false)
+        }
+        _ => {
+            return Err(candidate_snapshot_error(
+                "candidate_snapshot.location_invalid",
+                format!("operation {op} does not define a candidate authority container"),
+            ));
+        }
+    };
+
+    if let Some(key) = duplicate_json_member_key(selected_members) {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.json_duplicate_key",
+            format!("duplicate field {key} in selected candidate authority container"),
+        ));
+    }
+    if let Some(key) = unknown_candidate_authority_key(selected_members, flat_push) {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.location_invalid",
+            format!("unknown field {key} is not part of the selected candidate authority shape"),
+        ));
+    }
+
+    let candidate = selected_members
+        .iter()
+        .find(|member| member.key == "candidate_snapshot")
+        .expect("selected candidate authority contains candidate_snapshot");
+    let raw = std::str::from_utf8(&bytes[candidate.value_start..candidate.value_end]).map_err(
+        |error| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("candidate_snapshot is not UTF-8: {error}"),
+            )
+        },
+    )?;
+    crate::candidate_snapshot::parse_and_validate_manifest_json(raw).map(Some)
+}
+
+fn skip_json_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        index += 1;
+    }
+    index
+}
+
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return Some(index + 1),
+            b'\\' => {
+                index += 1;
+                if index >= bytes.len() {
+                    return None;
+                }
+                index += 1;
+            }
+            byte if byte < 0x20 => return None,
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match *bytes.get(start)? {
+        b'"' => json_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut stack = vec![bytes[start]];
+            let mut index = start + 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => index = json_string_end(bytes, index)?,
+                    b'{' | b'[' => {
+                        stack.push(bytes[index]);
+                        index += 1;
+                    }
+                    b'}' => {
+                        if stack.pop() != Some(b'{') {
+                            return None;
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Some(index);
+                        }
+                    }
+                    b']' => {
+                        if stack.pop() != Some(b'[') {
+                            return None;
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Some(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut index = start;
+            while bytes.get(index).is_some_and(|byte| {
+                !matches!(byte, b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')
+            }) {
+                index += 1;
+            }
+            (index > start).then_some(index)
+        }
+    }
+}
+
 impl Request {
     /// Parse `{"op":"get_status","worktree":"W"}` (best-effort; unknown
     /// op ⇒ `None` so the adapter answers a clean protocol error rather
     /// than panicking).
     pub fn from_json(text: &str) -> Option<Request> {
-        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        Self::try_from_json(text).ok().flatten()
+    }
+
+    /// Parse a request while retaining the stable typed-candidate failure
+    /// taxonomy. Legacy malformed/unknown requests remain `Ok(None)` so
+    /// existing best-effort callers keep their historical behavior.
+    pub fn try_from_json(text: &str) -> Result<Option<Request>, CandidateSnapshotError> {
+        let v: serde_json::Value = match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        // Preserve and validate the typed candidate manifest from the raw
+        // request after the surrounding request has passed basic JSON syntax.
+        // `serde_json::Value` deliberately keeps only the last duplicate
+        // object key, which is acceptable for legacy best-effort metadata but
+        // would erase an identity conflict inside a candidate snapshot.
+        let op = v
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let candidate_snapshot = candidate_snapshot_manifest_from_request_json(text, op)?;
+        Ok(Self::from_json_value(v, candidate_snapshot))
+    }
+
+    fn from_json_value(
+        v: serde_json::Value,
+        candidate_snapshot: Option<CandidateSnapshotManifest>,
+    ) -> Option<Request> {
         let op = v.get("op")?.as_str()?;
         let wt = || {
             v.get("worktree")
@@ -1094,7 +1604,8 @@ impl Request {
                 // Hard witness gate never promoted (see the CI witness's
                 // never-fires bug). The flat CLI has no `options{}` key, so it
                 // hits `unwrap_or(&v)` and stays byte-identical.
-                let options = push_overlay_options_from_json(v.get("options").unwrap_or(&v));
+                let mut options = push_overlay_options_from_json(v.get("options").unwrap_or(&v));
+                options.candidate_snapshot = candidate_snapshot;
                 if options.is_empty() {
                     Some(Request::PushOverlay {
                         worktree,
@@ -1112,7 +1623,10 @@ impl Request {
                     })
                 }
             }
-            "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(&v))),
+            "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(
+                &v,
+                candidate_snapshot,
+            ))),
             "lane_enqueue" => {
                 let id = v.get("id").and_then(serde_json::Value::as_str)?.to_string();
                 let head = v
@@ -1209,6 +1723,19 @@ impl Request {
                             serde_json::Value::String(source_sha.to_string()),
                         );
                     }
+                    if let Some(comparison_base_sha) = options.comparison_base_sha.as_deref() {
+                        map.insert(
+                            "comparison_base_sha".to_string(),
+                            serde_json::Value::String(comparison_base_sha.to_string()),
+                        );
+                    }
+                    if let Some(candidate_snapshot) = options.candidate_snapshot.as_ref() {
+                        map.insert(
+                            "candidate_snapshot".to_string(),
+                            serde_json::to_value(candidate_snapshot)
+                                .expect("candidate snapshot DTO is always serializable"),
+                        );
+                    }
                     if let Some(changed_files) = options
                         .changed_files
                         .as_ref()
@@ -1279,7 +1806,12 @@ fn batch_check_request_to_json(request: &BatchCheckRequest) -> serde_json::Value
     })
 }
 
-fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
+fn batch_check_request_from_value(
+    v: &serde_json::Value,
+    candidate_snapshot: Option<CandidateSnapshotManifest>,
+) -> BatchCheckRequest {
+    let mut options = push_overlay_options_from_json(v.get("options").unwrap_or(v));
+    options.candidate_snapshot = candidate_snapshot;
     BatchCheckRequest {
         batch_id: v
             .get("batch_id")
@@ -1299,7 +1831,7 @@ fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
             .to_string(),
         members: batch_members_from_json(v.get("members")),
         check_profile: check_profile_from_json(v.get("check_profile")),
-        options: push_overlay_options_from_json(v.get("options").unwrap_or(v)),
+        options,
         corun: v
             .get("corun")
             .and_then(serde_json::Value::as_bool)
@@ -1366,6 +1898,19 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
             map.insert(
                 "source_sha".to_string(),
                 serde_json::Value::String(source_sha.to_string()),
+            );
+        }
+        if let Some(comparison_base_sha) = options.comparison_base_sha.as_deref() {
+            map.insert(
+                "comparison_base_sha".to_string(),
+                serde_json::Value::String(comparison_base_sha.to_string()),
+            );
+        }
+        if let Some(candidate_snapshot) = options.candidate_snapshot.as_ref() {
+            map.insert(
+                "candidate_snapshot".to_string(),
+                serde_json::to_value(candidate_snapshot)
+                    .expect("candidate snapshot DTO is always serializable"),
             );
         }
         if let Some(changed_files) = options
@@ -1453,6 +1998,12 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty()),
+        comparison_base_sha: v
+            .get("comparison_base_sha")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        candidate_snapshot: None,
         changed_files: string_array_from_json(v.get("changed_files")),
         gate: v
             .get("gate")
@@ -1619,6 +2170,12 @@ pub struct PushOverlayAck {
     /// backpressure; `Some(<other>)` reserved for future use. Absent on
     /// the JSON wire so pre-existing pollers/tests are byte-identical.
     pub reject_http_status: Option<u16>,
+    /// Stable machine-branchable rejection code supplied by the service.
+    /// `None` preserves the legacy `submission.rejected` outcome-v3 code.
+    /// Unlike the HTTP-only status/body metadata, a non-empty value is
+    /// carried by the acknowledgement JSON codec so transport boundaries do
+    /// not erase `candidate_snapshot.*` or `attempt.*` taxonomy.
+    pub reject_code: Option<String>,
     /// R3 mitigation — structured reject payload paired with
     /// [`Self::reject_http_status`]. When set, the HTTP layer serves it
     /// as the response body verbatim (application/json). `None` ⇒ fall
@@ -1627,14 +2184,29 @@ pub struct PushOverlayAck {
 }
 
 /// Serialise a [`PushOverlayAck`] to wire JSON
-/// (`{"worktree":..,"accepted":..,"applied_files":..}`).
+/// (`{"worktree":..,"accepted":..,"applied_files":..}` plus optional
+/// `reject_code`).
 pub fn pushoverlayack_to_json(a: &PushOverlayAck) -> String {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "worktree": a.worktree,
         "accepted": a.accepted,
         "applied_files": a.applied_files,
-    })
-    .to_string()
+    });
+    if let Some(code) = a
+        .reject_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        value
+            .as_object_mut()
+            .expect("push overlay ack codec constructs an object")
+            .insert(
+                "reject_code".to_string(),
+                serde_json::Value::String(code.to_string()),
+            );
+    }
+    value.to_string()
 }
 
 /// Parse a [`PushOverlayAck`] from wire JSON (best-effort: a missing
@@ -1652,10 +2224,14 @@ pub fn pushoverlayack_from_json(text: &str) -> Option<PushOverlayAck> {
             .get("applied_files")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32,
-        // Reject metadata is HTTP-side (status + body), never on the wire
-        // ack JSON — mirrors the "absent on the JSON wire" contract at
-        // the struct definition.
+        // Status/body metadata remains HTTP-side, never on the ack JSON.
         reject_http_status: None,
+        reject_code: v
+            .get("reject_code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_string),
         reject_body: None,
     })
 }
@@ -1838,6 +2414,17 @@ pub fn status_to_json(s: &WorktreeStatus) -> String {
                 serde_json::Value::String(sha.clone()),
             );
     }
+    for (key, value) in [
+        ("candidate_manifest_digest", &s.candidate_manifest_digest),
+        ("candidate_snapshot_digest", &s.candidate_snapshot_digest),
+        ("candidate_tree_oid", &s.candidate_tree_oid),
+    ] {
+        if let Some(value) = value {
+            obj.as_object_mut()
+                .expect("status_to_json constructed an object literal")
+                .insert(key.to_string(), serde_json::Value::String(value.clone()));
+        }
+    }
     if s.ra_blind_paths {
         obj.as_object_mut()
             .expect("status_to_json constructed an object literal")
@@ -1892,6 +2479,18 @@ pub fn status_from_json(text: &str) -> Option<WorktreeStatus> {
             .get("base_sha")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
+        candidate_manifest_digest: v
+            .get("candidate_manifest_digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        candidate_snapshot_digest: v
+            .get("candidate_snapshot_digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        candidate_tree_oid: v
+            .get("candidate_tree_oid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         ra_blind_paths: v
             .get("ra_blind_paths")
             .and_then(serde_json::Value::as_bool)
@@ -1991,6 +2590,17 @@ pub fn event_to_json(e: &TransitionEvent) -> String {
                 serde_json::Value::String(sha.clone()),
             );
     }
+    for (key, value) in [
+        ("candidate_manifest_digest", &e.candidate_manifest_digest),
+        ("candidate_snapshot_digest", &e.candidate_snapshot_digest),
+        ("candidate_tree_oid", &e.candidate_tree_oid),
+    ] {
+        if let Some(value) = value {
+            obj.as_object_mut()
+                .expect("event_to_json constructed an object literal")
+                .insert(key.to_string(), serde_json::Value::String(value.clone()));
+        }
+    }
     if e.ra_blind_paths {
         obj.as_object_mut()
             .expect("event_to_json constructed an object literal")
@@ -2027,6 +2637,18 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
             .get("base_sha")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.to_string()),
+        candidate_manifest_digest: v
+            .get("candidate_manifest_digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        candidate_snapshot_digest: v
+            .get("candidate_snapshot_digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        candidate_tree_oid: v
+            .get("candidate_tree_oid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         ra_blind_paths: v
             .get("ra_blind_paths")
             .and_then(serde_json::Value::as_bool)
@@ -2042,6 +2664,65 @@ pub fn event_from_json(text: &str) -> Option<TransitionEvent> {
 mod tests {
     use super::*;
     use crate::config::FleetConfig;
+
+    fn candidate_manifest_fixture() -> CandidateSnapshotManifest {
+        let base = crate::GitTreeRef {
+            commit_sha: "de16c5f7dd233165813ffa72719869e3181c554b".into(),
+            tree_oid: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+        };
+        let entry = crate::SnapshotEntry {
+            path: "empty.bin".into(),
+            mode: "100644".into(),
+            blob_oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into(),
+            size: 0,
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        };
+        let mut manifest = CandidateSnapshotManifest {
+            schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1.into(),
+            git_object_format: crate::GitObjectFormat::Sha1,
+            comparison_base: base.clone(),
+            candidate: crate::CandidateSnapshot::Overlay {
+                base,
+                tree_oid: String::new(),
+                entry_count: 1,
+                entries: vec![entry.clone()],
+                snapshot_digest: String::new(),
+                operation_count: 1,
+                operations: vec![crate::OverlayOperation::Upsert {
+                    path: entry.path,
+                    mode: entry.mode,
+                    blob_oid: entry.blob_oid,
+                    size: entry.size,
+                    sha256: entry.sha256,
+                    payload: crate::OverlayPayload {
+                        encoding: "base64".into(),
+                        data: String::new(),
+                    },
+                }],
+            },
+            manifest_digest: String::new(),
+        };
+        let tree_oid = crate::compute_candidate_tree_oid(&manifest).unwrap();
+        let crate::CandidateSnapshot::Overlay {
+            tree_oid: advertised_tree,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture is an overlay")
+        };
+        *advertised_tree = tree_oid;
+        let snapshot_digest = crate::compute_snapshot_digest(&manifest).unwrap();
+        let crate::CandidateSnapshot::Overlay {
+            snapshot_digest: advertised_snapshot,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture is an overlay")
+        };
+        *advertised_snapshot = snapshot_digest;
+        manifest.manifest_digest = crate::compute_manifest_digest(&manifest).unwrap();
+        manifest
+    }
 
     // ───────────────────────── #14 auth ─────────────────────────
 
@@ -2281,6 +2962,8 @@ mod tests {
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -2368,6 +3051,9 @@ mod tests {
             // Attribution case: a gate push carries its commit; the echo
             // must survive the wire byte-for-byte (pollers string-match).
             base_sha: Some("0123abc0123abc0123abc0123abc0123abc01234".into()),
+            candidate_manifest_digest: None,
+            candidate_snapshot_digest: None,
+            candidate_tree_oid: None,
             // #A8 annotation case: a macro-blind-path push must carry the
             // bit across the wire (a consumer keys witness demand on it).
             ra_blind_paths: true,
@@ -2407,6 +3093,9 @@ mod tests {
             // Legacy case: no SHA on the push ⇒ key absent on the wire
             // (additive contract — old parsers see exactly the old JSON).
             base_sha: None,
+            candidate_manifest_digest: None,
+            candidate_snapshot_digest: None,
+            candidate_tree_oid: None,
             ra_blind_paths: false,
             // Empty ran-checks (coalesced / RA-native) ⇒ key absent on the
             // wire, same additive discipline as base_sha.
@@ -2419,6 +3108,16 @@ mod tests {
             !wire.contains("base_sha"),
             "absent base_sha must not appear on the wire: {wire}"
         );
+        for key in [
+            "candidate_manifest_digest",
+            "candidate_snapshot_digest",
+            "candidate_tree_oid",
+        ] {
+            assert!(
+                !wire.contains(key),
+                "absent {key} must not alter the legacy status wire: {wire}"
+            );
+        }
         assert!(
             !wire.contains("ra_blind_paths"),
             "false ra_blind_paths must not appear on the wire (#A8 additive contract): {wire}"
@@ -2444,6 +3143,49 @@ mod tests {
         assert!(
             !s.ra_blind_paths,
             "absent ra_blind_paths key ⇒ false (#A8 pre-A8 servers)"
+        );
+    }
+
+    #[test]
+    fn candidate_identity_roundtrips_on_status_and_transition_event() {
+        let status = WorktreeStatus {
+            worktree: "/shared/wt".into(),
+            verdict: "green".into(),
+            daemon_build_id: "candidate-daemon".into(),
+            crates: Vec::new(),
+            red_diagnostics: 0,
+            verdict_failure_reason: None,
+            base_sha: Some("same-comparison-base".into()),
+            candidate_manifest_digest: Some("sha256:manifest-a".into()),
+            candidate_snapshot_digest: Some("sha256:snapshot-a".into()),
+            candidate_tree_oid: Some("tree-a".into()),
+            ra_blind_paths: false,
+            gated_checks_ran: Vec::new(),
+            heartbeat_age_secs: 3,
+            published_at: 42,
+        };
+        assert_eq!(
+            status_from_json(&status_to_json(&status)),
+            Some(status.clone()),
+            "all three candidate identities must survive status wire roundtrip"
+        );
+
+        let event = TransitionEvent {
+            worktree: status.worktree.clone(),
+            verdict: status.verdict.clone(),
+            red_diagnostics: status.red_diagnostics,
+            verdict_failure_reason: None,
+            base_sha: status.base_sha.clone(),
+            candidate_manifest_digest: status.candidate_manifest_digest.clone(),
+            candidate_snapshot_digest: status.candidate_snapshot_digest.clone(),
+            candidate_tree_oid: status.candidate_tree_oid.clone(),
+            ra_blind_paths: false,
+            published_at: status.published_at,
+        };
+        assert_eq!(
+            event_from_json(&event_to_json(&event)),
+            Some(event),
+            "subscription events must carry the same candidate result evidence"
         );
     }
 
@@ -2580,6 +3322,8 @@ mod tests {
                 base_sha: Some("abc123".into()),
                 source_ref: Some("refs/pull/42/head".into()),
                 source_sha: Some("0123456789012345678901234567890123456789".into()),
+                comparison_base_sha: None,
+                candidate_snapshot: None,
                 changed_files: Some(vec!["src/lib.rs".into()]),
                 gate: true,
                 check_ids: None,
@@ -2587,6 +3331,186 @@ mod tests {
             },
         };
         assert_eq!(Request::from_json(&req.to_json()), Some(req));
+    }
+
+    #[test]
+    fn push_overlay_v2_preserves_typed_candidate_snapshot_and_comparison_base() {
+        let manifest = candidate_manifest_fixture();
+        let manifest_json = crate::canonical_manifest_json(&manifest).unwrap();
+        let wire = format!(
+            r#"{{
+                "op":"push_overlay",
+                "worktree":"/client/wt",
+                "base_ref":"origin/dev",
+                "files":[],
+                "options":{{
+                  "repo_relative":true,
+                  "analysis_root":"/workspace/tf-multiverse",
+                  "comparison_base_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
+                  "candidate_snapshot":{manifest_json}
+                }}
+            }}"#
+        );
+
+        let parsed = Request::from_json(&wire).expect("typed candidate request parses");
+        let encoded: serde_json::Value =
+            serde_json::from_str(&parsed.to_json()).expect("roundtrip JSON");
+        assert_eq!(
+            encoded["comparison_base_sha"], "de16c5f7dd233165813ffa72719869e3181c554b",
+            "comparison base is independent from legacy base_sha"
+        );
+        assert_eq!(
+            encoded["candidate_snapshot"]["schema"], "cargoless-candidate-snapshot/1",
+            "the typed candidate manifest must survive every transport codec"
+        );
+        assert_eq!(
+            encoded["candidate_snapshot"]["candidate"]["kind"],
+            "overlay"
+        );
+    }
+
+    #[test]
+    fn candidate_push_accepts_flat_and_nested_authority_roundtrips() {
+        let manifest = candidate_manifest_fixture();
+        let manifest_json = crate::canonical_manifest_json(&manifest).unwrap();
+        for authority in [
+            format!(
+                r#""comparison_base_sha":"{}","candidate_snapshot":{manifest_json}"#,
+                manifest.comparison_base.commit_sha
+            ),
+            format!(
+                r#""options":{{"comparison_base_sha":"{}","candidate_snapshot":{manifest_json}}}"#,
+                manifest.comparison_base.commit_sha
+            ),
+        ] {
+            let wire = format!(
+                r#"{{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],{authority}}}"#
+            );
+            let parsed = Request::try_from_json(&wire)
+                .expect("valid authority location")
+                .expect("candidate push parses");
+            let Request::PushOverlayV2 { options, .. } = &parsed else {
+                panic!("candidate push must retain V2 authority")
+            };
+            assert_eq!(options.candidate_snapshot.as_ref(), Some(&manifest));
+            assert_eq!(
+                options.comparison_base_sha.as_deref(),
+                Some(manifest.comparison_base.commit_sha.as_str())
+            );
+            let reparsed = Request::try_from_json(&parsed.to_json())
+                .expect("encoded authority is valid")
+                .expect("encoded candidate push parses");
+            assert_eq!(reparsed, parsed);
+        }
+    }
+
+    #[test]
+    fn candidate_push_rejects_scope_grafting_and_ambiguous_authority() {
+        let cases = [
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"metadata":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{}},"options":{}}"#,
+                "candidate_snapshot.json_duplicate_key",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{},"comparison_base_sha":"a","comparison_base_sha":"b"}}"#,
+                "candidate_snapshot.json_duplicate_key",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{},"future_candidate_authority":"opaque"}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"comparison_base_sha":"a","options":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.pairing_invalid",
+            ),
+            (
+                r#"{"op":"batch_check","batch_id":"b","base_ref":"main","members":[],"candidate_snapshot":{},"options":{}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
+                r#"{"op":"batch_check","batch_id":"b","base_ref":"main","members":[],"comparison_base_sha":"a","options":{"candidate_snapshot":{}}}"#,
+                "candidate_snapshot.pairing_invalid",
+            ),
+        ];
+
+        for (wire, expected_code) in cases {
+            let error = Request::try_from_json(wire)
+                .expect_err("ambiguous candidate authority must fail closed");
+            assert_eq!(error.code, expected_code, "wire: {wire}");
+        }
+    }
+
+    #[test]
+    fn candidate_batch_preserves_nested_authority_roundtrip() {
+        let manifest = candidate_manifest_fixture();
+        let request = BatchCheckRequest {
+            options: PushOverlayOptions {
+                comparison_base_sha: Some(manifest.comparison_base.commit_sha.clone()),
+                candidate_snapshot: Some(manifest),
+                ..PushOverlayOptions::default()
+            },
+            ..BatchCheckRequest::new("batch", "origin/main")
+        };
+        let wire = Request::BatchCheck(request.clone()).to_json();
+        let parsed = Request::try_from_json(&wire)
+            .expect("nested batch authority is valid")
+            .expect("candidate batch parses");
+        assert_eq!(parsed, Request::BatchCheck(request));
+    }
+
+    #[test]
+    fn legacy_push_without_candidate_remains_best_effort() {
+        let wire = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{"gate":true},
+            "options":{"future_legacy_hint":"ignored"}
+        }"#;
+        let parsed = Request::try_from_json(wire)
+            .expect("legacy duplicate and unknown fields remain tolerated")
+            .expect("legacy push still parses");
+        assert!(matches!(parsed, Request::PushOverlay { .. }));
+    }
+
+    #[test]
+    fn push_overlay_rejects_duplicate_candidate_manifest_keys() {
+        let duplicate = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{
+              "candidate_snapshot":{
+                "schema":"cargoless-candidate-snapshot/1",
+                "schema":"cargoless-candidate-snapshot/2"
+              }
+            }
+        }"#;
+        assert!(
+            Request::from_json(duplicate).is_none(),
+            "duplicate manifest keys must fail closed before Value parsing discards identity"
+        );
+    }
+
+    #[test]
+    fn push_overlay_parse_preserves_candidate_snapshot_error_taxonomy() {
+        let duplicate = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{
+              "candidate_snapshot":{
+                "schema":"cargoless-candidate-snapshot/1",
+                "schema":"cargoless-candidate-snapshot/2"
+              }
+            }
+        }"#;
+
+        let error = Request::try_from_json(duplicate)
+            .expect_err("invalid typed candidate must retain its structured parse error");
+        assert_eq!(error.code, "candidate_snapshot.json_duplicate_key");
+        assert!(
+            error.message.contains("duplicate field"),
+            "message must preserve actionable parser context: {error}"
+        );
     }
 
     #[test]
@@ -2734,11 +3658,14 @@ mod tests {
             worktree: "wt-y".into(),
             accepted: true,
             applied_files: 7,
+            reject_code: Some("candidate_snapshot.identity_conflict".into()),
             ..Default::default()
         };
-        assert_eq!(
-            pushoverlayack_from_json(&pushoverlayack_to_json(&a)),
-            Some(a)
+        let wire = pushoverlayack_to_json(&a);
+        assert_eq!(pushoverlayack_from_json(&wire), Some(a));
+        assert!(
+            wire.contains(r#""reject_code":"candidate_snapshot.identity_conflict""#),
+            "structured rejection code must survive transport codecs: {wire}"
         );
         // Best-effort: no worktree ⇒ None; missing scalars ⇒ false/0.
         assert_eq!(pushoverlayack_from_json("{}"), None);
@@ -2746,6 +3673,13 @@ mod tests {
         let partial = pushoverlayack_from_json(r#"{"worktree":"w"}"#).unwrap();
         assert!(!partial.accepted);
         assert_eq!(partial.applied_files, 0);
+        assert_eq!(
+            partial.reject_code, None,
+            "legacy acknowledgements without reject_code remain compatible"
+        );
+        let blank = pushoverlayack_from_json(r#"{"worktree":"w","reject_code":"  "}"#)
+            .expect("blank optional code does not invalidate a legacy ack");
+        assert_eq!(blank.reject_code, None, "blank codes normalize to absent");
     }
 
     #[test]

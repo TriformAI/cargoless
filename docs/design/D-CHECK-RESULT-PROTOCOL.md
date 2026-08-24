@@ -114,3 +114,42 @@ tree. The standalone CLI exits 75 for indeterminate evidence, emits WARN for an
 allowed degradation, and returns ordinary failure only for authoritative
 failed checks. Daemon and batch consumers likewise preserve indeterminate as a
 separate verdict rather than relabeling it as a code RED.
+
+## Candidate result protocol v2
+
+`cargoless.check-result/v2` is the candidate-snapshot form of the protocol.
+It is available only when Cargoless has already validated an immutable typed
+candidate. The command receives `CARGOLESS_CHECK_RESULT_PATH` without a fake
+legacy source/base identity, plus:
+
+| Variable | Meaning |
+| --- | --- |
+| `CARGOLESS_CANDIDATE_SNAPSHOT_PATH` | Linux `/proc/self/fd/N` authority backed by the sealed canonical manifest bytes; never a mutable named path |
+| `CARGOLESS_CANDIDATE_SNAPSHOT_DIGEST` | Complete candidate snapshot digest |
+| `CARGOLESS_COMPARISON_BASE_SHA` | Immutable comparison commit |
+| `CARGOLESS_SOURCE_SHA` | Exact candidate commit, for `tree` candidates only |
+
+The v2 subject replaces `source_sha` and `base_sha` with these six authority
+fields, all of which must exactly match the verified run context:
+
+```json
+{
+  "candidate_kind": "overlay",
+  "candidate_snapshot_digest": "sha256:...",
+  "candidate_tree_oid": "0123456789abcdef0123456789abcdef01234567",
+  "comparison_base_sha": "89abcdef0123456789abcdef0123456789abcdef",
+  "manifest_digest": "sha256:...",
+  "engine": "migration-burndown",
+  "engine_version": "1",
+  "policy_hash": "sha256:..."
+}
+```
+
+`candidate_sha` is the sixth authority field for a `tree` candidate. It is
+required there and absent for `index` and `overlay`; JSON `null` is never an
+alternative to absence. `engine`, `engine_version`, and `policy_hash` are
+required non-empty producer metadata, not configured expected values.
+
+The v2 root and subject objects are closed. Unknown or duplicate keys fail
+closed, as do missing, empty, or mismatched authority fields. v1 parsing and
+its source/base subject remain unchanged.

@@ -40,7 +40,13 @@
 
 use core::fmt;
 
+pub mod candidate_snapshot;
 pub mod outcome;
+
+pub use candidate_snapshot::{
+    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotManifest, GitObjectFormat,
+    GitTreeRef, OverlayOperation, OverlayPayload, SnapshotEntry,
+};
 
 // ---------------------------------------------------------------------------
 // Content identity

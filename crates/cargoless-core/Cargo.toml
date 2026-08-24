@@ -28,7 +28,8 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # Owner-added (daemon-core, Epic 2 / CWDL #4). serde_json for LSP JSON-RPC:
 # we emit controlled requests but must robustly parse rust-analyzer's
 # publishDiagnostics (nested arrays, escaped strings) — hand-rolled JSON there
-# is a latent-bug factory. Uses Value + json! only (no serde_derive
-# proc-macro), keeping cold-build cost (AC#1/#2) low. cargoless-proto stays
-# serde-free; this dep is cargoless-core-local.
+# is a latent-bug factory. Candidate result-v2 and evidence inventories also
+# need closed typed envelopes, so serde derive is now a direct core dependency.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+unicode-normalization = "0.1"

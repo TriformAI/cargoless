@@ -35,12 +35,32 @@ impl TransportClient for InProcClient {
         Ok(self.service.get_status(worktree))
     }
 
+    fn get_status_candidate_attributed(
+        &self,
+        worktree: &str,
+        manifest_digest: &str,
+    ) -> Result<Option<WorktreeStatus>, TransportError> {
+        Ok(self
+            .service
+            .get_status_candidate_attributed(worktree, manifest_digest))
+    }
+
     fn get_verdict(&self, worktree: &str) -> Result<Option<String>, TransportError> {
         Ok(self.service.get_verdict(worktree))
     }
 
     fn get_diagnostics(&self, worktree: &str) -> Result<Vec<Diagnostic>, TransportError> {
         Ok(self.service.get_diagnostics(worktree))
+    }
+
+    fn get_diagnostics_candidate_attributed(
+        &self,
+        worktree: &str,
+        manifest_digest: &str,
+    ) -> Result<Vec<Diagnostic>, TransportError> {
+        Ok(self
+            .service
+            .get_diagnostics_candidate_attributed(worktree, manifest_digest))
     }
 
     fn list_worktrees(&self) -> Result<Vec<WorktreeSummary>, TransportError> {
@@ -156,6 +176,9 @@ pub(crate) mod testmock {
                     red_diagnostics: 0,
                     verdict_failure_reason: None,
                     base_sha: None,
+                    candidate_manifest_digest: None,
+                    candidate_snapshot_digest: None,
+                    candidate_tree_oid: None,
                     ra_blind_paths: false,
                     gated_checks_ran: Vec::new(),
                     heartbeat_age_secs: 1,
@@ -172,6 +195,9 @@ pub(crate) mod testmock {
                     red_diagnostics: 1,
                     verdict_failure_reason: None,
                     base_sha: None,
+                    candidate_manifest_digest: None,
+                    candidate_snapshot_digest: None,
+                    candidate_tree_oid: None,
                     ra_blind_paths: false,
                     gated_checks_ran: Vec::new(),
                     heartbeat_age_secs: 0,
@@ -250,6 +276,9 @@ mod tests {
             red_diagnostics: 1,
             verdict_failure_reason: None,
             base_sha: None,
+            candidate_manifest_digest: None,
+            candidate_snapshot_digest: None,
+            candidate_tree_oid: None,
             ra_blind_paths: false,
             published_at: 7,
         };

@@ -719,19 +719,71 @@ fn structured_result_json(
             })
         })
         .collect::<Vec<_>>();
+    let mut subject = serde_json::Map::from_iter([
+        (
+            "engine".to_string(),
+            serde_json::Value::String(details.subject.engine.clone()),
+        ),
+        (
+            "engine_version".to_string(),
+            serde_json::Value::String(details.subject.engine_version.clone()),
+        ),
+        (
+            "policy_hash".to_string(),
+            serde_json::Value::String(details.subject.policy_hash.clone()),
+        ),
+        (
+            "provider".to_string(),
+            serde_json::to_value(&details.subject.provider).unwrap_or(serde_json::Value::Null),
+        ),
+        (
+            "model".to_string(),
+            serde_json::to_value(&details.subject.model).unwrap_or(serde_json::Value::Null),
+        ),
+        (
+            "model_revision".to_string(),
+            serde_json::to_value(&details.subject.model_revision)
+                .unwrap_or(serde_json::Value::Null),
+        ),
+        (
+            "dimensions".to_string(),
+            serde_json::to_value(details.subject.dimensions).unwrap_or(serde_json::Value::Null),
+        ),
+    ]);
+    match &details.subject.identity {
+        cargoless_core::project_checks::StructuredCheckIdentity::ExactGit {
+            source_sha,
+            base_sha,
+        } => {
+            subject.insert("source_sha".into(), source_sha.clone().into());
+            subject.insert("base_sha".into(), base_sha.clone().into());
+        }
+        cargoless_core::project_checks::StructuredCheckIdentity::Candidate(candidate) => {
+            subject.insert("candidate_kind".into(), candidate.kind.clone().into());
+            subject.insert(
+                "candidate_snapshot_digest".into(),
+                candidate.snapshot_digest.clone().into(),
+            );
+            subject.insert(
+                "candidate_tree_oid".into(),
+                candidate.tree_oid.clone().into(),
+            );
+            if let Some(candidate_sha) = candidate.candidate_sha.as_ref() {
+                subject.insert("candidate_sha".into(), candidate_sha.clone().into());
+            }
+            subject.insert(
+                "comparison_base_sha".into(),
+                candidate.comparison_base_sha.clone().into(),
+            );
+            subject.insert(
+                "manifest_digest".into(),
+                candidate.manifest_digest.clone().into(),
+            );
+        }
+    }
     serde_json::json!({
         "summary": details.summary,
-        "subject": {
-            "source_sha": details.subject.source_sha,
-            "base_sha": details.subject.base_sha,
-            "engine": details.subject.engine,
-            "engine_version": details.subject.engine_version,
-            "policy_hash": details.subject.policy_hash,
-            "provider": details.subject.provider,
-            "model": details.subject.model,
-            "model_revision": details.subject.model_revision,
-            "dimensions": details.subject.dimensions,
-        },
+        "subject": subject,
         "findings": findings,
         "degradation": details.degradation.as_ref().map(|degradation| serde_json::json!({
             "reason": degradation.reason,
