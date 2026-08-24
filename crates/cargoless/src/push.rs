@@ -612,11 +612,16 @@ fn candidate_changed_paths(manifest: &CandidateSnapshotManifest) -> Vec<String> 
         .collect()
 }
 
+struct LegacyProjection {
+    files: Vec<(String, String)>,
+    omitted_binary_paths: Vec<String>,
+}
+
 fn legacy_projection(
     repo: &Path,
     manifest: &CandidateSnapshotManifest,
     repo_relative: bool,
-) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+) -> Result<LegacyProjection, String> {
     let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
         return Err("push: typed candidate must be an overlay".to_string());
     };
@@ -637,7 +642,10 @@ fn legacy_projection(
             }
         }
     }
-    Ok((files, omitted_binary_paths))
+    Ok(LegacyProjection {
+        files,
+        omitted_binary_paths,
+    })
 }
 
 #[cfg(test)]
@@ -646,7 +654,7 @@ fn legacy_files_from_candidate_snapshot(
     manifest: &CandidateSnapshotManifest,
     repo_relative: bool,
 ) -> Result<Vec<(String, String)>, String> {
-    legacy_projection(repo, manifest, repo_relative).map(|(files, _)| files)
+    legacy_projection(repo, manifest, repo_relative).map(|projection| projection.files)
 }
 
 fn push_payload_from_candidate_snapshot(
@@ -654,7 +662,10 @@ fn push_payload_from_candidate_snapshot(
     manifest: &CandidateSnapshotManifest,
     repo_relative: bool,
 ) -> Result<PushPayload, String> {
-    let (files, omitted_binary_paths) = legacy_projection(repo, manifest, repo_relative)?;
+    let LegacyProjection {
+        files,
+        omitted_binary_paths,
+    } = legacy_projection(repo, manifest, repo_relative)?;
     let mut payload = PushPayload::new();
     payload.content_stats = files
         .iter()
