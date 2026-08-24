@@ -2771,41 +2771,78 @@ mod tests {
 
     #[test]
     fn push_overlay_v2_preserves_typed_candidate_snapshot_and_comparison_base() {
-        let wire = r#"{
-            "op":"push_overlay",
-            "worktree":"/client/wt",
-            "base_ref":"origin/dev",
-            "files":[],
-            "options":{
-              "repo_relative":true,
-              "analysis_root":"/workspace/tf-multiverse",
-              "comparison_base_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
-              "candidate_snapshot":{
-                "schema":"cargoless-candidate-snapshot/1",
-                "git_object_format":"sha1",
-                "comparison_base":{
-                  "commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
-                  "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-                },
-                "candidate":{
-                  "kind":"overlay",
-                  "base":{
-                    "commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
-                    "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-                  },
-                  "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-                  "entry_count":0,
-                  "entries":[],
-                  "snapshot_digest":"sha256:678716534d66e13c5330ef9f0fe7f6c2c07aaca9215b417a698c89e7e923e59e",
-                  "operation_count":0,
-                  "operations":[]
-                },
-                "manifest_digest":"sha256:24e2a0b606300456dee5a423cbf3ea1fac756ee794eede8c97d5af0cd4c7bbc2"
-              }
-            }
-        }"#;
+        let base = crate::GitTreeRef {
+            commit_sha: "de16c5f7dd233165813ffa72719869e3181c554b".into(),
+            tree_oid: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+        };
+        let entry = crate::SnapshotEntry {
+            path: "empty.bin".into(),
+            mode: "100644".into(),
+            blob_oid: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".into(),
+            size: 0,
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+        };
+        let mut manifest = CandidateSnapshotManifest {
+            schema: crate::CANDIDATE_SNAPSHOT_SCHEMA_V1.into(),
+            git_object_format: crate::GitObjectFormat::Sha1,
+            comparison_base: base.clone(),
+            candidate: crate::CandidateSnapshot::Overlay {
+                base,
+                tree_oid: String::new(),
+                entry_count: 1,
+                entries: vec![entry.clone()],
+                snapshot_digest: String::new(),
+                operation_count: 1,
+                operations: vec![crate::OverlayOperation::Upsert {
+                    path: entry.path,
+                    mode: entry.mode,
+                    blob_oid: entry.blob_oid,
+                    size: entry.size,
+                    sha256: entry.sha256,
+                    payload: crate::OverlayPayload {
+                        encoding: "base64".into(),
+                        data: String::new(),
+                    },
+                }],
+            },
+            manifest_digest: String::new(),
+        };
+        let tree_oid = crate::compute_candidate_tree_oid(&manifest).unwrap();
+        let crate::CandidateSnapshot::Overlay {
+            tree_oid: advertised_tree,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture is an overlay")
+        };
+        *advertised_tree = tree_oid;
+        let snapshot_digest = crate::compute_snapshot_digest(&manifest).unwrap();
+        let crate::CandidateSnapshot::Overlay {
+            snapshot_digest: advertised_snapshot,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture is an overlay")
+        };
+        *advertised_snapshot = snapshot_digest;
+        manifest.manifest_digest = crate::compute_manifest_digest(&manifest).unwrap();
+        let manifest_json = crate::canonical_manifest_json(&manifest).unwrap();
+        let wire = format!(
+            r#"{{
+                "op":"push_overlay",
+                "worktree":"/client/wt",
+                "base_ref":"origin/dev",
+                "files":[],
+                "options":{{
+                  "repo_relative":true,
+                  "analysis_root":"/workspace/tf-multiverse",
+                  "comparison_base_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
+                  "candidate_snapshot":{manifest_json}
+                }}
+            }}"#
+        );
 
-        let parsed = Request::from_json(wire).expect("typed candidate request parses");
+        let parsed = Request::from_json(&wire).expect("typed candidate request parses");
         let encoded: serde_json::Value =
             serde_json::from_str(&parsed.to_json()).expect("roundtrip JSON");
         assert_eq!(
