@@ -26,6 +26,7 @@ use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 mod appserve;
 mod batchcheck;
 mod build;
+mod candidate_snapshot_git;
 mod check;
 mod checks;
 mod clean;

@@ -889,6 +889,7 @@ fn payload_path(repo: &Path, rel: &str, repo_relative: bool) -> String {
 mod tests {
     use super::*;
     use cargoless_core::transport::CargoSubcommand;
+    use cargoless_core::{CandidateSnapshot, OverlayOperation};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -911,6 +912,96 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn text_overlay_fixture() -> PathBuf {
+        let root = temp_root("typed-legacy-projection");
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "Candidate Snapshot Test"]);
+        git(
+            &root,
+            &["config", "user.email", "candidate-snapshot@example.invalid"],
+        );
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        git(&root, &["config", "core.hooksPath", "/dev/null"]);
+        write_file(&root, "empty.txt", b"not empty\n");
+        write_file(&root, "modified.txt", b"old\n");
+        write_file(&root, "removed.txt", b"remove\n");
+        write_file(&root, "unchanged.txt", b"same\n");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+        write_file(&root, "empty.txt", b"");
+        write_file(&root, "modified.txt", b"new\n");
+        std::fs::remove_file(root.join("removed.txt")).unwrap();
+        root
+    }
+
+    #[test]
+    fn push_options_and_legacy_files_are_derived_from_one_typed_manifest() {
+        let root = text_overlay_fixture();
+        let built = crate::candidate_snapshot_git::build_overlay_manifest(&root, "HEAD")
+            .unwrap()
+            .expect("fixture has a delta");
+        let files = legacy_files_from_candidate_snapshot(&root, &built.manifest, true).unwrap();
+
+        assert_eq!(
+            files,
+            vec![
+                ("empty.txt".to_string(), String::new()),
+                ("modified.txt".to_string(), "new\n".to_string()),
+                ("removed.txt".to_string(), String::new()),
+            ]
+        );
+        let CandidateSnapshot::Overlay { operations, .. } = &built.manifest.candidate else {
+            panic!("push candidate must be an overlay");
+        };
+        assert_eq!(
+            files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            operations
+                .iter()
+                .map(OverlayOperation::path)
+                .collect::<Vec<_>>()
+        );
+
+        let mut options = PushOverlayOptions::default();
+        apply_candidate_snapshot_options(&mut options, &built.manifest);
+        assert_eq!(
+            options.comparison_base_sha.as_deref(),
+            Some(built.manifest.comparison_base.commit_sha.as_str())
+        );
+        assert_eq!(options.candidate_snapshot.as_ref(), Some(&built.manifest));
+    }
+
+    #[test]
+    fn legacy_projection_fails_closed_for_typed_binary_payload() {
+        let root = text_overlay_fixture();
+        write_file(&root, "binary.bin", [0x00, 0xff, 0x80, b'B']);
+        let built = crate::candidate_snapshot_git::build_overlay_manifest(&root, "HEAD")
+            .unwrap()
+            .expect("fixture has a delta");
+
+        let error = legacy_files_from_candidate_snapshot(&root, &built.manifest, true)
+            .expect_err("binary typed bytes cannot enter the UTF-8 compatibility projection");
+
+        assert!(error.contains("binary.bin"));
+        assert!(error.contains("UTF-8 compatibility projection"));
     }
 
     /// **2c keystone test — the client-side composing-equivalence
