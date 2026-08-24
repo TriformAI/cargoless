@@ -3862,6 +3862,91 @@ mod tests {
     }
 
     #[test]
+    fn post_attempt_v3_preserves_structured_service_rejection_code_and_legacy_fallback() {
+        struct RejectingAttemptService {
+            reject_code: Option<String>,
+        }
+
+        impl VerdictService for RejectingAttemptService {
+            fn get_status(&self, _worktree: &str) -> Option<WorktreeStatus> {
+                None
+            }
+
+            fn get_verdict(&self, _worktree: &str) -> Option<String> {
+                None
+            }
+
+            fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+
+            fn push_overlay_with_options(
+                &self,
+                worktree: &str,
+                _base_ref: &str,
+                _files: &[(String, String)],
+                _check_profile: Option<&CheckProfile>,
+                _options: Option<&PushOverlayOptions>,
+            ) -> PushOverlayAck {
+                PushOverlayAck {
+                    worktree: worktree.to_string(),
+                    accepted: false,
+                    applied_files: 0,
+                    reject_http_status: Some(409),
+                    reject_code: self.reject_code.clone(),
+                    reject_body: Some("stable service rejection".into()),
+                }
+            }
+        }
+
+        let request = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{"semantic":{
+              "request_id":"req.rejection-code",
+              "attempt_id":"attempt.rejection-code",
+              "trace_id":"0123456789abcdef0123456789abcdef",
+              "attempt_number":1,"maximum_attempts":3,"retry_after_ms":1000
+            }}
+        }"#;
+        for (service_code, expected_code) in [
+            (
+                Some("attempt.identity_conflict"),
+                "attempt.identity_conflict",
+            ),
+            (None, "submission.rejected"),
+        ] {
+            let server = HttpServer::bind(
+                "127.0.0.1:0",
+                Arc::new(RejectingAttemptService {
+                    reject_code: service_code.map(str::to_string),
+                }),
+                Arc::new(AllowAll),
+            )
+            .expect("bind");
+            std::thread::sleep(Duration::from_millis(50));
+            let (status, response) = raw_v3_post(server.addr(), request);
+            assert_eq!(status, 409, "service rejection stays an HTTP conflict");
+            let rejection: serde_json::Value =
+                serde_json::from_str(&response).expect("v3 rejection is JSON");
+            assert_eq!(
+                rejection.get("code").and_then(serde_json::Value::as_str),
+                Some(expected_code),
+                "v3 caller must receive a stable branchable code: {response}"
+            );
+            assert_eq!(rejection["summary"], "stable service rejection");
+            drop(server);
+        }
+    }
+
+    #[test]
     fn post_attempt_v3_preserves_candidate_snapshot_error_before_service_mutation() {
         struct CountingAttemptService {
             pushes: Arc<AtomicUsize>,

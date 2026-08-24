@@ -3633,11 +3633,14 @@ mod tests {
             worktree: "wt-y".into(),
             accepted: true,
             applied_files: 7,
+            reject_code: Some("candidate_snapshot.identity_conflict".into()),
             ..Default::default()
         };
-        assert_eq!(
-            pushoverlayack_from_json(&pushoverlayack_to_json(&a)),
-            Some(a)
+        let wire = pushoverlayack_to_json(&a);
+        assert_eq!(pushoverlayack_from_json(&wire), Some(a));
+        assert!(
+            wire.contains(r#""reject_code":"candidate_snapshot.identity_conflict""#),
+            "structured rejection code must survive transport codecs: {wire}"
         );
         // Best-effort: no worktree ⇒ None; missing scalars ⇒ false/0.
         assert_eq!(pushoverlayack_from_json("{}"), None);
@@ -3645,6 +3648,13 @@ mod tests {
         let partial = pushoverlayack_from_json(r#"{"worktree":"w"}"#).unwrap();
         assert!(!partial.accepted);
         assert_eq!(partial.applied_files, 0);
+        assert_eq!(
+            partial.reject_code, None,
+            "legacy acknowledgements without reject_code remain compatible"
+        );
+        let blank = pushoverlayack_from_json(r#"{"worktree":"w","reject_code":"  "}"#)
+            .expect("blank optional code does not invalidate a legacy ack");
+        assert_eq!(blank.reject_code, None, "blank codes normalize to absent");
     }
 
     #[test]
