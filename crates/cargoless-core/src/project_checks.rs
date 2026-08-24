@@ -4089,8 +4089,11 @@ checks:
         let candidate_dir = root.join(".cargoless");
         fs::create_dir_all(&candidate_dir).unwrap();
         let manifest_path = candidate_dir.join("candidate-snapshot.json");
-        fs::write(&manifest_path, b"{\"schema\":\"cargoless-candidate-snapshot/1\"}\n")
-            .unwrap();
+        fs::write(
+            &manifest_path,
+            b"{\"schema\":\"cargoless-candidate-snapshot/1\"}\n",
+        )
+        .unwrap();
         fs::write(
             root.join(MANIFEST_NAME),
             r#"
@@ -4108,21 +4111,12 @@ checks:
         let context = CandidateSnapshotCheckContext {
             manifest_path: canonical_root.join(".cargoless/candidate-snapshot.json"),
             manifest_digest:
-                "sha256:a363a22a9ab3317a8d7d616ecb4ac66ef7d0f2d7dd46d8a1010f44a601b8377c"
-                    .into(),
+                "sha256:a363a22a9ab3317a8d7d616ecb4ac66ef7d0f2d7dd46d8a1010f44a601b8377c".into(),
             comparison_base_sha: "de16c5f7dd233165813ffa72719869e3181c554b".into(),
         };
 
-        let report = run_profile_inner(
-            &root,
-            "dev",
-            &[],
-            None,
-            None,
-            None,
-            Some(context.clone()),
-        )
-        .unwrap();
+        let report =
+            run_profile_inner(&root, "dev", &[], None, None, None, Some(context.clone())).unwrap();
         assert_eq!(report.tree, TreeState::Green);
         assert_eq!(
             fs::read_to_string(root.join("candidate-env.out")).unwrap(),
