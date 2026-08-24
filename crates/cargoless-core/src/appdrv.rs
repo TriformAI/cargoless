@@ -696,6 +696,15 @@ mod tests {
         rec: Arc<Recorder>,
         ports: Arc<PortAllocator>,
     ) -> Driver<Recorder, Recorder, Recorder> {
+        driver_with_max_concurrent_builds(names, rec, ports, 1)
+    }
+
+    fn driver_with_max_concurrent_builds(
+        names: &[&str],
+        rec: Arc<Recorder>,
+        ports: Arc<PortAllocator>,
+        max_concurrent_builds: usize,
+    ) -> Driver<Recorder, Recorder, Recorder> {
         let svc = Arc::new(AppServeState::new());
         // Unique per `driver()` call, not just per process: cargo runs the
         // test module multi-threaded in ONE process, and several tests use
@@ -729,7 +738,7 @@ mod tests {
                 svc,
                 ports,
                 now: || 0,
-                max_concurrent_builds: 1,
+                max_concurrent_builds,
             },
             dir,
         )
@@ -1007,7 +1016,7 @@ mod tests {
             ..Default::default()
         });
         let ports = Arc::new(PortAllocator::new(9040, 9049));
-        let mut d = driver(&["dev", "other"], rec, ports);
+        let mut d = driver_with_max_concurrent_builds(&["dev", "other"], rec, ports, 2);
 
         d.drive(
             "dev",
