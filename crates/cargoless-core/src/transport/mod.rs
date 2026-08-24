@@ -3112,6 +3112,10 @@ mod tests {
                 "candidate_snapshot.json_duplicate_key",
             ),
             (
+                r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"options":{"candidate_snapshot":{},"future_candidate_authority":"opaque"}}"#,
+                "candidate_snapshot.location_invalid",
+            ),
+            (
                 r#"{"op":"push_overlay","worktree":"w","base_ref":"b","files":[],"comparison_base_sha":"a","options":{"candidate_snapshot":{}}}"#,
                 "candidate_snapshot.pairing_invalid",
             ),
