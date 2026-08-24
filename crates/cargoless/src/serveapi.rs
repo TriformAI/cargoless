@@ -60,14 +60,19 @@ use cargoless_core::outcome::{
     OutcomeEnvelope, PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind,
     RetryDirective, Subject, Surface,
 };
-use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
+use cargoless_core::project_checks::{
+    CandidateSnapshotCheckContext, ProjectCheckReport, plan_dev_with_changes,
+};
 use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
     AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, LaneEnqueueRequest,
     PushOverlayAck, PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus,
     WorktreeSummary, batchreport_to_json,
 };
-use cargoless_core::{Diagnostic, Severity, TreeState};
+use cargoless_core::{
+    CandidateSnapshot, CandidateSnapshotManifest, Diagnostic, OverlayOperation, Severity,
+    TreeState, canonical_manifest_json, decode_overlay_payload,
+};
 
 /// Poison-tolerant lock (same discipline as `model::poisoned` /
 /// `inproc::testmock`): a panicked verdict path must not wedge the read
@@ -141,6 +146,9 @@ pub struct PushedOverlay {
     pub source_ref: Option<String>,
     /// Verified candidate commit used by git-native project checks.
     pub source_sha: Option<String>,
+    /// Digest-bound complete candidate. Present only for typed overlay pushes;
+    /// exact-Git pushes continue to use source_ref/source_sha unchanged.
+    pub candidate_snapshot: Option<CandidateSnapshotManifest>,
     /// Unix timestamp of the push receipt. Diagnostics-only for 2b;
     /// future idle-evict policy (Wave-2) reads this.
     pub last_push_unix: u64,
@@ -176,6 +184,7 @@ pub(crate) struct ProjectCheckRunContext {
     pub base_sha: Option<String>,
     pub source_ref: Option<String>,
     pub source_sha: Option<String>,
+    pub candidate_snapshot: Option<CandidateSnapshotManifest>,
     pub overlay_files: Vec<(String, String)>,
     pub materialize_overlay: bool,
     /// Carried from [`PushedOverlay::gate`]: the EmitVerdict arm promotes
@@ -2935,6 +2944,12 @@ impl ServeVerdictState {
         f: impl FnOnce(&Path, Option<&Path>) -> T,
     ) -> Result<T, String> {
         if !context.materialize_overlay {
+            if context.candidate_snapshot.is_some() {
+                return Err(
+                    "candidate_snapshot.materialization_required: typed candidates must run in an isolated scratch"
+                        .to_string(),
+                );
+            }
             // No overlay to materialize ⇒ no scratch ⇒ no warm dir; run in
             // place with the historical cold per-run target.
             return Ok(f(&context.root, None));
@@ -2943,7 +2958,7 @@ impl ServeVerdictState {
         if let Some(state_dir) = self.project_check_state_dir.as_deref() {
             return self.with_project_check_scratch_overlay(context, state_dir, f);
         }
-        if context.source_sha.is_some() {
+        if context.source_sha.is_some() || context.candidate_snapshot.is_some() {
             let fallback_state = context.root.join(".cargoless");
             return self.with_project_check_scratch_overlay(context, &fallback_state, f);
         }
@@ -2992,11 +3007,31 @@ impl ServeVerdictState {
                     ));
                 }
                 source_sha
+            } else if let Some(manifest) = context.candidate_snapshot.as_ref() {
+                let base = manifest.candidate.base().ok_or_else(|| {
+                    "candidate_snapshot.kind_unsupported: project-check overlay requires an overlay base"
+                        .to_string()
+                })?;
+                if !local_commit_exists(&context.root, &base.commit_sha) {
+                    return Err(format!(
+                        "candidate_snapshot.base_commit_missing: verified base commit {} is no longer present locally",
+                        base.commit_sha
+                    ));
+                }
+                base.commit_sha.as_str()
             } else {
                 sync_analysis_root(&context.root, &context.base_ref)?;
                 context.base_ref.as_str()
             };
             prepare_project_check_scratch(&context.root, &scratch_root, checkout_ref)?;
+        }
+
+        if let Some(manifest) = context.candidate_snapshot.as_ref() {
+            if let Err(error) = materialize_candidate_snapshot(&scratch_root, manifest) {
+                let _guard = poisoned(&self.sync_lock);
+                let _ = cleanup_project_check_scratch(&context.root, &scratch_root);
+                return Err(error);
+            }
         }
 
         // CGLS-26 — resolve a WARM shared target dir (or None = cold per-run).
@@ -3006,7 +3041,7 @@ impl ServeVerdictState {
         let warm = self.resolve_warm_target(state_dir, &scratch_root);
         let warm_dir = warm.as_ref().map(|w| w.dir.as_path());
 
-        let result = if context.source_sha.is_some() {
+        let result = if context.source_sha.is_some() || context.candidate_snapshot.is_some() {
             Ok(f(&scratch_root, warm_dir))
         } else {
             match materialize_overlay_files_from_root(
@@ -3265,10 +3300,11 @@ impl ServeVerdictState {
         wt: &Path,
         context: &ProjectCheckRunContext,
     ) -> Option<(crate::servedrv::ProjectCheckSummary, Vec<String>)> {
-        // Git-native candidates are already complete, immutable trees. Until
-        // the batch API carries per-member source SHAs, never union them into
-        // a base-ref overlay batch: exactness outranks this optimization.
-        if context.source_sha.is_some() {
+        // Git-native and typed candidates are complete immutable identities.
+        // Until the batch API carries one exact identity per member, never
+        // union either form into a base-ref overlay batch: exactness outranks
+        // this optimization.
+        if context.source_sha.is_some() || context.candidate_snapshot.is_some() {
             return None;
         }
         let base_ref = context.base_ref.trim();
@@ -3295,6 +3331,8 @@ impl ServeVerdictState {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None, // changed_files live on the member, not the options
             // Carry the push's gate + witness-only filter through the coalesced
             // lane. `run_batch_check_now` reads these off `request.options` to
@@ -4260,11 +4298,21 @@ impl VerdictService for ServeVerdictState {
         let mut base_sha = None;
         let mut source_ref = None;
         let mut source_sha = None;
+        let mut candidate_snapshot = None;
+        let mut typed_legacy_files = None;
         let mut changed_files = None;
         let mut gate = false;
         let mut check_ids = None;
         if let Some(options) = options {
-            changed_files = options.changed_files.clone();
+            match typed_candidate_overlay(options, files) {
+                Ok(Some((manifest, derived_changed_files, projection))) => {
+                    candidate_snapshot = Some(manifest);
+                    changed_files = Some(derived_changed_files);
+                    typed_legacy_files = Some(projection);
+                }
+                Ok(None) => changed_files = options.changed_files.clone(),
+                Err(error) => return rejected_push(worktree, &error),
+            }
             gate = options.gate;
             check_ids = options.check_ids.clone();
             analysis_root = options
@@ -4291,6 +4339,9 @@ impl VerdictService for ServeVerdictState {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
+            if let Some(manifest) = candidate_snapshot.as_ref() {
+                base_sha = Some(manifest.comparison_base.commit_sha.clone());
+            }
 
             if source_ref.is_some() != source_sha.is_some() {
                 return rejected_push(
@@ -4337,6 +4388,7 @@ impl VerdictService for ServeVerdictState {
                 let Some(root) = analysis_root.as_ref() else {
                     return rejected_push(worktree, "repo-relative push missing analysis_root");
                 };
+                let files = typed_legacy_files.as_deref().unwrap_or(files);
                 mapped_files = match map_repo_relative_files(root, files) {
                     Ok(files) => files,
                     Err(e) => return rejected_push(worktree, &e),
@@ -4356,7 +4408,7 @@ impl VerdictService for ServeVerdictState {
             // "revert RA to the on-disk tree" operation. Placed BEFORE
             // `ensure_analysis_root` so a doomed push never spends the
             // sync_lock on a fetch.
-            if files.is_empty() && source_sha.is_none() {
+            if files.is_empty() && source_sha.is_none() && candidate_snapshot.is_none() {
                 if let Some(changed) = changed_files.as_ref().filter(|c| !c.is_empty()) {
                     return rejected_push(
                         worktree,
@@ -4377,7 +4429,12 @@ impl VerdictService for ServeVerdictState {
             }
 
             if let Some(root) = analysis_root.as_ref() {
-                if let (Some(source_ref), Some(source_sha)) =
+                if let Some(manifest) = candidate_snapshot.as_ref() {
+                    let _guard = poisoned(&self.sync_lock);
+                    if let Err(error) = ensure_candidate_snapshot_base(root, base_ref, manifest) {
+                        return rejected_push(worktree, &error);
+                    }
+                } else if let (Some(source_ref), Some(source_sha)) =
                     (source_ref.as_deref(), source_sha.as_deref())
                 {
                     let _guard = poisoned(&self.sync_lock);
@@ -4400,7 +4457,10 @@ impl VerdictService for ServeVerdictState {
             return rejected_push(worktree, "daemon is quiescing");
         }
 
-        let applied_files = files.len() as u32;
+        let applied_files = candidate_snapshot
+            .as_ref()
+            .map(|manifest| manifest.candidate.operation_count())
+            .unwrap_or(files.len() as u64) as u32;
         let pushed = PushedOverlay {
             base_ref: base_ref.to_string(),
             files: mapped_files,
@@ -4408,6 +4468,7 @@ impl VerdictService for ServeVerdictState {
             base_sha,
             source_ref,
             source_sha,
+            candidate_snapshot,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files,
             check_profile: check_profile.cloned(),
@@ -4447,6 +4508,7 @@ impl VerdictService for ServeVerdictState {
                     base_sha: pushed.base_sha.clone(),
                     source_ref: pushed.source_ref.clone(),
                     source_sha: pushed.source_sha.clone(),
+                    candidate_snapshot: pushed.candidate_snapshot.clone(),
                     overlay_files: pushed.files.clone(),
                     materialize_overlay: pushed.analysis_root.is_some(),
                     gate: true,
@@ -4657,6 +4719,7 @@ impl ServeBatchChecker<'_> {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files,
             materialize_overlay: true,
             gate: self.gate,
@@ -4952,6 +5015,117 @@ fn map_repo_relative_files(
         .collect()
 }
 
+fn typed_candidate_overlay(
+    options: &PushOverlayOptions,
+    legacy_files: &[(String, String)],
+) -> Result<
+    Option<(
+        CandidateSnapshotManifest,
+        Vec<String>,
+        Vec<(String, String)>,
+    )>,
+    String,
+> {
+    let comparison_base_sha = options
+        .comparison_base_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let manifest = options.candidate_snapshot.as_ref();
+    match (comparison_base_sha, manifest) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(
+                "candidate_snapshot.manifest_missing: comparison base requires a typed manifest"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "candidate_snapshot.comparison_base_missing: typed manifest requires comparison_base_sha"
+                    .to_string(),
+            );
+        }
+        (Some(_), Some(_)) => {}
+    }
+    let (Some(comparison_base_sha), Some(manifest)) = (comparison_base_sha, manifest) else {
+        return Err(
+            "candidate_snapshot.pairing_invalid: typed candidate identity is incomplete"
+                .to_string(),
+        );
+    };
+    cargoless_core::validate_candidate_snapshot_manifest(manifest)
+        .map_err(|error| error.to_string())?;
+    if comparison_base_sha != manifest.comparison_base.commit_sha {
+        return Err(format!(
+            "candidate_snapshot.comparison_base_mismatch: option {comparison_base_sha} differs from manifest {}",
+            manifest.comparison_base.commit_sha
+        ));
+    }
+    if options
+        .base_sha
+        .as_deref()
+        .is_some_and(|base_sha| base_sha != comparison_base_sha)
+    {
+        return Err(
+            "candidate_snapshot.base_attribution_mismatch: base_sha differs from comparison base"
+                .to_string(),
+        );
+    }
+    if !options.repo_relative || options.analysis_root.is_none() {
+        return Err(
+            "candidate_snapshot.analysis_root_missing: typed overlays require repo_relative analysis_root"
+                .to_string(),
+        );
+    }
+    if options.source_ref.is_some() || options.source_sha.is_some() {
+        return Err(
+            "candidate_snapshot.identity_conflict: typed overlay and exact-Git source are mutually exclusive"
+                .to_string(),
+        );
+    }
+    let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
+        return Err(
+            "candidate_snapshot.kind_unsupported: push_overlay requires kind=overlay".to_string(),
+        );
+    };
+
+    let changed_files = operations
+        .iter()
+        .map(|operation| operation.path().to_string())
+        .collect::<Vec<_>>();
+    if let Some(advertised) = options.changed_files.as_ref() {
+        if advertised != &changed_files {
+            return Err(
+                "candidate_snapshot.changed_files_mismatch: hint differs from typed operations"
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut projection = Vec::new();
+    for operation in operations {
+        match operation {
+            OverlayOperation::Delete { path, .. } => {
+                projection.push((path.clone(), String::new()));
+            }
+            OverlayOperation::Upsert { path, payload, .. } => {
+                let bytes = decode_overlay_payload(payload).map_err(|error| error.to_string())?;
+                if let Ok(content) = String::from_utf8(bytes) {
+                    projection.push((path.clone(), content));
+                }
+            }
+        }
+    }
+    if projection != legacy_files {
+        return Err(
+            "candidate_snapshot.legacy_projection_mismatch: files differ from typed operations"
+                .to_string(),
+        );
+    }
+    Ok(Some((manifest.clone(), changed_files, projection)))
+}
+
 fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -5111,6 +5285,68 @@ fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_candidate_snapshot_base(
+    root: &Path,
+    base_ref: &str,
+    manifest: &CandidateSnapshotManifest,
+) -> Result<(), String> {
+    sync_analysis_root(root, base_ref)?;
+    if !local_commit_exists(root, &manifest.comparison_base.commit_sha) {
+        return Err(format!(
+            "candidate_snapshot.base_commit_missing: comparison base {} is absent after fetching {base_ref}",
+            manifest.comparison_base.commit_sha
+        ));
+    }
+    let resolved = crate::candidate_snapshot_git::resolve_commit_snapshot(
+        root,
+        &manifest.comparison_base.commit_sha,
+    )
+    .map_err(|error| error.to_string())?;
+    if resolved.git_object_format != manifest.git_object_format {
+        return Err(format!(
+            "candidate_snapshot.object_format_mismatch: repository uses {} but manifest uses {}",
+            resolved.git_object_format.as_str(),
+            manifest.git_object_format.as_str()
+        ));
+    }
+    if resolved.reference != manifest.comparison_base {
+        return Err(format!(
+            "candidate_snapshot.base_tree_mismatch: resolved {:?} differs from advertised {:?}",
+            resolved.reference, manifest.comparison_base
+        ));
+    }
+    if !run_git_success(
+        root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &manifest.comparison_base.commit_sha,
+            "HEAD",
+        ],
+    )? {
+        return Err(format!(
+            "candidate_snapshot.base_unreachable: comparison base {} is not reachable from fetched {base_ref}",
+            manifest.comparison_base.commit_sha
+        ));
+    }
+    // The RA compatibility overlay is a delta from this exact base, not from
+    // the moving symbolic ref used only to fetch/reachability-check it.
+    reset_analysis_root(root, &manifest.comparison_base.commit_sha)?;
+    let candidate_entries = manifest
+        .candidate
+        .entries()
+        .iter()
+        .cloned()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    cargoless_core::validate_manifest_against_entry_maps(
+        manifest,
+        Some(&resolved.entries),
+        &candidate_entries,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// `true` when `s` is a full git object hash (40-hex SHA-1 or 64-hex
 /// SHA-256) — the only shape we trust the local mirror for. A symbolic
 /// ref (branch/tag name, `origin/dev`, an abbreviated hash) returns
@@ -5261,6 +5497,193 @@ pub(crate) fn recover_project_check_scratch(
 
 fn materialize_overlay_files(root: &Path, files: &[(String, String)]) -> Result<(), String> {
     materialize_overlay_files_from_root(root, root, files)
+}
+
+fn materialize_candidate_snapshot(
+    scratch_root: &Path,
+    manifest: &CandidateSnapshotManifest,
+) -> Result<(), String> {
+    let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
+        return Err(
+            "candidate_snapshot.kind_unsupported: project-check materialization requires kind=overlay"
+                .to_string(),
+        );
+    };
+    for operation in operations {
+        let relative = safe_repo_relative_path(operation.path())?;
+        match operation {
+            OverlayOperation::Delete { path, .. } => {
+                ensure_candidate_parent(scratch_root, &relative, false)?;
+                let target = scratch_root.join(&relative);
+                let metadata = std::fs::symlink_metadata(&target).map_err(|error| {
+                    format!(
+                        "candidate_snapshot.delete_missing: could not inspect {path:?}: {error}"
+                    )
+                })?;
+                if !metadata.file_type().is_file() {
+                    return Err(format!(
+                        "candidate_snapshot.overlay_mode_unsupported: delete target {path:?} is not a regular file"
+                    ));
+                }
+                std::fs::remove_file(&target).map_err(|error| {
+                    format!("candidate_snapshot.materialize_failed: delete {path:?}: {error}")
+                })?;
+            }
+            OverlayOperation::Upsert {
+                path,
+                mode,
+                payload,
+                ..
+            } => {
+                ensure_candidate_parent(scratch_root, &relative, true)?;
+                let target = scratch_root.join(&relative);
+                if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+                    if !metadata.file_type().is_file() {
+                        return Err(format!(
+                            "candidate_snapshot.overlay_mode_unsupported: upsert target {path:?} is not a regular file"
+                        ));
+                    }
+                }
+                let bytes = decode_overlay_payload(payload).map_err(|error| error.to_string())?;
+                std::fs::write(&target, bytes).map_err(|error| {
+                    format!("candidate_snapshot.materialize_failed: upsert {path:?}: {error}")
+                })?;
+                set_candidate_mode(&target, mode)?;
+            }
+        }
+    }
+
+    let manifest_relative = Path::new(".cargoless/candidate-snapshot.json");
+    ensure_candidate_parent(scratch_root, manifest_relative, true)?;
+    let manifest_path = scratch_root.join(manifest_relative);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let manifest_dir = manifest_path.parent().ok_or_else(|| {
+            "candidate_snapshot.manifest_write_failed: missing parent".to_string()
+        })?;
+        std::fs::set_permissions(manifest_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                format!(
+                    "candidate_snapshot.manifest_write_failed: chmod `{}`: {error}",
+                    manifest_dir.display()
+                )
+            },
+        )?;
+    }
+    let canonical = canonical_manifest_json(manifest).map_err(|error| error.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&manifest_path).map_err(|error| {
+        format!(
+            "candidate_snapshot.manifest_write_failed: could not create `{}`: {error}",
+            manifest_path.display()
+        )
+    })?;
+    use std::io::Write as _;
+    file.write_all(canonical.as_bytes()).map_err(|error| {
+        format!(
+            "candidate_snapshot.manifest_write_failed: could not write `{}`: {error}",
+            manifest_path.display()
+        )
+    })
+}
+
+fn ensure_candidate_parent(
+    root: &Path,
+    relative: &Path,
+    create_missing: bool,
+) -> Result<(), String> {
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut cursor = root.to_path_buf();
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!(
+                "candidate_snapshot.path_noncanonical: invalid path `{}`",
+                relative.display()
+            ));
+        };
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "candidate_snapshot.symlink_traversal: parent `{}` is a symlink",
+                    cursor.display()
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "candidate_snapshot.path_conflict: parent `{}` is not a directory",
+                    cursor.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+                std::fs::create_dir(&cursor).map_err(|error| {
+                    format!(
+                        "candidate_snapshot.materialize_failed: create parent `{}`: {error}",
+                        cursor.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "candidate_snapshot.materialize_failed: inspect parent `{}`: {error}",
+                    cursor.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_candidate_mode(path: &Path, mode: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let permissions = match mode {
+        "100644" => std::fs::Permissions::from_mode(0o644),
+        "100755" => std::fs::Permissions::from_mode(0o755),
+        _ => {
+            return Err(format!(
+                "candidate_snapshot.overlay_mode_unsupported: unsupported mode {mode:?}"
+            ));
+        }
+    };
+    std::fs::set_permissions(path, permissions).map_err(|error| {
+        format!(
+            "candidate_snapshot.materialize_failed: chmod `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_candidate_mode(_path: &Path, mode: &str) -> Result<(), String> {
+    if matches!(mode, "100644" | "100755") {
+        Ok(())
+    } else {
+        Err(format!(
+            "candidate_snapshot.overlay_mode_unsupported: unsupported mode {mode:?}"
+        ))
+    }
+}
+
+pub(crate) fn candidate_snapshot_check_context(
+    root: &Path,
+    manifest: &CandidateSnapshotManifest,
+) -> CandidateSnapshotCheckContext {
+    CandidateSnapshotCheckContext {
+        manifest_path: root.join(".cargoless/candidate-snapshot.json"),
+        manifest_digest: manifest.manifest_digest.clone(),
+        comparison_base_sha: manifest.comparison_base.commit_sha.clone(),
+    }
 }
 
 // ── CGLS-26: warm shared witness target dir ──────────────────────────────
@@ -6760,6 +7183,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -6874,6 +7299,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -8125,6 +8552,8 @@ checks:
                 base_sha: None,
                 source_ref: None,
                 source_sha: None,
+                comparison_base_sha: None,
+                candidate_snapshot: None,
                 changed_files: None,
                 gate: false,
                 check_ids: None,
@@ -8442,6 +8871,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![(
                 project
                     .root
@@ -9103,6 +9533,8 @@ checks:
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -9154,6 +9586,8 @@ checks:
             base_sha: Some(head),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -9213,6 +9647,8 @@ checks:
             base_sha: Some(source_sha.clone()),
             source_ref: Some("refs/heads/main".to_string()),
             source_sha: Some(source_sha.clone()),
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".to_string()]),
             gate: true,
             check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
@@ -9521,6 +9957,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![
                 (
                     root.join("src/lib.rs").to_string_lossy().into_owned(),
@@ -9571,6 +10008,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![
                 (
                     project
@@ -9704,6 +10142,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -9933,6 +10373,8 @@ checks:
             base_sha: Some(sha.to_string()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -10116,6 +10558,7 @@ checks:
             base_sha: Some(sha.into()),
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
@@ -10148,6 +10591,7 @@ checks:
             base_sha: Some(sha.into()),
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
@@ -10292,6 +10736,7 @@ checks:
             base_sha: Some("cafe1234".into()),
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: changed,
             check_profile: None,
@@ -10475,6 +10920,8 @@ checks:
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             gate: false,
             check_ids: None,
@@ -10501,6 +10948,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -10526,6 +10975,8 @@ checks:
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/removed.rs".into()]),
             gate: false,
             check_ids: None,
@@ -11139,6 +11590,7 @@ checks:
                 base_sha: None,
                 source_ref: None,
                 source_sha: None,
+                candidate_snapshot: None,
                 overlay_files: Vec::new(),
                 materialize_overlay: false,
                 gate: true,

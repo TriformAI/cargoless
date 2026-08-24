@@ -1751,6 +1751,7 @@ fn exec(
                             base_sha: pushed.base_sha.clone(),
                             source_ref: pushed.source_ref.clone(),
                             source_sha: pushed.source_sha.clone(),
+                            candidate_snapshot: pushed.candidate_snapshot.clone(),
                             overlay_files: pushed.files.clone(),
                             materialize_overlay,
                             gate: pushed.gate,
@@ -3265,32 +3266,41 @@ fn run_project_checks_and_log(
             base_sha: ctx.base_sha.clone()?,
         })
     });
-    let report = match (context.as_ref(), gated_ids.as_deref()) {
-        (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_profile_with_ids_in_at(
+    let report =
+        match (context.as_ref(), gated_ids.as_deref()) {
+            (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root, warm| {
+                let candidate = ctx.candidate_snapshot.as_ref().map(|manifest| {
+                    crate::serveapi::candidate_snapshot_check_context(root, manifest)
+                });
+                cargoless_core::project_checks::run_profile_with_ids_in_at_candidate(
+                    root,
+                    "dev",
+                    ids,
+                    None,
+                    warm,
+                    identity.as_ref(),
+                    candidate.as_ref(),
+                )
+            }),
+            (Some(ctx), None) => api.with_project_check_overlay(ctx, |root, warm| {
+                let candidate = ctx.candidate_snapshot.as_ref().map(|manifest| {
+                    crate::serveapi::candidate_snapshot_check_context(root, manifest)
+                });
+                cargoless_core::project_checks::run_profile_with_ids_in_at_candidate(
+                    root,
+                    "dev",
+                    &[],
+                    changed_files,
+                    warm,
+                    identity.as_ref(),
+                    candidate.as_ref(),
+                )
+            }),
+            (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
                 root,
-                "dev",
-                ids,
-                None,
-                warm,
-                identity.as_ref(),
-            )
-        }),
-        (Some(ctx), None) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_profile_with_ids_in_at(
-                root,
-                "dev",
-                &[],
                 changed_files,
-                warm,
-                identity.as_ref(),
-            )
-        }),
-        (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
-            root,
-            changed_files,
-        )),
-    };
+            )),
+        };
     // INFRA-36 span: complementary to verdict.publish, scoped to the
     // project-checks layer. Lets SigNoz reconstruct "what did the gate
     // actually compute?" independent of "what verdict did the daemon
@@ -4775,6 +4785,7 @@ mod tests {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![
                 (
                     "physics/src/runtime/wire/executor.rs".to_string(),
@@ -5250,6 +5261,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![(
                 root.join("src/added.rs").to_string_lossy().into_owned(),
                 "pub fn added() {}\n".to_string(),

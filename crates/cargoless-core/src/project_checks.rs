@@ -104,6 +104,16 @@ pub struct ProjectCheckRunIdentity {
     pub base_sha: String,
 }
 
+/// Immutable candidate identity exported to every command check in one run.
+/// The daemon owns creation and cleanup of the manifest file; project-checks
+/// only threads this exact per-run authority into child environments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateSnapshotCheckContext {
+    pub manifest_path: PathBuf,
+    pub manifest_digest: String,
+    pub comparison_base_sha: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredCheckSubject {
     pub source_sha: String,
@@ -680,6 +690,7 @@ pub fn run_profile_with_changes_at(
         changed_files,
         None,
         identity.cloned(),
+        None,
     )
 }
 
@@ -701,6 +712,7 @@ pub fn run_profile_with_changes_in(
         changed_files,
         witness_target_dir,
         None,
+        None,
     )
 }
 
@@ -721,7 +733,7 @@ pub fn run_profile_with_ids(
     ids: &[String],
     changed_files: Option<&[String]>,
 ) -> io::Result<ProjectCheckReport> {
-    run_profile_inner(root, profile_name, ids, changed_files, None, None)
+    run_profile_inner(root, profile_name, ids, changed_files, None, None, None)
 }
 
 /// CGLS-26 — [`run_profile_with_ids`] with an optional WARM shared
@@ -740,6 +752,7 @@ pub fn run_profile_with_ids_in(
         ids,
         changed_files,
         witness_target_dir,
+        None,
         None,
     )
 }
@@ -760,6 +773,30 @@ pub fn run_profile_with_ids_in_at(
         changed_files,
         witness_target_dir,
         identity.cloned(),
+        None,
+    )
+}
+
+/// Candidate-bound form used by typed overlay checks. Unlike the legacy
+/// changed-files hint, this context identifies the complete immutable tree
+/// and is exported to every child check.
+pub fn run_profile_with_ids_in_at_candidate(
+    root: &Path,
+    profile_name: &str,
+    ids: &[String],
+    changed_files: Option<&[String]>,
+    witness_target_dir: Option<&Path>,
+    identity: Option<&ProjectCheckRunIdentity>,
+    candidate_snapshot: Option<&CandidateSnapshotCheckContext>,
+) -> io::Result<ProjectCheckReport> {
+    run_profile_inner(
+        root,
+        profile_name,
+        ids,
+        changed_files,
+        witness_target_dir,
+        identity.cloned(),
+        candidate_snapshot.cloned(),
     )
 }
 
@@ -775,6 +812,7 @@ fn run_profile_inner(
     changed_files: Option<&[String]>,
     witness_target_dir: Option<&Path>,
     identity: Option<ProjectCheckRunIdentity>,
+    candidate_snapshot: Option<CandidateSnapshotCheckContext>,
 ) -> io::Result<ProjectCheckReport> {
     let started = Instant::now();
     let root = fs::canonicalize(root)?;
@@ -822,6 +860,7 @@ fn run_profile_inner(
         profile_name: profile_name.to_string(),
         changed_files: changed_files.map(|files| normalize_changed_files(&root, files)),
         identity,
+        candidate_snapshot,
         witness_target_dir: witness_target_dir.map(Path::to_path_buf),
         cancel: Arc::new(AtomicBool::new(false)),
     });
@@ -1026,6 +1065,7 @@ struct RunContext {
     profile_name: String,
     changed_files: Option<Vec<String>>,
     identity: Option<ProjectCheckRunIdentity>,
+    candidate_snapshot: Option<CandidateSnapshotCheckContext>,
     /// CGLS-26 — optional WARM, persistent, shared `CARGO_TARGET_DIR` for the
     /// witness compile. `None` (the default and every non-witness caller)
     /// keeps the historical per-run `ctx.root/.cargoless-target`, byte-for-
@@ -1842,6 +1882,20 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(candidate) = ctx.candidate_snapshot.as_ref() {
+        cmd.env(
+            "CARGOLESS_CANDIDATE_SNAPSHOT_PATH",
+            &candidate.manifest_path,
+        )
+        .env(
+            "CARGOLESS_CANDIDATE_SNAPSHOT_DIGEST",
+            &candidate.manifest_digest,
+        )
+        .env(
+            "CARGOLESS_COMPARISON_BASE_SHA",
+            &candidate.comparison_base_sha,
+        );
+    }
     if let (Some(path), Some(identity)) = (&structured_result_path, &ctx.identity) {
         cmd.env("CARGOLESS_CHECK_RESULT_PATH", path)
             .env("CARGOLESS_SOURCE_SHA", &identity.source_sha)
