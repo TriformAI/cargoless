@@ -1123,56 +1123,335 @@ pub struct LaneEnqueueRequest {
     pub changed_files: Vec<String>,
 }
 
-fn candidate_snapshot_manifest_from_request_json(
+#[derive(Debug)]
+struct RawJsonObjectMember {
+    key: String,
+    key_start: usize,
+    value_start: usize,
+    value_end: usize,
+}
+
+const CANDIDATE_AUTHORITY_KEYS: &[&str] = &[
+    "repo_relative",
+    "analysis_root",
+    "base_sha",
+    "source_ref",
+    "source_sha",
+    "comparison_base_sha",
+    "candidate_snapshot",
+    "changed_files",
+    "gate",
+    "check_ids",
+    "semantic",
+];
+const PUSH_REQUEST_ENVELOPE_KEYS: &[&str] =
+    &["op", "worktree", "base_ref", "files", "check_profile"];
+
+fn candidate_snapshot_error(
+    code: &'static str,
+    message: impl Into<String>,
+) -> CandidateSnapshotError {
+    CandidateSnapshotError {
+        code,
+        message: message.into(),
+    }
+}
+
+fn raw_json_object_members(
+    bytes: &[u8],
+    start: usize,
+) -> Result<Vec<RawJsonObjectMember>, CandidateSnapshotError> {
+    if bytes.get(start) != Some(&b'{') {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.json_invalid",
+            "candidate-bearing request authority container must be a JSON object",
+        ));
+    }
+
+    let mut members = Vec::new();
+    let mut index = skip_json_whitespace(bytes, start + 1);
+    if bytes.get(index) == Some(&b'}') {
+        return Ok(members);
+    }
+    loop {
+        let key_start = index;
+        let key_end = json_string_end(bytes, key_start).ok_or_else(|| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                "invalid JSON object key while locating candidate authority",
+            )
+        })?;
+        let key: String = serde_json::from_slice(&bytes[key_start..key_end]).map_err(|error| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("invalid JSON object key while locating candidate authority: {error}"),
+            )
+        })?;
+        index = skip_json_whitespace(bytes, key_end);
+        if bytes.get(index) != Some(&b':') {
+            return Err(candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("field {key} is missing its JSON value separator"),
+            ));
+        }
+        let value_start = skip_json_whitespace(bytes, index + 1);
+        let value_end = json_value_end(bytes, value_start).ok_or_else(|| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("field {key} does not contain a valid JSON value"),
+            )
+        })?;
+        members.push(RawJsonObjectMember {
+            key,
+            key_start,
+            value_start,
+            value_end,
+        });
+
+        index = skip_json_whitespace(bytes, value_end);
+        match bytes.get(index) {
+            Some(b',') => index = skip_json_whitespace(bytes, index + 1),
+            Some(b'}') => return Ok(members),
+            _ => {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.json_invalid",
+                    "candidate authority object has an invalid member separator",
+                ));
+            }
+        }
+    }
+}
+
+fn candidate_snapshot_value_spans(
     text: &str,
-) -> Result<Option<CandidateSnapshotManifest>, CandidateSnapshotError> {
+) -> Result<Vec<(usize, usize, usize)>, CandidateSnapshotError> {
     let bytes = text.as_bytes();
-    let mut value_span = None;
+    let mut value_spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] != b'"' {
             index += 1;
             continue;
         }
-        let string_end = json_string_end(bytes, index).ok_or_else(|| CandidateSnapshotError {
-            code: "candidate_snapshot.json_invalid",
-            message: "unterminated JSON string while locating candidate_snapshot".to_string(),
+        let key_start = index;
+        let string_end = json_string_end(bytes, index).ok_or_else(|| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                "unterminated JSON string while locating candidate_snapshot",
+            )
         })?;
         let decoded: String =
             serde_json::from_slice(&bytes[index..string_end]).map_err(|error| {
-                CandidateSnapshotError {
-                    code: "candidate_snapshot.json_invalid",
-                    message: format!(
-                        "invalid JSON string while locating candidate_snapshot: {error}"
-                    ),
-                }
+                candidate_snapshot_error(
+                    "candidate_snapshot.json_invalid",
+                    format!("invalid JSON string while locating candidate_snapshot: {error}"),
+                )
             })?;
         let mut colon = skip_json_whitespace(bytes, string_end);
         if decoded == "candidate_snapshot" && bytes.get(colon) == Some(&b':') {
             colon += 1;
             let value_start = skip_json_whitespace(bytes, colon);
-            let value_end =
-                json_value_end(bytes, value_start).ok_or_else(|| CandidateSnapshotError {
-                    code: "candidate_snapshot.json_invalid",
-                    message: "candidate_snapshot value is not valid JSON".to_string(),
-                })?;
-            if value_span.replace((value_start, value_end)).is_some() {
-                return Err(CandidateSnapshotError {
-                    code: "candidate_snapshot.json_duplicate_key",
-                    message: "duplicate field candidate_snapshot in request".to_string(),
-                });
-            }
+            let value_end = json_value_end(bytes, value_start).ok_or_else(|| {
+                candidate_snapshot_error(
+                    "candidate_snapshot.json_invalid",
+                    "candidate_snapshot value is not valid JSON",
+                )
+            })?;
+            value_spans.push((key_start, value_start, value_end));
         }
         index = string_end;
     }
+    Ok(value_spans)
+}
 
-    let Some((start, end)) = value_span else {
+fn duplicate_json_member_key(members: &[RawJsonObjectMember]) -> Option<&str> {
+    members.iter().find_map(|candidate| {
+        (members
+            .iter()
+            .filter(|member| member.key == candidate.key)
+            .count()
+            > 1)
+        .then_some(candidate.key.as_str())
+    })
+}
+
+fn has_candidate_authority_key(members: &[RawJsonObjectMember]) -> bool {
+    members.iter().any(|member| {
+        CANDIDATE_AUTHORITY_KEYS
+            .iter()
+            .any(|key| member.key == *key)
+    })
+}
+
+fn unknown_candidate_authority_key(
+    members: &[RawJsonObjectMember],
+    flat_push: bool,
+) -> Option<&str> {
+    members.iter().find_map(|member| {
+        let known_authority = CANDIDATE_AUTHORITY_KEYS
+            .iter()
+            .any(|key| member.key == *key);
+        let known_envelope = flat_push
+            && PUSH_REQUEST_ENVELOPE_KEYS
+                .iter()
+                .any(|key| member.key == *key);
+        (!known_authority && !known_envelope).then_some(member.key.as_str())
+    })
+}
+
+fn candidate_snapshot_manifest_from_request_json(
+    text: &str,
+    op: &str,
+) -> Result<Option<CandidateSnapshotManifest>, CandidateSnapshotError> {
+    let candidate_spans = candidate_snapshot_value_spans(text)?;
+    if candidate_spans.is_empty() {
+        // The strict authority-location contract is additive. Legacy requests
+        // with no typed candidate retain serde_json::Value's historical
+        // best-effort duplicate/unknown-field behaviour.
         return Ok(None);
+    }
+
+    let bytes = text.as_bytes();
+    let root_start = skip_json_whitespace(bytes, 0);
+    let root_members = raw_json_object_members(bytes, root_start)?;
+    let root_options: Vec<_> = root_members
+        .iter()
+        .filter(|member| member.key == "options")
+        .collect();
+    if root_options.len() > 1 {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.json_duplicate_key",
+            "duplicate field options in candidate-bearing request",
+        ));
+    }
+
+    let options_members = root_options
+        .first()
+        .filter(|member| bytes.get(member.value_start) == Some(&b'{'))
+        .map(|member| raw_json_object_members(bytes, member.value_start))
+        .transpose()?
+        .unwrap_or_default();
+    let root_candidates: Vec<_> = root_members
+        .iter()
+        .filter(|member| member.key == "candidate_snapshot")
+        .collect();
+    let options_candidates: Vec<_> = options_members
+        .iter()
+        .filter(|member| member.key == "candidate_snapshot")
+        .collect();
+    let direct_candidate_key_starts: Vec<_> = root_candidates
+        .iter()
+        .chain(options_candidates.iter())
+        .map(|member| member.key_start)
+        .collect();
+    if candidate_spans.iter().any(|(key_start, _, _)| {
+        !direct_candidate_key_starts
+            .iter()
+            .any(|direct| direct == key_start)
+    }) {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.location_invalid",
+            "candidate_snapshot must be a direct member of the selected push authority container or batch options",
+        ));
+    }
+
+    let (selected_members, flat_push) = match op {
+        "push_overlay" => {
+            if !root_candidates.is_empty() && !options_candidates.is_empty() {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.pairing_invalid",
+                    "candidate authority is split across flat and nested push containers",
+                ));
+            }
+            if root_candidates.len() > 1 || options_candidates.len() > 1 {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.json_duplicate_key",
+                    "duplicate field candidate_snapshot in selected push authority container",
+                ));
+            }
+            if !root_candidates.is_empty() {
+                if !root_options.is_empty() {
+                    return Err(candidate_snapshot_error(
+                        "candidate_snapshot.pairing_invalid",
+                        "flat candidate authority cannot be combined with a nested options container",
+                    ));
+                }
+                (&root_members, true)
+            } else if !options_candidates.is_empty() {
+                if has_candidate_authority_key(&root_members) {
+                    return Err(candidate_snapshot_error(
+                        "candidate_snapshot.pairing_invalid",
+                        "candidate authority fields are split across flat and nested push containers",
+                    ));
+                }
+                (&options_members, false)
+            } else {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.location_invalid",
+                    "push_overlay candidate_snapshot is not in a supported direct authority container",
+                ));
+            }
+        }
+        "batch_check" => {
+            if !root_candidates.is_empty() {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.location_invalid",
+                    "batch_check candidate_snapshot must be a direct member of options",
+                ));
+            }
+            if options_candidates.len() > 1 {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.json_duplicate_key",
+                    "duplicate field candidate_snapshot in batch options",
+                ));
+            }
+            if options_candidates.is_empty() {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.location_invalid",
+                    "batch_check candidate_snapshot is not a direct member of options",
+                ));
+            }
+            if has_candidate_authority_key(&root_members) {
+                return Err(candidate_snapshot_error(
+                    "candidate_snapshot.pairing_invalid",
+                    "candidate authority fields are split across batch root and options",
+                ));
+            }
+            (&options_members, false)
+        }
+        _ => {
+            return Err(candidate_snapshot_error(
+                "candidate_snapshot.location_invalid",
+                format!("operation {op} does not define a candidate authority container"),
+            ));
+        }
     };
-    let raw = std::str::from_utf8(&bytes[start..end]).map_err(|error| CandidateSnapshotError {
-        code: "candidate_snapshot.json_invalid",
-        message: format!("candidate_snapshot is not UTF-8: {error}"),
-    })?;
+
+    if let Some(key) = duplicate_json_member_key(selected_members) {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.json_duplicate_key",
+            format!("duplicate field {key} in selected candidate authority container"),
+        ));
+    }
+    if let Some(key) = unknown_candidate_authority_key(selected_members, flat_push) {
+        return Err(candidate_snapshot_error(
+            "candidate_snapshot.location_invalid",
+            format!("unknown field {key} is not part of the selected candidate authority shape"),
+        ));
+    }
+
+    let candidate = selected_members
+        .iter()
+        .find(|member| member.key == "candidate_snapshot")
+        .expect("selected candidate authority contains candidate_snapshot");
+    let raw = std::str::from_utf8(&bytes[candidate.value_start..candidate.value_end]).map_err(
+        |error| {
+            candidate_snapshot_error(
+                "candidate_snapshot.json_invalid",
+                format!("candidate_snapshot is not UTF-8: {error}"),
+            )
+        },
+    )?;
     crate::candidate_snapshot::parse_and_validate_manifest_json(raw).map(Some)
 }
 
@@ -1277,7 +1556,11 @@ impl Request {
         // `serde_json::Value` deliberately keeps only the last duplicate
         // object key, which is acceptable for legacy best-effort metadata but
         // would erase an identity conflict inside a candidate snapshot.
-        let candidate_snapshot = candidate_snapshot_manifest_from_request_json(text)?;
+        let op = v
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let candidate_snapshot = candidate_snapshot_manifest_from_request_json(text, op)?;
         Ok(Self::from_json_value(v, candidate_snapshot))
     }
 
@@ -3152,6 +3435,19 @@ mod tests {
             .expect("nested batch authority is valid")
             .expect("candidate batch parses");
         assert_eq!(parsed, Request::BatchCheck(request));
+    }
+
+    #[test]
+    fn legacy_push_without_candidate_remains_best_effort() {
+        let wire = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{"gate":true},
+            "options":{"future_legacy_hint":"ignored"}
+        }"#;
+        let parsed = Request::try_from_json(wire)
+            .expect("legacy duplicate and unknown fields remain tolerated")
+            .expect("legacy push still parses");
+        assert!(matches!(parsed, Request::PushOverlay { .. }));
     }
 
     #[test]
