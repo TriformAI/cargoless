@@ -91,6 +91,37 @@ fn roster_stale_id(output: &str) -> Option<String> {
     ids.next().is_none().then_some(id)
 }
 
+/// The dispatcher's own last word before it gave up with `EX_TEMPFAIL`.
+///
+/// A bare "exit 75" is a category, not a diagnosis: a real dispatcher has a
+/// dozen ways to reach it (unfetchable ref, moved candidate, no merge base,
+/// unreachable preview slot...) and it always says which one on stderr, which
+/// `run_to_completion` already captured. Dropping that leaves the largest
+/// infrastructure bucket in the trail undiagnosable after the fact — the
+/// failure the lane is *most* likely to be asked about is the one it explains
+/// least. `EX_ROSTER_STALE` below already reads this same text; this is the
+/// same courtesy for the more common exit.
+///
+/// Last non-blank line, because shell scripts print context first and the
+/// verdict last. Bounded and single-line so it stays safe to paste into a trail
+/// line, a forge status, or a PR comment.
+fn tempfail_detail(output: &str) -> Option<String> {
+    const MAX: usize = 200;
+    let line = output.lines().rev().find(|l| !l.trim().is_empty())?.trim();
+    let cleaned: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(match cleaned.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}...", &cleaned[..cut]),
+        None => cleaned.to_string(),
+    })
+}
+
 /// Why a candidate tree could not be produced.
 ///
 /// The distinction is load-bearing. `Infra` is nobody's fault and everyone
@@ -749,10 +780,16 @@ impl LegRunner for DispatchLegRunner {
         // and shell authors reach for it without being told.
         const EX_TEMPFAIL: i32 = 75;
         if code == Some(EX_TEMPFAIL) {
-            return Err(io::Error::other(format!(
-                "dispatcher reported a transient failure (exit {EX_TEMPFAIL}); \
-                 no verdict was produced"
-            )));
+            return Err(io::Error::other(match tempfail_detail(&text) {
+                Some(detail) => format!(
+                    "dispatcher reported a transient failure (exit {EX_TEMPFAIL}); \
+                     no verdict was produced: {detail}"
+                ),
+                None => format!(
+                    "dispatcher reported a transient failure (exit {EX_TEMPFAIL}); \
+                     no verdict was produced, and it printed no reason"
+                ),
+            }));
         }
 
         // Versioned, fail-closed protocol for an exact remote roster that
@@ -2299,6 +2336,72 @@ pub fn unix_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tempfail_detail_tests {
+    use super::tempfail_detail;
+
+    /// The production symptom: 986 of 1164 infrastructure entries in a real
+    /// lane trail said only "exit 75", while the dispatcher had named the
+    /// cause on stderr every single time.
+    #[test]
+    fn the_dispatchers_own_last_word_is_what_gets_reported() {
+        let out = "lane-dispatch: fetching candidate\n\
+                   lane-dispatch: cannot fetch exact candidate refs/heads/lane-candidate/1-551\n";
+        assert_eq!(
+            tempfail_detail(out).as_deref(),
+            Some("lane-dispatch: cannot fetch exact candidate refs/heads/lane-candidate/1-551"),
+        );
+    }
+
+    /// Shell scripts print context first and the verdict last, so trailing
+    /// blank lines must not be mistaken for "it said nothing".
+    #[test]
+    fn trailing_blank_lines_are_skipped() {
+        assert_eq!(
+            tempfail_detail("noise\nthe real reason\n\n   \n").as_deref(),
+            Some("the real reason"),
+        );
+    }
+
+    /// A silent dispatcher must read as silent, not as an empty quote.
+    #[test]
+    fn silence_is_reported_as_none() {
+        assert!(tempfail_detail("").is_none());
+        assert!(tempfail_detail("\n  \n\t\n").is_none());
+    }
+
+    /// This text is pasted into trail lines and forge statuses, so a runaway
+    /// dispatcher must not be able to flood them.
+    #[test]
+    fn a_runaway_line_is_bounded() {
+        let detail = tempfail_detail(&"x".repeat(10_000)).expect("a long line is still a reason");
+        assert!(detail.len() < 260, "unbounded: {} bytes", detail.len());
+        assert!(
+            detail.ends_with("..."),
+            "truncation must be visible: {detail}"
+        );
+    }
+
+    /// Truncation slices by char boundary, never by byte: a multi-byte
+    /// character straddling the cut would panic the lane on an infra failure —
+    /// turning a diagnosis into an outage.
+    #[test]
+    fn truncating_multibyte_text_does_not_panic() {
+        let detail = tempfail_detail(&"\u{e9}".repeat(10_000)).expect("still a reason");
+        assert!(detail.ends_with("..."), "expected truncation: {detail}");
+    }
+
+    /// Control characters would corrupt a single-line trail record.
+    #[test]
+    fn control_characters_are_neutralised() {
+        let detail = tempfail_detail("a\rb\tc").expect("a reason");
+        assert!(
+            !detail.contains('\r') && !detail.contains('\t'),
+            "control chars survived: {detail:?}",
+        );
+    }
 }
 
 #[cfg(test)]
