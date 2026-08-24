@@ -1091,6 +1091,124 @@ mod tests {
         assert!(error.to_string().contains("64 MiB"));
     }
 
+    fn manifest_accounting_fixture() -> (
+        GitTreeRef,
+        BTreeMap<String, SnapshotEntry>,
+        Vec<OverlayOperation>,
+    ) {
+        let path = "empty.bin".to_string();
+        let blob_oid = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".to_string();
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string();
+        (
+            GitTreeRef {
+                commit_sha: "de16c5f7dd233165813ffa72719869e3181c554b".to_string(),
+                tree_oid: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
+            },
+            BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry {
+                    path: path.clone(),
+                    mode: "100644".to_string(),
+                    blob_oid: blob_oid.clone(),
+                    size: 0,
+                    sha256: sha256.clone(),
+                },
+            )]),
+            vec![OverlayOperation::Upsert {
+                path,
+                mode: "100644".to_string(),
+                blob_oid,
+                size: 0,
+                sha256,
+                payload: OverlayPayload {
+                    encoding: "base64".to_string(),
+                    data: String::new(),
+                },
+            }],
+        )
+    }
+
+    #[test]
+    fn manifest_metadata_limit_rejects_before_complete_entry_clone() {
+        let (base, mut entries, mut operations) = manifest_accounting_fixture();
+        let long_path = format!("{}.bin", "a".repeat(1024));
+        let (_, mut entry) = entries.pop_first().unwrap();
+        entry.path = long_path.clone();
+        entries.insert(long_path.clone(), entry);
+        let OverlayOperation::Upsert { path, .. } = &mut operations[0] else {
+            unreachable!("fixture contains one upsert")
+        };
+        *path = long_path;
+
+        let error = ensure_overlay_manifest_json_limit(
+            GitObjectFormat::Sha1,
+            &base,
+            &"0".repeat(40),
+            &entries,
+            &operations,
+            512,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("candidate_snapshot.limit_exceeded")
+        );
+        assert!(error.to_string().contains("manifest exceeds"));
+    }
+
+    #[test]
+    fn manifest_metadata_accounting_matches_admitted_canonical_json() {
+        let (base, entries, operations) = manifest_accounting_fixture();
+        let mut manifest = CandidateSnapshotManifest {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1.to_string(),
+            git_object_format: GitObjectFormat::Sha1,
+            comparison_base: base.clone(),
+            candidate: CandidateSnapshot::Overlay {
+                base: base.clone(),
+                tree_oid: "0".repeat(40),
+                entry_count: entries.len() as u64,
+                entries: entries.values().cloned().collect(),
+                snapshot_digest: ZERO_DIGEST.to_string(),
+                operation_count: operations.len() as u64,
+                operations: operations.clone(),
+            },
+            manifest_digest: ZERO_DIGEST.to_string(),
+        };
+        let tree_oid = compute_candidate_tree_oid(&manifest).unwrap();
+        let CandidateSnapshot::Overlay {
+            tree_oid: advertised_tree_oid,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture contains an overlay")
+        };
+        *advertised_tree_oid = tree_oid.clone();
+        let computed_snapshot_digest = compute_snapshot_digest(&manifest).unwrap();
+        let CandidateSnapshot::Overlay {
+            snapshot_digest, ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!("fixture contains an overlay")
+        };
+        *snapshot_digest = computed_snapshot_digest;
+        manifest.manifest_digest = compute_manifest_digest(&manifest).unwrap();
+        let canonical = canonical_manifest_json(&manifest).unwrap();
+
+        let accounted = ensure_overlay_manifest_json_limit(
+            GitObjectFormat::Sha1,
+            &base,
+            &tree_oid,
+            &entries,
+            &operations,
+            MAX_MANIFEST_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(accounted, canonical.len());
+    }
+
     #[test]
     fn streaming_sha256_matches_canonical_hash_across_chunk_boundaries() {
         let bytes = vec![b'a'; 1_000_000];
