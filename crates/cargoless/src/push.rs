@@ -990,18 +990,31 @@ mod tests {
     }
 
     #[test]
-    fn legacy_projection_fails_closed_for_typed_binary_payload() {
+    fn legacy_projection_omits_binary_without_weakening_the_typed_candidate() {
         let root = text_overlay_fixture();
         write_file(&root, "binary.bin", [0x00, 0xff, 0x80, b'B']);
         let built = crate::candidate_snapshot_git::build_overlay_manifest(&root, "HEAD")
             .unwrap()
             .expect("fixture has a delta");
 
-        let error = legacy_files_from_candidate_snapshot(&root, &built.manifest, true)
-            .expect_err("binary typed bytes cannot enter the UTF-8 compatibility projection");
+        let files = legacy_files_from_candidate_snapshot(&root, &built.manifest, true).unwrap();
+        let changed_paths = candidate_changed_paths(&built.manifest);
 
-        assert!(error.contains("binary.bin"));
-        assert!(error.contains("UTF-8 compatibility projection"));
+        assert!(files.iter().all(|(path, _)| path != "binary.bin"));
+        assert!(changed_paths.iter().any(|path| path == "binary.bin"));
+        let CandidateSnapshot::Overlay { operations, .. } = &built.manifest.candidate else {
+            panic!("push candidate must be an overlay");
+        };
+        assert!(matches!(
+            operations
+                .iter()
+                .find(|operation| operation.path() == "binary.bin"),
+            Some(OverlayOperation::Upsert { .. })
+        ));
+
+        let mut options = PushOverlayOptions::default();
+        apply_candidate_snapshot_options(&mut options, &built.manifest);
+        assert_eq!(options.candidate_snapshot.as_ref(), Some(&built.manifest));
     }
 
     /// **2c keystone test — the client-side composing-equivalence
