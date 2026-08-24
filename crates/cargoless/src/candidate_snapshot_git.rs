@@ -13,11 +13,18 @@ use cargoless_core::{
     CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotError,
     CandidateSnapshotManifest, GitObjectFormat, GitTreeRef, OverlayOperation, OverlayPayload,
     SnapshotEntry, canonical_manifest_json, compute_candidate_tree_oid, compute_manifest_digest,
-    compute_snapshot_digest, parse_and_validate_manifest_json, sha256_hex,
+    compute_snapshot_digest, parse_and_validate_manifest_json,
     validate_manifest_against_entry_maps,
 };
 
 const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const MAX_TREE_ENTRIES: usize = 1_000_000;
+const MAX_OVERLAY_OPERATIONS: usize = 65_536;
+const MAX_UPSERT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOTAL_UPSERT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_LS_TREE_RECORD_BYTES: usize = MAX_PATH_BYTES + 128;
 static TEMP_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -59,7 +66,7 @@ type Result<T> = std::result::Result<T, CandidateSnapshotGitError>;
 pub(crate) struct ResolvedGitTree {
     pub(crate) tree_oid: String,
     pub(crate) entries: BTreeMap<String, SnapshotEntry>,
-    pub(crate) blobs: BTreeMap<String, Vec<u8>>,
+    pub(crate) retained_blobs: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,29 @@ pub(crate) struct ResolvedCommitSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BuiltCandidateOverlay {
     pub(crate) manifest: CandidateSnapshotManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntryMetadata {
+    mode: String,
+    blob_oid: String,
+    advertised_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedGitTree {
+    tree_oid: String,
+    entries: BTreeMap<String, TreeEntryMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PayloadPlan {
+    retained_oids: BTreeSet<String>,
+}
+
+struct StreamedBlobs {
+    identities: BTreeMap<String, (u64, String)>,
+    retained: BTreeMap<String, Vec<u8>>,
 }
 
 struct TemporaryIndex {
@@ -141,105 +171,14 @@ pub(crate) fn resolve_commit_snapshot(
     })
 }
 
-/// Resolve one immutable tree object to canonical entries and blob bytes.
+/// Resolve one immutable tree object while streaming its blobs into entry identities.
 pub(crate) fn resolve_tree_snapshot(
     repo: &Path,
     git_object_format: GitObjectFormat,
     tree_oid: &str,
 ) -> Result<ResolvedGitTree> {
-    if tree_oid.len() != git_object_format.oid_hex_len()
-        || !tree_oid
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(CandidateSnapshotGitError::new(format!(
-            "candidate_snapshot.oid_invalid: invalid {} tree object id {tree_oid:?}",
-            git_object_format.as_str()
-        )));
-    }
-    let output = git_output(
-        repo,
-        None,
-        ["ls-tree", "-rz", "--full-tree", "-l", tree_oid],
-    )?;
-    let mut raw_entries = Vec::new();
-    let mut blob_oids = BTreeSet::new();
-    for record in output
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or_else(|| {
-                CandidateSnapshotGitError::new("git ls-tree returned a record without a path")
-            })?;
-        let metadata = std::str::from_utf8(&record[..tab]).map_err(|error| {
-            CandidateSnapshotGitError::new(format!(
-                "git ls-tree returned non-UTF-8 metadata: {error}"
-            ))
-        })?;
-        let mut fields = metadata.split_ascii_whitespace();
-        let mode = fields
-            .next()
-            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted entry mode"))?;
-        let object_type = fields
-            .next()
-            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object type"))?;
-        let blob_oid = fields
-            .next()
-            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object id"))?;
-        let _advertised_size = fields
-            .next()
-            .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object size"))?;
-        if fields.next().is_some() {
-            return Err(CandidateSnapshotGitError::new(
-                "git ls-tree returned unexpected entry metadata",
-            ));
-        }
-        if object_type != "blob" {
-            return Err(CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.gitlink_unsupported: Git entry mode {mode} has object type {object_type}"
-            )));
-        }
-        let path = String::from_utf8(record[tab + 1..].to_vec()).map_err(|error| {
-            CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.path_noncanonical: Git path is not UTF-8: {error}"
-            ))
-        })?;
-        raw_entries.push((path, mode.to_string(), blob_oid.to_string()));
-        blob_oids.insert(blob_oid.to_string());
-    }
-
-    let blobs = load_blobs(repo, &blob_oids)?;
-    let mut entries = BTreeMap::new();
-    for (path, mode, blob_oid) in raw_entries {
-        let bytes = blobs.get(&blob_oid).ok_or_else(|| {
-            CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.blob_missing: cat-file omitted {blob_oid}"
-            ))
-        })?;
-        let entry = SnapshotEntry {
-            path: path.clone(),
-            mode,
-            blob_oid,
-            size: u64::try_from(bytes.len()).map_err(|_| {
-                CandidateSnapshotGitError::new("candidate_snapshot.limit_exceeded: blob too large")
-            })?,
-            sha256: sha256_hex(bytes),
-        };
-        if entries.insert(path.clone(), entry).is_some() {
-            return Err(CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.entry_duplicate: duplicate Git path {path:?}"
-            )));
-        }
-    }
-
-    Ok(ResolvedGitTree {
-        tree_oid: tree_oid.to_string(),
-        entries,
-        blobs,
-    })
+    let parsed = parse_tree_metadata(repo, git_object_format, tree_oid)?;
+    hydrate_tree_snapshot(repo, parsed, &BTreeSet::new())
 }
 
 /// Build the complete worktree candidate through an isolated temporary index.
@@ -256,7 +195,10 @@ pub(crate) fn build_overlay_manifest(
     )?;
     git_output(repo, Some(&temporary_index.path), ["add", "-A", "--", "."])?;
     let candidate_tree_oid = git_text(repo, Some(&temporary_index.path), ["write-tree"])?;
-    let candidate = resolve_tree_snapshot(repo, base.git_object_format, &candidate_tree_oid)?;
+    let candidate_metadata =
+        parse_tree_metadata(repo, base.git_object_format, &candidate_tree_oid)?;
+    let payload_plan = plan_changed_payloads(&base.entries, &candidate_metadata.entries)?;
+    let candidate = hydrate_tree_snapshot(repo, candidate_metadata, &payload_plan.retained_oids)?;
     let operations = overlay_operations(&base, &candidate)?;
     if operations.is_empty() {
         return Ok(None);
@@ -313,7 +255,7 @@ fn overlay_operations(
         .collect();
     let upsert = |path: &String, candidate_entry: &SnapshotEntry| -> Result<OverlayOperation> {
         let bytes = candidate
-            .blobs
+            .retained_blobs
             .get(&candidate_entry.blob_oid)
             .ok_or_else(|| {
                 CandidateSnapshotGitError::new(format!(
@@ -355,6 +297,243 @@ fn overlay_operations(
         }
     }
     Ok(operations)
+}
+
+fn parse_tree_metadata(
+    repo: &Path,
+    git_object_format: GitObjectFormat,
+    tree_oid: &str,
+) -> Result<ParsedGitTree> {
+    validate_git_oid(git_object_format, tree_oid, "tree")?;
+    let mut command = git_command(repo, None);
+    command.args(["ls-tree", "-rz", "--full-tree", "-l", tree_oid]);
+    let debug = format!("{command:?}");
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree stdout unavailable"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut entries = BTreeMap::new();
+    let parsed = (|| -> Result<()> {
+        while let Some(record) = read_delimited_record(
+            &mut reader,
+            b'\0',
+            MAX_LS_TREE_RECORD_BYTES,
+            "git ls-tree record",
+        )? {
+            if entries.len() >= MAX_TREE_ENTRIES {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.limit_exceeded: tree entry count exceeds v1 limit {MAX_TREE_ENTRIES}"
+                )));
+            }
+            let (path, entry) = parse_tree_record(git_object_format, &record)?;
+            if entries.insert(path.clone(), entry).is_some() {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.entry_duplicate: duplicate Git path {path:?}"
+                )));
+            }
+        }
+        Ok(())
+    })();
+    drop(reader);
+    if let Err(error) = parsed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let status = child.wait()?;
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    if !status.success() {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "{debug} exited {:?}: {}",
+            status.code(),
+            stderr.trim()
+        )));
+    }
+
+    Ok(ParsedGitTree {
+        tree_oid: tree_oid.to_string(),
+        entries,
+    })
+}
+
+fn parse_tree_record(
+    git_object_format: GitObjectFormat,
+    record: &[u8],
+) -> Result<(String, TreeEntryMetadata)> {
+    let tab = record
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| {
+            CandidateSnapshotGitError::new("git ls-tree returned a record without a path")
+        })?;
+    let metadata = std::str::from_utf8(&record[..tab]).map_err(|error| {
+        CandidateSnapshotGitError::new(format!("git ls-tree returned non-UTF-8 metadata: {error}"))
+    })?;
+    let mut fields = metadata.split_ascii_whitespace();
+    let mode = fields
+        .next()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted entry mode"))?;
+    let object_type = fields
+        .next()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object type"))?;
+    let blob_oid = fields
+        .next()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object id"))?;
+    let advertised_size = fields
+        .next()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git ls-tree omitted object size"))?;
+    if fields.next().is_some() {
+        return Err(CandidateSnapshotGitError::new(
+            "git ls-tree returned unexpected entry metadata",
+        ));
+    }
+    if object_type != "blob" {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.gitlink_unsupported: Git entry mode {mode} has object type {object_type}"
+        )));
+    }
+    validate_git_oid(git_object_format, blob_oid, "blob")?;
+    let advertised_size: u64 = advertised_size.parse().map_err(|error| {
+        CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.blob_missing: invalid advertised size for {blob_oid}: {error}"
+        ))
+    })?;
+    if advertised_size > MAX_JSON_INTEGER {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.limit_exceeded: blob {blob_oid} exceeds the v1 integer limit"
+        )));
+    }
+    let path_bytes = &record[tab + 1..];
+    if path_bytes.len() > MAX_PATH_BYTES {
+        return Err(CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.limit_exceeded: Git path exceeds {MAX_PATH_BYTES} bytes"
+        )));
+    }
+    let path = String::from_utf8(path_bytes.to_vec()).map_err(|error| {
+        CandidateSnapshotGitError::new(format!(
+            "candidate_snapshot.path_noncanonical: Git path is not UTF-8: {error}"
+        ))
+    })?;
+    Ok((
+        path,
+        TreeEntryMetadata {
+            mode: mode.to_string(),
+            blob_oid: blob_oid.to_string(),
+            advertised_size,
+        },
+    ))
+}
+
+fn plan_changed_payloads(
+    base: &BTreeMap<String, SnapshotEntry>,
+    candidate: &BTreeMap<String, TreeEntryMetadata>,
+) -> Result<PayloadPlan> {
+    let paths: BTreeSet<&String> = base.keys().chain(candidate.keys()).collect();
+    let mut operation_count = 0usize;
+    let mut total_upsert_bytes = 0u64;
+    let mut retained_oids = BTreeSet::new();
+    for path in paths {
+        let changed = match (base.get(path), candidate.get(path)) {
+            (Some(_), None) => true,
+            (None, Some(_)) => true,
+            (Some(base_entry), Some(candidate_entry)) => {
+                base_entry.mode != candidate_entry.mode
+                    || base_entry.blob_oid != candidate_entry.blob_oid
+            }
+            (None, None) => unreachable!("path originated in one metadata map"),
+        };
+        if !changed {
+            continue;
+        }
+        operation_count = operation_count.checked_add(1).ok_or_else(|| {
+            CandidateSnapshotGitError::new(
+                "candidate_snapshot.limit_exceeded: operation count overflowed",
+            )
+        })?;
+        if operation_count > MAX_OVERLAY_OPERATIONS {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.limit_exceeded: operation count exceeds v1 limit {MAX_OVERLAY_OPERATIONS}"
+            )));
+        }
+        let Some(candidate_entry) = candidate.get(path) else {
+            continue;
+        };
+        if candidate_entry.advertised_size > MAX_UPSERT_BYTES as u64 {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.limit_exceeded: upsert at {path:?} exceeds 32 MiB"
+            )));
+        }
+        total_upsert_bytes = total_upsert_bytes
+            .checked_add(candidate_entry.advertised_size)
+            .ok_or_else(|| {
+                CandidateSnapshotGitError::new(
+                    "candidate_snapshot.limit_exceeded: aggregate upsert size overflowed",
+                )
+            })?;
+        if total_upsert_bytes > MAX_TOTAL_UPSERT_BYTES as u64 {
+            return Err(CandidateSnapshotGitError::new(
+                "candidate_snapshot.limit_exceeded: overlay upserts exceed 64 MiB",
+            ));
+        }
+        retained_oids.insert(candidate_entry.blob_oid.clone());
+    }
+    Ok(PayloadPlan { retained_oids })
+}
+
+fn validate_git_oid(format: GitObjectFormat, oid: &str, object: &str) -> Result<()> {
+    if oid.len() == format.oid_hex_len()
+        && oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(CandidateSnapshotGitError::new(format!(
+        "candidate_snapshot.oid_invalid: invalid {} {object} object id {oid:?}",
+        format.as_str()
+    )))
+}
+
+fn read_delimited_record<R: BufRead>(
+    reader: &mut R,
+    delimiter: u8,
+    maximum_bytes: usize,
+    description: &str,
+) -> Result<Option<Vec<u8>>> {
+    let mut record = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if record.is_empty() {
+                Ok(None)
+            } else {
+                Err(CandidateSnapshotGitError::new(format!(
+                    "{description} ended without its delimiter"
+                )))
+            };
+        }
+        let delimiter_at = available.iter().position(|byte| *byte == delimiter);
+        let consumed = delimiter_at.unwrap_or(available.len());
+        if record.len().saturating_add(consumed) > maximum_bytes {
+            return Err(CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.limit_exceeded: {description} exceeds {maximum_bytes} bytes"
+            )));
+        }
+        record.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed + usize::from(delimiter_at.is_some()));
+        if delimiter_at.is_some() {
+            return Ok(Some(record));
+        }
+    }
 }
 
 fn git_object_format(repo: &Path) -> Result<GitObjectFormat> {
@@ -433,9 +612,60 @@ where
         .to_string())
 }
 
-fn load_blobs(repo: &Path, blob_oids: &BTreeSet<String>) -> Result<BTreeMap<String, Vec<u8>>> {
-    if blob_oids.is_empty() {
-        return Ok(BTreeMap::new());
+fn hydrate_tree_snapshot(
+    repo: &Path,
+    parsed: ParsedGitTree,
+    retained_oids: &BTreeSet<String>,
+) -> Result<ResolvedGitTree> {
+    let mut advertised_sizes = BTreeMap::new();
+    for entry in parsed.entries.values() {
+        match advertised_sizes.insert(entry.blob_oid.clone(), entry.advertised_size) {
+            Some(previous) if previous != entry.advertised_size => {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_size_mismatch: blob {} has conflicting advertised sizes {previous} and {}",
+                    entry.blob_oid, entry.advertised_size
+                )));
+            }
+            _ => {}
+        }
+    }
+    let streamed = stream_blobs(repo, &advertised_sizes, retained_oids)?;
+    let mut entries = BTreeMap::new();
+    for (path, metadata) in parsed.entries {
+        let (size, sha256) = streamed.identities.get(&metadata.blob_oid).ok_or_else(|| {
+            CandidateSnapshotGitError::new(format!(
+                "candidate_snapshot.blob_missing: cat-file omitted {}",
+                metadata.blob_oid
+            ))
+        })?;
+        entries.insert(
+            path.clone(),
+            SnapshotEntry {
+                path,
+                mode: metadata.mode,
+                blob_oid: metadata.blob_oid,
+                size: *size,
+                sha256: sha256.clone(),
+            },
+        );
+    }
+    Ok(ResolvedGitTree {
+        tree_oid: parsed.tree_oid,
+        entries,
+        retained_blobs: streamed.retained,
+    })
+}
+
+fn stream_blobs(
+    repo: &Path,
+    advertised_sizes: &BTreeMap<String, u64>,
+    retained_oids: &BTreeSet<String>,
+) -> Result<StreamedBlobs> {
+    if advertised_sizes.is_empty() {
+        return Ok(StreamedBlobs {
+            identities: BTreeMap::new(),
+            retained: BTreeMap::new(),
+        });
     }
     let mut child = git_command(repo, None)
         .args(["cat-file", "--batch"])
@@ -443,51 +673,90 @@ fn load_blobs(repo: &Path, blob_oids: &BTreeSet<String>) -> Result<BTreeMap<Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| CandidateSnapshotGitError::new("git cat-file stdin unavailable"))?;
-        for oid in blob_oids {
-            writeln!(stdin, "{oid}")?;
-        }
-    }
-
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| CandidateSnapshotGitError::new("git cat-file stdin unavailable"))?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| CandidateSnapshotGitError::new("git cat-file stdout unavailable"))?;
     let mut reader = BufReader::new(stdout);
+    let mut identities = BTreeMap::new();
     let mut blobs = BTreeMap::new();
-    for expected_oid in blob_oids {
-        let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 {
-            return Err(CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.blob_missing: cat-file ended before {expected_oid}"
-            )));
+    let streamed = (|| -> Result<()> {
+        for (expected_oid, advertised_size) in advertised_sizes {
+            writeln!(stdin, "{expected_oid}")?;
+            stdin.flush()?;
+            let header = read_delimited_record(&mut reader, b'\n', 256, "git cat-file header")?
+                .ok_or_else(|| {
+                    CandidateSnapshotGitError::new(format!(
+                        "candidate_snapshot.blob_missing: cat-file ended before {expected_oid}"
+                    ))
+                })?;
+            let header = std::str::from_utf8(&header).map_err(|error| {
+                CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_missing: non-UTF-8 cat-file header for {expected_oid}: {error}"
+                ))
+            })?;
+            let fields: Vec<&str> = header.split_ascii_whitespace().collect();
+            if fields.len() != 3 || fields[0] != expected_oid || fields[1] != "blob" {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_missing: unexpected cat-file response {header:?} for {expected_oid}"
+                )));
+            }
+            let size: u64 = fields[2].parse().map_err(|error| {
+                CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_missing: invalid cat-file size for {expected_oid}: {error}"
+                ))
+            })?;
+            if size != *advertised_size {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_size_mismatch: cat-file reports {size} bytes for {expected_oid}, ls-tree advertised {advertised_size}"
+                )));
+            }
+
+            let retain = retained_oids.contains(expected_oid);
+            if retain && size > MAX_UPSERT_BYTES as u64 {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.limit_exceeded: upsert blob {expected_oid} exceeds 32 MiB"
+                )));
+            }
+            let mut hasher = StreamingSha256::new();
+            let bytes = if retain {
+                let size = usize::try_from(size).map_err(|_| {
+                    CandidateSnapshotGitError::new(
+                        "candidate_snapshot.limit_exceeded: upsert size does not fit memory",
+                    )
+                })?;
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes)?;
+                hasher.update(&bytes);
+                Some(bytes)
+            } else {
+                stream_hash_exact(&mut reader, size, &mut hasher)?;
+                None
+            };
+            let mut delimiter = [0];
+            reader.read_exact(&mut delimiter)?;
+            if delimiter != [b'\n'] {
+                return Err(CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_missing: invalid cat-file delimiter for {expected_oid}"
+                )));
+            }
+            identities.insert(expected_oid.clone(), (size, hasher.finish_hex()));
+            if let Some(bytes) = bytes {
+                blobs.insert(expected_oid.clone(), bytes);
+            }
         }
-        let fields: Vec<&str> = header.split_ascii_whitespace().collect();
-        if fields.len() != 3 || fields[0] != expected_oid || fields[1] != "blob" {
-            return Err(CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.blob_missing: unexpected cat-file response {:?} for {expected_oid}",
-                header.trim_end()
-            )));
-        }
-        let size: usize = fields[2].parse().map_err(|error| {
-            CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.blob_missing: invalid cat-file size for {expected_oid}: {error}"
-            ))
-        })?;
-        let mut bytes = vec![0; size];
-        reader.read_exact(&mut bytes)?;
-        let mut delimiter = [0];
-        reader.read_exact(&mut delimiter)?;
-        if delimiter != [b'\n'] {
-            return Err(CandidateSnapshotGitError::new(format!(
-                "candidate_snapshot.blob_missing: invalid cat-file delimiter for {expected_oid}"
-            )));
-        }
-        blobs.insert(expected_oid.clone(), bytes);
+        Ok(())
+    })();
+    drop(stdin);
+    drop(reader);
+    if let Err(error) = streamed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
     }
 
     let status = child.wait()?;
@@ -502,7 +771,162 @@ fn load_blobs(repo: &Path, blob_oids: &BTreeSet<String>) -> Result<BTreeMap<Stri
             stderr.trim()
         )));
     }
-    Ok(blobs)
+    Ok(StreamedBlobs {
+        identities,
+        retained: blobs,
+    })
+}
+
+fn stream_hash_exact<R: Read>(
+    reader: &mut R,
+    mut remaining: u64,
+    hasher: &mut StreamingSha256,
+) -> Result<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded stream chunk fits usize");
+        reader.read_exact(&mut buffer[..chunk])?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+struct StreamingSha256 {
+    state: [u32; 8],
+    block: [u8; 64],
+    buffered: usize,
+    byte_len: u64,
+}
+
+impl StreamingSha256 {
+    const INITIAL_STATE: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    #[rustfmt::skip]
+    const ROUND_CONSTANTS: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    fn new() -> Self {
+        Self {
+            state: Self::INITIAL_STATE,
+            block: [0; 64],
+            buffered: 0,
+            byte_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.byte_len = self.byte_len.wrapping_add(bytes.len() as u64);
+        if self.buffered > 0 {
+            let copied = (64 - self.buffered).min(bytes.len());
+            self.block[self.buffered..self.buffered + copied].copy_from_slice(&bytes[..copied]);
+            self.buffered += copied;
+            bytes = &bytes[copied..];
+            if self.buffered == 64 {
+                let block = self.block;
+                self.compress(&block);
+                self.buffered = 0;
+            }
+            if bytes.is_empty() {
+                return;
+            }
+        }
+        let mut chunks = bytes.chunks_exact(64);
+        for chunk in &mut chunks {
+            let block: &[u8; 64] = chunk.try_into().expect("exact SHA-256 block");
+            self.compress(block);
+        }
+        let remainder = chunks.remainder();
+        self.block[..remainder.len()].copy_from_slice(remainder);
+        self.buffered = remainder.len();
+    }
+
+    fn finish_hex(mut self) -> String {
+        let bit_len = self.byte_len.wrapping_mul(8);
+        self.block[self.buffered] = 0x80;
+        self.buffered += 1;
+        if self.buffered > 56 {
+            self.block[self.buffered..].fill(0);
+            let block = self.block;
+            self.compress(&block);
+            self.block = [0; 64];
+        } else {
+            self.block[self.buffered..56].fill(0);
+        }
+        self.block[56..].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.block;
+        self.compress(&block);
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = String::with_capacity(64);
+        for byte in self.state.into_iter().flat_map(u32::to_be_bytes) {
+            hex.push(HEX[(byte >> 4) as usize] as char);
+            hex.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        hex
+    }
+
+    fn compress(&mut self, block: &[u8; 64]) {
+        let mut words = [0u32; 64];
+        for (word, bytes) in words.iter_mut().take(16).zip(block.chunks_exact(4)) {
+            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+        for (constant, word) in Self::ROUND_CONSTANTS.iter().zip(words) {
+            let upper_sigma = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ ((!e) & g);
+            let first = h
+                .wrapping_add(upper_sigma)
+                .wrapping_add(choice)
+                .wrapping_add(*constant)
+                .wrapping_add(word);
+            let lower_sigma = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let second = lower_sigma.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(first);
+            d = c;
+            c = b;
+            b = a;
+            a = first.wrapping_add(second);
+        }
+        for (slot, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
@@ -577,9 +1001,8 @@ mod tests {
         root
     }
 
-    fn metadata(path: &str, oid: &str, advertised_size: u64) -> TreeEntryMetadata {
+    fn metadata(oid: &str, advertised_size: u64) -> TreeEntryMetadata {
         TreeEntryMetadata {
-            path: path.to_string(),
             mode: "100644".to_string(),
             blob_oid: oid.to_string(),
             advertised_size,
@@ -630,11 +1053,7 @@ mod tests {
         let base = BTreeMap::new();
         let candidate = BTreeMap::from([(
             "too-large.bin".to_string(),
-            metadata(
-                "too-large.bin",
-                &"a".repeat(40),
-                MAX_UPSERT_BYTES as u64 + 1,
-            ),
+            metadata(&"a".repeat(40), MAX_UPSERT_BYTES as u64 + 1),
         )]);
 
         let error = plan_changed_payloads(&base, &candidate).unwrap_err();
@@ -653,16 +1072,13 @@ mod tests {
         let candidate = BTreeMap::from([
             (
                 "first.bin".to_string(),
-                metadata("first.bin", &"a".repeat(40), MAX_UPSERT_BYTES as u64),
+                metadata(&"a".repeat(40), MAX_UPSERT_BYTES as u64),
             ),
             (
                 "second.bin".to_string(),
-                metadata("second.bin", &"b".repeat(40), MAX_UPSERT_BYTES as u64),
+                metadata(&"b".repeat(40), MAX_UPSERT_BYTES as u64),
             ),
-            (
-                "overflow.bin".to_string(),
-                metadata("overflow.bin", &"c".repeat(40), 1),
-            ),
+            ("overflow.bin".to_string(), metadata(&"c".repeat(40), 1)),
         ]);
 
         let error = plan_changed_payloads(&base, &candidate).unwrap_err();
@@ -673,6 +1089,17 @@ mod tests {
                 .contains("candidate_snapshot.limit_exceeded")
         );
         assert!(error.to_string().contains("64 MiB"));
+    }
+
+    #[test]
+    fn streaming_sha256_matches_canonical_hash_across_chunk_boundaries() {
+        let bytes = vec![b'a'; 1_000_000];
+        let mut streamed = StreamingSha256::new();
+        for chunk in bytes.chunks(7_919) {
+            streamed.update(chunk);
+        }
+
+        assert_eq!(streamed.finish_hex(), cargoless_core::sha256_hex(&bytes));
     }
 
     #[test]
@@ -690,7 +1117,7 @@ mod tests {
         let resolved = resolve_tree_snapshot(&root, GitObjectFormat::Sha1, &base_tree).unwrap();
         assert!(resolved.entries.contains_key("unchanged-large.bin"));
         assert!(
-            resolved.blobs.is_empty(),
+            resolved.retained_blobs.is_empty(),
             "tree resolution must retain no payloads"
         );
 
