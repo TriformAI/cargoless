@@ -2427,7 +2427,7 @@ mod tests {
     use std::time::Duration;
 
     use super::super::inproc::testmock::MockService;
-    use super::super::{AllowAll, BatchCheckRequest, BearerToken};
+    use super::super::{AllowAll, BatchCheckRequest, BearerToken, CheckProfile};
     use super::*;
 
     fn server() -> HttpServer {

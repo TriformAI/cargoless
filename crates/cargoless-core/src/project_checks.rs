@@ -2235,10 +2235,11 @@ fn check_command(ctx: &RunContext, check: &CheckConfig) -> ProjectCheckResult {
                     fn setsid() -> i32;
                 }
                 const F_SETFD: core::ffi::c_int = 2;
-                if let Some(fd) = candidate_authority_fd
-                    && fcntl(fd, F_SETFD, 0) < 0
-                {
-                    return Err(io::Error::last_os_error());
+                match candidate_authority_fd {
+                    Some(fd) if fcntl(fd, F_SETFD, 0) < 0 => {
+                        return Err(io::Error::last_os_error());
+                    }
+                    _ => {}
                 }
                 let _ = setsid();
                 Ok(())
@@ -2460,10 +2461,10 @@ fn read_structured_result(
     }
     match parse_structured_result(ctx, check, &value) {
         Ok(mut result) => {
-            if check.result_protocol.as_deref() == Some("cargoless.check-result/v2")
-                && let Some(structured) = result.structured.as_mut()
-            {
-                structured.verified_result_bytes = text.into_bytes();
+            if check.result_protocol.as_deref() == Some("cargoless.check-result/v2") {
+                if let Some(structured) = result.structured.as_mut() {
+                    structured.verified_result_bytes = text.into_bytes();
+                }
             }
             result
         }
