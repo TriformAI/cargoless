@@ -311,6 +311,28 @@ fn overlay_operations(
         .keys()
         .chain(candidate.entries.keys())
         .collect();
+    let upsert = |path: &String, candidate_entry: &SnapshotEntry| -> Result<OverlayOperation> {
+        let bytes = candidate
+            .blobs
+            .get(&candidate_entry.blob_oid)
+            .ok_or_else(|| {
+                CandidateSnapshotGitError::new(format!(
+                    "candidate_snapshot.blob_missing: missing candidate blob {}",
+                    candidate_entry.blob_oid
+                ))
+            })?;
+        Ok(OverlayOperation::Upsert {
+            path: path.clone(),
+            mode: candidate_entry.mode.clone(),
+            blob_oid: candidate_entry.blob_oid.clone(),
+            size: candidate_entry.size,
+            sha256: candidate_entry.sha256.clone(),
+            payload: OverlayPayload {
+                encoding: "base64".to_string(),
+                data: encode_base64(bytes),
+            },
+        })
+    };
     let mut operations = Vec::new();
     for path in paths {
         match (base.entries.get(path), candidate.entries.get(path)) {
@@ -319,32 +341,14 @@ fn overlay_operations(
                 base_mode: base_entry.mode.clone(),
                 base_blob_oid: base_entry.blob_oid.clone(),
             }),
-            (base_entry, Some(candidate_entry))
-                if base_entry.is_none_or(|base_entry| {
-                    base_entry.mode != candidate_entry.mode
-                        || base_entry.blob_oid != candidate_entry.blob_oid
-                }) =>
+            (None, Some(candidate_entry)) => {
+                operations.push(upsert(path, candidate_entry)?);
+            }
+            (Some(base_entry), Some(candidate_entry))
+                if base_entry.mode != candidate_entry.mode
+                    || base_entry.blob_oid != candidate_entry.blob_oid =>
             {
-                let bytes = candidate
-                    .blobs
-                    .get(&candidate_entry.blob_oid)
-                    .ok_or_else(|| {
-                        CandidateSnapshotGitError::new(format!(
-                            "candidate_snapshot.blob_missing: missing candidate blob {}",
-                            candidate_entry.blob_oid
-                        ))
-                    })?;
-                operations.push(OverlayOperation::Upsert {
-                    path: path.clone(),
-                    mode: candidate_entry.mode.clone(),
-                    blob_oid: candidate_entry.blob_oid.clone(),
-                    size: candidate_entry.size,
-                    sha256: candidate_entry.sha256.clone(),
-                    payload: OverlayPayload {
-                        encoding: "base64".to_string(),
-                        data: encode_base64(bytes),
-                    },
-                });
+                operations.push(upsert(path, candidate_entry)?);
             }
             (Some(_), Some(_)) => {}
             (None, None) => unreachable!("path originated in one entry map"),
