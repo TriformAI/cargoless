@@ -96,7 +96,7 @@ pub struct AttemptAdmissionReservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptAdmissionDecision {
-    Reserved(AttemptAdmissionReservation),
+    Reserved(Box<AttemptAdmissionReservation>),
     Existing(Box<AttemptAdmissionRecord>),
 }
 
@@ -346,13 +346,13 @@ impl EvidenceStore {
             Ok(()) => {
                 fs::remove_file(&tmp)?;
                 sync_directory(&admissions)?;
-                Ok(AttemptAdmissionDecision::Reserved(
+                Ok(AttemptAdmissionDecision::Reserved(Box::new(
                     AttemptAdmissionReservation {
                         attempt_id: identity.attempt_id.clone(),
                         owner_token,
                         identity: identity.clone(),
                     },
-                ))
+                )))
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&tmp);

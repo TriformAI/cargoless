@@ -2131,7 +2131,7 @@ impl ServeVerdictState {
             return match store.reserve_attempt_admission(identity) {
                 Ok(AttemptAdmissionDecision::Reserved(reservation)) => {
                     Ok(AttemptReservationDecisionV3::New(Box::new(
-                        AttemptReservationV3::Durable(reservation),
+                        AttemptReservationV3::Durable(*reservation),
                     )))
                 }
                 Ok(AttemptAdmissionDecision::Existing(existing)) => {
