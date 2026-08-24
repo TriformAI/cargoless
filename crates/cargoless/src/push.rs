@@ -315,7 +315,7 @@ fn await_verdict(
         // reading the shared last-publisher slot.
         let poll = match legacy_await_status_address(base_sha) {
             LegacyAwaitStatusAddress::Base(base_sha) => {
-                client.get_status_attributed(worktree, base_sha)
+                client.get_status_attributed(worktree, Some(base_sha))
             }
             LegacyAwaitStatusAddress::Latest => client.get_status(worktree),
         };

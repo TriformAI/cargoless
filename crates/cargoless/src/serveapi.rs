@@ -11743,7 +11743,7 @@ checks:
             "compatibility must not mutate the legacy namespace mode"
         );
         let _ = std::fs::remove_dir_all(state_dir);
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
     }
 
     #[test]
@@ -11990,7 +11990,7 @@ checks:
             else {
                 unreachable!()
             };
-            overlay_digest.to_string()
+            overlay_digest.as_str().to_string()
         };
         let original = digest(&options);
 
@@ -12064,7 +12064,6 @@ checks:
                 manifest
                     .candidate
                     .operations()
-                    .unwrap()
                     .iter()
                     .map(|operation| operation.path().to_string())
                     .collect(),
@@ -12966,7 +12965,7 @@ checks:
             "an unrecorded substitute must never be adopted and deleted"
         );
         let _ = std::fs::remove_dir_all(state_dir);
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
     }
 
     #[cfg(unix)]
@@ -13044,11 +13043,10 @@ checks:
         assert_candidate_run_dirs_empty(&state_dir);
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ =
-                api.with_project_check_overlay(&context, |_scratch, _warm, manifest_path| -> () {
-                    assert!(manifest_path.is_some());
-                    panic!("simulated project-check panic");
-                });
+            let _ = api.with_project_check_overlay(&context, |_scratch, _warm, manifest_path| {
+                assert!(manifest_path.is_some());
+                panic!("simulated project-check panic");
+            });
         }));
         assert!(panic.is_err(), "the project-check panic remains observable");
         assert_candidate_run_dirs_empty(&state_dir);
@@ -13347,7 +13345,7 @@ checks:
                 .contains(scratch.to_string_lossy().as_ref()),
             "recovery prunes the old worktree registration"
         );
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -13403,7 +13401,7 @@ checks:
             b"must survive\n",
             "paired sidecar state is preserved when candidate scratch is unsafe"
         );
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
@@ -13440,7 +13438,7 @@ checks:
             b"do not inspect or delete\n",
             "repo-relative default state must leave typed candidate state untouched"
         );
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
     }
 
     #[cfg(unix)]
@@ -13480,7 +13478,7 @@ checks:
             "default provenance must be checked before canonicalizing a symlink target"
         );
         let _ = std::fs::remove_file(default_state);
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
         let _ = std::fs::remove_dir_all(external);
     }
 
@@ -13509,7 +13507,7 @@ checks:
         );
         cleanup_project_check_scratch(&project.root, &scratch).unwrap();
         let _ = std::fs::remove_file(state_dir.join("candidate-snapshots"));
-        let _ = std::fs::remove_dir_all(project.root);
+        drop(project);
         let _ = std::fs::remove_dir_all(state_dir);
         let _ = std::fs::remove_dir_all(outside);
     }
