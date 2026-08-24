@@ -69,8 +69,10 @@ pub use candidate_snapshot::{
 };
 pub use cargoless_cas::{ContentStore, LocalDiskStore, sha256_hex};
 pub use cargoless_proto::{
-    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
-    Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,
+    ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger,
+    CANDIDATE_SNAPSHOT_SCHEMA_V1, CandidateSnapshot, CandidateSnapshotManifest, CheckResult,
+    ContentHash, Diagnostic, FileState, GitObjectFormat, GitTreeRef, InputHash, OverlayOperation,
+    OverlayPayload, Profile, Severity, SnapshotEntry, StateEvent, TargetTriple, TreeState,
 };
 pub use config::{
     FleetConfig, FleetConfigError, FleetOverrides, Provenance, Source, TelemetryConfig,
