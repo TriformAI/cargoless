@@ -26,6 +26,7 @@ use cargoless_core::transport::{CargoSubcommand, CheckProfile};
 mod appserve;
 mod batchcheck;
 mod build;
+mod candidate_snapshot_git;
 mod check;
 mod checks;
 mod clean;
@@ -209,6 +210,10 @@ struct Opts {
     /// `verdict --check-id <id>` repeatable — B3 witness check-ids,
     /// attached to the push as `PushOverlayOptions::check_ids`.
     verdict_check_ids: Vec<String>,
+    /// `verdict --candidate-snapshot` — opt in to the typed candidate/v2
+    /// evidence protocol. Defaults off until the caller atomically enables a
+    /// v2 project-check result producer.
+    verdict_candidate_snapshot: bool,
     /// `verdict -- <repo>` — positional repo path after the `--`
     /// separator (the thin-wrapper calling convention).
     verdict_repo_positional: Option<PathBuf>,
@@ -568,6 +573,9 @@ fn parse(args: &[String]) -> Result<Parsed, ParseError> {
                         .clone(),
                 );
             }
+            "--candidate-snapshot" if cmd == Cmd::Verdict => {
+                opts.verdict_candidate_snapshot = true;
+            }
             // `verdict ... -- <repo>`: everything after the separator is
             // positional; exactly one (the repo path) is accepted.
             "--" if cmd == Cmd::Verdict => {
@@ -630,7 +638,7 @@ fn usage() {
     println!("                        --remove tears it down now");
     println!("  batch-check --remote <URL> --request-json <PATH>");
     println!("                        Native optimistic batch gate; prints report JSON");
-    println!("  verdict --remote <URL> [--remote <URL>...] [-- <REPO>]");
+    println!("  verdict --remote <URL> [--remote <URL>...] [--candidate-snapshot] [-- <REPO>]");
     println!("                        One-shot gate verdict: push the diff, await the");
     println!("                        SHA-attributed verdict, print one JSON object;");
     println!("                        exit 0=green 1=red 75=unknown/infra 2=setup");
@@ -712,6 +720,7 @@ fn usage() {
     println!("  --output json|text    stdout format (default json: one object with");
     println!("                        verdict/base_sha/remote/source keys)");
     println!("  --check-id <ID>       repeatable: witness check-ids attached to the push");
+    println!("  --candidate-snapshot  opt in to typed candidate + v2 result evidence");
     println!("  -- <REPO>             positional repo path (after the -- separator)");
     println!();
     println!(
@@ -1043,6 +1052,7 @@ fn main() -> ExitCode {
                 server_root: parsed.opts.push_server_root.clone(),
                 gate: parsed.opts.push_gate,
                 check_ids: parsed.opts.verdict_check_ids.clone(),
+                candidate_snapshot: parsed.opts.verdict_candidate_snapshot,
                 await_timeout_secs: parsed.opts.push_await_timeout_secs.unwrap_or(900),
             });
         }
@@ -1180,6 +1190,7 @@ mod tests {
             "http://shard-0:8787",
             "--check-id",
             "portal-compile",
+            "--candidate-snapshot",
             "--gate",
             "--base",
             "origin/dev",
@@ -1207,6 +1218,7 @@ mod tests {
             ]
         );
         assert_eq!(p.opts.verdict_check_ids, vec!["portal-compile".to_string()]);
+        assert!(p.opts.verdict_candidate_snapshot);
         assert!(p.opts.push_gate);
         assert_eq!(p.opts.push_base.as_deref(), Some("origin/dev"));
         assert_eq!(p.opts.push_await_timeout_secs, Some(300));
@@ -1217,6 +1229,22 @@ mod tests {
         // The scalar --remote used by status/push/batch-check stays unset:
         // verdict's repeatable arm captured every occurrence.
         assert_eq!(p.opts.remote, None);
+    }
+
+    #[test]
+    fn verdict_candidate_snapshot_defaults_off() {
+        let parsed = parse(&v(&[
+            "verdict",
+            "--remote",
+            "http://pool:8787",
+            "--",
+            "/workspace/repo",
+        ]))
+        .unwrap();
+        assert!(
+            !parsed.opts.verdict_candidate_snapshot,
+            "typed candidate transport must remain opt-in until tf enables result protocol v2"
+        );
     }
 
     #[test]
@@ -1233,7 +1261,7 @@ mod tests {
 
     #[test]
     fn verdict_flags_are_scoped_to_verdict() {
-        // --header/--output/--check-id exist only in the verdict grammar;
+        // Verdict-only flags must not expand another command's grammar.
         // other commands must keep rejecting them (no surface creep).
         assert_eq!(
             parse(&v(&["push", "--header", "X: y"])),
@@ -1242,6 +1270,10 @@ mod tests {
         assert_eq!(
             parse(&v(&["status", "--output", "json"])),
             Err(ParseError::UnknownFlag("--output".into()))
+        );
+        assert_eq!(
+            parse(&v(&["push", "--candidate-snapshot"])),
+            Err(ParseError::UnknownFlag("--candidate-snapshot".into()))
         );
         // And push's scalar --remote semantics are untouched.
         let p = parse(&v(&["push", "--remote", "http://h:1"])).unwrap();

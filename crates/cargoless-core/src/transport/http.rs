@@ -852,7 +852,23 @@ fn handle(
                     return;
                 }
             };
-            match Request::from_json(&String::from_utf8_lossy(&body)) {
+            let request = match Request::try_from_json(&String::from_utf8_lossy(&body)) {
+                Ok(request) => request,
+                Err(error) => {
+                    write_v3_response(
+                        &mut writer,
+                        400,
+                        "Bad Request",
+                        &serde_json::json!({
+                            "code": error.code,
+                            "message": error.message,
+                        })
+                        .to_string(),
+                    );
+                    return;
+                }
+            };
+            match request {
                 Some(Request::PushOverlayV2 {
                     worktree,
                     base_ref,
@@ -1042,7 +1058,24 @@ fn handle(
                 return;
             }
         };
-        match Request::from_json(&String::from_utf8_lossy(&body)) {
+        let request = match Request::try_from_json(&String::from_utf8_lossy(&body)) {
+            Ok(request) => request,
+            Err(error) => {
+                write_response(
+                    &mut writer,
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    &serde_json::json!({
+                        "code": error.code,
+                        "message": error.message,
+                    })
+                    .to_string(),
+                );
+                return;
+            }
+        };
+        match request {
             Some(Request::PushOverlay {
                 worktree,
                 base_ref,
@@ -1406,12 +1439,15 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
         if let Some(w) = rest.strip_suffix("/diagnostics") {
             let w = pct_decode(w);
             let base_sha = query_param(&req.query, "base_sha").map(|s| pct_decode(&s));
-            return (
-                200,
-                crate::diagnostics_store::serialize(
-                    &svc.get_diagnostics_attributed(&w, base_sha.as_deref()),
-                ),
-            );
+            let manifest_digest =
+                query_param(&req.query, "manifest_digest").map(|s| pct_decode(&s));
+            let diagnostics = match manifest_digest.as_deref() {
+                Some(manifest_digest) => {
+                    svc.get_diagnostics_candidate_attributed(&w, manifest_digest)
+                }
+                None => svc.get_diagnostics_attributed(&w, base_sha.as_deref()),
+            };
+            return (200, crate::diagnostics_store::serialize(&diagnostics));
         }
     }
     match req.path.as_str() {
@@ -1451,7 +1487,15 @@ fn route_oneshot(svc: &dyn VerdictService, req: &HttpReq) -> (u16, String) {
             // never cross-attributes. Absent/empty → current-slot behavior.
             Some(w) => {
                 let base_sha = query_param(&req.query, "base_sha").map(|s| pct_decode(&s));
-                match svc.get_status_attributed(&w, base_sha.as_deref()) {
+                let manifest_digest =
+                    query_param(&req.query, "manifest_digest").map(|s| pct_decode(&s));
+                let status = match manifest_digest.as_deref() {
+                    Some(manifest_digest) => {
+                        svc.get_status_candidate_attributed(&w, manifest_digest)
+                    }
+                    None => svc.get_status_attributed(&w, base_sha.as_deref()),
+                };
+                match status {
                     Some(s) => (200, status_to_json(&s)),
                     None => (404, "null".into()),
                 }
@@ -2095,6 +2139,37 @@ impl HttpClient {
             ))),
         }
     }
+
+    /// Fetch one allow-listed artifact from an exact attempt's durable
+    /// evidence bundle. The artifact is a single filename, never a path; the
+    /// server performs the definitive evidence allow-list check.
+    pub fn get_attempt_evidence_v3(
+        &self,
+        attempt_id: &AttemptId,
+        artifact: &str,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        if artifact.is_empty()
+            || artifact.starts_with('.')
+            || artifact.contains("..")
+            || !artifact
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(TransportError::Protocol(format!(
+                "invalid outcome-v3 evidence artifact name: {artifact:?}"
+            )));
+        }
+        let path = format!("/v3/attempts/{attempt_id}/evidence/{artifact}");
+        let (code, body) = self.get(&path)?;
+        match code {
+            200 => Ok(Some(body.into_bytes())),
+            404 => Ok(None),
+            401 => Err(TransportError::Unauthorized),
+            other => Err(TransportError::Protocol(format!(
+                "GET {path} returned {other}: {body}"
+            ))),
+        }
+    }
 }
 
 impl TransportClient for HttpClient {
@@ -2138,6 +2213,24 @@ impl TransportClient for HttpClient {
         Ok(status_from_json(&body))
     }
 
+    fn get_status_candidate_attributed(
+        &self,
+        w: &str,
+        manifest_digest: &str,
+    ) -> Result<Option<WorktreeStatus>, TransportError> {
+        let (code, body) = self.get(&format!(
+            "/status?worktree={w}&manifest_digest={}",
+            pct_encode_query(manifest_digest)
+        ))?;
+        if code == 404 {
+            return Ok(None);
+        }
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
+        Ok(status_from_json(&body))
+    }
+
     fn get_verdict(&self, w: &str) -> Result<Option<String>, TransportError> {
         let (code, body) = self.get(&format!("/verdict?worktree={w}"))?;
         if code == 404 {
@@ -2154,6 +2247,21 @@ impl TransportClient for HttpClient {
 
     fn get_diagnostics(&self, w: &str) -> Result<Vec<Diagnostic>, TransportError> {
         let (code, body) = self.get(&format!("/worktrees/{w}/diagnostics"))?;
+        if code == 401 {
+            return Err(TransportError::Unauthorized);
+        }
+        Ok(crate::diagnostics_store::deserialize(&body))
+    }
+
+    fn get_diagnostics_candidate_attributed(
+        &self,
+        w: &str,
+        manifest_digest: &str,
+    ) -> Result<Vec<Diagnostic>, TransportError> {
+        let (code, body) = self.get(&format!(
+            "/worktrees/{w}/diagnostics?manifest_digest={}",
+            pct_encode_query(manifest_digest)
+        ))?;
         if code == 401 {
             return Err(TransportError::Unauthorized);
         }
@@ -2450,6 +2558,9 @@ mod tests {
             // SSE attribution case: the echo must survive the SSE frame
             // (the subscribe-driven poller path A2 exists for).
             base_sha: Some("feedfeedfeedfeedfeedfeedfeedfeedfeedfeed".into()),
+            candidate_manifest_digest: None,
+            candidate_snapshot_digest: None,
+            candidate_tree_oid: None,
             // #A8 annotation case: the blind-path bit must survive the
             // SSE frame too (a gate consumer keys witness demand on it).
             ra_blind_paths: true,
@@ -2582,6 +2693,60 @@ mod tests {
     }
 
     #[test]
+    fn attempt_evidence_client_fetches_exact_named_artifact() {
+        struct AttemptEvidence;
+
+        impl VerdictService for AttemptEvidence {
+            fn get_status(&self, _worktree: &str) -> Option<WorktreeStatus> {
+                None
+            }
+
+            fn get_verdict(&self, _worktree: &str) -> Option<String> {
+                None
+            }
+
+            fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+
+            fn get_evidence_v3(&self, attempt_id: &AttemptId, artifact: &str) -> Option<Vec<u8>> {
+                (attempt_id.as_str() == "attempt.evidence.1"
+                    && artifact == "project-check-result-001.json")
+                    .then(|| br#"{"schema":"cargoless.check-result/v2"}"#.to_vec())
+            }
+        }
+
+        let server =
+            HttpServer::bind("127.0.0.1:0", Arc::new(AttemptEvidence), Arc::new(AllowAll)).unwrap();
+        let client = client_for(&server);
+        let attempt_id = AttemptId::new("attempt.evidence.1").unwrap();
+        assert_eq!(
+            client
+                .get_attempt_evidence_v3(&attempt_id, "project-check-result-001.json")
+                .unwrap(),
+            Some(br#"{"schema":"cargoless.check-result/v2"}"#.to_vec())
+        );
+        assert_eq!(
+            client
+                .get_attempt_evidence_v3(&attempt_id, "project-check-result-002.json")
+                .unwrap(),
+            None
+        );
+        let invalid = client
+            .get_attempt_evidence_v3(&attempt_id, "../outcome.json")
+            .unwrap_err();
+        assert!(matches!(invalid, TransportError::Protocol(_)));
+    }
+
+    #[test]
     fn status_route_threads_base_sha_into_get_status_attributed() {
         // The `<absent>` fix at the wire: `GET /status?worktree=W&base_sha=X`
         // must reach `get_status_attributed(W, Some("X"))`, and an absent
@@ -2606,6 +2771,9 @@ mod tests {
                     verdict_failure_reason: None,
                     // Echo the routed param so the test can assert it arrived.
                     base_sha: base_sha.map(str::to_string),
+                    candidate_manifest_digest: None,
+                    candidate_snapshot_digest: None,
+                    candidate_tree_oid: None,
                     ra_blind_paths: false,
                     gated_checks_ran: Vec::new(),
                     heartbeat_age_secs: 0,
@@ -2740,6 +2908,9 @@ mod tests {
                     red_diagnostics: 0,
                     verdict_failure_reason: None,
                     base_sha: base_sha.map(str::to_string),
+                    candidate_manifest_digest: None,
+                    candidate_snapshot_digest: None,
+                    candidate_tree_oid: None,
                     ra_blind_paths: false,
                     gated_checks_ran: Vec::new(),
                     heartbeat_age_secs: 0,
@@ -2796,6 +2967,101 @@ mod tests {
             got.base_sha, None,
             "None ⇒ no base_sha param on the wire ⇒ daemon returns None"
         );
+    }
+
+    #[test]
+    fn candidate_manifest_digest_addresses_status_and_diagnostics_over_http() {
+        struct EchoCandidateIdentity;
+        impl VerdictService for EchoCandidateIdentity {
+            fn get_status(&self, _worktree: &str) -> Option<WorktreeStatus> {
+                None
+            }
+            fn get_status_candidate_attributed(
+                &self,
+                worktree: &str,
+                manifest_digest: &str,
+            ) -> Option<WorktreeStatus> {
+                Some(WorktreeStatus {
+                    worktree: worktree.into(),
+                    verdict: "green".into(),
+                    daemon_build_id: crate::build_id().to_string(),
+                    crates: Vec::new(),
+                    red_diagnostics: 0,
+                    verdict_failure_reason: None,
+                    base_sha: Some("same-comparison-base".into()),
+                    candidate_manifest_digest: Some(manifest_digest.into()),
+                    candidate_snapshot_digest: Some(format!("snapshot:{manifest_digest}")),
+                    candidate_tree_oid: Some(format!("tree:{manifest_digest}")),
+                    ra_blind_paths: false,
+                    gated_checks_ran: Vec::new(),
+                    heartbeat_age_secs: 0,
+                    published_at: 1000,
+                })
+            }
+            fn get_verdict(&self, _worktree: &str) -> Option<String> {
+                None
+            }
+            fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+            fn get_diagnostics_candidate_attributed(
+                &self,
+                worktree: &str,
+                manifest_digest: &str,
+            ) -> Vec<Diagnostic> {
+                vec![Diagnostic {
+                    file_path: std::path::PathBuf::from(worktree),
+                    line: 1,
+                    col: 1,
+                    severity: crate::Severity::Error,
+                    code: Some("CANDIDATE".into()),
+                    message: manifest_digest.into(),
+                    source: Some("test".into()),
+                }]
+            }
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+        }
+
+        let server = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(EchoCandidateIdentity),
+            Arc::new(AllowAll),
+        )
+        .expect("bind ephemeral");
+        std::thread::sleep(Duration::from_millis(50));
+        let client = client_for(&server);
+
+        let first = client
+            .get_status_candidate_attributed("/shared", "sha256:manifest-a")
+            .expect("transport")
+            .expect("first candidate status");
+        let second = client
+            .get_status_candidate_attributed("/shared", "sha256:manifest-b")
+            .expect("transport")
+            .expect("second candidate status");
+        assert_eq!(first.base_sha, second.base_sha);
+        assert_eq!(
+            first.candidate_manifest_digest.as_deref(),
+            Some("sha256:manifest-a")
+        );
+        assert_eq!(
+            second.candidate_manifest_digest.as_deref(),
+            Some("sha256:manifest-b")
+        );
+        assert_ne!(
+            first.candidate_snapshot_digest, second.candidate_snapshot_digest,
+            "same-base candidates must remain separately addressable"
+        );
+
+        let diagnostics = client
+            .get_diagnostics_candidate_attributed("/shared", "sha256:manifest-b")
+            .expect("diagnostics transport");
+        assert_eq!(diagnostics[0].message, "sha256:manifest-b");
     }
 
     #[test]
@@ -3353,6 +3619,29 @@ mod tests {
         (code, b.to_string())
     }
 
+    fn raw_v3_post(addr: std::net::SocketAddr, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "POST /v3/attempts HTTP/1.1\r\nHost: x\r\n\
+             X-Cargoless-Protocol: {PROTOCOL_HEADER_VALUE}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, response) = raw.split_once("\r\n\r\n").expect("HTTP response");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status code");
+        (status, response.to_string())
+    }
+
     fn overlay_body() -> String {
         Request::PushOverlay {
             worktree: "wt-push".into(),
@@ -3442,6 +3731,147 @@ mod tests {
             400
         );
         drop(s);
+    }
+
+    #[test]
+    fn post_overlay_returns_branchable_candidate_snapshot_parse_error() {
+        let s = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(MockService::new()),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let body = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{
+              "candidate_snapshot":{
+                "schema":"cargoless-candidate-snapshot/1",
+                "schema":"cargoless-candidate-snapshot/2"
+              }
+            }
+        }"#;
+
+        let (status, response) =
+            raw_post(s.addr(), "/overlay", body, Some(&body.len().to_string()));
+        assert_eq!(status, 400);
+        let error: serde_json::Value =
+            serde_json::from_str(&response).expect("typed parse rejection is JSON");
+        assert_eq!(
+            error["code"], "candidate_snapshot.json_duplicate_key",
+            "callers must branch on the stable candidate error code: {response}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("duplicate field")),
+            "response must preserve actionable CandidateSnapshotError.message: {response}"
+        );
+        drop(s);
+    }
+
+    #[test]
+    fn post_attempt_v3_preserves_candidate_snapshot_error_before_service_mutation() {
+        struct CountingAttemptService {
+            pushes: Arc<AtomicUsize>,
+        }
+
+        impl VerdictService for CountingAttemptService {
+            fn get_status(&self, _worktree: &str) -> Option<WorktreeStatus> {
+                None
+            }
+
+            fn get_verdict(&self, _worktree: &str) -> Option<String> {
+                None
+            }
+
+            fn get_diagnostics(&self, _worktree: &str) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+
+            fn list_worktrees(&self) -> Vec<WorktreeSummary> {
+                Vec::new()
+            }
+
+            fn subscribe(&self) -> Receiver<TransitionEvent> {
+                channel().1
+            }
+
+            fn push_overlay_with_options(
+                &self,
+                worktree: &str,
+                _base_ref: &str,
+                _files: &[(String, String)],
+                _check_profile: Option<&CheckProfile>,
+                _options: Option<&PushOverlayOptions>,
+            ) -> PushOverlayAck {
+                self.pushes.fetch_add(1, Ordering::SeqCst);
+                PushOverlayAck {
+                    worktree: worktree.to_string(),
+                    accepted: false,
+                    applied_files: 0,
+                    reject_http_status: Some(409),
+                    reject_body: Some("test service must not receive invalid candidate".into()),
+                }
+            }
+        }
+
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let server = HttpServer::bind(
+            "127.0.0.1:0",
+            Arc::new(CountingAttemptService {
+                pushes: pushes.clone(),
+            }),
+            Arc::new(AllowAll),
+        )
+        .expect("bind");
+        std::thread::sleep(Duration::from_millis(50));
+        let candidate = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "candidate_snapshot":{
+              "schema":"cargoless-candidate-snapshot/1",
+              "schema":"cargoless-candidate-snapshot/2"
+            },
+            "semantic":{
+              "request_id":"req.candidate-taxonomy",
+              "attempt_id":"attempt.candidate-taxonomy",
+              "trace_id":"0123456789abcdef0123456789abcdef",
+              "attempt_number":1,"maximum_attempts":3,"retry_after_ms":1000
+            }
+        }"#;
+
+        let (status, response) = raw_v3_post(server.addr(), candidate);
+        assert_eq!(status, 400);
+        let error: serde_json::Value =
+            serde_json::from_str(&response).expect("typed v3 parse rejection is JSON");
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "code": "candidate_snapshot.json_duplicate_key",
+                "message": "duplicate field candidate_snapshot in request",
+            }),
+            "POST /v3/attempts must preserve the branchable candidate taxonomy: {response}"
+        );
+        assert_eq!(
+            pushes.load(Ordering::SeqCst),
+            0,
+            "invalid candidate authority must be rejected before service mutation"
+        );
+
+        let legacy_malformed = r#"{"op":"nonsense"}"#;
+        let (status, response) = raw_v3_post(server.addr(), legacy_malformed);
+        assert_eq!(status, 400);
+        let error: serde_json::Value =
+            serde_json::from_str(&response).expect("legacy v3 parse rejection is JSON");
+        assert_eq!(error["code"], "request.invalid_attempt");
+        assert!(
+            error["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("complete options.semantic identity")),
+            "legacy malformed mapping must remain compatible: {response}"
+        );
+        assert_eq!(pushes.load(Ordering::SeqCst), 0);
+        drop(server);
     }
 
     #[test]
@@ -3818,6 +4248,9 @@ mod tests {
             red_diagnostics: 0,
             verdict_failure_reason: None,
             base_sha: None,
+            candidate_manifest_digest: None,
+            candidate_snapshot_digest: None,
+            candidate_tree_oid: None,
             ra_blind_paths: false,
             gated_checks_ran: Vec::new(),
             heartbeat_age_secs: 0,

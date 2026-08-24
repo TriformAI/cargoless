@@ -468,11 +468,26 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
     //                            compiles and deliberately leaves the pointer
     //                            alone rather than advancing it to nothing.
     let state_dir = scope.fleet.state_dir_abs(&scope.repo_root);
-    match crate::serveapi::recover_project_check_scratch(&scope.repo_root, &state_dir) {
+    if scope.fleet.provenance.state_dir != cargoless_core::config::Source::Default {
+        if let Err(error) =
+            crate::serveapi::validate_candidate_state_dir(&scope.repo_root, &state_dir)
+        {
+            crate::ui::error(format!(
+                "explicit daemon state is unsafe for typed candidates at {}: {error}",
+                state_dir.display()
+            ));
+            return ExitCode::from(2);
+        }
+    }
+    match crate::serveapi::recover_project_check_scratch_for_source(
+        &scope.repo_root,
+        &state_dir,
+        scope.fleet.provenance.state_dir,
+    ) {
         Ok(0) => {}
         Ok(recovered) => eprintln!(
             "[cargoless:obs] project-check-startup-recovery root={} recovered={recovered}",
-            state_dir.join("project-check-runs").display()
+            state_dir.display()
         ),
         Err(error) => {
             crate::ui::error(format!(
@@ -1751,6 +1766,7 @@ fn exec(
                             base_sha: pushed.base_sha.clone(),
                             source_ref: pushed.source_ref.clone(),
                             source_sha: pushed.source_sha.clone(),
+                            candidate_snapshot: pushed.candidate_snapshot.clone(),
                             overlay_files: pushed.files.clone(),
                             materialize_overlay,
                             gate: pushed.gate,
@@ -2078,7 +2094,15 @@ fn exec(
             };
             // Off / Warn / RA-native publish: no Hard witness ran here, so
             // there are no enumerable gated checks to report.
-            publish_verdict(&wt, payload, attribution, Vec::new(), "EmitVerdict", api);
+            publish_verdict(
+                &wt,
+                payload,
+                attribution,
+                Vec::new(),
+                Vec::new(),
+                "EmitVerdict",
+                api,
+            );
         }
     }
 }
@@ -2325,6 +2349,9 @@ fn publish_verdict(
     // witness's `gated_checks_ran` proof). Empty for FS-watch / RA-native /
     // coalesced / timed-out verdicts — those publish with the key absent.
     gated_checks_ran: Vec<String>,
+    // Exact candidate result-v2 bytes verified by the project-check parser.
+    // Empty for every non-candidate, non-witness, or verification-failure path.
+    verified_project_checks: Vec<crate::serveapi::VerifiedProjectCheckEvidence>,
     // CGLS-27 — what DISPATCHED this publish, for the `verdict.publish`
     // span. Was hardcoded `"EmitVerdict"`, which became false the moment a
     // second dispatch site existed: the respawn-strand drain would have
@@ -2475,12 +2502,17 @@ fn publish_verdict(
     // Same site, mirror sink: feed the read-plane VerdictService + emit
     // the transition (subscribe-emit, 0b). Best-effort by construction —
     // a poisoned lock recovers; a transport hiccup never wedges the loop.
-    api.publish_attributed_with_checks(
+    let candidate = attribution
+        .as_ref()
+        .and_then(|attribution| attribution.candidate.clone());
+    api.publish_attributed_with_candidate_checks(
         wt,
         payload,
         attribution.as_ref().and_then(|a| a.base_sha.clone()),
+        candidate,
         ra_blind_paths,
         gated_checks_ran,
+        verified_project_checks,
         attribution.and_then(|a| a.semantic),
     );
 }
@@ -2517,6 +2549,7 @@ fn publish_reopen_cap_exceeded(
         wt,
         statusfile::VerdictPayload::unknown(REOPEN_CAP_EXCEEDED_REASON),
         attribution,
+        Vec::new(),
         Vec::new(),
         "DiagnosticFreshnessReopenCap",
         api,
@@ -2558,6 +2591,7 @@ fn publish_stranded_unknown(
         statusfile::VerdictPayload::unknown(STRANDED_PUSH_REASON),
         Some(attribution),
         // No project checks ran — RA died before a verdict existed.
+        Vec::new(),
         Vec::new(),
         "RaRespawnStranded",
         api,
@@ -2757,9 +2791,10 @@ fn spawn_project_checks_warn(
         .name("cargoless-project-checks-warn".to_string())
         .spawn(move || {
             let _permit = permit;
-            // Warn mode never publishes a verdict, so the ran-check ids
-            // (the witness's gate proof) are irrelevant here — discard them.
-            let (summary, _ran_check_ids) = run_project_checks_and_log(&wt, context, &api);
+            // Warn mode never publishes a verdict, so the ran-check ids and
+            // candidate evidence are irrelevant here — discard the envelope.
+            let ProjectCheckExecution { summary, .. } =
+                run_project_checks_and_log(&wt, context, &api);
             eprintln!(
                 "[cargoless:obs] project-checks-warn wt={} gate=false summary={}",
                 wt.display(),
@@ -2938,17 +2973,20 @@ fn spawn_project_checks_hard_with_timeout(
     // supersedes this older commit's in-flight witness (the `<absent>` bug).
     // Captured here and threaded into both finish sites; the attribution is
     // moved into the supervisor below, so we can't read it back there.
-    let witness_base_sha = attribution
+    let witness_key = attribution
         .as_ref()
-        .and_then(|a| a.base_sha.clone())
+        .and_then(crate::serveapi::PushAttribution::witness_key)
         .filter(|s| !s.is_empty());
+    let candidate = attribution
+        .as_ref()
+        .and_then(|attribution| attribution.candidate.clone());
     // CGLS-23 H4 — snapshot payload shape before the supervisor takes
     // ownership of `context`. Captured here so the watchdog-fire arm
     // can log it even though `context` is moved into the worker below.
     let input_summary = summarize_witness_input(context.as_ref());
     let generation = api.begin_hard_witness(
         &wt_key,
-        witness_base_sha.as_deref(),
+        witness_key.as_deref(),
         attribution
             .as_ref()
             .and_then(|attribution| attribution.semantic.as_ref()),
@@ -2957,15 +2995,15 @@ fn spawn_project_checks_hard_with_timeout(
     let supervisor = {
         let wt = wt.clone();
         let wt_key = wt_key.clone();
-        let witness_base_sha = witness_base_sha.clone();
+        let witness_key = witness_key.clone();
+        let candidate = candidate.clone();
         let input_summary = input_summary.clone();
         let api = Arc::clone(&api);
         move || {
-            // The channel carries the verdict AND the ran-check ids (the
-            // witness's `gated_checks_ran` proof) back from the detached
-            // worker — the ids are computed inside the worker and have no
-            // other path to the supervisor's publish.
-            let (tx, rx) = channel::<(ProjectCheckSummary, Vec<String>)>();
+            // One worker handoff keeps the verdict, ran-check proof, and
+            // exact verified candidate result bytes paired through the
+            // detached worker boundary.
+            let (tx, rx) = channel::<ProjectCheckExecution>();
             let worker = std::thread::Builder::new()
                 .name("cargoless-witness".to_string())
                 .spawn({
@@ -2995,10 +3033,9 @@ fn spawn_project_checks_hard_with_timeout(
                         }
                     }
                 });
-            // `ran_check_ids` is empty for every non-Ok arm: a timed-out,
-            // dead, or unspawnable witness ran no enumerable check, so the
-            // witness's gate-proof list is correctly absent.
-            let (summary, ran_check_ids) = match worker {
+            // Timeout/death/spawn failure ran no enumerable authoritative
+            // result, so both proof and candidate evidence stay empty.
+            let execution = match worker {
                 // Dropping the JoinHandle detaches the worker on purpose:
                 // never join a possibly-wedged witness.
                 Ok(_detached) => match rx.recv_timeout(timeout) {
@@ -3008,10 +3045,10 @@ fn spawn_project_checks_hard_with_timeout(
                             "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=timeout timeout_ms={} base_sha={} {} (#A4.3 CGLS-23)",
                             wt.display(),
                             timeout.as_millis(),
-                            witness_base_sha.as_deref().unwrap_or("none"),
+                            witness_key.as_deref().unwrap_or("none"),
                             input_summary,
                         );
-                        (
+                        ProjectCheckExecution::without_candidate_evidence(
                             ProjectCheckSummary::Indeterminate {
                                 reason: "witness",
                                 detail: format!("timeout after {}ms", timeout.as_millis()),
@@ -3023,10 +3060,10 @@ fn spawn_project_checks_hard_with_timeout(
                         eprintln!(
                             "[cargoless:obs] project-checks-hard wt={} verdict=unknown witness=worker-died base_sha={} {} (#A4.3 CGLS-23)",
                             wt.display(),
-                            witness_base_sha.as_deref().unwrap_or("none"),
+                            witness_key.as_deref().unwrap_or("none"),
                             input_summary,
                         );
-                        (
+                        ProjectCheckExecution::without_candidate_evidence(
                             ProjectCheckSummary::Indeterminate {
                                 reason: "witness",
                                 detail: "worker exited without a result".to_string(),
@@ -3035,7 +3072,7 @@ fn spawn_project_checks_hard_with_timeout(
                         )
                     }
                 },
-                Err(e) => (
+                Err(e) => ProjectCheckExecution::without_candidate_evidence(
                     ProjectCheckSummary::Indeterminate {
                         reason: "witness",
                         detail: format!("spawn failed: {e}"),
@@ -3043,6 +3080,11 @@ fn spawn_project_checks_hard_with_timeout(
                     Vec::new(),
                 ),
             };
+            let ProjectCheckExecution {
+                summary,
+                ran_check_ids,
+                verified_candidate_results,
+            } = execution;
             if matches!(summary, ProjectCheckSummary::Empty) {
                 // Loud vacuous-green marker even when REQUIRE is off —
                 // soak evidence is a grep away (#A10).
@@ -3058,13 +3100,24 @@ fn spawn_project_checks_hard_with_timeout(
                 _ => Vec::new(),
             };
             let payload = compose_hard_mode_payload(authoritative_error, summary);
-            if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
-                api.retain_diagnostics(&wt_key, witness_base_sha.as_deref(), retained_diagnostics);
+            if api.finish_hard_witness(&wt_key, witness_key.as_deref(), generation) {
+                if let Some(candidate) = candidate.as_ref() {
+                    api.retain_candidate_diagnostics(&wt_key, candidate, retained_diagnostics);
+                } else {
+                    api.retain_diagnostics(
+                        &wt_key,
+                        attribution
+                            .as_ref()
+                            .and_then(|value| value.base_sha.as_deref()),
+                        retained_diagnostics,
+                    );
+                }
                 publish_verdict(
                     &wt,
                     payload,
                     attribution,
                     ran_check_ids,
+                    verified_candidate_results,
                     "EmitVerdict",
                     &api,
                 );
@@ -3093,13 +3146,24 @@ fn spawn_project_checks_hard_with_timeout(
                 detail: format!("spawn failed: {e}"),
             },
         );
-        if api.finish_hard_witness(&wt_key, witness_base_sha.as_deref(), generation) {
+        if api.finish_hard_witness(&wt_key, witness_key.as_deref(), generation) {
             // No supervisor thread spawned ⇒ no witness ran ⇒ no gated checks.
-            api.retain_diagnostics(&wt_key, witness_base_sha.as_deref(), Vec::new());
+            if let Some(candidate) = candidate.as_ref() {
+                api.retain_candidate_diagnostics(&wt_key, candidate, Vec::new());
+            } else {
+                api.retain_diagnostics(
+                    &wt_key,
+                    attribution_fallback
+                        .as_ref()
+                        .and_then(|value| value.base_sha.as_deref()),
+                    Vec::new(),
+                );
+            }
             publish_verdict(
                 &wt,
                 payload,
                 attribution_fallback,
+                Vec::new(),
                 Vec::new(),
                 "EmitVerdict",
                 &api,
@@ -3189,20 +3253,35 @@ pub(crate) enum ProjectCheckSummary {
     Empty,
 }
 
-/// Returns the verdict summary AND the ids of the project checks that
-/// actually RAN (`report.results[].id`) — the witness's positive
-/// `gated_checks_ran` proof. The ran ids are an OUTPUT of executing the
-/// checks (unlike the inbound `base_sha` attribution), so they cannot ride
-/// the `PushAttribution`; they travel back to `publish_verdict` via this
-/// return tuple (and, in Hard mode, the worker→supervisor channel). The
-/// coalesced fast-path and every report-less arm return an empty Vec — the
-/// witness reads that as "cannot enumerate" and falls back to plain
-/// base_sha attribution (transition-safe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectCheckExecution {
+    summary: ProjectCheckSummary,
+    ran_check_ids: Vec<String>,
+    verified_candidate_results: Vec<crate::serveapi::VerifiedProjectCheckEvidence>,
+}
+
+impl ProjectCheckExecution {
+    fn without_candidate_evidence(
+        summary: ProjectCheckSummary,
+        ran_check_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            summary,
+            ran_check_ids,
+            verified_candidate_results: Vec::new(),
+        }
+    }
+}
+
+/// Returns one worker handoff containing the summary, positive ran-check
+/// proof, and exact verified candidate result-v2 bytes. Candidate snapshots
+/// bypass coalescing, so only the direct report path can populate evidence;
+/// every report-less, legacy, or coalesced arm leaves it empty.
 fn run_project_checks_and_log(
     wt: &Path,
     context: Option<crate::serveapi::ProjectCheckRunContext>,
     api: &Arc<crate::serveapi::ServeVerdictState>,
-) -> (ProjectCheckSummary, Vec<String>) {
+) -> ProjectCheckExecution {
     // Fast-path: when the context carries a non-empty base_ref and the
     // overlay needs materializing (central-daemon push mode), route through
     // the BatchCoalescer so that N concurrent pushers with the same
@@ -3237,7 +3316,7 @@ fn run_project_checks_and_log(
                 // fingerprint — so `gated_checks_ran` is populated here exactly
                 // as the direct path populates it, instead of falling back to
                 // plain base_sha attribution.
-                return (summary, ran_check_ids);
+                return ProjectCheckExecution::without_candidate_evidence(summary, ran_check_ids);
             }
         }
     }
@@ -3266,26 +3345,52 @@ fn run_project_checks_and_log(
         })
     });
     let report = match (context.as_ref(), gated_ids.as_deref()) {
-        (Some(ctx), Some(ids)) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_profile_with_ids_in_at(
-                root,
-                "dev",
-                ids,
-                None,
-                warm,
-                identity.as_ref(),
-            )
-        }),
-        (Some(ctx), None) => api.with_project_check_overlay(ctx, |root, warm| {
-            cargoless_core::project_checks::run_profile_with_ids_in_at(
-                root,
-                "dev",
-                &[],
-                changed_files,
-                warm,
-                identity.as_ref(),
-            )
-        }),
+        (Some(ctx), Some(ids)) => {
+            api.with_project_check_overlay(ctx, |root, warm, candidate_manifest_path| {
+                let candidate = ctx.candidate_snapshot.as_ref().map(|manifest| {
+                    crate::serveapi::candidate_snapshot_check_context(
+                        candidate_manifest_path
+                            .expect("typed candidate is paired with an external manifest"),
+                        manifest,
+                    )
+                });
+                // An explicit typed candidate ID is an authority-bound policy
+                // request, not merely a compiler witness. The gate profile is
+                // the closed superset of dev/background/gate tiers, while the
+                // explicit ID intersection still selects only what the client
+                // requested. Exact-Git and legacy witnesses retain `dev`.
+                let profile = if candidate.is_some() { "gate" } else { "dev" };
+                cargoless_core::project_checks::run_profile_with_ids_in_at_candidate(
+                    root,
+                    profile,
+                    ids,
+                    None,
+                    warm,
+                    identity.as_ref(),
+                    candidate.as_ref(),
+                )
+            })
+        }
+        (Some(ctx), None) => {
+            api.with_project_check_overlay(ctx, |root, warm, candidate_manifest_path| {
+                let candidate = ctx.candidate_snapshot.as_ref().map(|manifest| {
+                    crate::serveapi::candidate_snapshot_check_context(
+                        candidate_manifest_path
+                            .expect("typed candidate is paired with an external manifest"),
+                        manifest,
+                    )
+                });
+                cargoless_core::project_checks::run_profile_with_ids_in_at_candidate(
+                    root,
+                    "dev",
+                    &[],
+                    changed_files,
+                    warm,
+                    identity.as_ref(),
+                    candidate.as_ref(),
+                )
+            })
+        }
         (None, _) => Ok(cargoless_core::project_checks::run_dev_with_changes(
             root,
             changed_files,
@@ -3312,7 +3417,10 @@ fn run_project_checks_and_log(
                 wt.display()
             );
             // No check ran ⇒ nothing to enumerate.
-            (ProjectCheckSummary::Empty, Vec::new())
+            ProjectCheckExecution::without_candidate_evidence(
+                ProjectCheckSummary::Empty,
+                Vec::new(),
+            )
         }
         Ok(Ok(report)) => {
             // The witness's positive proof: the ids of the checks that
@@ -3329,6 +3437,24 @@ fn run_project_checks_and_log(
             let tree_red = report.tree == cargoless_core::TreeState::Red;
             let has_indeterminate = report.has_indeterminate();
             let has_degraded = report.has_degraded();
+            let verified_candidate_results = report
+                .results
+                .iter()
+                .filter_map(|result| {
+                    let structured = result.structured.as_ref()?;
+                    if !matches!(
+                        &structured.subject.identity,
+                        cargoless_core::project_checks::StructuredCheckIdentity::Candidate(_)
+                    ) || structured.verified_result_bytes.is_empty()
+                    {
+                        return None;
+                    }
+                    Some(crate::serveapi::VerifiedProjectCheckEvidence {
+                        check_id: result.id.clone(),
+                        bytes: structured.verified_result_bytes.clone(),
+                    })
+                })
+                .collect();
             tracing::info!(
                 outcome = if has_indeterminate {
                     "indeterminate"
@@ -3382,7 +3508,7 @@ fn run_project_checks_and_log(
                     diagnostic.message.lines().next().unwrap_or("")
                 );
             }
-            if has_indeterminate {
+            let summary = if has_indeterminate {
                 let detail = report
                     .results
                     .iter()
@@ -3397,13 +3523,10 @@ fn run_project_checks_and_log(
                         "structured project check did not produce an authoritative result"
                             .to_string()
                     });
-                (
-                    ProjectCheckSummary::Indeterminate {
-                        reason: "structured_result_indeterminate",
-                        detail,
-                    },
-                    ran_check_ids,
-                )
+                ProjectCheckSummary::Indeterminate {
+                    reason: "structured_result_indeterminate",
+                    detail,
+                }
             } else if tree_red {
                 // Defensive: if the tree is Red the error_count should
                 // be > 0 (per `result_from_diags` in cargoless-core,
@@ -3413,27 +3536,26 @@ fn run_project_checks_and_log(
                 // `VerdictPayload::red(0)`'s downgrade at the
                 // project-check layer.
                 if error_count == 0 {
-                    (
-                        ProjectCheckSummary::Indeterminate {
-                            reason: "project_check_red_without_diagnostics",
-                            detail: format!(
-                                "tree=red but error_count=0 across {} results",
-                                report.results.len()
-                            ),
-                        },
-                        ran_check_ids,
-                    )
+                    ProjectCheckSummary::Indeterminate {
+                        reason: "project_check_red_without_diagnostics",
+                        detail: format!(
+                            "tree=red but error_count=0 across {} results",
+                            report.results.len()
+                        ),
+                    }
                 } else {
-                    (
-                        ProjectCheckSummary::Red {
-                            error_count,
-                            diagnostics: report.diagnostics,
-                        },
-                        ran_check_ids,
-                    )
+                    ProjectCheckSummary::Red {
+                        error_count,
+                        diagnostics: report.diagnostics,
+                    }
                 }
             } else {
-                (ProjectCheckSummary::Green, ran_check_ids)
+                ProjectCheckSummary::Green
+            };
+            ProjectCheckExecution {
+                summary,
+                ran_check_ids,
+                verified_candidate_results,
             }
         }
         Ok(Err(e)) => {
@@ -3452,7 +3574,7 @@ fn run_project_checks_and_log(
                 wt.display(),
                 e
             );
-            (
+            ProjectCheckExecution::without_candidate_evidence(
                 ProjectCheckSummary::Indeterminate {
                     reason: "project_check_setup_error",
                     detail: e.to_string(),
@@ -3473,7 +3595,7 @@ fn run_project_checks_and_log(
                 root.display(),
                 e
             );
-            (
+            ProjectCheckExecution::without_candidate_evidence(
                 ProjectCheckSummary::Indeterminate {
                     reason: "project_check_overlay_error",
                     detail: e.to_string(),
@@ -3508,7 +3630,7 @@ fn slowest_project_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cargoless_core::transport::{PushOverlayOptions, VerdictService};
+    use cargoless_core::transport::{AttemptContext, PushOverlayOptions, VerdictService};
 
     #[test]
     fn lane_intergeneration_yield_is_bounded_and_defaults_off() {
@@ -3639,6 +3761,8 @@ mod tests {
             base_sha: Some("deadbeef".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -3690,6 +3814,8 @@ mod tests {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -3751,6 +3877,8 @@ mod tests {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["Cargo.toml".into()]),
             gate: false,
             check_ids: None,
@@ -4242,6 +4370,8 @@ mod tests {
             base_sha: Some("beefface".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -4767,6 +4897,7 @@ mod tests {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![
                 (
                     "physics/src/runtime/wire/executor.rs".to_string(),
@@ -4955,6 +5086,7 @@ mod tests {
     fn test_attribution(base_sha: &str) -> crate::serveapi::PushAttribution {
         crate::serveapi::PushAttribution {
             base_sha: Some(base_sha.to_string()),
+            candidate: None,
             macro_blind_hit: false,
             push_received_unix: statusfile::now_unix(),
             consumed_unix: statusfile::now_unix(),
@@ -5155,6 +5287,291 @@ checks:
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn hard_witness_persists_verified_candidate_v2_result_after_sidecar_cleanup() {
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let root = temp_root("candidate-v2-evidence");
+        let state_dir = temp_root("candidate-v2-evidence-state");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(
+            root.join("emit-result.sh"),
+            r#"#!/usr/bin/env bash
+set -eu
+CANDIDATE_TREE_OID="$(sed -E 's/^.*"tree_oid":"([0-9a-f]+)".*$/\1/' "$CARGOLESS_CANDIDATE_SNAPSHOT_PATH")"
+MANIFEST_DIGEST="$(sed -E 's/^.*"manifest_digest":"([^"]+)".*$/\1/' "$CARGOLESS_CANDIDATE_SNAPSHOT_PATH")"
+cat > "$CARGOLESS_CHECK_RESULT_PATH" <<JSON
+{
+  "schema": "cargoless.check-result/v2",
+  "check_id": "candidate-policy",
+  "status": "passed",
+  "summary": "candidate policy satisfied",
+  "subject": {
+    "candidate_kind": "overlay",
+    "candidate_snapshot_digest": "$CARGOLESS_CANDIDATE_SNAPSHOT_DIGEST",
+    "candidate_tree_oid": "$CANDIDATE_TREE_OID",
+    "comparison_base_sha": "$CARGOLESS_COMPARISON_BASE_SHA",
+    "manifest_digest": "$MANIFEST_DIGEST",
+    "engine": "migration-burndown",
+    "engine_version": "1",
+    "policy_hash": "policy-v1"
+  },
+  "findings": []
+}
+JSON
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("cargoless.checks.yaml"),
+            r#"version: 1
+profiles:
+  dev:
+    include: ["candidate-policy"]
+    timeout_ms: 30000
+    max_parallel: 1
+checks:
+  - id: candidate-policy
+    kind: command
+    read_only: true
+    command: ["bash", "emit-result.sh"]
+    timeout_ms: 15000
+    cache: none
+    result_protocol: cargoless.check-result/v2
+"#,
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate evidence base"]);
+        let base_sha = git(&root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("candidate.txt"), "candidate bytes\n").unwrap();
+        let manifest = crate::candidate_snapshot_git::build_overlay_manifest(&root, &base_sha)
+            .unwrap()
+            .expect("candidate fixture contains an overlay")
+            .manifest;
+        let expected_result = format!(
+            "{{\n  \"schema\": \"cargoless.check-result/v2\",\n  \"check_id\": \"candidate-policy\",\n  \"status\": \"passed\",\n  \"summary\": \"candidate policy satisfied\",\n  \"subject\": {{\n    \"candidate_kind\": \"overlay\",\n    \"candidate_snapshot_digest\": \"{}\",\n    \"candidate_tree_oid\": \"{}\",\n    \"comparison_base_sha\": \"{}\",\n    \"manifest_digest\": \"{}\",\n    \"engine\": \"migration-burndown\",\n    \"engine_version\": \"1\",\n    \"policy_hash\": \"policy-v1\"\n  }},\n  \"findings\": []\n}}\n",
+            manifest.candidate.snapshot_digest(),
+            manifest.candidate.tree_oid(),
+            manifest.comparison_base.commit_sha,
+            manifest.manifest_digest,
+        )
+        .into_bytes();
+        let semantic = AttemptContext {
+            request_id: cargoless_core::outcome::RequestId::new("candidate-request").unwrap(),
+            attempt_id: cargoless_core::outcome::AttemptId::new("candidate-attempt").unwrap(),
+            trace_id: cargoless_core::outcome::TraceId::new("0123456789abcdef").unwrap(),
+            previous_attempt_id: None,
+            attempt_number: 1,
+            maximum_attempts: 3,
+            retry_after_ms: 5000,
+        };
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some(base_sha.clone()),
+            comparison_base_sha: Some(manifest.comparison_base.commit_sha.clone()),
+            candidate_snapshot: Some(manifest.clone()),
+            changed_files: Some(vec!["candidate.txt".to_string()]),
+            gate: true,
+            check_ids: Some(vec!["candidate-policy".to_string()]),
+            semantic: Some(semantic.clone()),
+            ..PushOverlayOptions::default()
+        };
+        let api = Arc::new(
+            crate::serveapi::ServeVerdictState::new()
+                .with_project_check_state_dir(state_dir.clone()),
+        );
+        let (direct_tx, direct_rx) = channel();
+        api.attach_direct_gate_signal(direct_tx);
+        let ack = api.push_overlay_with_options(
+            "/client/candidate",
+            &base_sha,
+            &[("candidate.txt".to_string(), "candidate bytes\n".to_string())],
+            None,
+            Some(&options),
+        );
+        assert!(ack.accepted, "typed candidate must enter the direct gate");
+        let request = direct_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("direct candidate gate request");
+        spawn_project_checks_hard_with_timeout(
+            request.wt,
+            false,
+            Some(request.context),
+            Some(request.attribution),
+            Arc::clone(&api),
+            Duration::from_secs(30),
+            true,
+        );
+
+        let status = await_verdict(&api, "/client/candidate", Duration::from_secs(30));
+        assert_eq!(status.verdict, "green");
+        let started = Instant::now();
+        let evidence = loop {
+            if let Some(bytes) =
+                api.get_evidence_v3(&semantic.attempt_id, "project-check-result-001.json")
+            {
+                break bytes;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "verified candidate result evidence was not persisted"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(evidence, expected_result);
+        for parent in [
+            "project-check-runs",
+            "candidate-project-check-runs",
+            "candidate-snapshots",
+        ] {
+            assert_eq!(
+                std::fs::read_dir(state_dir.join(parent))
+                    .map(|entries| entries.count())
+                    .unwrap_or(0),
+                0,
+                "transient {parent} must be cleaned after exact bytes are retained"
+            );
+        }
+        assert!(
+            state_dir
+                .join("evidence-v3")
+                .join(semantic.attempt_id.as_str())
+                .join("project-check-result-001.json")
+                .is_file(),
+            "durable per-attempt evidence remains after transient authority cleanup"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn typed_explicit_background_check_uses_gate_profile_without_changing_exact_git() {
+        fn git(root: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let root = temp_root("candidate-background-profile");
+        let state_dir = temp_root("candidate-background-profile-state");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(
+            root.join("cargoless.checks.yaml"),
+            r#"version: 1
+profiles:
+  dev:
+    include: ["dev"]
+  gate:
+    include: ["dev", "background", "gate"]
+checks:
+  - id: migration-burndown
+    tier: background
+    kind: command
+    read_only: true
+    command: ["bash", "-lc", "true"]
+    cache: none
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate background base"]);
+        let base_sha = git(&root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("candidate.txt"), b"candidate\n").unwrap();
+        let manifest = crate::candidate_snapshot_git::build_overlay_manifest(&root, &base_sha)
+            .unwrap()
+            .expect("candidate fixture has an overlay")
+            .manifest;
+        let requested = vec!["migration-burndown".to_string()];
+        let api = Arc::new(
+            crate::serveapi::ServeVerdictState::new()
+                .with_project_check_state_dir(state_dir.clone()),
+        );
+        let candidate_context = crate::serveapi::ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec!["candidate.txt".to_string()]),
+            base_ref: String::new(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(manifest),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: Some(requested.clone()),
+        };
+
+        let candidate = run_project_checks_and_log(
+            Path::new("/client/candidate-background"),
+            Some(candidate_context),
+            &api,
+        );
+        assert_eq!(candidate.summary, ProjectCheckSummary::Green);
+        assert_eq!(candidate.ran_check_ids, requested);
+
+        let exact_git_context = crate::serveapi::ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: None,
+            base_ref: String::new(),
+            base_sha: Some(base_sha.clone()),
+            source_ref: Some("HEAD".to_string()),
+            source_sha: Some(base_sha),
+            candidate_snapshot: None,
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: Some(vec!["migration-burndown".to_string()]),
+        };
+        let exact_git = run_project_checks_and_log(
+            Path::new("/client/exact-git-background"),
+            Some(exact_git_context),
+            &api,
+        );
+        assert_eq!(exact_git.summary, ProjectCheckSummary::Empty);
+        assert!(
+            exact_git.ran_check_ids.is_empty(),
+            "exact-Git retains the dev profile and does not widen to background"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     /// Minimal git-backed project with one committed project-check
     /// (`no-fail-token`) and a resolvable `origin/main` — the smallest setup
     /// that makes `project_check_plan_coalesce_token` return `Some` so a push
@@ -5242,6 +5659,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![(
                 root.join("src/added.rs").to_string_lossy().into_owned(),
                 "pub fn added() {}\n".to_string(),

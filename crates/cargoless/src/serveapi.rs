@@ -60,14 +60,19 @@ use cargoless_core::outcome::{
     OutcomeEnvelope, PassBasis, PathOverlap, Phase, PhaseRecord, Producer, Relation, RelationKind,
     RetryDirective, Subject, Surface,
 };
-use cargoless_core::project_checks::{ProjectCheckReport, plan_dev_with_changes};
+use cargoless_core::project_checks::{
+    CandidateSnapshotCheckContext, ProjectCheckReport, plan_dev_with_changes,
+};
 use cargoless_core::sha256_hex;
 use cargoless_core::transport::{
     AttemptContext, BatchCheckRequest, CheckProfile, DaemonActivity, LaneEnqueueRequest,
     PushOverlayAck, PushOverlayOptions, TransitionEvent, VerdictService, WorktreeStatus,
     WorktreeSummary, batchreport_to_json,
 };
-use cargoless_core::{Diagnostic, Severity, TreeState};
+use cargoless_core::{
+    CandidateSnapshot, CandidateSnapshotManifest, Diagnostic, OverlayOperation, Severity,
+    TreeState, canonical_manifest_json, decode_overlay_payload,
+};
 
 /// Poison-tolerant lock (same discipline as `model::poisoned` /
 /// `inproc::testmock`): a panicked verdict path must not wedge the read
@@ -76,11 +81,15 @@ fn poisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-static PROJECT_CHECK_SCRATCH_SEQ: AtomicU64 = AtomicU64::new(1);
 /// #A4.3 — global hard-witness generation source. Monotonic and never
 /// recycled across worktrees, so `finish_hard_witness`'s equality check
 /// can never be fooled by a reused value.
 static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Every accepted typed candidate is a distinct execution, even when a client
+/// retries byte-identical manifest content. The manifest digest addresses the
+/// retained result; this process-local sequence keeps concurrent hard-witness
+/// claims from superseding one another before either result is published.
+static CANDIDATE_EXECUTION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct HardWitnessClaim {
@@ -141,6 +150,9 @@ pub struct PushedOverlay {
     pub source_ref: Option<String>,
     /// Verified candidate commit used by git-native project checks.
     pub source_sha: Option<String>,
+    /// Digest-bound complete candidate. Present only for typed overlay pushes;
+    /// exact-Git pushes continue to use source_ref/source_sha unchanged.
+    pub candidate_snapshot: Option<CandidateSnapshotManifest>,
     /// Unix timestamp of the push receipt. Diagnostics-only for 2b;
     /// future idle-evict policy (Wave-2) reads this.
     pub last_push_unix: u64,
@@ -176,6 +188,7 @@ pub(crate) struct ProjectCheckRunContext {
     pub base_sha: Option<String>,
     pub source_ref: Option<String>,
     pub source_sha: Option<String>,
+    pub candidate_snapshot: Option<CandidateSnapshotManifest>,
     pub overlay_files: Vec<(String, String)>,
     pub materialize_overlay: bool,
     /// Carried from [`PushedOverlay::gate`]: the EmitVerdict arm promotes
@@ -195,7 +208,42 @@ pub(crate) struct DirectGateRequest {
     pub attribution: PushAttribution,
 }
 
+/// Exact bytes from one successfully verified candidate result-v2 document.
+///
+/// Construction happens only from a [`ProjectCheckReport`] whose structured
+/// subject was bound to the verified candidate run context. The evidence
+/// store deliberately persists the original bytes, not a reserialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedProjectCheckEvidence {
+    pub check_id: String,
+    pub bytes: Vec<u8>,
+}
+
 type AttributedDiagnostics = BTreeMap<(String, Option<String>), Vec<Diagnostic>>;
+type CandidateDiagnostics = BTreeMap<(String, String), Vec<Diagnostic>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidateVerdictIdentity {
+    pub manifest_digest: String,
+    pub snapshot_digest: String,
+    pub tree_oid: String,
+    pub execution_id: u64,
+}
+
+impl CandidateVerdictIdentity {
+    fn from_manifest(manifest: &CandidateSnapshotManifest) -> Self {
+        Self {
+            manifest_digest: manifest.manifest_digest.clone(),
+            snapshot_digest: manifest.candidate.snapshot_digest().to_string(),
+            tree_oid: manifest.candidate.tree_oid().to_string(),
+            execution_id: CANDIDATE_EXECUTION_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
+        }
+    }
+
+    fn witness_key(&self) -> String {
+        format!("candidate:{}:{}", self.manifest_digest, self.execution_id)
+    }
+}
 
 /// Verdict-attribution record for one consumed push (#A2/#A7). Captured by
 /// the serve loop's SwitchOverlay arm at the moment a [`PushedOverlay`] is
@@ -210,6 +258,10 @@ pub(crate) struct PushAttribution {
     /// [`WorktreeStatus`] so a poller sharing a status key with other
     /// branches accepts only verdicts stamped with its own commit.
     pub base_sha: Option<String>,
+    /// Typed candidate execution identity. This is deliberately separate
+    /// from legacy `base_sha`: comparison attribution is not candidate
+    /// content identity and must never drive coalescing or result lookup.
+    pub candidate: Option<CandidateVerdictIdentity>,
     /// #A8 — `true` iff the push's `changed_files` matched the daemon's
     /// macro-blind path globs (`CARGOLESS_MACRO_BLIND_PATHS`) at consume
     /// time. Rides the attribution so it stays paired with `base_sha`
@@ -228,6 +280,15 @@ pub(crate) struct PushAttribution {
     /// Kept on the consumed push so final publication can update exactly the
     /// attempt that caused it, even when the same SHA is retried.
     pub semantic: Option<AttemptContext>,
+}
+
+impl PushAttribution {
+    pub(crate) fn witness_key(&self) -> Option<String> {
+        self.candidate
+            .as_ref()
+            .map(CandidateVerdictIdentity::witness_key)
+            .or_else(|| self.base_sha.clone().filter(|value| !value.is_empty()))
+    }
 }
 
 impl PushAttribution {
@@ -390,12 +451,31 @@ fn overlay_subject_v3(
         "profile={profile:?};gate={};check_ids={:?}",
         options.gate, options.check_ids
     );
+    let overlay_digest = match options.candidate_snapshot.as_ref() {
+        Some(manifest) => {
+            let legacy_digest = canonical_pairs_digest(files);
+            let mut preimage = b"cargoless-overlay-subject\0v1\0".to_vec();
+            for value in [
+                legacy_digest.as_str(),
+                manifest.manifest_digest.as_str(),
+                manifest.candidate.snapshot_digest(),
+                manifest.candidate.tree_oid(),
+            ] {
+                preimage.extend_from_slice(value.len().to_string().as_bytes());
+                preimage.push(0);
+                preimage.extend_from_slice(value.as_bytes());
+                preimage.push(0);
+            }
+            sha256_hex(&preimage)
+        }
+        None => canonical_pairs_digest(files),
+    };
     Ok(Subject::Overlay {
         repository: text_v3(repository),
         worktree_key: text_v3(worktree),
         base_ref: text_v3(base_ref),
         base_sha: text_v3(base_sha),
-        overlay_digest: text_v3(canonical_pairs_digest(files)),
+        overlay_digest: text_v3(overlay_digest),
         changed_files_digest: text_v3(canonical_strings_digest(changed_files)),
         check_plan_digest: text_v3(sha256_hex(plan.as_bytes())),
     })
@@ -590,6 +670,9 @@ pub struct ServeVerdictState {
     /// attributed verdict history. This prevents simultaneous PRs sharing a
     /// worktree key from reading each other's compiler output.
     diagnostics: Mutex<AttributedDiagnostics>,
+    /// Typed-candidate diagnostics keyed by immutable manifest identity,
+    /// never by the mutable shared worktree slot or comparison base.
+    candidate_diagnostics: Mutex<CandidateDiagnostics>,
     /// Live transition-event subscribers (the SSE / in-proc fan-out).
     /// Retain-on-send like `model`'s buses so a dropped subscriber never
     /// stalls the (single) producer.
@@ -750,6 +833,106 @@ pub struct ServeVerdictState {
     /// `Err` rather than silently accepting — a caller told "queued" would
     /// wait forever for a build that is never going to run.
     lane: Option<LaneHost>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectCheckAuthority {
+    CandidateSnapshot,
+    ExactGit,
+    LegacyOverlay,
+}
+
+impl ProjectCheckAuthority {
+    fn from_context(context: &ProjectCheckRunContext) -> Self {
+        if context.candidate_snapshot.is_some() {
+            Self::CandidateSnapshot
+        } else if context.source_sha.is_some() {
+            Self::ExactGit
+        } else {
+            Self::LegacyOverlay
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CandidateSnapshot => "candidate-snapshot",
+            Self::ExactGit => "exact-git",
+            Self::LegacyOverlay => "legacy-overlay",
+        }
+    }
+}
+
+struct ProjectCheckRunCleanup<'a> {
+    api: &'a ServeVerdictState,
+    root: &'a Path,
+    authority: ProjectCheckAuthority,
+    scratch_run: ProtectedRunDirectory,
+    candidate_run: Option<ProtectedRunDirectory>,
+    cleaned: bool,
+}
+
+impl ProjectCheckRunCleanup<'_> {
+    fn cleanup(&mut self) -> (Result<(), String>, Result<(), String>) {
+        if self.cleaned {
+            return (Ok(()), Ok(()));
+        }
+        self.cleaned = true;
+        let scratch = {
+            let _guard = poisoned(&self.api.sync_lock);
+            cleanup_protected_project_check_scratch(self.root, &self.scratch_run)
+        };
+        let manifest = self
+            .candidate_run
+            .as_ref()
+            .map(cleanup_protected_candidate_manifest_run)
+            .unwrap_or(Ok(()));
+        (scratch, manifest)
+    }
+}
+
+impl Drop for ProjectCheckRunCleanup<'_> {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        let (scratch, manifest) = self.cleanup();
+        for (scope, result) in [("scratch", scratch), ("candidate-manifest", manifest)] {
+            if let Err(error) = result {
+                eprintln!(
+                    "[cargoless:obs] project-check-panic-cleanup authority={} scope={scope} root={} error={error}",
+                    self.authority.label(),
+                    self.root.display()
+                );
+            }
+        }
+    }
+}
+
+fn finish_project_check_run<T>(
+    authority: ProjectCheckAuthority,
+    result: Result<T, String>,
+    scratch_cleanup: Result<(), String>,
+    manifest_cleanup: Result<(), String>,
+) -> Result<T, String> {
+    let cleanup_errors = [scratch_cleanup.err(), manifest_cleanup.err()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if cleanup_errors.is_empty() {
+        return result;
+    }
+    if authority == ProjectCheckAuthority::CandidateSnapshot {
+        return Err(format!(
+            "candidate_snapshot.cleanup_failed: {}",
+            cleanup_errors.join("; ")
+        ));
+    }
+    eprintln!(
+        "[cargoless:obs] project-check-cleanup-failed authority={} errors={}",
+        authority.label(),
+        cleanup_errors.join("; ")
+    );
+    result
 }
 
 #[derive(Default)]
@@ -1975,6 +2158,7 @@ impl ServeVerdictState {
         context: &AttemptContext,
         payload: &crate::statusfile::VerdictPayload,
         gated_checks_ran: &[String],
+        verified_project_checks: &[VerifiedProjectCheckEvidence],
         worktree: &str,
     ) {
         let Some(mut outcome) = poisoned(&self.outcomes_v3)
@@ -2022,6 +2206,28 @@ impl ServeVerdictState {
                 serde_json::to_string(&payload.analysis_failure_reason).expect("reason JSON"),
             ),
         );
+        let project_check_evidence_error = if verified_project_checks.len() > 999 {
+            Some(format!(
+                "{} verified project-check results exceed the 999-artifact evidence limit",
+                verified_project_checks.len()
+            ))
+        } else {
+            for (index, result) in verified_project_checks.iter().enumerate() {
+                let sequence = u32::try_from(index + 1)
+                    .expect("the verified project-check evidence limit fits u32");
+                tracing::debug!(
+                    attempt_id = %context.attempt_id,
+                    check_id = %result.check_id,
+                    sequence,
+                    "retaining verified candidate result evidence"
+                );
+                evidence.push(
+                    ArtifactKind::ProjectCheckResult(sequence),
+                    result.bytes.clone(),
+                );
+            }
+            None
+        };
         let (
             ra_process_generation,
             ra_pid,
@@ -2281,7 +2487,9 @@ impl ServeVerdictState {
         if ra_process_generation > 0 {
             outcome.producer.rust_analyzer_generation = Some(ra_process_generation);
         }
-        let evidence_error = if let Some(store) = self.evidence_store_v3.as_ref() {
+        let evidence_error = if project_check_evidence_error.is_some() {
+            project_check_evidence_error
+        } else if let Some(store) = self.evidence_store_v3.as_ref() {
             let class = if matches!(outcome.conclusion, Conclusion::Passed { .. }) {
                 EvidenceClass::Success
             } else {
@@ -2522,6 +2730,31 @@ impl ServeVerdictState {
         gated_checks_ran: Vec<String>,
         semantic: Option<AttemptContext>,
     ) {
+        self.publish_attributed_with_candidate_checks(
+            wt,
+            payload,
+            base_sha,
+            None,
+            ra_blind_paths,
+            gated_checks_ran,
+            Vec::new(),
+            semantic,
+        );
+    }
+
+    /// Candidate-addressable form of [`Self::publish_attributed_with_checks`].
+    /// Legacy callers pass no candidate and retain base-SHA addressing.
+    pub(crate) fn publish_attributed_with_candidate_checks(
+        &self,
+        wt: &Path,
+        payload: crate::statusfile::VerdictPayload,
+        base_sha: Option<String>,
+        candidate: Option<CandidateVerdictIdentity>,
+        ra_blind_paths: bool,
+        gated_checks_ran: Vec<String>,
+        verified_project_checks: Vec<VerifiedProjectCheckEvidence>,
+        semantic: Option<AttemptContext>,
+    ) {
         let worktree = wt.to_string_lossy().into_owned();
         let verdict_color = payload.verdict.as_str().to_string();
         let red_diagnostics = payload.red_diagnostics;
@@ -2540,6 +2773,13 @@ impl ServeVerdictState {
             red_diagnostics,
             verdict_failure_reason: failure_reason.clone(),
             base_sha: base_sha.clone(),
+            candidate_manifest_digest: candidate
+                .as_ref()
+                .map(|identity| identity.manifest_digest.clone()),
+            candidate_snapshot_digest: candidate
+                .as_ref()
+                .map(|identity| identity.snapshot_digest.clone()),
+            candidate_tree_oid: candidate.as_ref().map(|identity| identity.tree_oid.clone()),
             ra_blind_paths,
             // The witness's positive "the gated check ran" proof. Empty for
             // FS-watch / coalesced / RA-native verdicts (no enumerated
@@ -2557,12 +2797,20 @@ impl ServeVerdictState {
         // superseded in the slot can still retrieve its own verdict here.
         // Unattributed (FS-watch) verdicts carry no SHA to address by and
         // never enter the ring.
-        if let Some(sha) = base_sha.as_deref().filter(|s| !s.is_empty()) {
+        if candidate.is_some() || base_sha.as_deref().is_some_and(|sha| !sha.is_empty()) {
             let mut hist = poisoned(&self.verdict_history);
             let ring = hist.entry(worktree.clone()).or_default();
-            // A re-push of the SAME commit replaces its prior entry (latest
-            // verdict for that sha wins) rather than accumulating duplicates.
-            ring.retain(|s| s.base_sha.as_deref() != Some(sha));
+            if let Some(identity) = candidate.as_ref() {
+                // Manifest digests are immutable result addresses. A retry
+                // may execute independently but its latest published result
+                // remains addressable at the same content identity.
+                ring.retain(|status| {
+                    status.candidate_manifest_digest.as_deref()
+                        != Some(identity.manifest_digest.as_str())
+                });
+            } else if let Some(sha) = base_sha.as_deref().filter(|s| !s.is_empty()) {
+                ring.retain(|status| status.base_sha.as_deref() != Some(sha));
+            }
             ring.push_back(status.clone());
             while ring.len() > self.witness_history_cap {
                 ring.pop_front();
@@ -2571,6 +2819,10 @@ impl ServeVerdictState {
                 .iter()
                 .filter_map(|entry| entry.base_sha.clone())
                 .collect();
+            let retained_manifests: BTreeSet<String> = ring
+                .iter()
+                .filter_map(|entry| entry.candidate_manifest_digest.clone())
+                .collect();
             drop(hist);
             poisoned(&self.diagnostics).retain(|(key_wt, key_sha), _| {
                 key_wt != &worktree
@@ -2578,6 +2830,9 @@ impl ServeVerdictState {
                     || key_sha
                         .as_ref()
                         .is_some_and(|candidate| retained_shas.contains(candidate))
+            });
+            poisoned(&self.candidate_diagnostics).retain(|(key_wt, manifest_digest), _| {
+                key_wt != &worktree || retained_manifests.contains(manifest_digest)
             });
         }
         // The slot is last-writer-wins, but never regresses to a STRICTLY
@@ -2602,13 +2857,26 @@ impl ServeVerdictState {
             red_diagnostics,
             verdict_failure_reason: failure_reason,
             base_sha,
+            candidate_manifest_digest: candidate
+                .as_ref()
+                .map(|identity| identity.manifest_digest.clone()),
+            candidate_snapshot_digest: candidate
+                .as_ref()
+                .map(|identity| identity.snapshot_digest.clone()),
+            candidate_tree_oid: candidate.map(|identity| identity.tree_oid),
             ra_blind_paths,
             published_at,
         };
         poisoned(&self.subs).retain(|s| s.send(ev.clone()).is_ok());
         self.mark_worktree_published(&worktree);
         if let Some(context) = semantic.as_ref() {
-            self.finish_outcome_v3(context, &payload, &gated_checks_ran, &worktree);
+            self.finish_outcome_v3(
+                context,
+                &payload,
+                &gated_checks_ran,
+                &verified_project_checks,
+                &worktree,
+            );
         }
     }
 
@@ -2692,11 +2960,16 @@ impl ServeVerdictState {
             &pushed.files,
             &macro_blind_macros(),
         );
-        self.publish_attributed_with_checks(
+        self.publish_attributed_with_candidate_checks(
             Path::new(wt_key),
             crate::statusfile::VerdictPayload::unknown(reason),
             pushed.base_sha,
+            pushed
+                .candidate_snapshot
+                .as_ref()
+                .map(CandidateVerdictIdentity::from_manifest),
             macro_blind_hit,
+            Vec::new(),
             Vec::new(),
             pushed.semantic,
         );
@@ -2764,6 +3037,21 @@ impl ServeVerdictState {
         }
     }
 
+    pub(crate) fn retain_candidate_diagnostics(
+        &self,
+        worktree: &str,
+        candidate: &CandidateVerdictIdentity,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        let mut retained = poisoned(&self.candidate_diagnostics);
+        let key = (worktree.to_string(), candidate.manifest_digest.clone());
+        if diagnostics.is_empty() {
+            retained.remove(&key);
+        } else {
+            retained.insert(key, diagnostics);
+        }
+    }
+
     /// #A2/#A7 — stamp the attribution for the push just consumed by the
     /// SwitchOverlay arm. Same lifecycle as `record_project_check_context`:
     /// recorded at consume, popped at publish; a replacing push for the
@@ -2798,6 +3086,10 @@ impl ServeVerdictState {
             worktree.to_string(),
             PushAttribution {
                 base_sha: pushed.base_sha.clone(),
+                candidate: pushed
+                    .candidate_snapshot
+                    .as_ref()
+                    .map(CandidateVerdictIdentity::from_manifest),
                 macro_blind_hit: compute_macro_blind_hit(
                     pushed.changed_files.as_deref(),
                     blind_globs,
@@ -2932,16 +3224,34 @@ impl ServeVerdictState {
     pub(crate) fn with_project_check_overlay<T>(
         &self,
         context: &ProjectCheckRunContext,
-        f: impl FnOnce(&Path, Option<&Path>) -> T,
+        f: impl FnOnce(&Path, Option<&Path>, Option<&CandidateManifestSidecar>) -> T,
     ) -> Result<T, String> {
+        #[cfg(not(target_os = "linux"))]
+        if context.candidate_snapshot.is_some() {
+            return Err(candidate_environment_unsafe(
+                "typed candidate execution requires Linux sealed child authority",
+            ));
+        }
         if !context.materialize_overlay {
+            if context.candidate_snapshot.is_some() {
+                return Err(
+                    "candidate_snapshot.materialization_required: typed candidates must run in an isolated scratch"
+                        .to_string(),
+                );
+            }
             // No overlay to materialize ⇒ no scratch ⇒ no warm dir; run in
             // place with the historical cold per-run target.
-            return Ok(f(&context.root, None));
+            return Ok(f(&context.root, None, None));
         }
 
         if let Some(state_dir) = self.project_check_state_dir.as_deref() {
             return self.with_project_check_scratch_overlay(context, state_dir, f);
+        }
+        if context.candidate_snapshot.is_some() {
+            return Err(
+                "candidate_snapshot.environment_unsafe: typed candidates require a configured external daemon state directory"
+                    .to_string(),
+            );
         }
         if context.source_sha.is_some() {
             let fallback_state = context.root.join(".cargoless");
@@ -2954,67 +3264,207 @@ impl ServeVerdictState {
     fn with_project_check_locked_overlay<T>(
         &self,
         context: &ProjectCheckRunContext,
-        f: impl FnOnce(&Path, Option<&Path>) -> T,
+        f: impl FnOnce(&Path, Option<&Path>, Option<&CandidateManifestSidecar>) -> T,
     ) -> Result<T, String> {
+        let authority = ProjectCheckAuthority::from_context(context);
         let _guard = poisoned(&self.sync_lock);
         reset_analysis_root(&context.root, &context.base_ref)?;
         materialize_overlay_files(&context.root, &context.overlay_files)?;
         // The local (no-state-dir) path always runs cold: warm caching is a
         // central-daemon-only optimization.
-        let result = f(&context.root, None);
-        if let Err(e) = reset_analysis_root(&context.root, &context.base_ref) {
-            eprintln!(
-                "[cargoless:obs] project-check-overlay-cleanup root={} error={}",
-                context.root.display(),
-                e
-            );
-        }
-        Ok(result)
+        let result = Ok(f(&context.root, None, None));
+        let cleanup = reset_analysis_root(&context.root, &context.base_ref);
+        finish_project_check_run(authority, result, cleanup, Ok(()))
     }
 
     fn with_project_check_scratch_overlay<T>(
         &self,
         context: &ProjectCheckRunContext,
         state_dir: &Path,
-        f: impl FnOnce(&Path, Option<&Path>) -> T,
+        f: impl FnOnce(&Path, Option<&Path>, Option<&CandidateManifestSidecar>) -> T,
     ) -> Result<T, String> {
-        let seq = PROJECT_CHECK_SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
-        let scratch_root = state_dir
-            .join("project-check-runs")
-            .join(format!("run-{}-{seq}", std::process::id()));
+        let authority = ProjectCheckAuthority::from_context(context);
+        let protected_state = ProtectedStateRoot::open(
+            &context.root,
+            state_dir,
+            authority == ProjectCheckAuthority::CandidateSnapshot,
+        )?;
+        let scratch_namespace = if authority == ProjectCheckAuthority::CandidateSnapshot {
+            protected_state.namespace("candidate-project-check-runs", true)?
+        } else {
+            protected_state.legacy_scratch_namespace(true)?
+        }
+        .expect("created namespace is present");
+        let candidate_namespace = if authority == ProjectCheckAuthority::CandidateSnapshot {
+            protected_state.namespace("candidate-snapshots", true)?
+        } else {
+            None
+        };
+        let run_name = unpredictable_project_check_run_name()?;
+        let scratch_run_dir = scratch_namespace.join(&run_name);
+        match create_candidate_private_directory(&scratch_run_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(candidate_environment_unsafe(format!(
+                    "unpredictable project-check run path `{}` already exists",
+                    scratch_run_dir.display()
+                )));
+            }
+            Err(error) => {
+                return Err(candidate_environment_unsafe(format!(
+                    "could not create protected project-check run `{}`: {error}",
+                    scratch_run_dir.display()
+                )));
+            }
+        }
+        let scratch_run =
+            match ProtectedRunDirectory::capture(scratch_run_dir.clone(), &scratch_namespace) {
+                Ok(run) => run,
+                Err(error) => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not bind scratch run identity; preserving `{}`: {error}",
+                        scratch_run_dir.display()
+                    )));
+                }
+            };
+        let scratch_root = scratch_run.path.join("worktree");
+        let candidate_run_dir = candidate_namespace
+            .as_ref()
+            .map(|namespace| namespace.join(&run_name));
 
-        {
+        let mut cleanup = ProjectCheckRunCleanup {
+            api: self,
+            root: &context.root,
+            authority,
+            scratch_run,
+            candidate_run: None,
+            cleaned: false,
+        };
+
+        let prepare = {
             let _guard = poisoned(&self.sync_lock);
             let checkout_ref = if let Some(source_sha) = context.source_sha.as_deref() {
                 if !local_commit_exists(&context.root, source_sha) {
-                    return Err(format!(
+                    Err(format!(
                         "verified source commit {source_sha} is no longer present locally"
-                    ));
+                    ))
+                } else {
+                    Ok(source_sha.to_string())
                 }
-                source_sha
+            } else if let Some(manifest) = context.candidate_snapshot.as_ref() {
+                manifest.candidate.base().ok_or_else(|| {
+                    "candidate_snapshot.kind_unsupported: project-check overlay requires an overlay base"
+                        .to_string()
+                }).and_then(|base| {
+                    if local_commit_exists(&context.root, &base.commit_sha) {
+                        Ok(base.commit_sha.clone())
+                    } else {
+                        Err(format!(
+                            "candidate_snapshot.base_commit_missing: verified base commit {} is no longer present locally",
+                            base.commit_sha
+                        ))
+                    }
+                })
             } else {
-                sync_analysis_root(&context.root, &context.base_ref)?;
-                context.base_ref.as_str()
+                sync_analysis_root(&context.root, &context.base_ref)
+                    .map(|()| context.base_ref.clone())
             };
-            prepare_project_check_scratch(&context.root, &scratch_root, checkout_ref)?;
+            checkout_ref.and_then(|checkout_ref| {
+                prepare_new_protected_project_check_scratch(
+                    &context.root,
+                    &scratch_root,
+                    &checkout_ref,
+                )
+            })
+        };
+        if let Err(error) = prepare {
+            let (scratch_cleanup, manifest_cleanup) = cleanup.cleanup();
+            return finish_project_check_run(
+                authority,
+                Err(error),
+                scratch_cleanup,
+                manifest_cleanup,
+            );
         }
+        if let Err(error) = set_private_directory_mode(&scratch_root) {
+            let (scratch_cleanup, manifest_cleanup) = cleanup.cleanup();
+            return finish_project_check_run(
+                authority,
+                Err(error),
+                scratch_cleanup,
+                manifest_cleanup,
+            );
+        }
+
+        let candidate_manifest = if let Some(manifest) = context.candidate_snapshot.as_ref() {
+            let candidate_run_dir = candidate_run_dir
+                .as_deref()
+                .expect("candidate run directory paired with manifest");
+            let setup = materialize_candidate_snapshot(&scratch_root, manifest)
+                .and_then(|()| create_candidate_manifest_run(candidate_run_dir));
+            if let Err(error) = setup {
+                let (scratch_cleanup, manifest_cleanup) = cleanup.cleanup();
+                return finish_project_check_run(
+                    authority,
+                    Err(error),
+                    scratch_cleanup,
+                    manifest_cleanup,
+                );
+            }
+            let candidate_run = match ProtectedRunDirectory::capture(
+                candidate_run_dir.to_path_buf(),
+                candidate_namespace
+                    .as_deref()
+                    .expect("candidate run has a protected namespace"),
+            ) {
+                Ok(run) => run,
+                Err(error) => {
+                    let (scratch_cleanup, _) = cleanup.cleanup();
+                    let preserved = Err(candidate_environment_unsafe(format!(
+                        "could not bind candidate run identity; preserving `{}`: {error}",
+                        candidate_run_dir.display()
+                    )));
+                    return finish_project_check_run(
+                        authority,
+                        Err(error),
+                        scratch_cleanup,
+                        preserved,
+                    );
+                }
+            };
+            cleanup.candidate_run = Some(candidate_run);
+            match write_candidate_manifest(candidate_run_dir, manifest) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    let (scratch_cleanup, manifest_cleanup) = cleanup.cleanup();
+                    return finish_project_check_run(
+                        authority,
+                        Err(error),
+                        scratch_cleanup,
+                        manifest_cleanup,
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         // CGLS-26 — resolve a WARM shared target dir (or None = cold per-run).
         // The returned guard holds the in-process + flock locks for the whole
         // compile and fails closed to cold on ANY doubt. `warm` is the dir to
         // hand the compile; the guard's lifetime keeps the locks held.
-        let warm = self.resolve_warm_target(state_dir, &scratch_root);
+        let warm = self.resolve_warm_target(&protected_state.canonical, &scratch_root);
         let warm_dir = warm.as_ref().map(|w| w.dir.as_path());
 
-        let result = if context.source_sha.is_some() {
-            Ok(f(&scratch_root, warm_dir))
+        let result = if context.source_sha.is_some() || context.candidate_snapshot.is_some() {
+            Ok(f(&scratch_root, warm_dir, candidate_manifest.as_ref()))
         } else {
             match materialize_overlay_files_from_root(
                 &context.root,
                 &scratch_root,
                 &context.overlay_files,
             ) {
-                Ok(()) => Ok(f(&scratch_root, warm_dir)),
+                Ok(()) => Ok(f(&scratch_root, warm_dir, None)),
                 Err(e) => Err(e),
             }
         };
@@ -3022,20 +3472,8 @@ impl ServeVerdictState {
         // layers. Explicit for clarity — the locks must outlive `f`.
         drop(warm);
 
-        let cleanup = {
-            let _guard = poisoned(&self.sync_lock);
-            cleanup_project_check_scratch(&context.root, &scratch_root)
-        };
-        if let Err(e) = cleanup {
-            eprintln!(
-                "[cargoless:obs] project-check-scratch-cleanup root={} scratch={} error={}",
-                context.root.display(),
-                scratch_root.display(),
-                e
-            );
-        }
-
-        result
+        let (scratch_cleanup, manifest_cleanup) = cleanup.cleanup();
+        finish_project_check_run(authority, result, scratch_cleanup, manifest_cleanup)
     }
 
     /// CGLS-26 — resolve a WARM, persistent, shared `CARGO_TARGET_DIR` for
@@ -3265,10 +3703,11 @@ impl ServeVerdictState {
         wt: &Path,
         context: &ProjectCheckRunContext,
     ) -> Option<(crate::servedrv::ProjectCheckSummary, Vec<String>)> {
-        // Git-native candidates are already complete, immutable trees. Until
-        // the batch API carries per-member source SHAs, never union them into
-        // a base-ref overlay batch: exactness outranks this optimization.
-        if context.source_sha.is_some() {
+        // Git-native and typed candidates are complete immutable identities.
+        // Until the batch API carries one exact identity per member, never
+        // union either form into a base-ref overlay batch: exactness outranks
+        // this optimization.
+        if context.source_sha.is_some() || context.candidate_snapshot.is_some() {
             return None;
         }
         let base_ref = context.base_ref.trim();
@@ -3295,6 +3734,8 @@ impl ServeVerdictState {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None, // changed_files live on the member, not the options
             // Carry the push's gate + witness-only filter through the coalesced
             // lane. `run_batch_check_now` reads these off `request.options` to
@@ -3585,6 +4026,12 @@ impl ServeVerdictState {
     }
 
     fn execute_batch_report(&self, request: &BatchCheckRequest) -> BatchReport {
+        if request.options.candidate_snapshot.is_some() {
+            return batch_indeterminate(
+                request,
+                "candidate_snapshot.coalescing_forbidden: typed candidates require one exact per-source execution and cannot use BatchCheckRequest",
+            );
+        }
         if let Some(key) = batch_coalesce_key(request) {
             self.batch_coalescer
                 .submit(key, request, |combined| self.run_batch_check_now(combined))
@@ -4075,7 +4522,10 @@ impl VerdictService for ServeVerdictState {
                     .and_then(|ring| {
                         ring.iter()
                             .rev()
-                            .find(|s| s.base_sha.as_deref() == Some(want))
+                            .find(|s| {
+                                s.candidate_manifest_digest.is_none()
+                                    && s.base_sha.as_deref() == Some(want)
+                            })
                             .cloned()
                     })
                 {
@@ -4086,7 +4536,9 @@ impl VerdictService for ServeVerdictState {
                 // is still current) — never cross-attribute another commit.
                 poisoned(&self.statuses)
                     .get(worktree)
-                    .filter(|s| s.base_sha.as_deref() == Some(want))
+                    .filter(|s| {
+                        s.candidate_manifest_digest.is_none() && s.base_sha.as_deref() == Some(want)
+                    })
                     .cloned()
                     .map(stamp_age)
             }
@@ -4097,6 +4549,39 @@ impl VerdictService for ServeVerdictState {
         }
     }
 
+    fn get_status_candidate_attributed(
+        &self,
+        worktree: &str,
+        manifest_digest: &str,
+    ) -> Option<WorktreeStatus> {
+        if manifest_digest.is_empty() {
+            return None;
+        }
+        let now = crate::statusfile::now_unix();
+        let stamp_age = |mut status: WorktreeStatus| {
+            status.heartbeat_age_secs = now.saturating_sub(status.published_at);
+            status
+        };
+        if let Some(hit) = poisoned(&self.verdict_history)
+            .get(worktree)
+            .and_then(|ring| {
+                ring.iter()
+                    .rev()
+                    .find(|status| {
+                        status.candidate_manifest_digest.as_deref() == Some(manifest_digest)
+                    })
+                    .cloned()
+            })
+        {
+            return Some(stamp_age(hit));
+        }
+        poisoned(&self.statuses)
+            .get(worktree)
+            .filter(|status| status.candidate_manifest_digest.as_deref() == Some(manifest_digest))
+            .cloned()
+            .map(stamp_age)
+    }
+
     fn get_verdict(&self, worktree: &str) -> Option<String> {
         poisoned(&self.statuses)
             .get(worktree)
@@ -4104,9 +4589,17 @@ impl VerdictService for ServeVerdictState {
     }
 
     fn get_diagnostics(&self, worktree: &str) -> Vec<Diagnostic> {
-        let current_sha = poisoned(&self.statuses)
-            .get(worktree)
-            .and_then(|status| status.base_sha.clone());
+        let status = poisoned(&self.statuses).get(worktree).cloned();
+        if let Some(manifest_digest) = status
+            .as_ref()
+            .and_then(|status| status.candidate_manifest_digest.as_ref())
+        {
+            return poisoned(&self.candidate_diagnostics)
+                .get(&(worktree.to_string(), manifest_digest.clone()))
+                .cloned()
+                .unwrap_or_default();
+        }
+        let current_sha = status.and_then(|status| status.base_sha);
         poisoned(&self.diagnostics)
             .get(&(worktree.to_string(), current_sha))
             .cloned()
@@ -4123,6 +4616,20 @@ impl VerdictService for ServeVerdictState {
         };
         poisoned(&self.diagnostics)
             .get(&(worktree.to_string(), Some(base_sha.to_string())))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn get_diagnostics_candidate_attributed(
+        &self,
+        worktree: &str,
+        manifest_digest: &str,
+    ) -> Vec<Diagnostic> {
+        if manifest_digest.is_empty() {
+            return Vec::new();
+        }
+        poisoned(&self.candidate_diagnostics)
+            .get(&(worktree.to_string(), manifest_digest.to_string()))
             .cloned()
             .unwrap_or_default()
     }
@@ -4260,11 +4767,21 @@ impl VerdictService for ServeVerdictState {
         let mut base_sha = None;
         let mut source_ref = None;
         let mut source_sha = None;
+        let mut candidate_snapshot = None;
+        let mut typed_legacy_files = None;
         let mut changed_files = None;
         let mut gate = false;
         let mut check_ids = None;
         if let Some(options) = options {
-            changed_files = options.changed_files.clone();
+            match typed_candidate_overlay(options, files) {
+                Ok(Some(candidate)) => {
+                    candidate_snapshot = Some(candidate.manifest);
+                    changed_files = Some(candidate.changed_files);
+                    typed_legacy_files = Some(candidate.legacy_files);
+                }
+                Ok(None) => changed_files = options.changed_files.clone(),
+                Err(error) => return rejected_push(worktree, &error),
+            }
             gate = options.gate;
             check_ids = options.check_ids.clone();
             analysis_root = options
@@ -4291,7 +4808,6 @@ impl VerdictService for ServeVerdictState {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-
             if source_ref.is_some() != source_sha.is_some() {
                 return rejected_push(
                     worktree,
@@ -4337,6 +4853,7 @@ impl VerdictService for ServeVerdictState {
                 let Some(root) = analysis_root.as_ref() else {
                     return rejected_push(worktree, "repo-relative push missing analysis_root");
                 };
+                let files = typed_legacy_files.as_deref().unwrap_or(files);
                 mapped_files = match map_repo_relative_files(root, files) {
                     Ok(files) => files,
                     Err(e) => return rejected_push(worktree, &e),
@@ -4356,7 +4873,7 @@ impl VerdictService for ServeVerdictState {
             // "revert RA to the on-disk tree" operation. Placed BEFORE
             // `ensure_analysis_root` so a doomed push never spends the
             // sync_lock on a fetch.
-            if files.is_empty() && source_sha.is_none() {
+            if files.is_empty() && source_sha.is_none() && candidate_snapshot.is_none() {
                 if let Some(changed) = changed_files.as_ref().filter(|c| !c.is_empty()) {
                     return rejected_push(
                         worktree,
@@ -4377,7 +4894,12 @@ impl VerdictService for ServeVerdictState {
             }
 
             if let Some(root) = analysis_root.as_ref() {
-                if let (Some(source_ref), Some(source_sha)) =
+                if let Some(manifest) = candidate_snapshot.as_ref() {
+                    let _guard = poisoned(&self.sync_lock);
+                    if let Err(error) = ensure_candidate_snapshot_base(root, base_ref, manifest) {
+                        return rejected_push(worktree, &error);
+                    }
+                } else if let (Some(source_ref), Some(source_sha)) =
                     (source_ref.as_deref(), source_sha.as_deref())
                 {
                     let _guard = poisoned(&self.sync_lock);
@@ -4400,7 +4922,10 @@ impl VerdictService for ServeVerdictState {
             return rejected_push(worktree, "daemon is quiescing");
         }
 
-        let applied_files = files.len() as u32;
+        let applied_files = candidate_snapshot
+            .as_ref()
+            .map(|manifest| manifest.candidate.operation_count())
+            .unwrap_or(files.len() as u64) as u32;
         let pushed = PushedOverlay {
             base_ref: base_ref.to_string(),
             files: mapped_files,
@@ -4408,6 +4933,7 @@ impl VerdictService for ServeVerdictState {
             base_sha,
             source_ref,
             source_sha,
+            candidate_snapshot,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files,
             check_profile: check_profile.cloned(),
@@ -4423,6 +4949,10 @@ impl VerdictService for ServeVerdictState {
             let now = crate::statusfile::now_unix();
             let attribution = PushAttribution {
                 base_sha: pushed.base_sha.clone(),
+                candidate: pushed
+                    .candidate_snapshot
+                    .as_ref()
+                    .map(CandidateVerdictIdentity::from_manifest),
                 macro_blind_hit: compute_macro_blind_hit(
                     pushed.changed_files.as_deref(),
                     &macro_blind_globs(),
@@ -4447,6 +4977,7 @@ impl VerdictService for ServeVerdictState {
                     base_sha: pushed.base_sha.clone(),
                     source_ref: pushed.source_ref.clone(),
                     source_sha: pushed.source_sha.clone(),
+                    candidate_snapshot: pushed.candidate_snapshot.clone(),
                     overlay_files: pushed.files.clone(),
                     materialize_overlay: pushed.analysis_root.is_some(),
                     gate: true,
@@ -4505,13 +5036,18 @@ impl VerdictService for ServeVerdictState {
         {
             let mut store = poisoned(&self.pushed);
             let queue = store.entry(worktree.to_string()).or_default();
-            match queue
-                .iter_mut()
-                .find(|queued| match (&queued.semantic, &pushed.semantic) {
-                    (Some(left), Some(right)) => left.attempt_id == right.attempt_id,
-                    (None, None) => queued.base_sha == pushed.base_sha,
-                    _ => false,
-                }) {
+            let replace = if pushed.candidate_snapshot.is_some() {
+                None
+            } else {
+                queue
+                    .iter_mut()
+                    .find(|queued| match (&queued.semantic, &pushed.semantic) {
+                        (Some(left), Some(right)) => left.attempt_id == right.attempt_id,
+                        (None, None) => queued.base_sha == pushed.base_sha,
+                        _ => false,
+                    })
+            };
+            match replace {
                 Some(existing) => *existing = pushed,
                 None => {
                     if queue.len() >= self.pushed_max_per_wt {
@@ -4657,13 +5193,14 @@ impl ServeBatchChecker<'_> {
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files,
             materialize_overlay: true,
             gate: self.gate,
             check_ids: self.check_ids.clone(),
         };
         self.api
-            .with_project_check_overlay(&context, |root, warm| {
+            .with_project_check_overlay(&context, |root, warm, _candidate_manifest_path| {
                 // Both arms thread the CGLS-26 warm target dir (or None=cold).
                 match gated_ids.as_deref() {
                     // GATED, witness-only. Run EXACTLY the requested witness
@@ -4952,6 +5489,110 @@ fn map_repo_relative_files(
         .collect()
 }
 
+struct TypedCandidateOverlay {
+    manifest: CandidateSnapshotManifest,
+    changed_files: Vec<String>,
+    legacy_files: Vec<(String, String)>,
+}
+
+fn typed_candidate_overlay(
+    options: &PushOverlayOptions,
+    legacy_files: &[(String, String)],
+) -> Result<Option<TypedCandidateOverlay>, String> {
+    let comparison_base_sha = options
+        .comparison_base_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let manifest = options.candidate_snapshot.as_ref();
+    match (comparison_base_sha, manifest) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(
+                "candidate_snapshot.manifest_missing: comparison base requires a typed manifest"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "candidate_snapshot.comparison_base_missing: typed manifest requires comparison_base_sha"
+                    .to_string(),
+            );
+        }
+        (Some(_), Some(_)) => {}
+    }
+    let (Some(comparison_base_sha), Some(manifest)) = (comparison_base_sha, manifest) else {
+        return Err(
+            "candidate_snapshot.pairing_invalid: typed candidate identity is incomplete"
+                .to_string(),
+        );
+    };
+    cargoless_core::validate_candidate_snapshot_manifest(manifest)
+        .map_err(|error| error.to_string())?;
+    if comparison_base_sha != manifest.comparison_base.commit_sha {
+        return Err(format!(
+            "candidate_snapshot.comparison_base_mismatch: option {comparison_base_sha} differs from manifest {}",
+            manifest.comparison_base.commit_sha
+        ));
+    }
+    if !options.repo_relative || options.analysis_root.is_none() {
+        return Err(
+            "candidate_snapshot.analysis_root_missing: typed overlays require repo_relative analysis_root"
+                .to_string(),
+        );
+    }
+    if options.source_ref.is_some() || options.source_sha.is_some() {
+        return Err(
+            "candidate_snapshot.identity_conflict: typed overlay and exact-Git source are mutually exclusive"
+                .to_string(),
+        );
+    }
+    let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
+        return Err(
+            "candidate_snapshot.kind_unsupported: push_overlay requires kind=overlay".to_string(),
+        );
+    };
+
+    let changed_files = operations
+        .iter()
+        .map(|operation| operation.path().to_string())
+        .collect::<Vec<_>>();
+    if let Some(advertised) = options.changed_files.as_ref() {
+        if advertised != &changed_files {
+            return Err(
+                "candidate_snapshot.changed_files_mismatch: hint differs from typed operations"
+                    .to_string(),
+            );
+        }
+    }
+
+    let mut projection = Vec::new();
+    for operation in operations {
+        match operation {
+            OverlayOperation::Delete { path, .. } => {
+                projection.push((path.clone(), String::new()));
+            }
+            OverlayOperation::Upsert { path, payload, .. } => {
+                let bytes = decode_overlay_payload(payload).map_err(|error| error.to_string())?;
+                if let Ok(content) = String::from_utf8(bytes) {
+                    projection.push((path.clone(), content));
+                }
+            }
+        }
+    }
+    if projection != legacy_files {
+        return Err(
+            "candidate_snapshot.legacy_projection_mismatch: files differ from typed operations"
+                .to_string(),
+        );
+    }
+    Ok(Some(TypedCandidateOverlay {
+        manifest: manifest.clone(),
+        changed_files,
+        legacy_files: projection,
+    }))
+}
+
 fn safe_repo_relative_path(path: &str) -> Result<PathBuf, String> {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -5111,6 +5752,113 @@ fn sync_analysis_root(root: &Path, base_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_candidate_snapshot_base(
+    root: &Path,
+    base_ref: &str,
+    manifest: &CandidateSnapshotManifest,
+) -> Result<(), String> {
+    sync_analysis_root(root, base_ref)?;
+    let comparison = crate::candidate_snapshot_git::resolve_commit_snapshot(
+        root,
+        &manifest.comparison_base.commit_sha,
+    )
+    .map_err(|error| {
+        format!(
+            "candidate_snapshot.comparison_base_invalid: could not resolve comparison base {}: {error}",
+            manifest.comparison_base.commit_sha
+        )
+    })?;
+    if comparison.git_object_format != manifest.git_object_format
+        || comparison.reference != manifest.comparison_base
+    {
+        return Err(format!(
+            "candidate_snapshot.comparison_base_invalid: resolved {:?} with {} differs from advertised {:?} with {}",
+            comparison.reference,
+            comparison.git_object_format.as_str(),
+            manifest.comparison_base,
+            manifest.git_object_format.as_str(),
+        ));
+    }
+
+    let advertised_base = manifest.candidate.base().ok_or_else(|| {
+        "candidate_snapshot.kind_unsupported: project-check overlay requires an overlay base"
+            .to_string()
+    })?;
+    if !local_commit_exists(root, &advertised_base.commit_sha) {
+        return Err(format!(
+            "candidate_snapshot.base_commit_missing: candidate base {} is absent after fetching {base_ref}",
+            advertised_base.commit_sha
+        ));
+    }
+    let operation_base = crate::candidate_snapshot_git::resolve_commit_snapshot(
+        root,
+        &advertised_base.commit_sha,
+    )
+    .map_err(|error| {
+        format!(
+            "candidate_snapshot.base_commit_missing: could not resolve candidate base {}: {error}",
+            advertised_base.commit_sha
+        )
+    })?;
+    if operation_base.git_object_format != manifest.git_object_format {
+        return Err(format!(
+            "candidate_snapshot.object_format_mismatch: repository uses {} but manifest uses {}",
+            operation_base.git_object_format.as_str(),
+            manifest.git_object_format.as_str()
+        ));
+    }
+    if operation_base.reference != *advertised_base {
+        return Err(format!(
+            "candidate_snapshot.base_tree_mismatch: resolved {:?} differs from advertised {:?}",
+            operation_base.reference, advertised_base
+        ));
+    }
+    if !run_git_success(
+        root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &manifest.comparison_base.commit_sha,
+            &advertised_base.commit_sha,
+        ],
+    )? {
+        return Err(format!(
+            "candidate_snapshot.comparison_base_invalid: comparison base {} is not an ancestor of candidate base {}",
+            manifest.comparison_base.commit_sha, advertised_base.commit_sha
+        ));
+    }
+    if !run_git_success(
+        root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &advertised_base.commit_sha,
+            "HEAD",
+        ],
+    )? {
+        return Err(format!(
+            "candidate_snapshot.base_unreachable: candidate base {} is not reachable from fetched {base_ref}",
+            advertised_base.commit_sha
+        ));
+    }
+    // The RA compatibility overlay is a delta from this exact base, not from
+    // the moving symbolic ref used only to fetch/reachability-check it.
+    reset_analysis_root(root, &advertised_base.commit_sha)?;
+    let candidate_entries = manifest
+        .candidate
+        .entries()
+        .iter()
+        .cloned()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    cargoless_core::validate_manifest_against_entry_maps(
+        manifest,
+        Some(&operation_base.entries),
+        &candidate_entries,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// `true` when `s` is a full git object hash (40-hex SHA-1 or 64-hex
 /// SHA-256) — the only shape we trust the local mirror for. A symbolic
 /// ref (branch/tag name, `origin/dev`, an abbreviated hash) returns
@@ -5182,6 +5930,87 @@ fn prepare_project_check_scratch(
     run_git(root, &["worktree", "add", "--detach", &scratch, base_ref])
 }
 
+fn prepare_new_protected_project_check_scratch(
+    root: &Path,
+    scratch_root: &Path,
+    base_ref: &str,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(scratch_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(candidate_environment_unsafe(format!(
+                "unpredictable project-check run path `{}` already exists",
+                scratch_root.display()
+            )));
+        }
+        Err(error) => {
+            return Err(candidate_environment_unsafe(format!(
+                "could not inspect new project-check run path `{}`: {error}",
+                scratch_root.display()
+            )));
+        }
+    }
+    let scratch = scratch_root.to_string_lossy().into_owned();
+    run_git(root, &["worktree", "add", "--detach", &scratch, base_ref])
+}
+
+fn set_private_directory_mode(_path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                candidate_environment_unsafe(format!(
+                    "could not protect run directory `{}`: {error}",
+                    _path.display()
+                ))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn cleanup_incomplete_project_check_scratch(
+    root: &Path,
+    scratch_root: &Path,
+    _canonical_parent: &Path,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(scratch_root) {
+        Ok(_) => Err(candidate_environment_unsafe(format!(
+            "incomplete project-check run `{}` has no pre-recorded identity; preserving it",
+            scratch_root.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            run_git(root, &["worktree", "prune", "--expire", "now"])
+        }
+        Err(error) => Err(candidate_environment_unsafe(format!(
+            "could not inspect incomplete project-check run `{}`: {error}",
+            scratch_root.display()
+        ))),
+    }
+}
+
+fn cleanup_protected_project_check_scratch(
+    root: &Path,
+    protected: &ProtectedRunDirectory,
+) -> Result<(), String> {
+    cleanup_protected_project_check_scratch_with_after_quarantine(root, protected, |_| {})
+}
+
+fn cleanup_protected_project_check_scratch_with_after_quarantine(
+    root: &Path,
+    protected: &ProtectedRunDirectory,
+    after_quarantine: impl FnOnce(&Path),
+) -> Result<(), String> {
+    let quarantine = protected.quarantine()?;
+    after_quarantine(&quarantine.path);
+    ensure_protected_original_absent(protected)?;
+    quarantine.verify()?;
+    remove_bound_protected_run(&quarantine)?;
+    run_git(root, &["worktree", "prune", "--expire", "now"])
+}
+
 fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(), String> {
     let scratch = scratch_root.to_string_lossy().into_owned();
     match run_git(root, &["worktree", "remove", "--force", &scratch]) {
@@ -5207,53 +6036,207 @@ fn cleanup_project_check_scratch(root: &Path, scratch_root: &Path) -> Result<(),
 /// Reclaim project-check worktrees left by a prior daemon process.
 ///
 /// This is a startup-only operation: the new process has not accepted work
-/// yet, so every directory under `project-check-runs` belongs to a dead
-/// predecessor. The warm target and durable evidence live beside this
-/// directory and are deliberately preserved.
+/// yet, so every directory under the legacy `project-check-runs` and strict
+/// `candidate-project-check-runs` namespaces belongs to a dead predecessor.
+/// The warm target and durable evidence live beside these directories and are
+/// deliberately preserved.
 pub(crate) fn recover_project_check_scratch(
     root: &Path,
     state_dir: &Path,
 ) -> Result<usize, String> {
-    let scratch_parent = state_dir.join("project-check-runs");
-    let entries = match std::fs::read_dir(&scratch_parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A dead process can leave Git metadata after the directory has
-            // already disappeared. Prune that metadata even when there are no
-            // filesystem entries to iterate.
-            run_git(root, &["worktree", "prune", "--expire", "now"])?;
+    let source = if state_dir.starts_with(root) {
+        cargoless_core::config::Source::Default
+    } else {
+        cargoless_core::config::Source::Cli
+    };
+    recover_project_check_scratch_for_source(root, state_dir, source)
+}
+
+pub(crate) fn recover_project_check_scratch_for_source(
+    root: &Path,
+    state_dir: &Path,
+    source: cargoless_core::config::Source,
+) -> Result<usize, String> {
+    let canonical_repo = std::fs::canonicalize(root).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not resolve repository for startup recovery `{}`: {error}",
+            root.display()
+        ))
+    })?;
+    if source == cargoless_core::config::Source::Default {
+        let metadata = match std::fs::symlink_metadata(state_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(candidate_environment_unsafe(format!(
+                    "could not inspect default state root `{}`: {error}",
+                    state_dir.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            // Default state never enables typed candidates. A hostile or stale
+            // default path is therefore not an authority to canonicalize or
+            // recover through; leave it untouched for operator inspection.
             return Ok(0);
         }
+        let canonical_state = std::fs::canonicalize(state_dir).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve default state root `{}`: {error}",
+                state_dir.display()
+            ))
+        })?;
+        if canonical_state != canonical_repo && !canonical_state.starts_with(&canonical_repo) {
+            return Ok(0);
+        }
+        return recover_legacy_project_check_scratch_only(root, &canonical_state);
+    }
+
+    let protected = ProtectedStateRoot::open(root, state_dir, true)?;
+    // Validate every protected namespace before deleting anything. The
+    // scratch namespace predates typed candidates and may safely retain its
+    // historical 0755 mode, but it must remain owner-controlled and not
+    // group/world-writable. Candidate sidecars retain the exact 0700 policy.
+    let scratch_parent = protected.legacy_scratch_namespace(false)?;
+    let candidate_scratch_parent = protected.namespace("candidate-project-check-runs", false)?;
+    let candidate_parent = protected.namespace("candidate-snapshots", false)?;
+    let scratch_runs = scratch_parent
+        .as_deref()
+        .map(legacy_scratch_recovery_runs)
+        .transpose()?
+        .unwrap_or_default();
+    let candidate_runs = candidate_parent
+        .as_deref()
+        .map(protected_recovery_runs)
+        .transpose()?
+        .unwrap_or_default();
+    let candidate_scratch_runs = candidate_scratch_parent
+        .as_deref()
+        .map(protected_recovery_runs)
+        .transpose()?
+        .unwrap_or_default();
+    let recovered = scratch_runs.len() + candidate_scratch_runs.len() + candidate_runs.len();
+    for run in &scratch_runs {
+        cleanup_protected_project_check_scratch(root, run)?;
+    }
+    for run in &candidate_scratch_runs {
+        cleanup_protected_project_check_scratch(root, run)?;
+    }
+    for run in &candidate_runs {
+        cleanup_protected_candidate_manifest_run(run)?;
+    }
+    run_git(root, &["worktree", "prune", "--expire", "now"])?;
+    Ok(recovered)
+}
+
+fn protected_recovery_runs(namespace: &Path) -> Result<Vec<ProtectedRunDirectory>, String> {
+    let entries = std::fs::read_dir(namespace).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not enumerate protected recovery namespace `{}`: {error}",
+            namespace.display()
+        ))
+    })?;
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not enumerate protected recovery namespace `{}`: {error}",
+                namespace.display()
+            ))
+        })?;
+        runs.push(ProtectedRunDirectory::capture(entry.path(), namespace)?);
+    }
+    Ok(runs)
+}
+
+fn legacy_scratch_recovery_runs(namespace: &Path) -> Result<Vec<ProtectedRunDirectory>, String> {
+    let entries = std::fs::read_dir(namespace).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not enumerate legacy scratch recovery namespace `{}`: {error}",
+            namespace.display()
+        ))
+    })?;
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not enumerate legacy scratch recovery namespace `{}`: {error}",
+                namespace.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        let required_mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            match std::fs::symlink_metadata(entry.path())
+                .map_err(|error| {
+                    candidate_environment_unsafe(format!(
+                        "could not inspect legacy scratch run `{}`: {error}",
+                        entry.path().display()
+                    ))
+                })?
+                .permissions()
+                .mode()
+                & 0o777
+            {
+                0o700 => 0o700,
+                0o755 => 0o755,
+                mode => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "legacy scratch run `{}` has unsupported mode {mode:04o}",
+                        entry.path().display()
+                    )));
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let required_mode = 0o700;
+        runs.push(ProtectedRunDirectory::capture_with_mode(
+            entry.path(),
+            namespace,
+            required_mode,
+        )?);
+    }
+    Ok(runs)
+}
+
+fn recover_legacy_project_check_scratch_only(
+    root: &Path,
+    state_dir: &Path,
+) -> Result<usize, String> {
+    let scratch_parent = state_dir.join("project-check-runs");
+    let mut recovered = 0usize;
+    match std::fs::read_dir(&scratch_parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!(
+                        "could not enumerate project-check scratch `{}`: {error}",
+                        scratch_parent.display()
+                    )
+                })?;
+                if !entry
+                    .file_type()
+                    .map_err(|error| {
+                        format!(
+                            "could not inspect project-check scratch `{}`: {error}",
+                            entry.path().display()
+                        )
+                    })?
+                    .is_dir()
+                {
+                    continue;
+                }
+                cleanup_project_check_scratch(root, &entry.path())?;
+                recovered += 1;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
                 "could not inspect project-check scratch `{}`: {error}",
                 scratch_parent.display()
             ));
         }
-    };
-
-    let mut recovered = 0usize;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "could not enumerate project-check scratch `{}`: {error}",
-                scratch_parent.display()
-            )
-        })?;
-        if !entry
-            .file_type()
-            .map_err(|error| {
-                format!(
-                    "could not inspect project-check scratch `{}`: {error}",
-                    entry.path().display()
-                )
-            })?
-            .is_dir()
-        {
-            continue;
-        }
-        cleanup_project_check_scratch(root, &entry.path())?;
-        recovered += 1;
     }
     run_git(root, &["worktree", "prune", "--expire", "now"])?;
     Ok(recovered)
@@ -5261,6 +6244,1150 @@ pub(crate) fn recover_project_check_scratch(
 
 fn materialize_overlay_files(root: &Path, files: &[(String, String)]) -> Result<(), String> {
     materialize_overlay_files_from_root(root, root, files)
+}
+
+fn materialize_candidate_snapshot(
+    scratch_root: &Path,
+    manifest: &CandidateSnapshotManifest,
+) -> Result<(), String> {
+    let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
+        return Err(
+            "candidate_snapshot.kind_unsupported: project-check materialization requires kind=overlay"
+                .to_string(),
+        );
+    };
+    for operation in operations {
+        let relative = safe_repo_relative_path(operation.path())?;
+        match operation {
+            OverlayOperation::Delete { path, .. } => {
+                ensure_candidate_parent(scratch_root, &relative, false)?;
+                let target = scratch_root.join(&relative);
+                let metadata = std::fs::symlink_metadata(&target).map_err(|error| {
+                    format!(
+                        "candidate_snapshot.delete_missing: could not inspect {path:?}: {error}"
+                    )
+                })?;
+                if !metadata.file_type().is_file() {
+                    return Err(format!(
+                        "candidate_snapshot.overlay_mode_unsupported: delete target {path:?} is not a regular file"
+                    ));
+                }
+                std::fs::remove_file(&target).map_err(|error| {
+                    format!("candidate_snapshot.materialize_failed: delete {path:?}: {error}")
+                })?;
+            }
+            OverlayOperation::Upsert {
+                path,
+                mode,
+                payload,
+                ..
+            } => {
+                ensure_candidate_parent(scratch_root, &relative, true)?;
+                let target = scratch_root.join(&relative);
+                if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+                    if !metadata.file_type().is_file() {
+                        return Err(format!(
+                            "candidate_snapshot.overlay_mode_unsupported: upsert target {path:?} is not a regular file"
+                        ));
+                    }
+                }
+                let bytes = decode_overlay_payload(payload).map_err(|error| error.to_string())?;
+                std::fs::write(&target, bytes).map_err(|error| {
+                    format!("candidate_snapshot.materialize_failed: upsert {path:?}: {error}")
+                })?;
+                set_candidate_mode(&target, mode)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct CandidateManifestSidecar {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    dev: u64,
+    ino: u64,
+}
+
+impl std::ops::Deref for CandidateManifestSidecar {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for CandidateManifestSidecar {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn write_candidate_manifest(
+    candidate_run_dir: &Path,
+    manifest: &CandidateSnapshotManifest,
+) -> Result<CandidateManifestSidecar, String> {
+    validate_candidate_directory(candidate_run_dir, Some(0o700))?;
+    let manifest_path = candidate_run_dir.join("manifest.json");
+    let canonical = canonical_manifest_json(manifest).map_err(|error| error.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&manifest_path).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not create exclusive manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    use std::io::Write as _;
+    file.write_all(canonical.as_bytes()).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not write manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not sync manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let written_metadata = file.metadata().map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not inspect written manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    validate_candidate_manifest_file(&manifest_path, &written_metadata)?;
+    drop(file);
+
+    let path_metadata = std::fs::symlink_metadata(&manifest_path).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not re-inspect manifest path `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(candidate_environment_unsafe(format!(
+            "manifest path `{}` became a symlink",
+            manifest_path.display()
+        )));
+    }
+    validate_candidate_manifest_file(&manifest_path, &path_metadata)?;
+
+    let mut reopened = std::fs::File::open(&manifest_path).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not reopen manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let reopened_metadata = reopened.metadata().map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not inspect reopened manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    validate_candidate_manifest_file(&manifest_path, &reopened_metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if written_metadata.dev() != reopened_metadata.dev()
+            || written_metadata.ino() != reopened_metadata.ino()
+        {
+            return Err(candidate_environment_unsafe(format!(
+                "manifest `{}` changed identity before execution",
+                manifest_path.display()
+            )));
+        }
+    }
+    let mut reopened_bytes = Vec::new();
+    reopened.read_to_end(&mut reopened_bytes).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not read reopened manifest `{}`: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    if reopened_bytes != canonical.as_bytes() {
+        return Err(candidate_environment_unsafe(format!(
+            "manifest `{}` changed bytes before execution",
+            manifest_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (written_metadata.dev(), written_metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (dev, ino) = (0, 0);
+    Ok(CandidateManifestSidecar {
+        path: manifest_path,
+        bytes: canonical.into_bytes(),
+        dev,
+        ino,
+    })
+}
+
+fn create_candidate_manifest_run(candidate_run_dir: &Path) -> Result<(), String> {
+    let parent = candidate_run_dir.parent().ok_or_else(|| {
+        candidate_environment_unsafe("candidate run directory has no state parent")
+    })?;
+    let canonical_parent = ensure_candidate_manifest_parent(parent)?;
+    create_candidate_private_directory(candidate_run_dir).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not create exclusive run directory `{}`: {error}",
+            candidate_run_dir.display()
+        ))
+    })?;
+    let protect = validate_candidate_directory(candidate_run_dir, Some(0o700));
+    let protected_identity = protect.and_then(|()| {
+        let canonical_run = std::fs::canonicalize(candidate_run_dir).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve run directory `{}`: {error}",
+                candidate_run_dir.display()
+            ))
+        })?;
+        if canonical_run.parent() != Some(canonical_parent.as_path()) {
+            return Err(candidate_environment_unsafe(format!(
+                "run directory `{}` escaped manifest namespace `{}`",
+                canonical_run.display(),
+                canonical_parent.display()
+            )));
+        }
+        Ok(())
+    });
+    if let Err(error) = protected_identity {
+        return Err(format!(
+            "{error}; preserving unbound run directory `{}`",
+            candidate_run_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_environment_unsafe(detail: impl std::fmt::Display) -> String {
+    format!("candidate_snapshot.environment_unsafe: {detail}")
+}
+
+#[derive(Debug, Clone)]
+struct ProtectedStateRoot {
+    canonical: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProtectedRunDirectory {
+    path: PathBuf,
+    canonical_parent: PathBuf,
+    required_mode: u32,
+    dev: u64,
+    ino: u64,
+    parent_dev: u64,
+    parent_ino: u64,
+}
+
+impl ProtectedStateRoot {
+    fn open(repo_root: &Path, state_dir: &Path, require_external: bool) -> Result<Self, String> {
+        if !require_external {
+            match std::fs::symlink_metadata(state_dir) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    create_candidate_private_directory(state_dir).map_err(|create_error| {
+                        candidate_environment_unsafe(format!(
+                            "could not create daemon state directory `{}`: {create_error}",
+                            state_dir.display()
+                        ))
+                    })?;
+                }
+                Err(error) => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not inspect daemon state directory `{}`: {error}",
+                        state_dir.display()
+                    )));
+                }
+            }
+        }
+        validate_candidate_directory(state_dir, None)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            let metadata = std::fs::symlink_metadata(state_dir).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect daemon state directory `{}`: {error}",
+                    state_dir.display()
+                ))
+            })?;
+            if metadata.uid() != effective_user_id() {
+                return Err(candidate_environment_unsafe(format!(
+                    "daemon state directory `{}` is not owned by the effective user",
+                    state_dir.display()
+                )));
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(candidate_environment_unsafe(format!(
+                    "daemon state directory `{}` is group- or world-writable",
+                    state_dir.display()
+                )));
+            }
+        }
+        let canonical = std::fs::canonicalize(state_dir).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve daemon state directory `{}`: {error}",
+                state_dir.display()
+            ))
+        })?;
+        if require_external {
+            let canonical_repo = std::fs::canonicalize(repo_root).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not resolve candidate repository `{}`: {error}",
+                    repo_root.display()
+                ))
+            })?;
+            if canonical == canonical_repo || canonical.starts_with(&canonical_repo) {
+                return Err(candidate_environment_unsafe(format!(
+                    "daemon state directory `{}` is inside candidate repository `{}`",
+                    canonical.display(),
+                    canonical_repo.display()
+                )));
+            }
+        }
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&canonical).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect canonical state root `{}`: {error}",
+                    canonical.display()
+                ))
+            })?;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Ok(Self {
+            canonical,
+            dev,
+            ino,
+        })
+    }
+
+    fn namespace(&self, name: &str, create: bool) -> Result<Option<PathBuf>, String> {
+        self.verify()?;
+        let path = self.canonical.join(name);
+        if create {
+            match create_candidate_private_directory(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not create protected namespace `{}`: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        } else {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not inspect protected namespace `{}`: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        validate_candidate_directory(&path, Some(0o700))?;
+        let canonical = std::fs::canonicalize(&path).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve protected namespace `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        if canonical.parent() != Some(self.canonical.as_path()) {
+            return Err(candidate_environment_unsafe(format!(
+                "protected namespace `{}` escaped state root `{}`",
+                canonical.display(),
+                self.canonical.display()
+            )));
+        }
+        Ok(Some(canonical))
+    }
+
+    fn legacy_scratch_namespace(&self, create: bool) -> Result<Option<PathBuf>, String> {
+        self.verify()?;
+        let path = self.canonical.join("project-check-runs");
+        if create {
+            match create_candidate_private_directory(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not create legacy scratch namespace `{}`: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        } else {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not inspect legacy scratch namespace `{}`: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        validate_candidate_directory(&path, None)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect legacy scratch namespace `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(candidate_environment_unsafe(format!(
+                    "legacy scratch namespace `{}` is group- or world-writable",
+                    path.display()
+                )));
+            }
+        }
+        let canonical = std::fs::canonicalize(&path).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve legacy scratch namespace `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        if canonical.parent() != Some(self.canonical.as_path()) {
+            return Err(candidate_environment_unsafe(format!(
+                "legacy scratch namespace `{}` escaped state root `{}`",
+                canonical.display(),
+                self.canonical.display()
+            )));
+        }
+        Ok(Some(canonical))
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        validate_candidate_directory(&self.canonical, None)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            let metadata = std::fs::metadata(&self.canonical).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect protected state root `{}`: {error}",
+                    self.canonical.display()
+                ))
+            })?;
+            if metadata.dev() != self.dev || metadata.ino() != self.ino {
+                return Err(candidate_environment_unsafe(format!(
+                    "protected state root `{}` changed file identity",
+                    self.canonical.display()
+                )));
+            }
+            if metadata.uid() != effective_user_id() || metadata.permissions().mode() & 0o022 != 0 {
+                return Err(candidate_environment_unsafe(format!(
+                    "protected state root `{}` changed owner or mode",
+                    self.canonical.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProtectedRunDirectory {
+    fn capture(path: PathBuf, canonical_parent: &Path) -> Result<Self, String> {
+        Self::capture_with_mode(path, canonical_parent, 0o700)
+    }
+
+    fn capture_with_mode(
+        path: PathBuf,
+        canonical_parent: &Path,
+        required_mode: u32,
+    ) -> Result<Self, String> {
+        validate_candidate_directory(&path, Some(required_mode))?;
+        let canonical = std::fs::canonicalize(&path).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve protected run `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        if canonical.parent() != Some(canonical_parent) {
+            return Err(candidate_environment_unsafe(format!(
+                "protected run `{}` escaped namespace `{}`",
+                canonical.display(),
+                canonical_parent.display()
+            )));
+        }
+        #[cfg(unix)]
+        let (dev, ino, parent_dev, parent_ino) = {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&canonical).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect protected run `{}`: {error}",
+                    canonical.display()
+                ))
+            })?;
+            let parent_metadata = std::fs::metadata(canonical_parent).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect protected run parent `{}`: {error}",
+                    canonical_parent.display()
+                ))
+            })?;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                parent_metadata.dev(),
+                parent_metadata.ino(),
+            )
+        };
+        #[cfg(not(unix))]
+        let (dev, ino, parent_dev, parent_ino) = (0, 0, 0, 0);
+        Ok(Self {
+            path: canonical,
+            canonical_parent: canonical_parent.to_path_buf(),
+            required_mode,
+            dev,
+            ino,
+            parent_dev,
+            parent_ino,
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        validate_candidate_directory(&self.path, Some(self.required_mode))?;
+        let canonical = std::fs::canonicalize(&self.path).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not resolve protected run `{}` during cleanup: {error}",
+                self.path.display()
+            ))
+        })?;
+        if canonical.parent() != Some(self.canonical_parent.as_path()) {
+            return Err(candidate_environment_unsafe(format!(
+                "protected run `{}` escaped namespace `{}` during cleanup",
+                canonical.display(),
+                self.canonical_parent.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&canonical).map_err(|error| {
+                candidate_environment_unsafe(format!(
+                    "could not inspect protected run `{}` during cleanup: {error}",
+                    canonical.display()
+                ))
+            })?;
+            if metadata.dev() != self.dev || metadata.ino() != self.ino {
+                return Err(candidate_environment_unsafe(format!(
+                    "protected run `{}` changed file identity before cleanup",
+                    canonical.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn quarantine(&self) -> Result<Self, String> {
+        self.verify()?;
+        let quarantine_name =
+            unpredictable_project_check_run_name()?.replacen("run-", ".cleanup-", 1);
+        let quarantine = self.canonical_parent.join(quarantine_name);
+        std::fs::rename(&self.path, &quarantine).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not atomically quarantine protected run `{}`: {error}",
+                self.path.display()
+            ))
+        })?;
+        let quarantined =
+            Self::capture_with_mode(quarantine, &self.canonical_parent, self.required_mode)?;
+        if quarantined.dev != self.dev || quarantined.ino != self.ino {
+            return Err(candidate_environment_unsafe(format!(
+                "quarantined run `{}` does not match the recorded file identity; preserving it",
+                quarantined.path.display()
+            )));
+        }
+        Ok(quarantined)
+    }
+}
+
+fn unpredictable_project_check_run_name() -> Result<String, String> {
+    let mut random = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not acquire unpredictable project-check run identity: {error}"
+            ))
+        })?;
+    let mut name = String::with_capacity(4 + random.len() * 2);
+    name.push_str("run-");
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(name)
+}
+
+pub(crate) fn validate_candidate_state_dir(
+    repo_root: &Path,
+    state_dir: &Path,
+) -> Result<PathBuf, String> {
+    ProtectedStateRoot::open(repo_root, state_dir, true).map(|root| root.canonical)
+}
+
+fn ensure_candidate_manifest_parent(parent: &Path) -> Result<PathBuf, String> {
+    match create_candidate_private_directory(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(candidate_environment_unsafe(format!(
+                "could not create manifest namespace `{}`: {error}",
+                parent.display()
+            )));
+        }
+    }
+    validate_candidate_directory(parent, Some(0o700))?;
+    std::fs::canonicalize(parent).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not resolve manifest namespace `{}`: {error}",
+            parent.display()
+        ))
+    })
+}
+
+fn create_candidate_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn validate_candidate_directory(path: &Path, required_mode: Option<u32>) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not inspect directory `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(candidate_environment_unsafe(format!(
+            "path `{}` is not a real directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != effective_user_id() {
+            return Err(candidate_environment_unsafe(format!(
+                "directory `{}` is not owned by the effective user",
+                path.display()
+            )));
+        }
+        if required_mode.is_some_and(|mode| metadata.permissions().mode() & 0o777 != mode) {
+            return Err(candidate_environment_unsafe(format!(
+                "directory `{}` does not have required mode {:04o}",
+                path.display(),
+                required_mode.expect("required mode checked")
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = required_mode;
+    Ok(())
+}
+
+fn validate_candidate_manifest_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
+    if !metadata.is_file() {
+        return Err(candidate_environment_unsafe(format!(
+            "manifest `{}` is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != effective_user_id() {
+            return Err(candidate_environment_unsafe(format!(
+                "manifest `{}` is not owned by the effective user",
+                path.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(candidate_environment_unsafe(format!(
+                "manifest `{}` does not have required mode 0600",
+                path.display()
+            )));
+        }
+        if metadata.nlink() != 1 {
+            return Err(candidate_environment_unsafe(format!(
+                "manifest `{}` has an unsafe hard-link count",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn effective_user_id() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid(2) has no arguments or failure mode and only returns
+    // the effective process identity used by filesystem permission checks.
+    unsafe { geteuid() }
+}
+
+fn cleanup_candidate_manifest_run(candidate_run_dir: &Path) -> Result<(), String> {
+    let Some(parent) = candidate_run_dir.parent() else {
+        return Err(candidate_environment_unsafe(
+            "candidate run directory has no cleanup parent",
+        ));
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => validate_candidate_directory(parent, Some(0o700))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(candidate_environment_unsafe(format!(
+                "could not inspect manifest namespace `{}` during cleanup: {error}",
+                parent.display()
+            )));
+        }
+    }
+    match std::fs::symlink_metadata(candidate_run_dir) {
+        Ok(_) => validate_candidate_directory(candidate_run_dir, Some(0o700))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(candidate_environment_unsafe(format!(
+                "could not inspect run directory `{}` during cleanup: {error}",
+                candidate_run_dir.display()
+            )));
+        }
+    }
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not resolve manifest namespace `{}` during cleanup: {error}",
+            parent.display()
+        ))
+    })?;
+    let canonical_run = std::fs::canonicalize(candidate_run_dir).map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not resolve run directory `{}` during cleanup: {error}",
+            candidate_run_dir.display()
+        ))
+    })?;
+    if canonical_run.parent() != Some(canonical_parent.as_path()) {
+        return Err(candidate_environment_unsafe(format!(
+            "run directory `{}` escaped manifest namespace `{}` during cleanup",
+            canonical_run.display(),
+            canonical_parent.display()
+        )));
+    }
+    match std::fs::remove_dir_all(candidate_run_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "remove candidate manifest run `{}`: {error}",
+            candidate_run_dir.display()
+        )),
+    }
+}
+
+fn cleanup_protected_candidate_manifest_run(
+    protected: &ProtectedRunDirectory,
+) -> Result<(), String> {
+    cleanup_protected_candidate_manifest_run_with_after_quarantine(protected, |_| {})
+}
+
+fn cleanup_protected_candidate_manifest_run_with_after_quarantine(
+    protected: &ProtectedRunDirectory,
+    after_quarantine: impl FnOnce(&Path),
+) -> Result<(), String> {
+    let quarantine = protected.quarantine()?;
+    after_quarantine(&quarantine.path);
+    ensure_protected_original_absent(protected)?;
+    quarantine.verify()?;
+    remove_bound_protected_run(&quarantine)
+}
+
+fn ensure_protected_original_absent(protected: &ProtectedRunDirectory) -> Result<(), String> {
+    match std::fs::symlink_metadata(&protected.path) {
+        Ok(_) => Err(candidate_environment_unsafe(format!(
+            "protected run path `{}` was replaced during cleanup; preserving both paths",
+            protected.path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(candidate_environment_unsafe(format!(
+            "could not inspect original protected run path `{}` during cleanup: {error}",
+            protected.path.display()
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_bound_protected_run(protected: &ProtectedRunDirectory) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    const O_DIRECTORY: core::ffi::c_int = 0x0001_0000;
+    const O_NOFOLLOW: core::ffi::c_int = 0x0002_0000;
+    const O_CLOEXEC: core::ffi::c_int = 0x0008_0000;
+    const AT_REMOVEDIR: core::ffi::c_int = 0x0200;
+    unsafe extern "C" {
+        fn unlinkat(
+            dirfd: core::ffi::c_int,
+            pathname: *const core::ffi::c_char,
+            flags: core::ffi::c_int,
+        ) -> core::ffi::c_int;
+    }
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        .open(&protected.path)
+        .map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not bind quarantined run `{}` for deletion: {error}",
+                protected.path.display()
+            ))
+        })?;
+    let metadata = directory.metadata().map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not inspect bound quarantined run `{}`: {error}",
+            protected.path.display()
+        ))
+    })?;
+    if metadata.dev() != protected.dev || metadata.ino() != protected.ino {
+        return Err(candidate_environment_unsafe(format!(
+            "quarantined run `{}` changed identity before bound deletion",
+            protected.path.display()
+        )));
+    }
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        .open(&protected.canonical_parent)
+        .map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not bind protected namespace `{}` for deletion: {error}",
+                protected.canonical_parent.display()
+            ))
+        })?;
+    let parent_metadata = parent.metadata().map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not inspect bound protected namespace `{}`: {error}",
+            protected.canonical_parent.display()
+        ))
+    })?;
+    if parent_metadata.dev() != protected.parent_dev
+        || parent_metadata.ino() != protected.parent_ino
+    {
+        return Err(candidate_environment_unsafe(format!(
+            "protected namespace `{}` changed identity before bound deletion",
+            protected.canonical_parent.display()
+        )));
+    }
+    fn remove_contents_at(directory: &std::fs::File) -> Result<(), String> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        const O_DIRECTORY: core::ffi::c_int = 0x0001_0000;
+        const O_NOFOLLOW: core::ffi::c_int = 0x0002_0000;
+        const O_CLOEXEC: core::ffi::c_int = 0x0008_0000;
+        const AT_REMOVEDIR: core::ffi::c_int = 0x0200;
+        unsafe extern "C" {
+            fn openat(
+                dirfd: core::ffi::c_int,
+                pathname: *const core::ffi::c_char,
+                flags: core::ffi::c_int,
+            ) -> core::ffi::c_int;
+            fn unlinkat(
+                dirfd: core::ffi::c_int,
+                pathname: *const core::ffi::c_char,
+                flags: core::ffi::c_int,
+            ) -> core::ffi::c_int;
+        }
+
+        let descriptor_root = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let entries = std::fs::read_dir(&descriptor_root).map_err(|error| {
+            candidate_environment_unsafe(format!(
+                "could not enumerate bound run directory `{}`: {error}",
+                descriptor_root.display()
+            ))
+        })?;
+        for entry in entries {
+            let name = entry
+                .map_err(|error| {
+                    candidate_environment_unsafe(format!(
+                        "could not enumerate bound run directory `{}`: {error}",
+                        descriptor_root.display()
+                    ))
+                })?
+                .file_name();
+            let name = CString::new(name.as_bytes()).map_err(|_| {
+                candidate_environment_unsafe("protected run entry name contains NUL")
+            })?;
+
+            // SAFETY: directory is a live directory descriptor and name is a
+            // live NUL-terminated single component. O_NOFOLLOW prevents a
+            // swapped symlink from redirecting recursion.
+            let child_fd = unsafe {
+                openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                )
+            };
+            if child_fd >= 0 {
+                // SAFETY: openat returned a new owned descriptor on success.
+                let child = unsafe { std::fs::File::from_raw_fd(child_fd) };
+                let child_metadata = child.metadata().map_err(|error| {
+                    candidate_environment_unsafe(format!(
+                        "could not inspect bound nested run directory: {error}"
+                    ))
+                })?;
+                remove_contents_at(&child)?;
+
+                // Re-open through the held parent descriptor after recursion
+                // and compare identity. A name substitution is preserved and
+                // fails closed instead of being recursively deleted.
+                let current_fd = unsafe {
+                    openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                    )
+                };
+                if current_fd < 0 {
+                    return Err(candidate_environment_unsafe(format!(
+                        "nested protected run directory changed before unlink: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                // SAFETY: openat returned a new owned descriptor on success.
+                let current = unsafe { std::fs::File::from_raw_fd(current_fd) };
+                let current_metadata = current.metadata().map_err(|error| {
+                    candidate_environment_unsafe(format!(
+                        "could not re-inspect nested protected run directory: {error}"
+                    ))
+                })?;
+                if current_metadata.dev() != child_metadata.dev()
+                    || current_metadata.ino() != child_metadata.ino()
+                {
+                    return Err(candidate_environment_unsafe(
+                        "nested protected run directory changed identity; preserving it",
+                    ));
+                }
+                // SAFETY: directory and name are still live; AT_REMOVEDIR
+                // removes only this directory entry and never follows it.
+                if unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), AT_REMOVEDIR) } != 0 {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not unlink bound nested run directory: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+            } else {
+                // A non-directory (including a symlink) is removed relative
+                // to the held directory descriptor. If it races into a
+                // directory, unlinkat fails rather than traversing it.
+                if unsafe { unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    return Err(candidate_environment_unsafe(format!(
+                        "could not unlink bound run entry: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    remove_contents_at(&directory)?;
+    // The held directory descriptor binds recursive traversal. Re-check the
+    // namespace entry after traversal, then unlink it relative to the held
+    // parent descriptor so a parent-path swap cannot redirect deletion.
+    let current = std::fs::symlink_metadata(
+        PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(
+            protected
+                .path
+                .file_name()
+                .expect("protected run has a name"),
+        ),
+    )
+    .map_err(|error| {
+        candidate_environment_unsafe(format!(
+            "could not re-inspect quarantined run entry `{}`: {error}",
+            protected.path.display()
+        ))
+    })?;
+    if current.dev() != protected.dev || current.ino() != protected.ino {
+        return Err(candidate_environment_unsafe(format!(
+            "quarantined run `{}` changed identity before unlink; preserving it",
+            protected.path.display()
+        )));
+    }
+    let name = CString::new(
+        protected
+            .path
+            .file_name()
+            .expect("protected run has a name")
+            .as_bytes(),
+    )
+    .map_err(|_| candidate_environment_unsafe("protected run name contains NUL"))?;
+    // SAFETY: parent is a live directory descriptor and name is a live,
+    // NUL-terminated single path component. AT_REMOVEDIR never follows it.
+    if unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), AT_REMOVEDIR) } != 0 {
+        return Err(candidate_environment_unsafe(format!(
+            "could not unlink bound quarantined run `{}`: {}",
+            protected.path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_bound_protected_run(protected: &ProtectedRunDirectory) -> Result<(), String> {
+    remove_bound_protected_run_with_after_verify(protected, |_| {})
+}
+
+#[cfg(not(target_os = "linux"))]
+fn remove_bound_protected_run_with_after_verify(
+    protected: &ProtectedRunDirectory,
+    after_verify: impl FnOnce(&Path),
+) -> Result<(), String> {
+    protected.verify()?;
+    after_verify(&protected.path);
+    Err(candidate_environment_unsafe(format!(
+        "atomic bound cleanup is unsupported on this platform; preserving protected run `{}`",
+        protected.path.display()
+    )))
+}
+
+fn ensure_candidate_parent(
+    root: &Path,
+    relative: &Path,
+    create_missing: bool,
+) -> Result<(), String> {
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut cursor = root.to_path_buf();
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(format!(
+                "candidate_snapshot.path_noncanonical: invalid path `{}`",
+                relative.display()
+            ));
+        };
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "candidate_snapshot.symlink_traversal: parent `{}` is a symlink",
+                    cursor.display()
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "candidate_snapshot.path_conflict: parent `{}` is not a directory",
+                    cursor.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+                std::fs::create_dir(&cursor).map_err(|error| {
+                    format!(
+                        "candidate_snapshot.materialize_failed: create parent `{}`: {error}",
+                        cursor.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "candidate_snapshot.materialize_failed: inspect parent `{}`: {error}",
+                    cursor.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_candidate_mode(path: &Path, mode: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let permissions = match mode {
+        "100644" => std::fs::Permissions::from_mode(0o644),
+        "100755" => std::fs::Permissions::from_mode(0o755),
+        _ => {
+            return Err(format!(
+                "candidate_snapshot.overlay_mode_unsupported: unsupported mode {mode:?}"
+            ));
+        }
+    };
+    std::fs::set_permissions(path, permissions).map_err(|error| {
+        format!(
+            "candidate_snapshot.materialize_failed: chmod `{}`: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_candidate_mode(_path: &Path, mode: &str) -> Result<(), String> {
+    if matches!(mode, "100644" | "100755") {
+        Ok(())
+    } else {
+        Err(format!(
+            "candidate_snapshot.overlay_mode_unsupported: unsupported mode {mode:?}"
+        ))
+    }
+}
+
+pub(crate) fn candidate_snapshot_check_context(
+    sidecar: &CandidateManifestSidecar,
+    manifest: &CandidateSnapshotManifest,
+) -> CandidateSnapshotCheckContext {
+    CandidateSnapshotCheckContext {
+        manifest_path: sidecar.path.clone(),
+        manifest_bytes: sidecar.bytes.clone(),
+        manifest_dev: sidecar.dev,
+        manifest_ino: sidecar.ino,
+        candidate_kind: manifest.candidate.kind().to_string(),
+        snapshot_digest: manifest.candidate.snapshot_digest().to_string(),
+        candidate_tree_oid: manifest.candidate.tree_oid().to_string(),
+        candidate_sha: match &manifest.candidate {
+            CandidateSnapshot::Tree { commit_sha, .. } => Some(commit_sha.clone()),
+            CandidateSnapshot::Index { .. } | CandidateSnapshot::Overlay { .. } => None,
+        },
+        manifest_digest: manifest.manifest_digest.clone(),
+        comparison_base_sha: manifest.comparison_base.commit_sha.clone(),
+    }
 }
 
 // ── CGLS-26: warm shared witness target dir ──────────────────────────────
@@ -5719,6 +7846,33 @@ fn git_timeout_from(env_ms: Option<u64>, args: &[&str]) -> Duration {
 fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(root).args(args);
+    for selector in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ] {
+        cmd.env_remove(selector);
+    }
+    for (name, _) in std::env::vars_os() {
+        let name_lossy = name.to_string_lossy();
+        if name_lossy.starts_with("GIT_CONFIG_KEY_") || name_lossy.starts_with("GIT_CONFIG_VALUE_")
+        {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.env("LC_ALL", "C")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1");
     cmd
 }
 
@@ -5761,6 +7915,47 @@ fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod git_bounds_tests {
     use super::*;
+
+    #[test]
+    fn git_command_removes_hostile_repository_and_object_selectors() {
+        let command = git_command(Path::new("/authoritative/repository"), &["status"]);
+        let env = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+            "GIT_QUARANTINE_PATH",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            assert_eq!(
+                env.get(key),
+                Some(&None),
+                "{key} must not override the explicit repository authority"
+            );
+        }
+        assert_eq!(
+            env.get("GIT_NO_REPLACE_OBJECTS"),
+            Some(&Some("1".to_string()))
+        );
+        assert_eq!(env.get("GIT_NO_LAZY_FETCH"), Some(&Some("1".to_string())));
+        assert_eq!(env.get("LC_ALL"), Some(&Some("C".to_string())));
+    }
 
     #[test]
     fn run_command_bounded_kills_on_deadline() {
@@ -5842,10 +8037,44 @@ mod git_bounds_tests {
             Duration::from_millis(60_000)
         );
     }
+
+    #[test]
+    fn cleanup_failure_is_authority_specific() {
+        let result = finish_project_check_run(
+            ProjectCheckAuthority::CandidateSnapshot,
+            Ok::<_, String>("verified"),
+            Err("scratch cleanup denied".to_string()),
+            Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            result.contains("candidate_snapshot.cleanup_failed"),
+            "{result}"
+        );
+        assert!(result.contains("scratch cleanup denied"), "{result}");
+
+        for authority in [
+            ProjectCheckAuthority::ExactGit,
+            ProjectCheckAuthority::LegacyOverlay,
+        ] {
+            assert_eq!(
+                finish_project_check_run(
+                    authority,
+                    Ok::<_, String>("verified"),
+                    Err("scratch cleanup denied".to_string()),
+                    Ok(()),
+                )
+                .unwrap(),
+                "verified",
+                "noncandidate cleanup is operational telemetry and must not replace the verdict"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -5856,6 +8085,12 @@ mod tests {
     use cargoless_core::transport::{
         AllowAll, AttemptContext, BatchCheckRequest, CargoSubcommand, PushOverlayOptions,
         TransportClient, VerdictService,
+    };
+    use cargoless_core::{
+        CandidateSnapshot, CandidateSnapshotManifest, GitObjectFormat, GitTreeRef,
+        OverlayOperation, OverlayPayload, SnapshotEntry, compute_candidate_tree_oid,
+        compute_manifest_digest, compute_snapshot_digest, parse_and_validate_manifest_json,
+        sha256_hex,
     };
 
     use super::*;
@@ -5874,6 +8109,76 @@ mod tests {
         root
     }
 
+    const CANDIDATE_SNAPSHOT_GOLDEN: &str = r#"{
+      "schema":"cargoless-candidate-snapshot/1",
+      "git_object_format":"sha1",
+      "comparison_base":{"commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b","tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+      "candidate":{"kind":"overlay","base":{"commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b","tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"},"tree_oid":"08d60034cad9ce340c4d42748bf0bc1b2e34d830","entry_count":2,"entries":[{"path":"empty.bin","mode":"100644","blob_oid":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391","size":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},{"path":"script.sh","mode":"100755","blob_oid":"9766475a4185a151dc9d56d614ffb9aaea3bfd42","size":3,"sha256":"dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"}],"snapshot_digest":"sha256:365cc276607bc3209bd7346f8de4f765e42e68bba8fdaf1b22687b6a169118ed","operation_count":2,"operations":[{"op":"upsert","path":"empty.bin","mode":"100644","blob_oid":"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391","size":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","payload":{"encoding":"base64","data":""}},{"op":"upsert","path":"script.sh","mode":"100755","blob_oid":"9766475a4185a151dc9d56d614ffb9aaea3bfd42","size":3,"sha256":"dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22","payload":{"encoding":"base64","data":"b2sK"}}]},
+      "manifest_digest":"sha256:a363a22a9ab3317a8d7d616ecb4ac66ef7d0f2d7dd46d8a1010f44a601b8377c"
+    }"#;
+
+    fn candidate_snapshot_golden() -> CandidateSnapshotManifest {
+        parse_and_validate_manifest_json(CANDIDATE_SNAPSHOT_GOLDEN).unwrap()
+    }
+
+    #[test]
+    fn candidate_check_context_maps_overlay_index_and_tree_identity_without_synthesis() {
+        let manifest_path = PathBuf::from("/state/candidate-snapshots/run-1/manifest.json");
+        let sidecar = CandidateManifestSidecar {
+            path: manifest_path.clone(),
+            bytes: CANDIDATE_SNAPSHOT_GOLDEN.as_bytes().to_vec(),
+            dev: 7,
+            ino: 11,
+        };
+        let overlay = candidate_snapshot_golden();
+        let overlay_context = candidate_snapshot_check_context(&sidecar, &overlay);
+        assert_eq!(overlay_context.manifest_path, manifest_path);
+        assert_eq!(overlay_context.manifest_bytes, sidecar.bytes);
+        assert_eq!(overlay_context.manifest_dev, 7);
+        assert_eq!(overlay_context.manifest_ino, 11);
+        assert_eq!(overlay_context.candidate_kind, "overlay");
+        assert_eq!(
+            overlay_context.snapshot_digest,
+            overlay.candidate.snapshot_digest()
+        );
+        assert_eq!(
+            overlay_context.candidate_tree_oid,
+            overlay.candidate.tree_oid()
+        );
+        assert_eq!(overlay_context.candidate_sha, None);
+
+        let entries = overlay.candidate.entries().to_vec();
+        let snapshot_digest = overlay.candidate.snapshot_digest().to_string();
+        let tree_oid = overlay.candidate.tree_oid().to_string();
+        let mut index = overlay.clone();
+        index.candidate = CandidateSnapshot::Index {
+            base: overlay.comparison_base.clone(),
+            tree_oid: tree_oid.clone(),
+            entry_count: entries.len() as u64,
+            entries: entries.clone(),
+            snapshot_digest: snapshot_digest.clone(),
+        };
+        let index_context = candidate_snapshot_check_context(&sidecar, &index);
+        assert_eq!(index_context.candidate_kind, "index");
+        assert_eq!(index_context.candidate_sha, None);
+
+        let commit_sha = "1".repeat(40);
+        let mut tree = overlay;
+        tree.candidate = CandidateSnapshot::Tree {
+            commit_sha: commit_sha.clone(),
+            tree_oid,
+            entry_count: entries.len() as u64,
+            entries,
+            snapshot_digest,
+        };
+        let tree_context = candidate_snapshot_check_context(&sidecar, &tree);
+        assert_eq!(tree_context.candidate_kind, "tree");
+        assert_eq!(
+            tree_context.candidate_sha.as_deref(),
+            Some(commit_sha.as_str())
+        );
+    }
+
     fn attempt_context(id: &str, attempt_number: u32) -> AttemptContext {
         AttemptContext {
             request_id: cargoless_core::outcome::RequestId::new("request-1").unwrap(),
@@ -5885,6 +8190,140 @@ mod tests {
             maximum_attempts: 3,
             retry_after_ms: 5000,
         }
+    }
+
+    #[test]
+    fn candidate_result_evidence_is_exact_and_retry_attempt_scoped() {
+        let state_dir = temp_root("candidate-result-evidence-retries");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let first = attempt_context("attempt-one", 1);
+        let second = attempt_context("attempt-two", 2);
+        let subject = || Subject::Overlay {
+            repository: text_v3("/repo"),
+            worktree_key: text_v3("/client/candidate"),
+            base_ref: text_v3("base-ref"),
+            base_sha: text_v3("base-sha"),
+            overlay_digest: text_v3("overlay-digest"),
+            changed_files_digest: text_v3("changed-files-digest"),
+            check_plan_digest: text_v3("check-plan-digest"),
+        };
+        api.begin_outcome_v3(
+            &first,
+            Surface::Overlay,
+            subject(),
+            Phase::Queued,
+            "first candidate attempt",
+        );
+        api.begin_outcome_v3(
+            &second,
+            Surface::Overlay,
+            subject(),
+            Phase::Queued,
+            "retried candidate attempt",
+        );
+
+        let tree_oid = "1".repeat(40);
+        let candidate_sha = "2".repeat(40);
+        let comparison_base_sha = "3".repeat(40);
+        let snapshot_digest = format!("sha256:{}", "4".repeat(64));
+        let manifest_digest = format!("sha256:{}", "5".repeat(64));
+        let result = |policy_hash: &str| {
+            format!(
+                "{{\n  \"schema\": \"cargoless.check-result/v2\",\n  \"check_id\": \"candidate-policy\",\n  \"status\": \"passed\",\n  \"summary\": \"candidate policy satisfied\",\n  \"subject\": {{\n    \"candidate_kind\": \"tree\",\n    \"candidate_snapshot_digest\": \"{snapshot_digest}\",\n    \"candidate_tree_oid\": \"{tree_oid}\",\n    \"candidate_sha\": \"{candidate_sha}\",\n    \"comparison_base_sha\": \"{comparison_base_sha}\",\n    \"manifest_digest\": \"{manifest_digest}\",\n    \"engine\": \"migration-burndown\",\n    \"engine_version\": \"1\",\n    \"policy_hash\": \"{policy_hash}\"\n  }},\n  \"findings\": []\n}}\n"
+            )
+            .into_bytes()
+        };
+        let first_bytes = result("policy-first");
+        let second_bytes = result("policy-second");
+        let candidate = |execution_id| CandidateVerdictIdentity {
+            manifest_digest: manifest_digest.clone(),
+            snapshot_digest: snapshot_digest.clone(),
+            tree_oid: tree_oid.clone(),
+            execution_id,
+        };
+
+        api.publish_attributed_with_candidate_checks(
+            Path::new("/client/candidate"),
+            crate::statusfile::VerdictPayload::green(),
+            Some(comparison_base_sha.clone()),
+            Some(candidate(1)),
+            false,
+            vec!["candidate-policy".to_string()],
+            vec![VerifiedProjectCheckEvidence {
+                check_id: "candidate-policy".to_string(),
+                bytes: first_bytes.clone(),
+            }],
+            Some(first.clone()),
+        );
+        api.publish_attributed_with_candidate_checks(
+            Path::new("/client/candidate"),
+            crate::statusfile::VerdictPayload::green(),
+            Some(comparison_base_sha),
+            Some(candidate(2)),
+            false,
+            vec!["candidate-policy".to_string()],
+            vec![VerifiedProjectCheckEvidence {
+                check_id: "candidate-policy".to_string(),
+                bytes: second_bytes.clone(),
+            }],
+            Some(second.clone()),
+        );
+
+        assert_eq!(
+            api.get_evidence_v3(&first.attempt_id, "project-check-result-001.json")
+                .unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            api.get_evidence_v3(&second.attempt_id, "project-check-result-001.json")
+                .unwrap(),
+            second_bytes
+        );
+        assert_ne!(
+            api.get_evidence_v3(&first.attempt_id, "project-check-result-001.json"),
+            api.get_evidence_v3(&second.attempt_id, "project-check-result-001.json"),
+            "a retry must never overwrite the predecessor's result evidence"
+        );
+        let retried = api.get_outcome_v3(&second.attempt_id).unwrap();
+        assert!(retried.relations.iter().any(|relation| {
+            relation.kind == RelationKind::RetriedFrom
+                && relation.attempt_id.as_ref() == Some(&first.attempt_id)
+        }));
+
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        assert_eq!(
+            reopened
+                .get_evidence_v3(&first.attempt_id, "project-check-result-001.json")
+                .unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            reopened
+                .get_evidence_v3(&second.attempt_id, "project-check-result-001.json")
+                .unwrap(),
+            second_bytes
+        );
+        let first_json: serde_json::Value = serde_json::from_slice(
+            &reopened
+                .get_evidence_v3(&first.attempt_id, "project-check-result-001.json")
+                .unwrap(),
+        )
+        .unwrap();
+        let result_subject = first_json["subject"].as_object().unwrap();
+        for field in [
+            "candidate_kind",
+            "candidate_snapshot_digest",
+            "candidate_tree_oid",
+            "candidate_sha",
+            "comparison_base_sha",
+            "manifest_digest",
+            "engine",
+            "engine_version",
+            "policy_hash",
+        ] {
+            assert!(result_subject.contains_key(field), "missing {field}");
+        }
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
@@ -6337,6 +8776,133 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    fn git_hash_blob(root: &Path, bytes: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git hash-object --stdin failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn overlay_manifest_with_delete_empty_executable_and_binary(
+        root: &Path,
+    ) -> CandidateSnapshotManifest {
+        let base_commit = git_capture(root, &["rev-parse", "HEAD"]);
+        let base_tree = git_capture(root, &["rev-parse", "HEAD^{tree}"]);
+        let removed_blob = git_capture(root, &["rev-parse", "HEAD:remove.txt"]);
+        let binary = [0_u8, 0xff, 0x80, b'\n'];
+        let script = b"#!/bin/sh\nexit 0\n";
+        let entries = vec![
+            SnapshotEntry {
+                path: "binary.bin".into(),
+                mode: "100644".into(),
+                blob_oid: git_hash_blob(root, &binary),
+                size: binary.len() as u64,
+                sha256: sha256_hex(&binary),
+            },
+            SnapshotEntry {
+                path: "empty.bin".into(),
+                mode: "100644".into(),
+                blob_oid: git_hash_blob(root, b""),
+                size: 0,
+                sha256: sha256_hex(b""),
+            },
+            SnapshotEntry {
+                path: "script.sh".into(),
+                mode: "100755".into(),
+                blob_oid: git_hash_blob(root, script),
+                size: script.len() as u64,
+                sha256: sha256_hex(script),
+            },
+        ];
+        let operations = vec![
+            OverlayOperation::Upsert {
+                path: "binary.bin".into(),
+                mode: "100644".into(),
+                blob_oid: entries[0].blob_oid.clone(),
+                size: binary.len() as u64,
+                sha256: entries[0].sha256.clone(),
+                payload: OverlayPayload {
+                    encoding: "base64".into(),
+                    data: "AP+ACg==".into(),
+                },
+            },
+            OverlayOperation::Upsert {
+                path: "empty.bin".into(),
+                mode: "100644".into(),
+                blob_oid: entries[1].blob_oid.clone(),
+                size: 0,
+                sha256: entries[1].sha256.clone(),
+                payload: OverlayPayload {
+                    encoding: "base64".into(),
+                    data: String::new(),
+                },
+            },
+            OverlayOperation::Delete {
+                path: "remove.txt".into(),
+                base_mode: "100644".into(),
+                base_blob_oid: removed_blob,
+            },
+            OverlayOperation::Upsert {
+                path: "script.sh".into(),
+                mode: "100755".into(),
+                blob_oid: entries[2].blob_oid.clone(),
+                size: script.len() as u64,
+                sha256: entries[2].sha256.clone(),
+                payload: OverlayPayload {
+                    encoding: "base64".into(),
+                    data: "IyEvYmluL3NoCmV4aXQgMAo=".into(),
+                },
+            },
+        ];
+        let base = GitTreeRef {
+            commit_sha: base_commit,
+            tree_oid: base_tree,
+        };
+        let mut manifest = CandidateSnapshotManifest {
+            schema: "cargoless-candidate-snapshot/1".into(),
+            git_object_format: GitObjectFormat::Sha1,
+            comparison_base: base.clone(),
+            candidate: CandidateSnapshot::Overlay {
+                base,
+                tree_oid: "0".repeat(40),
+                entry_count: entries.len() as u64,
+                entries,
+                snapshot_digest: format!("sha256:{}", "0".repeat(64)),
+                operation_count: operations.len() as u64,
+                operations,
+            },
+            manifest_digest: format!("sha256:{}", "0".repeat(64)),
+        };
+        let tree_oid = compute_candidate_tree_oid(&manifest).unwrap();
+        let CandidateSnapshot::Overlay {
+            tree_oid: advertised_tree,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!()
+        };
+        *advertised_tree = tree_oid;
+        let snapshot_digest = compute_snapshot_digest(&manifest).unwrap();
+        let CandidateSnapshot::Overlay {
+            snapshot_digest: advertised_snapshot,
+            ..
+        } = &mut manifest.candidate
+        else {
+            unreachable!()
+        };
+        *advertised_snapshot = snapshot_digest;
+        manifest.manifest_digest = compute_manifest_digest(&manifest).unwrap();
+        manifest
+    }
+
     /// Build a repo whose `origin` remote advertises only `main`, but which
     /// locally holds a SECOND commit reachable from no remote ref — exactly
     /// the shape of a push pinning `base_sha` to a non-tip dev commit the
@@ -6614,6 +9180,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -6728,6 +9296,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -7979,6 +10549,8 @@ checks:
                 base_sha: None,
                 source_ref: None,
                 source_sha: None,
+                comparison_base_sha: None,
+                candidate_snapshot: None,
                 changed_files: None,
                 gate: false,
                 check_ids: None,
@@ -8296,6 +10868,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![(
                 project
                     .root
@@ -8957,6 +11530,8 @@ checks:
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -9008,6 +11583,8 @@ checks:
             base_sha: Some(head),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into()]),
             gate: false,
             check_ids: None,
@@ -9067,6 +11644,8 @@ checks:
             base_sha: Some(source_sha.clone()),
             source_ref: Some("refs/heads/main".to_string()),
             source_sha: Some(source_sha.clone()),
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".to_string()]),
             gate: true,
             check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
@@ -9092,12 +11671,15 @@ checks:
             Some(source_sha.as_str())
         );
         let seen = api
-            .with_project_check_overlay(&request.context, |scratch, _warm| {
-                (
-                    git_capture(scratch, &["rev-parse", "HEAD"]),
-                    std::fs::read_to_string(scratch.join("src/lib.rs")).unwrap(),
-                )
-            })
+            .with_project_check_overlay(
+                &request.context,
+                |scratch, _warm, _candidate_manifest_path| {
+                    (
+                        git_capture(scratch, &["rev-parse", "HEAD"]),
+                        std::fs::read_to_string(scratch.join("src/lib.rs")).unwrap(),
+                    )
+                },
+            )
             .unwrap();
         assert_eq!(seen.0, source_sha);
         assert_eq!(seen.1, "pub fn candidate() {}\n");
@@ -9113,6 +11695,55 @@ checks:
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_git_accepts_preexisting_legacy_0755_scratch_namespace() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = setup_batch_project("exact-git-legacy-scratch-mode");
+        let source_sha = git_capture(&project.root, &["rev-parse", "HEAD"]);
+        let state_dir = temp_root("exact-git-legacy-scratch-mode-state");
+        let scratch_namespace = state_dir.join("project-check-runs");
+        std::fs::create_dir(&scratch_namespace).unwrap();
+        std::fs::set_permissions(&scratch_namespace, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = ProjectCheckRunContext {
+            root: project.root.clone(),
+            changed_files: Some(vec!["src/lib.rs".to_string()]),
+            base_ref: "origin/main".to_string(),
+            base_sha: Some(source_sha.clone()),
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(source_sha.clone()),
+            candidate_snapshot: None,
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+        };
+
+        let seen = api
+            .with_project_check_overlay(&context, |scratch, _warm, sidecar| {
+                assert!(sidecar.is_none(), "exact Git has no typed sidecar");
+                assert_eq!(git_capture(scratch, &["rev-parse", "HEAD"]), source_sha);
+                scratch.to_path_buf()
+            })
+            .expect("a safe pre-existing legacy namespace remains compatible");
+
+        assert!(!seen.exists(), "the isolated exact-Git checkout is cleaned");
+        assert_eq!(
+            std::fs::metadata(&scratch_namespace)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "compatibility must not mutate the legacy namespace mode"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+        let _ = std::fs::remove_dir_all(project.root);
     }
 
     #[test]
@@ -9176,6 +11807,1271 @@ checks:
     }
 
     #[test]
+    fn typed_overlay_keeps_attribution_comparison_and_operation_bases_distinct() {
+        let root = temp_root("candidate-distinct-bases");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+
+        std::fs::write(root.join("comparison.txt"), b"comparison\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "comparison base"]);
+        let comparison_commit = git_capture(&root, &["rev-parse", "HEAD"]);
+        let comparison_tree = git_capture(&root, &["rev-parse", "HEAD^{tree}"]);
+
+        std::fs::write(root.join("overlay-base-only.txt"), b"overlay base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "overlay base"]);
+        let overlay_base_commit = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("attribution-only.txt"), b"legacy attribution\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "legacy attribution"]);
+        let legacy_base_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        git(&root, &["reset", "--hard", &overlay_base_commit]);
+        std::fs::write(root.join("candidate.txt"), b"candidate bytes\n").unwrap();
+        let mut manifest =
+            crate::candidate_snapshot_git::build_overlay_manifest(&root, &overlay_base_commit)
+                .unwrap()
+                .expect("candidate fixture has an overlay")
+                .manifest;
+        manifest.comparison_base = GitTreeRef {
+            commit_sha: comparison_commit.clone(),
+            tree_oid: comparison_tree.clone(),
+        };
+        manifest.manifest_digest = compute_manifest_digest(&manifest).unwrap();
+        std::fs::remove_file(root.join("candidate.txt")).unwrap();
+        git(&root, &["reset", "--hard", &legacy_base_sha]);
+
+        let CandidateSnapshot::Overlay {
+            base: operation_base,
+            ..
+        } = &manifest.candidate
+        else {
+            panic!("fixture must remain an overlay");
+        };
+        assert_ne!(legacy_base_sha, comparison_commit);
+        assert_ne!(legacy_base_sha, operation_base.commit_sha);
+        assert_ne!(comparison_commit, operation_base.commit_sha);
+
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some(legacy_base_sha.clone()),
+            comparison_base_sha: Some(comparison_commit.clone()),
+            candidate_snapshot: Some(manifest.clone()),
+            changed_files: Some(vec!["candidate.txt".into()]),
+            ..Default::default()
+        };
+        let typed = typed_candidate_overlay(
+            &options,
+            &[("candidate.txt".into(), "candidate bytes\n".into())],
+        )
+        .expect("legacy attribution is independent from comparison authority")
+        .expect("typed candidate is present");
+        assert_eq!(typed.manifest, manifest);
+
+        ensure_candidate_snapshot_base(&root, &legacy_base_sha, &manifest)
+            .expect("operations validate against candidate.base, not comparison_base");
+        assert_eq!(
+            git_capture(&root, &["rev-parse", "HEAD"]),
+            operation_base.commit_sha,
+            "analysis root resets to the operation base before scratch materialization"
+        );
+
+        let mut wrong_tree = manifest.clone();
+        let CandidateSnapshot::Overlay { base, .. } = &mut wrong_tree.candidate else {
+            unreachable!()
+        };
+        base.tree_oid = comparison_tree.clone();
+        wrong_tree.manifest_digest = compute_manifest_digest(&wrong_tree).unwrap();
+        let error = ensure_candidate_snapshot_base(&root, &legacy_base_sha, &wrong_tree)
+            .expect_err("advertised candidate.base tree must match the resolved commit");
+        assert!(
+            error.contains("candidate_snapshot.base_tree_mismatch"),
+            "unexpected wrong-tree taxonomy: {error}"
+        );
+
+        let unrelated_comparison = git_capture(
+            &root,
+            &[
+                "commit-tree",
+                &comparison_tree,
+                "-m",
+                "unrelated comparison",
+            ],
+        );
+        let mut unrelated = manifest.clone();
+        unrelated.comparison_base.commit_sha = unrelated_comparison;
+        unrelated.manifest_digest = compute_manifest_digest(&unrelated).unwrap();
+        let error = ensure_candidate_snapshot_base(&root, &legacy_base_sha, &unrelated)
+            .expect_err("comparison base must be an ancestor of candidate.base");
+        assert!(
+            error.contains("candidate_snapshot.comparison_base_invalid"),
+            "unexpected ancestry taxonomy: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_backed_batch_is_rejected_before_analysis_root_touch() {
+        let api = ServeVerdictState::new();
+        let forbidden_root = temp_root("candidate-batch-must-not-touch");
+        assert!(!forbidden_root.exists());
+
+        let manifest = candidate_snapshot_golden();
+        let mut request = BatchCheckRequest::new("candidate-batch", "origin/main");
+        request.coalesce_key = Some("must-not-coalesce".to_string());
+        request.options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(forbidden_root.to_string_lossy().into_owned()),
+            base_sha: Some("e".repeat(40)),
+            source_ref: None,
+            source_sha: None,
+            comparison_base_sha: Some(manifest.comparison_base.commit_sha.clone()),
+            candidate_snapshot: Some(manifest),
+            changed_files: Some(vec!["empty.bin".to_string()]),
+            gate: true,
+            check_ids: Some(vec!["candidate-policy".to_string()]),
+            semantic: None,
+        };
+        request.members = vec![BatchMember {
+            worktree: "/client/candidate".to_string(),
+            files: vec![("empty.bin".to_string(), String::new())],
+            changed_files: vec!["empty.bin".to_string()],
+        }];
+
+        let report = api.batch_check(&request);
+        assert_eq!(report.verdict, BatchVerdict::Indeterminate);
+        assert_eq!(report.combined_checks, 0);
+        assert_eq!(report.solo_checks, 0);
+        assert!(
+            report
+                .members
+                .iter()
+                .flat_map(|member| &member.diagnostics)
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("candidate_snapshot.coalescing_forbidden")),
+            "typed candidate batches must fail with the stable code before any legacy union path: {report:?}"
+        );
+        assert!(
+            !forbidden_root.exists(),
+            "candidate-backed batch rejection must happen before analysis-root access"
+        );
+        let counts = api.batch_coalescer.counts();
+        assert_eq!(counts.waiters, 0);
+        assert_eq!(counts.members, 0);
+        assert_eq!(
+            counts.inflight_runs, 0,
+            "candidate-backed batches may never enter the coalescer"
+        );
+    }
+
+    #[test]
+    fn typed_candidate_subject_binds_manifest_snapshot_and_tree_identity() {
+        let files = vec![("empty.bin".to_string(), String::new())];
+        let mut options = PushOverlayOptions {
+            analysis_root: Some("/server/repository".to_string()),
+            base_sha: Some("legacy-attribution".to_string()),
+            changed_files: Some(vec!["empty.bin".to_string()]),
+            candidate_snapshot: Some(candidate_snapshot_golden()),
+            ..PushOverlayOptions::default()
+        };
+        let digest = |options: &PushOverlayOptions| {
+            let Subject::Overlay { overlay_digest, .. } =
+                overlay_subject_v3("/client/worktree", "origin/main", &files, None, options)
+                    .unwrap()
+            else {
+                unreachable!()
+            };
+            overlay_digest.to_string()
+        };
+        let original = digest(&options);
+
+        let manifest = options.candidate_snapshot.as_mut().unwrap();
+        manifest.manifest_digest = format!("sha256:{}", "a".repeat(64));
+        assert_ne!(
+            digest(&options),
+            original,
+            "manifest digest is subject identity"
+        );
+        *options.candidate_snapshot.as_mut().unwrap() = candidate_snapshot_golden();
+
+        let CandidateSnapshot::Overlay {
+            snapshot_digest, ..
+        } = &mut options.candidate_snapshot.as_mut().unwrap().candidate
+        else {
+            unreachable!()
+        };
+        *snapshot_digest = format!("sha256:{}", "b".repeat(64));
+        assert_ne!(
+            digest(&options),
+            original,
+            "snapshot digest is subject identity"
+        );
+        *options.candidate_snapshot.as_mut().unwrap() = candidate_snapshot_golden();
+
+        let CandidateSnapshot::Overlay { tree_oid, .. } =
+            &mut options.candidate_snapshot.as_mut().unwrap().candidate
+        else {
+            unreachable!()
+        };
+        *tree_oid = "c".repeat(40);
+        assert_ne!(
+            digest(&options),
+            original,
+            "candidate tree is subject identity"
+        );
+    }
+
+    #[test]
+    fn identical_typed_candidates_never_replace_queue_or_hard_witness() {
+        let root = temp_root("candidate-noncoalescing");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(root.join("remove.txt"), b"remove me\n").unwrap();
+        std::fs::create_dir_all(root.join(".cargoless")).unwrap();
+        std::fs::write(
+            root.join(".cargoless/candidate-snapshot.json"),
+            b"tracked candidate content\n",
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate base"]);
+        let manifest = overlay_manifest_with_delete_empty_executable_and_binary(&root);
+        let legacy_files = vec![
+            ("empty.bin".to_string(), String::new()),
+            ("remove.txt".to_string(), String::new()),
+            ("script.sh".to_string(), "#!/bin/sh\nexit 0\n".to_string()),
+        ];
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some("same-legacy-attribution".to_string()),
+            comparison_base_sha: Some(manifest.comparison_base.commit_sha.clone()),
+            candidate_snapshot: Some(manifest.clone()),
+            changed_files: Some(
+                manifest
+                    .candidate
+                    .operations()
+                    .unwrap()
+                    .iter()
+                    .map(|operation| operation.path().to_string())
+                    .collect(),
+            ),
+            ..PushOverlayOptions::default()
+        };
+        let api = ServeVerdictState::new();
+        assert!(
+            api.push_overlay_with_options(
+                "/client/candidate",
+                &manifest.comparison_base.commit_sha,
+                &legacy_files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+        assert!(
+            api.push_overlay_with_options(
+                "/client/candidate",
+                &manifest.comparison_base.commit_sha,
+                &legacy_files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+
+        let first = api
+            .take_overlay_for("/client/candidate")
+            .expect("first candidate remains queued");
+        let second = api
+            .take_overlay_for("/client/candidate")
+            .expect("identical candidate is a separate execution");
+        assert!(api.take_overlay_for("/client/candidate").is_none());
+        api.record_push_attribution("/candidate-first", &first);
+        api.record_push_attribution("/candidate-second", &second);
+        let first = api.take_push_attribution("/candidate-first").unwrap();
+        let second = api.take_push_attribution("/candidate-second").unwrap();
+        assert_eq!(
+            first.candidate.as_ref().unwrap().manifest_digest,
+            second.candidate.as_ref().unwrap().manifest_digest
+        );
+        let first_key = first.witness_key().unwrap();
+        let second_key = second.witness_key().unwrap();
+        assert_ne!(
+            first_key, second_key,
+            "even identical manifests never coalesce"
+        );
+        let first_generation = api.begin_hard_witness(
+            "/client/candidate",
+            Some(&first_key),
+            first.semantic.as_ref(),
+        );
+        let second_generation = api.begin_hard_witness(
+            "/client/candidate",
+            Some(&second_key),
+            second.semantic.as_ref(),
+        );
+        assert!(api.finish_hard_witness("/client/candidate", Some(&first_key), first_generation));
+        assert!(api.finish_hard_witness("/client/candidate", Some(&second_key), second_generation));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn candidate_status_events_and_diagnostics_are_manifest_addressable() {
+        let api = ServeVerdictState::new();
+        let events = api.subscribe();
+        let first = CandidateVerdictIdentity {
+            manifest_digest: format!("sha256:{}", "1".repeat(64)),
+            snapshot_digest: format!("sha256:{}", "a".repeat(64)),
+            tree_oid: "a".repeat(40),
+            execution_id: 1,
+        };
+        let second = CandidateVerdictIdentity {
+            manifest_digest: format!("sha256:{}", "2".repeat(64)),
+            snapshot_digest: format!("sha256:{}", "b".repeat(64)),
+            tree_oid: "b".repeat(40),
+            execution_id: 2,
+        };
+        let diagnostic = |message: &str| Diagnostic {
+            file_path: PathBuf::from("policy.yaml"),
+            line: 1,
+            col: 1,
+            severity: Severity::Error,
+            code: Some("policy.failed".to_string()),
+            message: message.to_string(),
+            source: Some("candidate-policy".to_string()),
+        };
+        api.retain_candidate_diagnostics("/shared", &first, vec![diagnostic("first")]);
+        api.publish_attributed_with_candidate_checks(
+            Path::new("/shared"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("same-base".to_string()),
+            Some(first.clone()),
+            false,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        api.retain_candidate_diagnostics("/shared", &second, vec![diagnostic("second")]);
+        api.publish_attributed_with_candidate_checks(
+            Path::new("/shared"),
+            crate::statusfile::VerdictPayload::red(1),
+            Some("same-base".to_string()),
+            Some(second.clone()),
+            false,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+
+        let first_status = api
+            .get_status_candidate_attributed("/shared", &first.manifest_digest)
+            .unwrap();
+        let second_status = api
+            .get_status_candidate_attributed("/shared", &second.manifest_digest)
+            .unwrap();
+        assert_eq!(
+            first_status.candidate_snapshot_digest.as_deref(),
+            Some(first.snapshot_digest.as_str())
+        );
+        assert_eq!(
+            second_status.candidate_tree_oid.as_deref(),
+            Some(second.tree_oid.as_str())
+        );
+        assert_eq!(
+            api.get_diagnostics_candidate_attributed("/shared", &first.manifest_digest)[0].message,
+            "first"
+        );
+        assert_eq!(
+            api.get_diagnostics_candidate_attributed("/shared", &second.manifest_digest)[0].message,
+            "second"
+        );
+        let first_event = events.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second_event = events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            first_event.candidate_manifest_digest.as_deref(),
+            Some(first.manifest_digest.as_str())
+        );
+        assert_eq!(
+            second_event.candidate_manifest_digest.as_deref(),
+            Some(second.manifest_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn candidate_snapshot_pairing_rejects_missing_or_mismatched_manifest_before_materialization() {
+        let api = ServeVerdictState::new();
+        let state = temp_root("candidate-pre-materialize");
+        let forbidden_root = state.join("must-not-be-created");
+        let comparison_base = "f".repeat(40);
+
+        let missing = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(forbidden_root.to_string_lossy().into_owned()),
+            comparison_base_sha: Some(comparison_base.clone()),
+            candidate_snapshot: None,
+            ..Default::default()
+        };
+        let ack = api.push_overlay_with_options(
+            "/client/candidate-missing",
+            "origin/main",
+            &[],
+            None,
+            Some(&missing),
+        );
+        assert!(!ack.accepted);
+        assert!(
+            ack.reject_body
+                .as_deref()
+                .is_some_and(|body| body.contains("candidate_snapshot.manifest_missing")),
+            "comparison_base_sha without a typed manifest must fail with stable taxonomy: {ack:?}"
+        );
+        assert!(
+            !forbidden_root.exists(),
+            "pairing validation must run before repository sync or materialization"
+        );
+
+        let mismatched = PushOverlayOptions {
+            candidate_snapshot: Some(candidate_snapshot_golden()),
+            ..missing
+        };
+        let ack = api.push_overlay_with_options(
+            "/client/candidate-mismatch",
+            "origin/main",
+            &[],
+            None,
+            Some(&mismatched),
+        );
+        assert!(!ack.accepted);
+        assert!(
+            ack.reject_body
+                .as_deref()
+                .is_some_and(|body| body.contains("candidate_snapshot.comparison_base_mismatch")),
+            "transport comparison base must equal the manifest authority: {ack:?}"
+        );
+        assert!(
+            !forbidden_root.exists(),
+            "mismatch rejection must remain pre-materialization"
+        );
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn candidate_backed_project_checks_are_never_coalesced() {
+        let project = setup_batch_project("candidate-no-coalesce");
+        let context = ProjectCheckRunContext {
+            root: project.root.clone(),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            base_ref: "origin/main".into(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(candidate_snapshot_golden()),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: Some(vec!["no-fail-token".into()]),
+        };
+
+        assert!(
+            ServeVerdictState::new()
+                .coalesced_project_check(Path::new("/client/candidate"), &context)
+                .is_none(),
+            "a digest-bound candidate must retain its own materialization and cannot join a union overlay"
+        );
+    }
+
+    fn candidate_materialization_context(label: &str) -> (PathBuf, ProjectCheckRunContext) {
+        let root = temp_root(label);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(root.join("remove.txt"), b"remove me\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate base"]);
+        let manifest = overlay_manifest_with_delete_empty_executable_and_binary(&root);
+        let context = ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec![
+                "binary.bin".into(),
+                "empty.bin".into(),
+                "remove.txt".into(),
+                "script.sh".into(),
+            ]),
+            base_ref: manifest.comparison_base.commit_sha.clone(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(manifest),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: None,
+        };
+        (root, context)
+    }
+
+    #[test]
+    fn candidate_snapshot_requires_configured_external_daemon_state() {
+        let (root, context) = candidate_materialization_context("candidate-state-required");
+        let api = ServeVerdictState::new();
+        let mut invoked = false;
+
+        let result = api.with_project_check_overlay(
+            &context,
+            |_scratch, _warm, _candidate_manifest_path| {
+                invoked = true;
+            },
+        );
+
+        let error = result.expect_err("typed candidates must not use repo-internal fallback state");
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "missing protected daemon state must use the frozen code: {error}"
+        );
+        assert!(!invoked, "the policy child must not execute");
+        assert!(
+            !root
+                .join(".cargoless/candidate-project-check-runs")
+                .exists(),
+            "typed candidates must not create transient authority inside repository contents"
+        );
+        assert!(
+            !root.join(".cargoless/project-check-runs").exists(),
+            "typed candidates must not fall back to the legacy scratch namespace"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_candidate_rejects_before_creating_protected_state() {
+        let (root, context) = candidate_materialization_context("candidate-non-linux-unsupported");
+        let state_dir = temp_root("candidate-non-linux-unsupported-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let mut invoked = false;
+
+        let error = api
+            .with_project_check_overlay(&context, |_scratch, _warm, _sidecar| {
+                invoked = true;
+            })
+            .expect_err("typed candidate authority is unsupported without Linux sealing");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        assert!(!invoked, "the candidate callback must not execute");
+        assert!(
+            !state_dir.join("candidate-project-check-runs").exists(),
+            "rejection occurs before scratch authority creation"
+        );
+        assert!(
+            !state_dir.join("project-check-runs").exists(),
+            "typed rejection never creates legacy scratch authority"
+        );
+        assert!(
+            !state_dir.join("candidate-snapshots").exists(),
+            "rejection occurs before sidecar authority creation"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_protected_cleanup_preserves_post_verify_replacement() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        let state_dir = temp_root("non-linux-cleanup-post-verify-replacement");
+        let namespace = state_dir.join("candidate-snapshots");
+        let run = namespace.join("run-recorded");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(run.join("original.sentinel"), b"original\n").unwrap();
+        let protected = ProtectedRunDirectory::capture(
+            std::fs::canonicalize(&run).unwrap(),
+            &std::fs::canonicalize(&namespace).unwrap(),
+        )
+        .unwrap();
+        let saved = namespace.join("saved-recorded-run");
+
+        let error = remove_bound_protected_run_with_after_verify(&protected, |path| {
+            std::fs::rename(path, &saved).unwrap();
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700).create(path).unwrap();
+            std::fs::write(path.join("replacement.sentinel"), b"must survive\n").unwrap();
+        })
+        .expect_err("non-Linux cleanup has no atomic bound deletion primitive");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(run.join("replacement.sentinel")).unwrap(),
+            b"must survive\n"
+        );
+        assert_eq!(
+            std::fs::read(saved.join("original.sentinel")).unwrap(),
+            b"original\n"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn candidate_snapshot_rejects_configured_state_inside_candidate_repository() {
+        let (root, context) = candidate_materialization_context("candidate-state-in-repo");
+        let state_dir = root.join(".daemon-state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let mut invoked = false;
+
+        let result = api.with_project_check_overlay(
+            &context,
+            |_scratch, _warm, _candidate_manifest_path| {
+                invoked = true;
+            },
+        );
+
+        let error = result.expect_err("configured candidate state must still be external");
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "in-repository state rejection must use the frozen code: {error}"
+        );
+        assert!(!invoked, "the policy child must not execute");
+        assert!(
+            !state_dir.join("candidate-snapshots").exists(),
+            "unsafe state is rejected before sidecar setup"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_snapshot_rejects_symlinked_sidecar_parent_before_child_execution() {
+        use std::os::unix::fs::symlink;
+
+        let (root, context) = candidate_materialization_context("candidate-sidecar-symlink");
+        let state_dir = temp_root("candidate-sidecar-symlink-state");
+        let outside = temp_root("candidate-sidecar-symlink-outside");
+        std::fs::write(outside.join("sentinel"), b"must remain untouched\n").unwrap();
+        symlink(&outside, state_dir.join("candidate-snapshots")).unwrap();
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let mut invoked = false;
+
+        let result = api.with_project_check_overlay(
+            &context,
+            |_scratch, _warm, _candidate_manifest_path| {
+                invoked = true;
+            },
+        );
+
+        let error = result.expect_err("sidecar namespace symlinks must fail closed");
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "symlink rejection must use the frozen code: {error}"
+        );
+        assert!(!invoked, "the policy child must not execute");
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"must remain untouched\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_snapshot_rejects_non_directory_or_permissive_sidecar_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (label, create_parent) in [
+            (
+                "file",
+                Box::new(|parent: &Path| std::fs::write(parent, b"not a directory\n"))
+                    as Box<dyn FnOnce(&Path) -> std::io::Result<()>>,
+            ),
+            (
+                "permissive",
+                Box::new(|parent: &Path| {
+                    std::fs::create_dir(parent)?;
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+                }),
+            ),
+        ] {
+            let (root, context) =
+                candidate_materialization_context(&format!("candidate-sidecar-{label}"));
+            let state_dir = temp_root(&format!("candidate-sidecar-{label}-state"));
+            create_parent(&state_dir.join("candidate-snapshots")).unwrap();
+            let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+            let mut invoked = false;
+
+            let result = api.with_project_check_overlay(
+                &context,
+                |_scratch, _warm, _candidate_manifest_path| {
+                    invoked = true;
+                },
+            );
+
+            let error = result.expect_err("unsafe sidecar namespace must fail closed");
+            assert!(
+                error.starts_with("candidate_snapshot.environment_unsafe:"),
+                "{label} parent rejection must use the frozen code: {error}"
+            );
+            assert!(!invoked, "the policy child must not execute");
+            let _ = std::fs::remove_dir_all(root);
+            let _ = if label == "file" {
+                std::fs::remove_file(state_dir.join("candidate-snapshots"))
+            } else {
+                Ok(())
+            };
+            let _ = std::fs::remove_dir_all(state_dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_snapshot_materializes_delete_empty_mode_and_binary_then_scopes_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_root("candidate-materialize");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(root.join("remove.txt"), b"remove me\n").unwrap();
+        std::fs::create_dir_all(root.join(".cargoless")).unwrap();
+        std::fs::write(
+            root.join(".cargoless/candidate-snapshot.json"),
+            b"tracked candidate content\n",
+        )
+        .unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate base"]);
+        let manifest = overlay_manifest_with_delete_empty_executable_and_binary(&root);
+        let state_dir = temp_root("candidate-materialize-state");
+        std::fs::write(state_dir.join("keep.sentinel"), b"unrelated state\n").unwrap();
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec![
+                "binary.bin".into(),
+                "empty.bin".into(),
+                "remove.txt".into(),
+                "script.sh".into(),
+            ]),
+            base_ref: manifest.comparison_base.commit_sha.clone(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(manifest.clone()),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: None,
+        };
+
+        let (scratch, manifest_path, manifest_run_dir) = api
+            .with_project_check_overlay(&context, |scratch, _warm, manifest_path| {
+                let manifest_path = manifest_path.expect("typed run has an external manifest");
+                assert!(
+                    !scratch.join("remove.txt").exists(),
+                    "typed delete is not an empty-file upsert"
+                );
+                assert_eq!(std::fs::read(scratch.join("empty.bin")).unwrap(), b"");
+                assert_eq!(
+                    std::fs::read(scratch.join("binary.bin")).unwrap(),
+                    [0_u8, 0xff, 0x80, b'\n'],
+                    "candidate payloads are arbitrary bytes, not UTF-8 strings"
+                );
+                assert_eq!(
+                    std::fs::metadata(scratch.join("script.sh"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0o111,
+                    "mode 100755 must remain executable"
+                );
+                assert_eq!(
+                    std::fs::read(scratch.join(".cargoless/candidate-snapshot.json")).unwrap(),
+                    b"tracked candidate content\n",
+                    "the protocol sidecar must never overwrite tracked candidate content"
+                );
+                assert!(
+                    !manifest_path.starts_with(scratch),
+                    "the protocol sidecar is outside candidate contents"
+                );
+                assert!(
+                    manifest_path
+                        .to_string_lossy()
+                        .contains("/candidate-snapshots/run-"),
+                    "manifest path must use the state-dir run namespace: {}",
+                    manifest_path.display()
+                );
+                let per_run = parse_and_validate_manifest_json(
+                    &std::fs::read_to_string(manifest_path).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(per_run, manifest, "the per-run file is the bound manifest");
+                assert_eq!(
+                    std::fs::metadata(manifest_path)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                let manifest_run_dir = manifest_path.parent().unwrap();
+                assert_eq!(
+                    std::fs::metadata(manifest_run_dir)
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                (
+                    scratch.to_path_buf(),
+                    manifest_path.to_path_buf(),
+                    manifest_run_dir.to_path_buf(),
+                )
+            })
+            .unwrap();
+
+        assert!(
+            !scratch.exists(),
+            "only the completed run scratch is removed"
+        );
+        assert!(
+            !manifest_path.exists(),
+            "the per-run manifest is not retained"
+        );
+        assert!(
+            !manifest_run_dir.exists(),
+            "the per-run manifest directory is not retained"
+        );
+        assert_eq!(
+            std::fs::read(state_dir.join("keep.sentinel")).unwrap(),
+            b"unrelated state\n",
+            "cleanup must not sweep sibling daemon state"
+        );
+        assert_eq!(
+            std::fs::read(root.join("remove.txt")).unwrap(),
+            b"remove me\n",
+            "candidate operations never mutate the shared analysis root"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_snapshot_uses_private_unpredictable_state_runs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (root, context) = candidate_materialization_context("candidate-private-runs");
+        let state_dir = temp_root("candidate-private-runs-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+
+        let run_names = api
+            .with_project_check_overlay(&context, |scratch, _warm, sidecar| {
+                let sidecar = sidecar.expect("typed run has an external sidecar");
+                let scratch_name = scratch
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let candidate_name = sidecar
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                assert_eq!(
+                    scratch
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .file_name()
+                        .and_then(|name| name.to_str()),
+                    Some("candidate-project-check-runs")
+                );
+                for directory in [
+                    scratch,
+                    scratch.parent().unwrap(),
+                    scratch.parent().unwrap().parent().unwrap(),
+                    sidecar.parent().unwrap(),
+                    sidecar.parent().unwrap().parent().unwrap(),
+                ] {
+                    assert_eq!(
+                        std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                        0o700,
+                        "protected namespace/run `{}` must be mode 0700",
+                        directory.display()
+                    );
+                }
+                (scratch_name, candidate_name)
+            })
+            .unwrap();
+
+        for name in [&run_names.0, &run_names.1] {
+            let suffix = name
+                .strip_prefix("run-")
+                .expect("protected run names use the closed run- namespace");
+            assert!(
+                suffix.len() >= 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "run authority must use an unpredictable hexadecimal suffix, got {name:?}"
+            );
+            assert!(
+                !name.contains(&std::process::id().to_string()),
+                "PID/sequence names are predictable and not authorities: {name:?}"
+            );
+        }
+        assert_eq!(run_names.0, run_names.1, "one run uses one authority key");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_cleanup_rejects_and_preserves_a_substituted_manifest_run() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let (root, context) = candidate_materialization_context("candidate-sidecar-substitute");
+        let state_dir = temp_root("candidate-sidecar-substitute-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let mut original = None;
+        let mut replacement = None;
+
+        let error = api
+            .with_project_check_overlay(&context, |_scratch, _warm, sidecar| {
+                let run = sidecar.unwrap().parent().unwrap().to_path_buf();
+                let saved = run.with_extension("original");
+                std::fs::rename(&run, &saved).unwrap();
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700).create(&run).unwrap();
+                std::fs::write(run.join("substitute.sentinel"), b"must survive\n").unwrap();
+                original = Some(saved);
+                replacement = Some(run);
+                "verified"
+            })
+            .expect_err("candidate cleanup must reject a substituted run directory");
+
+        assert!(
+            error.starts_with("candidate_snapshot.cleanup_failed:"),
+            "{error}"
+        );
+        let replacement = replacement.unwrap();
+        assert_eq!(
+            std::fs::read(replacement.join("substitute.sentinel")).unwrap(),
+            b"must survive\n",
+            "cleanup must never delete a path whose file identity changed"
+        );
+        std::fs::remove_dir_all(&replacement).unwrap();
+        std::fs::rename(original.unwrap(), &replacement).unwrap();
+        cleanup_candidate_manifest_run(&replacement).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_cleanup_preserves_post_quarantine_name_replacement() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        let state_dir = temp_root("candidate-quarantine-replacement");
+        let namespace = state_dir.join("candidate-snapshots");
+        let run = namespace.join("run-recorded");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(run.join("original.sentinel"), b"original\n").unwrap();
+        let protected = ProtectedRunDirectory::capture(
+            std::fs::canonicalize(&run).unwrap(),
+            &std::fs::canonicalize(&namespace).unwrap(),
+        )
+        .unwrap();
+        let saved = namespace.join("saved-recorded-run");
+        let mut replacement = None;
+
+        let error = cleanup_protected_candidate_manifest_run_with_after_quarantine(
+            &protected,
+            |quarantine| {
+                std::fs::rename(quarantine, &saved).unwrap();
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700).create(quarantine).unwrap();
+                std::fs::write(quarantine.join("replacement.sentinel"), b"must survive\n").unwrap();
+                replacement = Some(quarantine.to_path_buf());
+            },
+        )
+        .expect_err("cleanup must reject a post-verification quarantine replacement");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        let replacement = replacement.unwrap();
+        assert_eq!(
+            std::fs::read(replacement.join("replacement.sentinel")).unwrap(),
+            b"must survive\n"
+        );
+        assert_eq!(
+            std::fs::read(saved.join("original.sentinel")).unwrap(),
+            b"original\n",
+            "the recorded run and the replacement are both preserved"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_cleanup_rejects_dangling_original_path_substitution() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let state_dir = temp_root("candidate-original-dangling-substitution");
+        let namespace = state_dir.join("candidate-snapshots");
+        let run = namespace.join("run-recorded");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let protected = ProtectedRunDirectory::capture(
+            std::fs::canonicalize(&run).unwrap(),
+            &std::fs::canonicalize(&namespace).unwrap(),
+        )
+        .unwrap();
+
+        let error = cleanup_protected_candidate_manifest_run_with_after_quarantine(
+            &protected,
+            |_quarantine| {
+                symlink(state_dir.join("missing-target"), &run).unwrap();
+            },
+        )
+        .expect_err("a dangling replacement at the original run name is still a substitution");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&run)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "cleanup must preserve the substituted symlink"
+        );
+        let _ = std::fs::remove_file(&run);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_cleanup_rejects_and_preserves_a_substituted_scratch_run() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let (root, context) = candidate_materialization_context("candidate-scratch-substitute");
+        let state_dir = temp_root("candidate-scratch-substitute-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let mut original = None;
+        let mut replacement = None;
+
+        let error = api
+            .with_project_check_overlay(&context, |scratch, _warm, _sidecar| {
+                let run = scratch
+                    .parent()
+                    .expect("checkout has a protected run parent")
+                    .to_path_buf();
+                let saved = run.with_extension("original");
+                std::fs::rename(&run, &saved).unwrap();
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700).create(&run).unwrap();
+                std::fs::write(run.join("substitute.sentinel"), b"must survive\n").unwrap();
+                original = Some(saved);
+                replacement = Some(run);
+                "verified"
+            })
+            .expect_err("candidate cleanup must reject a substituted scratch directory");
+
+        assert!(
+            error.starts_with("candidate_snapshot.cleanup_failed:"),
+            "{error}"
+        );
+        let replacement = replacement.unwrap();
+        assert_eq!(
+            std::fs::read(replacement.join("substitute.sentinel")).unwrap(),
+            b"must survive\n",
+            "cleanup must preserve a substituted scratch path"
+        );
+        std::fs::remove_dir_all(&replacement).unwrap();
+        std::fs::rename(original.unwrap(), &replacement).unwrap();
+        cleanup_project_check_scratch(&root, &replacement.join("worktree")).unwrap();
+        std::fs::remove_dir(&replacement).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_cleanup_never_adopts_an_unrecorded_run_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = setup_batch_project("unrecorded-incomplete-scratch");
+        let state_dir = temp_root("unrecorded-incomplete-scratch-state");
+        let namespace = state_dir.join("project-check-runs");
+        let scratch = namespace.join("run-unrecorded");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(scratch.join("substitute.sentinel"), b"must survive\n").unwrap();
+
+        let error = cleanup_incomplete_project_check_scratch(
+            &project.root,
+            &scratch,
+            &std::fs::canonicalize(&namespace).unwrap(),
+        )
+        .expect_err("cleanup may only delete a run identity captured before population");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(scratch.join("substitute.sentinel")).unwrap(),
+            b"must survive\n",
+            "an unrecorded substitute must never be adopted and deleted"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+        let _ = std::fs::remove_dir_all(project.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_checkout_lives_beneath_a_prebound_private_run() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let (root, context) = candidate_materialization_context("candidate-prebound-run");
+        let state_dir = temp_root("candidate-prebound-run-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+
+        api.with_project_check_overlay(&context, |scratch, _warm, _sidecar| {
+            assert_eq!(
+                scratch.file_name().and_then(|name| name.to_str()),
+                Some("worktree"),
+                "Git must populate a checkout beneath the pre-bound authority directory"
+            );
+            let run = scratch
+                .parent()
+                .expect("checkout has a protected run parent");
+            assert!(
+                run.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("run-")),
+                "the protected wrapper retains the unpredictable run identity"
+            );
+            let metadata = std::fs::symlink_metadata(run).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(metadata.uid(), effective_user_id());
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn candidate_run_cleans_external_manifest_on_returned_error_and_panic() {
+        let root = temp_root("candidate-cleanup-all-exits");
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        std::fs::write(root.join("remove.txt"), b"remove me\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate base"]);
+        let manifest = overlay_manifest_with_delete_empty_executable_and_binary(&root);
+        let state_dir = temp_root("candidate-cleanup-all-exits-state");
+        let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let context = ProjectCheckRunContext {
+            root: root.clone(),
+            changed_files: Some(vec!["empty.bin".into()]),
+            base_ref: manifest.comparison_base.commit_sha.clone(),
+            base_sha: None,
+            source_ref: None,
+            source_sha: None,
+            candidate_snapshot: Some(manifest),
+            overlay_files: Vec::new(),
+            materialize_overlay: true,
+            gate: true,
+            check_ids: None,
+        };
+
+        let callback_error = api
+            .with_project_check_overlay(&context, |_scratch, _warm, manifest_path| {
+                assert!(manifest_path.is_some());
+                Err::<(), String>("policy returned an error".to_string())
+            })
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(callback_error, "policy returned an error");
+        assert_candidate_run_dirs_empty(&state_dir);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                api.with_project_check_overlay(&context, |_scratch, _warm, manifest_path| -> () {
+                    assert!(manifest_path.is_some());
+                    panic!("simulated project-check panic");
+                });
+        }));
+        assert!(panic.is_err(), "the project-check panic remains observable");
+        assert_candidate_run_dirs_empty(&state_dir);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    fn assert_candidate_run_dirs_empty(state_dir: &Path) {
+        for parent in [
+            "project-check-runs",
+            "candidate-project-check-runs",
+            "candidate-snapshots",
+        ] {
+            let path = state_dir.join(parent);
+            let count = std::fs::read_dir(&path)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            assert_eq!(count, 0, "{parent} must not retain completed run state");
+        }
+    }
+
+    #[test]
     fn project_check_overlay_materializes_changed_files_then_cleans_root() {
         let root = temp_root("project-overlay");
         git(&root, &["init"]);
@@ -9201,6 +13097,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![
                 (
                     root.join("src/lib.rs").to_string_lossy().into_owned(),
@@ -9217,7 +13114,7 @@ checks:
         };
 
         let seen = api
-            .with_project_check_overlay(&context, |root, _warm| {
+            .with_project_check_overlay(&context, |root, _warm, _candidate_manifest_path| {
                 (
                     std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
                     std::fs::read_to_string(root.join("new.yaml")).unwrap(),
@@ -9251,6 +13148,7 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             overlay_files: vec![
                 (
                     project
@@ -9271,7 +13169,7 @@ checks:
         };
 
         let seen = api
-            .with_project_check_overlay(&context, |root, _warm| {
+            .with_project_check_overlay(&context, |root, _warm, _candidate_manifest_path| {
                 assert_ne!(
                     root,
                     project.root.as_path(),
@@ -9337,20 +13235,40 @@ checks:
     }
 
     #[test]
-    fn project_check_startup_recovery_removes_abandoned_scratch_only() {
+    fn project_check_startup_recovery_removes_abandoned_run_artifacts_only() {
         let project = setup_batch_project("project-overlay-startup-recovery");
         let state_dir = temp_root("project-overlay-startup-recovery-state");
         let scratch = state_dir.join("project-check-runs/run-1-7");
+        let candidate_run = state_dir.join("candidate-snapshots/run-1-7");
         let warm_marker = state_dir.join("witness-target-warm/current/keep");
 
         prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
         std::fs::create_dir_all(warm_marker.parent().unwrap()).unwrap();
         std::fs::write(&warm_marker, "warm cache is durable\n").unwrap();
+        std::fs::create_dir_all(&candidate_run).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                scratch.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(
+                candidate_run.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            std::fs::set_permissions(&candidate_run, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        std::fs::write(candidate_run.join("manifest.json"), "abandoned sidecar\n").unwrap();
 
         let recovered = recover_project_check_scratch(&project.root, &state_dir)
             .expect("daemon startup must reclaim scratch left by a dead predecessor");
 
-        assert_eq!(recovered, 1, "one abandoned run was reclaimed");
+        assert_eq!(recovered, 2, "both abandoned run artifacts were reclaimed");
         assert!(
             !scratch.exists(),
             "abandoned scratch no longer consumes the PVC"
@@ -9358,6 +13276,10 @@ checks:
         assert!(
             warm_marker.exists(),
             "startup recovery preserves the durable warm target"
+        );
+        assert!(
+            !candidate_run.exists(),
+            "startup recovery removes the abandoned external manifest"
         );
         let registrations = Command::new("git")
             .arg("-C")
@@ -9374,6 +13296,224 @@ checks:
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_startup_recovers_legacy_0755_direct_worktree_without_weakening_candidates() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = setup_batch_project("external-legacy-direct-worktree-recovery");
+        let state_dir = temp_root("external-legacy-direct-worktree-recovery-state");
+        let scratch_namespace = state_dir.join("project-check-runs");
+        let scratch = scratch_namespace.join("run-legacy-direct");
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
+        std::fs::set_permissions(&scratch_namespace, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let candidate_namespace = state_dir.join("candidate-snapshots");
+        std::fs::create_dir(&candidate_namespace).unwrap();
+        std::fs::set_permissions(&candidate_namespace, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+
+        let recovered = recover_project_check_scratch_for_source(
+            &project.root,
+            &state_dir,
+            cargoless_core::config::Source::Cli,
+        )
+        .expect("safe legacy direct worktrees remain recoverable after upgrade");
+
+        assert_eq!(recovered, 1);
+        assert!(
+            !scratch.exists(),
+            "the abandoned direct worktree is removed"
+        );
+        assert_eq!(
+            std::fs::metadata(&candidate_namespace)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "legacy compatibility must not relax candidate namespace mode"
+        );
+        let registrations = Command::new("git")
+            .arg("-C")
+            .arg(&project.root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(registrations.status.success());
+        assert!(
+            !String::from_utf8_lossy(&registrations.stdout)
+                .contains(scratch.to_string_lossy().as_ref()),
+            "recovery prunes the old worktree registration"
+        );
+        let _ = std::fs::remove_dir_all(project.root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_startup_rejects_permissive_candidate_scratch_before_paired_deletion() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = setup_batch_project("external-permissive-candidate-scratch-recovery");
+        let state_dir = temp_root("external-permissive-candidate-scratch-recovery-state");
+        let candidate_scratch_namespace = state_dir.join("candidate-project-check-runs");
+        let candidate_scratch = candidate_scratch_namespace.join("run-paired");
+        std::fs::create_dir_all(&candidate_scratch).unwrap();
+        std::fs::set_permissions(
+            &candidate_scratch_namespace,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(&candidate_scratch, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(
+            candidate_scratch.join("scratch.sentinel"),
+            b"must survive\n",
+        )
+        .unwrap();
+
+        let candidate_namespace = state_dir.join("candidate-snapshots");
+        let candidate_run = candidate_namespace.join("run-paired");
+        std::fs::create_dir_all(&candidate_run).unwrap();
+        std::fs::set_permissions(&candidate_namespace, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(&candidate_run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(candidate_run.join("manifest.json"), b"must survive\n").unwrap();
+
+        let error = recover_project_check_scratch_for_source(
+            &project.root,
+            &state_dir,
+            cargoless_core::config::Source::Cli,
+        )
+        .expect_err("candidate scratch and sidecar namespaces are one strict recovery unit");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(candidate_scratch.join("scratch.sentinel")).unwrap(),
+            b"must survive\n",
+            "unsafe candidate scratch validation must precede all deletion"
+        );
+        assert_eq!(
+            std::fs::read(candidate_run.join("manifest.json")).unwrap(),
+            b"must survive\n",
+            "paired sidecar state is preserved when candidate scratch is unsafe"
+        );
+        let _ = std::fs::remove_dir_all(project.root);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_relative_startup_recovery_leaves_candidate_namespace_untouched() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = setup_batch_project("project-overlay-default-state-recovery");
+        let state_dir = project.root.join(".cargoless");
+        let scratch = state_dir.join("project-check-runs/run-abandoned");
+        let candidate_run = state_dir.join("candidate-snapshots/run-abandoned");
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
+        std::fs::create_dir_all(&candidate_run).unwrap();
+        std::fs::set_permissions(
+            candidate_run.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&candidate_run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            candidate_run.join("manifest.json"),
+            b"do not inspect or delete\n",
+        )
+        .unwrap();
+
+        let recovered = recover_project_check_scratch(&project.root, &state_dir)
+            .expect("legacy exact-Git recovery remains available");
+
+        assert_eq!(recovered, 1, "only the exact-Git scratch is recovered");
+        assert!(!scratch.exists());
+        assert_eq!(
+            std::fs::read(candidate_run.join("manifest.json")).unwrap(),
+            b"do not inspect or delete\n",
+            "repo-relative default state must leave typed candidate state untouched"
+        );
+        let _ = std::fs::remove_dir_all(project.root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_state_symlink_never_reclassifies_or_deletes_external_candidate_state() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let project = setup_batch_project("project-overlay-default-state-symlink");
+        let external = temp_root("project-overlay-default-state-symlink-external");
+        let candidate_run = external.join("candidate-snapshots/run-abandoned");
+        std::fs::create_dir_all(&candidate_run).unwrap();
+        std::fs::set_permissions(
+            candidate_run.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&candidate_run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            candidate_run.join("manifest.json"),
+            b"must remain untouched\n",
+        )
+        .unwrap();
+        let default_state = project.root.join(".cargoless");
+        symlink(&external, &default_state).unwrap();
+
+        let recovered = recover_project_check_scratch_for_source(
+            &project.root,
+            &default_state,
+            cargoless_core::config::Source::Default,
+        )
+        .expect("repo-default state stays typed-disabled even when its path is hostile");
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            std::fs::read(candidate_run.join("manifest.json")).unwrap(),
+            b"must remain untouched\n",
+            "default provenance must be checked before canonicalizing a symlink target"
+        );
+        let _ = std::fs::remove_file(default_state);
+        let _ = std::fs::remove_dir_all(project.root);
+        let _ = std::fs::remove_dir_all(external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_external_startup_state_fails_before_any_recovery_deletion() {
+        use std::os::unix::fs::symlink;
+
+        let project = setup_batch_project("project-overlay-unsafe-state-recovery");
+        let state_dir = temp_root("project-overlay-unsafe-state-recovery-state");
+        let outside = temp_root("project-overlay-unsafe-state-recovery-outside");
+        let scratch = state_dir.join("project-check-runs/run-abandoned");
+        prepare_project_check_scratch(&project.root, &scratch, "origin/main").unwrap();
+        symlink(&outside, state_dir.join("candidate-snapshots")).unwrap();
+
+        let error = recover_project_check_scratch(&project.root, &state_dir)
+            .expect_err("an unsafe external namespace must fail closed");
+
+        assert!(
+            error.starts_with("candidate_snapshot.environment_unsafe:"),
+            "{error}"
+        );
+        assert!(
+            scratch.exists(),
+            "all protected namespaces must be validated before recovery deletes anything"
+        );
+        cleanup_project_check_scratch(&project.root, &scratch).unwrap();
+        let _ = std::fs::remove_file(state_dir.join("candidate-snapshots"));
+        let _ = std::fs::remove_dir_all(project.root);
+        let _ = std::fs::remove_dir_all(state_dir);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
     #[test]
     fn push_overlay_with_options_rejects_escaping_repo_relative_paths() {
         let api = ServeVerdictState::new();
@@ -9384,6 +13524,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -9613,6 +13755,8 @@ checks:
             base_sha: Some(sha.to_string()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -9796,6 +13940,7 @@ checks:
             base_sha: Some(sha.into()),
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
@@ -9828,6 +13973,7 @@ checks:
             base_sha: Some(sha.into()),
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: None,
             check_profile: None,
@@ -9972,6 +14118,7 @@ checks:
             base_sha: Some("cafe1234".into()),
             source_ref: None,
             source_sha: None,
+            candidate_snapshot: None,
             last_push_unix: crate::statusfile::now_unix(),
             changed_files: changed,
             check_profile: None,
@@ -10155,6 +14302,8 @@ checks:
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/lib.rs".into(), "src/main.rs".into()]),
             gate: false,
             check_ids: None,
@@ -10181,6 +14330,8 @@ checks:
             base_sha: None,
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -10206,6 +14357,8 @@ checks:
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: Some(vec!["src/removed.rs".into()]),
             gate: false,
             check_ids: None,
@@ -10819,6 +14972,7 @@ checks:
                 base_sha: None,
                 source_ref: None,
                 source_sha: None,
+                candidate_snapshot: None,
                 overlay_files: Vec::new(),
                 materialize_overlay: false,
                 gate: true,

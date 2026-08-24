@@ -483,6 +483,9 @@ mod tests {
             red_diagnostics: 1,
             verdict_failure_reason: None,
             base_sha: None,
+            candidate_manifest_digest: None,
+            candidate_snapshot_digest: None,
+            candidate_tree_oid: None,
             ra_blind_paths: false,
             published_at: 99,
         };

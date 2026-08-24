@@ -44,6 +44,9 @@ use std::process::{Command, ExitCode};
 
 use cargoless_core::transport::http::{HttpClient, MAX_OVERLAY_BYTES, prepare_json_body};
 use cargoless_core::transport::{CheckProfile, PushOverlayOptions, Request, TransportClient};
+use cargoless_core::{
+    CandidateSnapshot, CandidateSnapshotManifest, OverlayOperation, decode_overlay_payload,
+};
 
 const WORKSPACE_CONFIG_FILES: &[&str] = &[
     "Cargo.toml",
@@ -110,62 +113,31 @@ impl AwaitFreshness {
     }
 }
 
-/// `cargoless push` entry. Returns an `ExitCode` per the v0 CLI
-/// convention: 0 = success (ack.accepted=true), 1 = rejected / transport
-/// error, 2 = setup / config error.
-pub fn run(opts: &PushOpts) -> ExitCode {
-    // 1. Enumerate changed files via git.
-    let changed = match git_changed_files(&opts.repo, &opts.base) {
-        Ok(files) => files,
-        Err(e) => {
-            crate::ui::error(format!(
-                "push: git diff against `{}` in `{}` failed: {e}",
-                opts.base,
-                opts.repo.display()
-            ));
-            return ExitCode::from(2);
-        }
-    };
-    if changed.is_empty() && !opts.await_verdict {
-        eprintln!(
-            "[cargoless:push] no changes vs {} in {} — nothing to push",
-            opts.base,
-            opts.repo.display()
-        );
-        return ExitCode::from(0);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyAwaitStatusAddress<'a> {
+    Latest,
+    Base(&'a str),
+}
 
-    // 2. Build the minimal overlay payload from exactly the git diff paths.
-    //    Changed source/text/config files are read as content or fail setup;
-    //    unsupported artifact extensions remain metadata-only for trigger
-    //    selection. Hard-excluded runtime/cache paths do not enter the sent
-    //    request at all. Deleted content files are carried deliberately as
-    //    empty overlays, preserving the existing push/delete representation
-    //    rather than silently dropping them.
+fn legacy_await_status_address(base_sha: Option<&str>) -> LegacyAwaitStatusAddress<'_> {
+    match base_sha {
+        Some(base_sha) => LegacyAwaitStatusAddress::Base(base_sha),
+        None => LegacyAwaitStatusAddress::Latest,
+    }
+}
+
+struct PreparedLegacyPushRequest {
+    payload: PushPayload,
+    options: Option<PushOverlayOptions>,
+    body: String,
+}
+
+fn prepare_legacy_push_request(
+    opts: &PushOpts,
+    changed: &[String],
+) -> Result<PreparedLegacyPushRequest, PushPayloadError> {
     let repo_relative = opts.server_root.is_some();
-    let mut payload = match build_push_payload(&opts.repo, &changed, repo_relative) {
-        Ok(payload) => payload,
-        Err(e) => {
-            crate::ui::error(e.to_string());
-            return ExitCode::from(2);
-        }
-    };
-    if payload.files.is_empty() && payload.trigger_paths.is_empty() && !opts.await_verdict {
-        eprintln!(
-            "[cargoless:push] all changes vs {} in {} are excluded runtime/cache paths — nothing to push",
-            opts.base,
-            opts.repo.display()
-        );
-        return ExitCode::from(0);
-    }
-
-    // 3. **C6 client-side canonicalize** (closes #262). Sort by path so
-    //    the daemon's `cluster_hash_from_pushed` sees a deterministic
-    //    file order regardless of how git/the OS enumerated the
-    //    changes. Without this, two semantically-identical pushes
-    //    could produce different cluster hashes ⇒ wrong-cluster
-    //    routing — which is the cross-WT-cluster-routing regression
-    //    class L3 flagged as worth a fix.
+    let mut payload = build_push_payload(&opts.repo, changed, repo_relative)?;
     payload.files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut options = PushOverlayOptions {
         changed_files: if payload.trigger_paths.is_empty() {
@@ -193,6 +165,63 @@ pub fn run(opts: &PushOpts) -> ExitCode {
         opts.check_profile.as_ref(),
         options.as_ref(),
     );
+    Ok(PreparedLegacyPushRequest {
+        payload,
+        options,
+        body,
+    })
+}
+
+/// `cargoless push` entry. Returns an `ExitCode` per the v0 CLI
+/// convention: 0 = success (ack.accepted=true), 1 = rejected / transport
+/// error, 2 = setup / config error.
+pub fn run(opts: &PushOpts) -> ExitCode {
+    // 1. Enumerate changed files via git.
+    let changed = match git_changed_files(&opts.repo, &opts.base) {
+        Ok(files) => files,
+        Err(e) => {
+            crate::ui::error(format!(
+                "push: git diff against `{}` in `{}` failed: {e}",
+                opts.base,
+                opts.repo.display()
+            ));
+            return ExitCode::from(2);
+        }
+    };
+    if changed.is_empty() && !opts.await_verdict {
+        eprintln!(
+            "[cargoless:push] no changes vs {} in {} — nothing to push",
+            opts.base,
+            opts.repo.display()
+        );
+        return ExitCode::from(0);
+    }
+
+    // 2. Build the minimal legacy overlay payload from exactly the git diff
+    //    paths. Typed candidate construction is intentionally reserved for
+    //    explicit `verdict --candidate-snapshot` callers of the helpers below.
+    let PreparedLegacyPushRequest {
+        payload,
+        options,
+        body,
+    } = match prepare_legacy_push_request(opts, &changed) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            crate::ui::error(e.to_string());
+            return ExitCode::from(2);
+        }
+    };
+    if payload.files.is_empty() && payload.trigger_paths.is_empty() && !opts.await_verdict {
+        eprintln!(
+            "[cargoless:push] all changes vs {} in {} are excluded runtime/cache paths — nothing to push",
+            opts.base,
+            opts.repo.display()
+        );
+        return ExitCode::from(0);
+    }
+
+    // 3. C6 canonical ordering, options, and wire construction are prepared by
+    //    the shared legacy request helper exercised by the regression test.
     emit_payload_diagnostics(&changed, &payload, body.len());
     if let Err(message) = validate_overlay_http_cap(&body, &payload.content_stats) {
         crate::ui::error(message);
@@ -284,9 +313,11 @@ fn await_verdict(
         // Path D (addressing) — when the push carried a base_sha, poll
         // via `verdict_history` for exactly that commit rather than
         // reading the shared last-publisher slot.
-        let poll = match base_sha {
-            Some(_) => client.get_status_attributed(worktree, base_sha),
-            None => client.get_status(worktree),
+        let poll = match legacy_await_status_address(base_sha) {
+            LegacyAwaitStatusAddress::Base(base_sha) => {
+                client.get_status_attributed(worktree, base_sha)
+            }
+            LegacyAwaitStatusAddress::Latest => client.get_status(worktree),
         };
         match poll {
             Ok(Some(status)) if freshness.is_fresh(status.published_at) => {
@@ -416,6 +447,7 @@ struct MetadataOnlyPath {
 enum MetadataOnlyReason {
     HardExcluded,
     UnsupportedPath,
+    TypedBinary,
 }
 
 impl MetadataOnlyReason {
@@ -423,6 +455,7 @@ impl MetadataOnlyReason {
         match self {
             MetadataOnlyReason::HardExcluded => "excluded",
             MetadataOnlyReason::UnsupportedPath => "metadata-only",
+            MetadataOnlyReason::TypedBinary => "typed-binary",
         }
     }
 }
@@ -580,6 +613,97 @@ pub(crate) fn build_push_payload(
     } else {
         Err(PushPayloadError { failures })
     }
+}
+
+pub(crate) fn candidate_changed_paths(manifest: &CandidateSnapshotManifest) -> Vec<String> {
+    manifest
+        .candidate
+        .operations()
+        .iter()
+        .map(|operation| operation.path().to_string())
+        .collect()
+}
+
+struct LegacyProjection {
+    files: Vec<(String, String)>,
+    omitted_binary_paths: Vec<String>,
+}
+
+fn legacy_projection(
+    repo: &Path,
+    manifest: &CandidateSnapshotManifest,
+    repo_relative: bool,
+) -> Result<LegacyProjection, String> {
+    let CandidateSnapshot::Overlay { operations, .. } = &manifest.candidate else {
+        return Err("push: typed candidate must be an overlay".to_string());
+    };
+    let mut files = Vec::new();
+    let mut omitted_binary_paths = Vec::new();
+    for operation in operations {
+        match operation {
+            OverlayOperation::Delete { path, .. } => {
+                files.push((payload_path(repo, path, repo_relative), String::new()));
+            }
+            OverlayOperation::Upsert { path, payload, .. } => {
+                let bytes = decode_overlay_payload(payload)
+                    .map_err(|error| format!("push: invalid typed payload at {path:?}: {error}"))?;
+                match String::from_utf8(bytes) {
+                    Ok(content) => files.push((payload_path(repo, path, repo_relative), content)),
+                    Err(_) => omitted_binary_paths.push(path.clone()),
+                }
+            }
+        }
+    }
+    Ok(LegacyProjection {
+        files,
+        omitted_binary_paths,
+    })
+}
+
+#[cfg(test)]
+fn legacy_files_from_candidate_snapshot(
+    repo: &Path,
+    manifest: &CandidateSnapshotManifest,
+    repo_relative: bool,
+) -> Result<Vec<(String, String)>, String> {
+    legacy_projection(repo, manifest, repo_relative).map(|projection| projection.files)
+}
+
+pub(crate) fn push_payload_from_candidate_snapshot(
+    repo: &Path,
+    manifest: &CandidateSnapshotManifest,
+    repo_relative: bool,
+) -> Result<PushPayload, String> {
+    let LegacyProjection {
+        files,
+        omitted_binary_paths,
+    } = legacy_projection(repo, manifest, repo_relative)?;
+    let mut payload = PushPayload::new();
+    payload.content_stats = files
+        .iter()
+        .map(|(path, content)| ContentFileStat {
+            path: path.clone(),
+            bytes: content.len(),
+        })
+        .collect();
+    payload.files = files;
+    payload.trigger_paths = candidate_changed_paths(manifest);
+    payload.metadata_only_paths = omitted_binary_paths
+        .into_iter()
+        .map(|path| MetadataOnlyPath {
+            path,
+            reason: MetadataOnlyReason::TypedBinary,
+        })
+        .collect();
+    Ok(payload)
+}
+
+pub(crate) fn apply_candidate_snapshot_options(
+    options: &mut PushOverlayOptions,
+    manifest: &CandidateSnapshotManifest,
+) {
+    options.comparison_base_sha = Some(manifest.comparison_base.commit_sha.clone());
+    options.candidate_snapshot = Some(manifest.clone());
 }
 
 pub(crate) fn push_overlay_request_body(
@@ -889,6 +1013,7 @@ fn payload_path(repo: &Path, rel: &str, repo_relative: bool) -> String {
 mod tests {
     use super::*;
     use cargoless_core::transport::CargoSubcommand;
+    use cargoless_core::{CandidateSnapshot, OverlayOperation};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -911,6 +1036,184 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn text_overlay_fixture() -> PathBuf {
+        let root = temp_root("typed-legacy-projection");
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "Candidate Snapshot Test"]);
+        git(
+            &root,
+            &["config", "user.email", "candidate-snapshot@example.invalid"],
+        );
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        git(&root, &["config", "core.hooksPath", "/dev/null"]);
+        write_file(&root, "empty.txt", b"not empty\n");
+        write_file(&root, "modified.txt", b"old\n");
+        write_file(&root, "removed.txt", b"remove\n");
+        write_file(&root, "unchanged.txt", b"same\n");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "base"]);
+        write_file(&root, "empty.txt", b"");
+        write_file(&root, "modified.txt", b"new\n");
+        std::fs::remove_file(root.join("removed.txt")).unwrap();
+        root
+    }
+
+    #[test]
+    fn push_options_and_legacy_files_are_derived_from_one_typed_manifest() {
+        let root = text_overlay_fixture();
+        let built = crate::candidate_snapshot_git::build_overlay_manifest(&root, "HEAD")
+            .unwrap()
+            .expect("fixture has a delta");
+        let files = legacy_files_from_candidate_snapshot(&root, &built.manifest, true).unwrap();
+
+        assert_eq!(
+            files,
+            vec![
+                ("empty.txt".to_string(), String::new()),
+                ("modified.txt".to_string(), "new\n".to_string()),
+                ("removed.txt".to_string(), String::new()),
+            ]
+        );
+        let CandidateSnapshot::Overlay { operations, .. } = &built.manifest.candidate else {
+            panic!("push candidate must be an overlay");
+        };
+        assert_eq!(
+            files.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            operations
+                .iter()
+                .map(OverlayOperation::path)
+                .collect::<Vec<_>>()
+        );
+
+        let mut options = PushOverlayOptions::default();
+        apply_candidate_snapshot_options(&mut options, &built.manifest);
+        assert_eq!(
+            options.comparison_base_sha.as_deref(),
+            Some(built.manifest.comparison_base.commit_sha.as_str())
+        );
+        assert_eq!(options.candidate_snapshot.as_ref(), Some(&built.manifest));
+    }
+
+    #[test]
+    fn legacy_projection_omits_binary_without_weakening_the_typed_candidate() {
+        let root = text_overlay_fixture();
+        write_file(&root, "binary.bin", [0x00, 0xff, 0x80, b'B']);
+        let built = crate::candidate_snapshot_git::build_overlay_manifest(&root, "HEAD")
+            .unwrap()
+            .expect("fixture has a delta");
+
+        let files = legacy_files_from_candidate_snapshot(&root, &built.manifest, true).unwrap();
+        let changed_paths = candidate_changed_paths(&built.manifest);
+
+        assert!(files.iter().all(|(path, _)| path != "binary.bin"));
+        assert!(changed_paths.iter().any(|path| path == "binary.bin"));
+        let CandidateSnapshot::Overlay { operations, .. } = &built.manifest.candidate else {
+            panic!("push candidate must be an overlay");
+        };
+        assert!(matches!(
+            operations
+                .iter()
+                .find(|operation| operation.path() == "binary.bin"),
+            Some(OverlayOperation::Upsert { .. })
+        ));
+
+        let mut options = PushOverlayOptions::default();
+        apply_candidate_snapshot_options(&mut options, &built.manifest);
+        assert_eq!(options.candidate_snapshot.as_ref(), Some(&built.manifest));
+    }
+
+    #[test]
+    fn ordinary_push_request_and_await_address_remain_legacy() {
+        let root = text_overlay_fixture();
+        let same_host = PushOpts {
+            remote: "http://localhost:8787".to_string(),
+            auth_token: None,
+            repo: root.clone(),
+            worktree: root.to_string_lossy().into_owned(),
+            base: "HEAD".to_string(),
+            check_profile: None,
+            server_root: None,
+            await_verdict: true,
+            await_timeout_secs: 10,
+            gate: false,
+        };
+        let changed = git_changed_files(&root, "HEAD").unwrap();
+        let prepared = prepare_legacy_push_request(&same_host, &changed).unwrap();
+        let options = prepared.options.as_ref().expect("changed_files options");
+
+        assert!(options.candidate_snapshot.is_none());
+        assert!(options.comparison_base_sha.is_none());
+        assert!(options.base_sha.is_none());
+        assert!(!options.repo_relative);
+        assert_eq!(
+            legacy_await_status_address(options.base_sha.as_deref()),
+            LegacyAwaitStatusAddress::Latest,
+            "same-host push must accept the fresh shared legacy status"
+        );
+        assert!(
+            prepared
+                .payload
+                .files
+                .iter()
+                .all(|(path, _)| Path::new(path).is_absolute())
+        );
+
+        let Request::PushOverlayV2 {
+            files,
+            options: wire_options,
+            ..
+        } = Request::from_json(&prepared.body).expect("ordinary push request parses")
+        else {
+            panic!("changed_files keeps the established v2 options envelope")
+        };
+        assert_eq!(files, prepared.payload.files);
+        assert!(wire_options.candidate_snapshot.is_none());
+        assert!(wire_options.comparison_base_sha.is_none());
+        assert!(wire_options.base_sha.is_none());
+
+        let central = PushOpts {
+            server_root: Some(PathBuf::from("/srv/repo")),
+            worktree: "/srv/repo".to_string(),
+            ..same_host
+        };
+        let prepared = prepare_legacy_push_request(&central, &changed).unwrap();
+        let base_sha = prepared
+            .options
+            .as_ref()
+            .and_then(|options| options.base_sha.as_deref())
+            .expect("central legacy push resolves its base SHA");
+        assert_eq!(
+            legacy_await_status_address(Some(base_sha)),
+            LegacyAwaitStatusAddress::Base(base_sha),
+            "central legacy push polls the established base-attributed route"
+        );
+        assert!(
+            prepared
+                .options
+                .as_ref()
+                .unwrap()
+                .candidate_snapshot
+                .is_none()
+        );
     }
 
     /// **2c keystone test — the client-side composing-equivalence

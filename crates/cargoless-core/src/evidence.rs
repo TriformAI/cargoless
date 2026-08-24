@@ -108,6 +108,7 @@ pub enum ArtifactKind {
     StdoutTail,
     StderrTail,
     Stack(u32),
+    ProjectCheckResult(u32),
 }
 
 impl ArtifactKind {
@@ -121,7 +122,14 @@ impl ArtifactKind {
             Self::StdoutTail => "stdout.tail".into(),
             Self::StderrTail => "stderr.tail".into(),
             Self::Stack(sequence) => format!("stack-{sequence:03}.txt"),
+            Self::ProjectCheckResult(sequence) => {
+                format!("project-check-result-{sequence:03}.json")
+            }
         }
+    }
+
+    fn is_mandatory(self) -> bool {
+        matches!(self, Self::ProjectCheckResult(_))
     }
 }
 
@@ -129,6 +137,38 @@ impl ArtifactKind {
 pub struct EvidenceArtifact {
     pub kind: ArtifactKind,
     pub bytes: Vec<u8>,
+}
+
+/// One canonical bundle-digest input. `meta.json` serializes the complete
+/// inventory with this exact shape so clients can independently recompute the
+/// terminal [`EvidenceRef`] identity even when an ordinary artifact was capped
+/// from the persisted/fetchable subset.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvidenceInventoryEntry {
+    pub name: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Compute the canonical evidence bundle digest from a complete inventory.
+///
+/// This is the single algorithm used by both the evidence writer and typed
+/// clients: sorted `(name, NUL, len, NUL, sha256, LF)` records hashed with
+/// SHA-256. Callers are responsible for rejecting duplicate/incomplete
+/// inventories before treating the digest as authoritative.
+pub fn canonical_evidence_bundle_digest(entries: &[EvidenceInventoryEntry]) -> String {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut canonical = Vec::new();
+    for entry in entries {
+        canonical.extend_from_slice(entry.name.as_bytes());
+        canonical.push(0);
+        canonical.extend_from_slice(entry.bytes.to_string().as_bytes());
+        canonical.push(0);
+        canonical.extend_from_slice(entry.sha256.as_bytes());
+        canonical.push(b'\n');
+    }
+    sha256_hex(&canonical)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -144,29 +184,19 @@ impl EvidenceBundle {
         });
     }
 
-    fn digest(&self) -> String {
-        let mut entries: Vec<(String, String, usize)> = self
-            .artifacts
+    fn inventory(&self) -> Vec<EvidenceInventoryEntry> {
+        self.artifacts
             .iter()
-            .map(|artifact| {
-                (
-                    artifact.kind.filename(),
-                    sha256_hex(&artifact.bytes),
-                    artifact.bytes.len(),
-                )
+            .map(|artifact| EvidenceInventoryEntry {
+                name: artifact.kind.filename(),
+                bytes: artifact.bytes.len() as u64,
+                sha256: sha256_hex(&artifact.bytes),
             })
-            .collect();
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut canonical = Vec::new();
-        for (name, digest, len) in entries {
-            canonical.extend_from_slice(name.as_bytes());
-            canonical.push(0);
-            canonical.extend_from_slice(len.to_string().as_bytes());
-            canonical.push(0);
-            canonical.extend_from_slice(digest.as_bytes());
-            canonical.push(b'\n');
-        }
-        sha256_hex(&canonical)
+            .collect()
+    }
+
+    fn digest(&self) -> String {
+        canonical_evidence_bundle_digest(&self.inventory())
     }
 }
 
@@ -222,9 +252,11 @@ impl EvidenceStore {
 
     /// Persist an already-finalized outcome and its detail artifacts.
     ///
-    /// Artifacts that would exceed the per-bundle cap are omitted
-    /// deterministically and named in `meta.json`. `outcome.json` is always
-    /// retained; if it alone exceeds the cap the call fails explicitly.
+    /// Ordinary artifacts that would exceed the per-bundle cap are omitted
+    /// deterministically and named in `meta.json`. Project-check result
+    /// documents are mandatory: capacity for their complete set is reserved
+    /// before any write, and an overflow fails atomically. `outcome.json` is
+    /// always retained; if it alone exceeds the cap the call fails explicitly.
     pub fn persist(
         &self,
         outcome: &OutcomeEnvelope,
@@ -252,6 +284,27 @@ impl EvidenceStore {
             ));
         }
 
+        let mut artifacts: Vec<&EvidenceArtifact> = bundle.artifacts.iter().collect();
+        artifacts.sort_by_key(|artifact| artifact.kind.filename());
+        let mut bundle_artifacts = bundle.inventory();
+        bundle_artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut mandatory_bytes = outcome_bytes.len() as u64;
+        for artifact in artifacts
+            .iter()
+            .filter(|artifact| artifact.kind.is_mandatory())
+        {
+            mandatory_bytes = mandatory_bytes.saturating_add(artifact.bytes.len() as u64);
+            if mandatory_bytes > self.policy.max_bundle_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "mandatory evidence artifact {} exceeds evidence bundle cap",
+                        artifact.kind.filename()
+                    ),
+                ));
+            }
+        }
+
         fs::create_dir_all(&self.root)?;
         let final_dir = self.root.join(outcome.attempt_id.as_str());
         let tmp_dir = self.root.join(format!(
@@ -267,24 +320,30 @@ impl EvidenceStore {
         let persist_result = (|| -> io::Result<()> {
             write_synced(&tmp_dir.join("outcome.json"), &outcome_bytes)?;
             let mut bytes_written = outcome_bytes.len() as u64;
+            let mut mandatory_bytes_remaining =
+                mandatory_bytes.saturating_sub(outcome_bytes.len() as u64);
             let mut omitted = Vec::new();
             let mut written = Vec::new();
-            let mut artifacts: Vec<&EvidenceArtifact> = bundle.artifacts.iter().collect();
-            artifacts.sort_by_key(|artifact| artifact.kind.filename());
             for artifact in artifacts {
                 let filename = artifact.kind.filename();
                 let size = artifact.bytes.len() as u64;
-                if bytes_written.saturating_add(size) > self.policy.max_bundle_bytes {
+                if artifact.kind.is_mandatory() {
+                    mandatory_bytes_remaining = mandatory_bytes_remaining.saturating_sub(size);
+                } else if bytes_written
+                    .saturating_add(size)
+                    .saturating_add(mandatory_bytes_remaining)
+                    > self.policy.max_bundle_bytes
+                {
                     omitted.push(filename);
                     continue;
                 }
                 write_synced(&tmp_dir.join(&filename), &artifact.bytes)?;
                 bytes_written += size;
-                written.push(serde_json::json!({
-                    "name": filename,
-                    "bytes": size,
-                    "sha256": sha256_hex(&artifact.bytes),
-                }));
+                written.push(EvidenceInventoryEntry {
+                    name: filename,
+                    bytes: size,
+                    sha256: sha256_hex(&artifact.bytes),
+                });
             }
             let created_at = now_unix();
             let meta = serde_json::to_vec_pretty(&serde_json::json!({
@@ -295,6 +354,7 @@ impl EvidenceStore {
                 "artifact_digest": bundle.digest(),
                 "bytes": bytes_written,
                 "artifacts": written,
+                "bundle_artifacts": bundle_artifacts,
                 "omitted_due_to_cap": omitted,
             }))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -369,7 +429,13 @@ impl EvidenceStore {
             .and_then(|rest| rest.strip_suffix(".txt"))
             .is_some_and(|digits| {
                 digits.len() == 3 && digits.bytes().all(|byte| byte.is_ascii_digit())
-            });
+            })
+            || name
+                .strip_prefix("project-check-result-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .is_some_and(|digits| {
+                    digits.len() == 3 && digits.bytes().all(|byte| byte.is_ascii_digit())
+                });
         if !allowed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -621,6 +687,96 @@ mod tests {
     }
 
     #[test]
+    fn persists_sequenced_project_check_results_byte_for_byte() {
+        let root = scratch("project-check-results");
+        let _ = fs::remove_dir_all(&root);
+        let store = EvidenceStore::new(&root);
+        let first =
+            b"{\n  \"schema\": \"cargoless.check-result/v2\",\n  \"check_id\": \"policy-a\"\n}\n";
+        let second = b"{\"schema\":\"cargoless.check-result/v2\",\"check_id\":\"policy-b\"}\n";
+        let mut bundle = EvidenceBundle::default();
+        bundle.push(ArtifactKind::ProjectCheckResult(1), first.to_vec());
+        bundle.push(ArtifactKind::ProjectCheckResult(2), second.to_vec());
+        let outcome = failed_outcome(&store, "attempt-project-checks", &bundle);
+
+        store
+            .persist(&outcome, EvidenceClass::Terminal, &bundle)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .read_named(&outcome.attempt_id, "project-check-result-001.json")
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            store
+                .read_artifact(&outcome.attempt_id, ArtifactKind::ProjectCheckResult(2))
+                .unwrap()
+                .unwrap(),
+            second
+        );
+        assert!(
+            store
+                .read_named(&outcome.attempt_id, "../project-check-result-001.json")
+                .is_err(),
+            "named evidence reads remain traversal-safe"
+        );
+        assert!(
+            store
+                .read_named(&outcome.attempt_id, "project-check-result-01.json")
+                .is_err(),
+            "result sequence names are exactly three digits"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mandatory_project_check_result_cap_overflow_fails_atomically() {
+        let root = scratch("project-check-results-cap");
+        let _ = fs::remove_dir_all(&root);
+        let first = b"first verified candidate result\n";
+        let second = b"second verified candidate result crosses the remaining cap\n";
+        let mut bundle = EvidenceBundle::default();
+        bundle.push(ArtifactKind::ProjectCheckResult(1), first.to_vec());
+        bundle.push(ArtifactKind::ProjectCheckResult(2), second.to_vec());
+
+        let sizing_store = EvidenceStore::new(&root);
+        let outcome = failed_outcome(&sizing_store, "attempt-project-check-cap", &bundle);
+        let outcome_bytes = serde_json::to_vec_pretty(&outcome).unwrap();
+        let store = EvidenceStore::with_policy(
+            &root,
+            EvidencePolicy {
+                max_bundle_bytes: outcome_bytes.len() as u64 + first.len() as u64,
+                ..EvidencePolicy::default()
+            },
+        );
+
+        let error = store
+            .persist(&outcome, EvidenceClass::Terminal, &bundle)
+            .expect_err("mandatory result 002 must not be silently omitted");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("project-check-result-002.json"),
+            "the failure identifies the mandatory result that crossed the cap: {error}"
+        );
+        assert!(
+            !store.root().join(outcome.attempt_id.as_str()).exists(),
+            "an incomplete terminal bundle must never become durable"
+        );
+        assert!(store.read_outcome(&outcome.attempt_id).unwrap().is_none());
+        assert!(
+            store
+                .read_named(&outcome.attempt_id, "meta.json")
+                .unwrap()
+                .is_none(),
+            "no metadata may claim durability for a partially retained mandatory result set"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cap_omits_detail_but_never_the_outcome() {
         let root = scratch("cap");
         let _ = fs::remove_dir_all(&root);
@@ -651,7 +807,13 @@ mod tests {
                 .join("meta.json"),
         )
         .unwrap();
-        assert!(meta.contains("stderr.tail"));
+        let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(
+            meta["bundle_artifacts"][0]["name"], "stderr.tail",
+            "the full digest inventory retains capped artifacts"
+        );
+        assert!(meta["artifacts"].as_array().unwrap().is_empty());
+        assert_eq!(meta["omitted_due_to_cap"][0], "stderr.tail");
         let _ = fs::remove_dir_all(root);
     }
 
