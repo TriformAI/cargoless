@@ -14945,6 +14945,354 @@ checks:
     }
 
     #[test]
+    fn attempt_replay_validates_candidate_pairing_before_idempotency() {
+        let api = ServeVerdictState::new();
+        let context = attempt_context("attempt-candidate-replay-validation", 1);
+        api.begin_outcome_v3(
+            &context,
+            Surface::Overlay,
+            Subject::Overlay {
+                repository: text_v3("/repo"),
+                worktree_key: text_v3("/wt"),
+                base_ref: text_v3("origin/main"),
+                base_sha: text_v3("base"),
+                overlay_digest: text_v3("overlay"),
+                changed_files_digest: text_v3("changed"),
+                check_plan_digest: text_v3("plan"),
+            },
+            Phase::Queued,
+            "pre-existing attempt",
+        );
+        let invalid = PushOverlayOptions {
+            comparison_base_sha: Some("a".repeat(40)),
+            base_sha: Some("base".into()),
+            semantic: Some(context),
+            ..Default::default()
+        };
+
+        let ack = api.push_overlay_with_options("/wt", "origin/main", &[], None, Some(&invalid));
+
+        assert!(!ack.accepted);
+        assert_eq!(
+            ack.reject_body.as_deref(),
+            Some("candidate_snapshot.manifest_missing: comparison base requires a typed manifest"),
+            "candidate_snapshot.* validation must retain precedence over replay admission"
+        );
+    }
+
+    #[test]
+    fn attempt_replay_rejects_changed_context_or_subject() {
+        let api = ServeVerdictState::new();
+        let files = vec![("src/lib.rs".to_string(), "pub fn first() {}".to_string())];
+        let context = attempt_context("attempt-identity-conflict", 1);
+        let options = PushOverlayOptions {
+            base_sha: Some("same-base".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+        assert!(
+            api.push_overlay_with_options(
+                "/wt-identity",
+                "origin/main",
+                &files,
+                None,
+                Some(&options),
+            )
+            .accepted
+        );
+
+        let mut changed_context = options.clone();
+        changed_context.semantic.as_mut().unwrap().trace_id =
+            cargoless_core::outcome::TraceId::new("fedcba9876543210").unwrap();
+        let ack = api.push_overlay_with_options(
+            "/wt-identity",
+            "origin/main",
+            &files,
+            None,
+            Some(&changed_context),
+        );
+        assert!(!ack.accepted);
+        assert_eq!(
+            ack.reject_body.as_deref(),
+            Some("attempt.identity_conflict")
+        );
+
+        let changed_files = vec![("src/lib.rs".to_string(), "pub fn second() {}".to_string())];
+        let ack = api.push_overlay_with_options(
+            "/wt-identity",
+            "origin/main",
+            &changed_files,
+            None,
+            Some(&options),
+        );
+        assert!(!ack.accepted);
+        assert_eq!(
+            ack.reject_body.as_deref(),
+            Some("attempt.identity_conflict")
+        );
+    }
+
+    #[test]
+    fn concurrent_identical_attempt_replay_dispatches_once() {
+        const CALLERS: usize = 32;
+        let api = Arc::new(ServeVerdictState::new());
+        let (tx, rx) = channel::<String>();
+        api.attach_push_signal(tx);
+        let barrier = Arc::new(Barrier::new(CALLERS + 1));
+        let context = attempt_context("attempt-concurrent-replay", 1);
+        let files = vec![("src/lib.rs".to_string(), "pub fn once() {}".to_string())];
+        let options = PushOverlayOptions {
+            base_sha: Some("same-base".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context),
+            ..Default::default()
+        };
+        let handles = (0..CALLERS)
+            .map(|_| {
+                let api = Arc::clone(&api);
+                let barrier = Arc::clone(&barrier);
+                let files = files.clone();
+                let options = options.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    api.push_overlay_with_options(
+                        "/wt-concurrent",
+                        "origin/main",
+                        &files,
+                        None,
+                        Some(&options),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            assert!(handle.join().unwrap().accepted);
+        }
+
+        assert_eq!(rx.try_iter().count(), 1, "one attempt queues exactly once");
+        assert_eq!(
+            poisoned(&api.pushed)
+                .get("/wt-concurrent")
+                .map(VecDeque::len),
+            Some(1)
+        );
+    }
+
+    fn evidence_directory_bytes(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accepted_attempt_replay_survives_restart_without_mutation() {
+        let state_dir = temp_root("attempt-replay-restart");
+        let files = vec![("src/lib.rs".to_string(), "pub fn stable() {}".to_string())];
+        let context = attempt_context("attempt-replay-restart", 1);
+        let options = PushOverlayOptions {
+            base_sha: Some("same-base".into()),
+            changed_files: Some(vec!["src/lib.rs".into()]),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+        let terminal = {
+            let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+            let (tx, rx) = channel::<String>();
+            api.attach_push_signal(tx);
+            assert!(
+                api.push_overlay_with_options(
+                    "/wt-restart",
+                    "origin/main",
+                    &files,
+                    None,
+                    Some(&options),
+                )
+                .accepted
+            );
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let pushed = api.take_overlay_for("/wt-restart").unwrap();
+            api.record_push_attribution("/wt-restart", &pushed);
+            let attribution = api.take_push_attribution("/wt-restart").unwrap();
+            api.publish_attributed_with_checks(
+                Path::new("/wt-restart"),
+                crate::statusfile::VerdictPayload::green(),
+                attribution.base_sha,
+                false,
+                Vec::new(),
+                Some(context.clone()),
+            );
+            api.get_outcome_v3(&context.attempt_id).unwrap()
+        };
+        let evidence_dir = state_dir
+            .join("evidence-v3")
+            .join(context.attempt_id.as_str());
+        let evidence_before = evidence_directory_bytes(&evidence_dir);
+
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let (tx, rx) = channel::<String>();
+        reopened.attach_push_signal(tx);
+        let replay = reopened.push_overlay_with_options(
+            "/wt-restart",
+            "origin/main",
+            &files,
+            None,
+            Some(&options),
+        );
+        assert!(
+            replay.accepted,
+            "exact durable retry reuses the accepted attempt"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "exact replay after restart must not queue again"
+        );
+        assert_eq!(reopened.get_outcome_v3(&context.attempt_id), Some(terminal));
+
+        let mut variants = Vec::new();
+        let mut changed = context.clone();
+        changed.request_id = cargoless_core::outcome::RequestId::new("request-2").unwrap();
+        variants.push(changed);
+        let mut changed = context.clone();
+        changed.trace_id = cargoless_core::outcome::TraceId::new("fedcba9876543210").unwrap();
+        variants.push(changed);
+        let mut changed = context.clone();
+        changed.previous_attempt_id =
+            Some(cargoless_core::outcome::AttemptId::new("attempt-parent").unwrap());
+        variants.push(changed);
+        let mut changed = context.clone();
+        changed.attempt_number = 2;
+        variants.push(changed);
+        let mut changed = context.clone();
+        changed.maximum_attempts = 4;
+        variants.push(changed);
+        let mut changed = context.clone();
+        changed.retry_after_ms += 1;
+        variants.push(changed);
+        for changed_context in variants {
+            let mut changed_options = options.clone();
+            changed_options.semantic = Some(changed_context);
+            let ack = reopened.push_overlay_with_options(
+                "/wt-restart",
+                "origin/main",
+                &files,
+                None,
+                Some(&changed_options),
+            );
+            assert!(!ack.accepted);
+            assert_eq!(
+                ack.reject_body.as_deref(),
+                Some("attempt.identity_conflict")
+            );
+        }
+
+        let changed_subject = reopened.push_overlay_with_options(
+            "/wt-restart",
+            "origin/main",
+            &[("src/lib.rs".to_string(), "pub fn changed() {}".to_string())],
+            None,
+            Some(&options),
+        );
+        assert!(!changed_subject.accepted);
+        assert_eq!(
+            changed_subject.reject_body.as_deref(),
+            Some("attempt.identity_conflict")
+        );
+        assert_eq!(
+            evidence_directory_bytes(&evidence_dir),
+            evidence_before,
+            "replay and conflicts must not rewrite terminal evidence bytes"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn exact_git_replay_after_restart_skips_external_git_and_dispatch() {
+        let root = temp_root("exact-git-replay");
+        let remote = temp_root("exact-git-replay-remote");
+        let state_dir = temp_root("exact-git-replay-state");
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn exact() {}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "exact candidate"]);
+        let source_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["push", "origin", "HEAD:main"]);
+
+        let context = attempt_context("attempt-exact-git-replay", 1);
+        let options = PushOverlayOptions {
+            repo_relative: true,
+            analysis_root: Some(root.to_string_lossy().into_owned()),
+            base_sha: Some(source_sha.clone()),
+            source_ref: Some("refs/heads/main".to_string()),
+            source_sha: Some(source_sha),
+            changed_files: Some(vec!["src/lib.rs".to_string()]),
+            gate: true,
+            check_ids: Some(vec!["ssr-compiler-witness".to_string()]),
+            semantic: Some(context.clone()),
+            ..Default::default()
+        };
+        {
+            let api = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+            let (direct_tx, direct_rx) = channel();
+            api.attach_direct_gate_signal(direct_tx);
+            let ack = api.push_overlay_with_options(
+                "/wt-exact-replay",
+                "origin/main",
+                &[],
+                None,
+                Some(&options),
+            );
+            assert!(ack.accepted, "{:?}", ack.reject_body);
+            direct_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+        let reopened = ServeVerdictState::new().with_project_check_state_dir(state_dir.clone());
+        let (direct_tx, direct_rx) = channel();
+        reopened.attach_direct_gate_signal(direct_tx);
+        let ack = reopened.push_overlay_with_options(
+            "/wt-exact-replay",
+            "origin/main",
+            &[],
+            None,
+            Some(&options),
+        );
+        assert!(
+            ack.accepted,
+            "exact replay must not touch the removed Git checkout"
+        );
+        assert!(direct_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(matches!(
+            reopened
+                .get_outcome_v3(&context.attempt_id)
+                .unwrap()
+                .conclusion,
+            Conclusion::Pending { .. }
+        ));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
     fn record_project_check_context_carries_gate_through_take() {
         let api = ServeVerdictState::new();
         api.record_project_check_context(
