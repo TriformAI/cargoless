@@ -32,3 +32,4 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # proc-macro), keeping cold-build cost (AC#1/#2) low. cargoless-proto stays
 # serde-free; this dep is cargoless-core-local.
 serde_json = "1"
+unicode-normalization = "0.1"

@@ -30,6 +30,7 @@ pub mod barrier;
 pub mod batch;
 pub mod build;
 pub mod cache_layout;
+pub mod candidate_snapshot;
 pub mod cargodiag;
 pub mod cluster;
 pub mod clusterdrv;
@@ -60,6 +61,12 @@ pub mod transport;
 pub mod watcher;
 mod yamlscan;
 
+pub use candidate_snapshot::{
+    CandidateSnapshotError, canonical_manifest_json, compute_candidate_tree_oid,
+    compute_manifest_digest, compute_snapshot_digest, decode_overlay_payload,
+    parse_and_validate_manifest_json, validate_candidate_snapshot_manifest,
+    validate_manifest_against_entry_maps,
+};
 pub use cargoless_cas::{ContentStore, LocalDiskStore, sha256_hex};
 pub use cargoless_proto::{
     ArtifactMeta, BuildIdentity, BuildOutcome, BuildResult, BuildTrigger, CheckResult, ContentHash,
