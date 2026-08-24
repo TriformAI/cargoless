@@ -2590,6 +2590,78 @@ mod tests {
     }
 
     #[test]
+    fn push_overlay_v2_preserves_typed_candidate_snapshot_and_comparison_base() {
+        let wire = r#"{
+            "op":"push_overlay",
+            "worktree":"/client/wt",
+            "base_ref":"origin/dev",
+            "files":[],
+            "options":{
+              "repo_relative":true,
+              "analysis_root":"/workspace/tf-multiverse",
+              "comparison_base_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
+              "candidate_snapshot":{
+                "schema":"cargoless-candidate-snapshot/1",
+                "git_object_format":"sha1",
+                "comparison_base":{
+                  "commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
+                  "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+                },
+                "candidate":{
+                  "kind":"overlay",
+                  "base":{
+                    "commit_sha":"de16c5f7dd233165813ffa72719869e3181c554b",
+                    "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+                  },
+                  "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+                  "entry_count":0,
+                  "entries":[],
+                  "snapshot_digest":"sha256:3a3675b92f2ed63ad31fef87284dd56b1edbdc1d5080585fdb270c7c3a107d59",
+                  "operation_count":0,
+                  "operations":[]
+                },
+                "manifest_digest":"sha256:3a3675b92f2ed63ad31fef87284dd56b1edbdc1d5080585fdb270c7c3a107d59"
+              }
+            }
+        }"#;
+
+        let parsed = Request::from_json(wire).expect("typed candidate request parses");
+        let encoded: serde_json::Value =
+            serde_json::from_str(&parsed.to_json()).expect("roundtrip JSON");
+        assert_eq!(
+            encoded["comparison_base_sha"],
+            "de16c5f7dd233165813ffa72719869e3181c554b",
+            "comparison base is independent from legacy base_sha"
+        );
+        assert_eq!(
+            encoded["candidate_snapshot"]["schema"],
+            "cargoless-candidate-snapshot/1",
+            "the typed candidate manifest must survive every transport codec"
+        );
+        assert_eq!(
+            encoded["candidate_snapshot"]["candidate"]["kind"],
+            "overlay"
+        );
+    }
+
+    #[test]
+    fn push_overlay_rejects_duplicate_candidate_manifest_keys() {
+        let duplicate = r#"{
+            "op":"push_overlay","worktree":"w","base_ref":"b","files":[],
+            "options":{
+              "candidate_snapshot":{
+                "schema":"cargoless-candidate-snapshot/1",
+                "schema":"cargoless-candidate-snapshot/2"
+              }
+            }
+        }"#;
+        assert!(
+            Request::from_json(duplicate).is_none(),
+            "duplicate manifest keys must fail closed before Value parsing discards identity"
+        );
+    }
+
+    #[test]
     fn push_overlay_gate_flag_wire_contract() {
         // Absent on the wire ⇒ false (old clients unaffected)...
         let parsed = Request::from_json(
