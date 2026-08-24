@@ -50,6 +50,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use cargoless_proto::candidate_snapshot::CandidateSnapshotManifest;
 use cargoless_proto::outcome::{AttemptId, OutcomeEnvelope, RequestId, TraceId};
 use cargoless_proto::{Diagnostic, Severity};
 
@@ -151,6 +152,13 @@ pub struct PushOverlayOptions {
     /// Exact candidate commit to check. When paired with `source_ref`, the
     /// daemon verifies reachability and checks this Git tree directly.
     pub source_sha: Option<String>,
+    /// Exact immutable comparison base used by candidate-bound checks. This
+    /// is independent from the legacy diagnostics-only `base_sha` field.
+    pub comparison_base_sha: Option<String>,
+    /// Closed, digest-bound snapshot manifest for the complete candidate.
+    /// Legacy pushes omit it; candidate-backed checks must validate it before
+    /// materializing or executing any check.
+    pub candidate_snapshot: Option<CandidateSnapshotManifest>,
     /// Repo-relative files changed by the client diff. These are distinct
     /// from `files`: the overlay payload also includes workspace config files
     /// needed for cluster routing, while project-check triggers should see
@@ -187,6 +195,13 @@ impl PushOverlayOptions {
             && self.base_sha.as_deref().unwrap_or("").trim().is_empty()
             && self.source_ref.as_deref().unwrap_or("").trim().is_empty()
             && self.source_sha.as_deref().unwrap_or("").trim().is_empty()
+            && self
+                .comparison_base_sha
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && self.candidate_snapshot.is_none()
             && self
                 .changed_files
                 .as_ref()
@@ -1052,11 +1067,131 @@ pub struct LaneEnqueueRequest {
     pub changed_files: Vec<String>,
 }
 
+fn candidate_snapshot_manifest_from_request_json(
+    text: &str,
+) -> Result<Option<CandidateSnapshotManifest>, ()> {
+    let bytes = text.as_bytes();
+    let mut value_span = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let string_end = json_string_end(bytes, index).ok_or(())?;
+        let decoded: String = serde_json::from_slice(&bytes[index..string_end]).map_err(|_| ())?;
+        let mut colon = skip_json_whitespace(bytes, string_end);
+        if decoded == "candidate_snapshot" && bytes.get(colon) == Some(&b':') {
+            colon += 1;
+            let value_start = skip_json_whitespace(bytes, colon);
+            let value_end = json_value_end(bytes, value_start).ok_or(())?;
+            if value_span.replace((value_start, value_end)).is_some() {
+                return Err(());
+            }
+        }
+        index = string_end;
+    }
+
+    let Some((start, end)) = value_span else {
+        return Ok(None);
+    };
+    let raw = std::str::from_utf8(&bytes[start..end]).map_err(|_| ())?;
+    crate::candidate_snapshot::parse_and_validate_manifest_json(raw)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn skip_json_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        index += 1;
+    }
+    index
+}
+
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return Some(index + 1),
+            b'\\' => {
+                index += 1;
+                if index >= bytes.len() {
+                    return None;
+                }
+                index += 1;
+            }
+            byte if byte < 0x20 => return None,
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match *bytes.get(start)? {
+        b'"' => json_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut stack = vec![bytes[start]];
+            let mut index = start + 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => index = json_string_end(bytes, index)?,
+                    b'{' | b'[' => {
+                        stack.push(bytes[index]);
+                        index += 1;
+                    }
+                    b'}' => {
+                        if stack.pop() != Some(b'{') {
+                            return None;
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Some(index);
+                        }
+                    }
+                    b']' => {
+                        if stack.pop() != Some(b'[') {
+                            return None;
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Some(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut index = start;
+            while bytes.get(index).is_some_and(|byte| {
+                !matches!(byte, b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')
+            }) {
+                index += 1;
+            }
+            (index > start).then_some(index)
+        }
+    }
+}
+
 impl Request {
     /// Parse `{"op":"get_status","worktree":"W"}` (best-effort; unknown
     /// op ⇒ `None` so the adapter answers a clean protocol error rather
     /// than panicking).
     pub fn from_json(text: &str) -> Option<Request> {
+        // Preserve and validate the typed candidate manifest from the raw
+        // request before parsing the surrounding request as `Value`.
+        // `serde_json::Value` deliberately keeps only the last duplicate
+        // object key, which is acceptable for legacy best-effort metadata but
+        // would erase an identity conflict inside a candidate snapshot.
+        let candidate_snapshot = candidate_snapshot_manifest_from_request_json(text).ok()?;
         let v: serde_json::Value = serde_json::from_str(text).ok()?;
         let op = v.get("op")?.as_str()?;
         let wt = || {
@@ -1094,7 +1229,8 @@ impl Request {
                 // Hard witness gate never promoted (see the CI witness's
                 // never-fires bug). The flat CLI has no `options{}` key, so it
                 // hits `unwrap_or(&v)` and stays byte-identical.
-                let options = push_overlay_options_from_json(v.get("options").unwrap_or(&v));
+                let mut options = push_overlay_options_from_json(v.get("options").unwrap_or(&v));
+                options.candidate_snapshot = candidate_snapshot;
                 if options.is_empty() {
                     Some(Request::PushOverlay {
                         worktree,
@@ -1112,7 +1248,10 @@ impl Request {
                     })
                 }
             }
-            "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(&v))),
+            "batch_check" => Some(Request::BatchCheck(batch_check_request_from_value(
+                &v,
+                candidate_snapshot,
+            ))),
             "lane_enqueue" => {
                 let id = v.get("id").and_then(serde_json::Value::as_str)?.to_string();
                 let head = v
@@ -1209,6 +1348,19 @@ impl Request {
                             serde_json::Value::String(source_sha.to_string()),
                         );
                     }
+                    if let Some(comparison_base_sha) = options.comparison_base_sha.as_deref() {
+                        map.insert(
+                            "comparison_base_sha".to_string(),
+                            serde_json::Value::String(comparison_base_sha.to_string()),
+                        );
+                    }
+                    if let Some(candidate_snapshot) = options.candidate_snapshot.as_ref() {
+                        map.insert(
+                            "candidate_snapshot".to_string(),
+                            serde_json::to_value(candidate_snapshot)
+                                .expect("candidate snapshot DTO is always serializable"),
+                        );
+                    }
                     if let Some(changed_files) = options
                         .changed_files
                         .as_ref()
@@ -1279,7 +1431,12 @@ fn batch_check_request_to_json(request: &BatchCheckRequest) -> serde_json::Value
     })
 }
 
-fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
+fn batch_check_request_from_value(
+    v: &serde_json::Value,
+    candidate_snapshot: Option<CandidateSnapshotManifest>,
+) -> BatchCheckRequest {
+    let mut options = push_overlay_options_from_json(v.get("options").unwrap_or(v));
+    options.candidate_snapshot = candidate_snapshot;
     BatchCheckRequest {
         batch_id: v
             .get("batch_id")
@@ -1299,7 +1456,7 @@ fn batch_check_request_from_value(v: &serde_json::Value) -> BatchCheckRequest {
             .to_string(),
         members: batch_members_from_json(v.get("members")),
         check_profile: check_profile_from_json(v.get("check_profile")),
-        options: push_overlay_options_from_json(v.get("options").unwrap_or(v)),
+        options,
         corun: v
             .get("corun")
             .and_then(serde_json::Value::as_bool)
@@ -1366,6 +1523,19 @@ fn push_overlay_options_to_json(options: &PushOverlayOptions) -> serde_json::Val
             map.insert(
                 "source_sha".to_string(),
                 serde_json::Value::String(source_sha.to_string()),
+            );
+        }
+        if let Some(comparison_base_sha) = options.comparison_base_sha.as_deref() {
+            map.insert(
+                "comparison_base_sha".to_string(),
+                serde_json::Value::String(comparison_base_sha.to_string()),
+            );
+        }
+        if let Some(candidate_snapshot) = options.candidate_snapshot.as_ref() {
+            map.insert(
+                "candidate_snapshot".to_string(),
+                serde_json::to_value(candidate_snapshot)
+                    .expect("candidate snapshot DTO is always serializable"),
             );
         }
         if let Some(changed_files) = options
@@ -1453,6 +1623,12 @@ fn push_overlay_options_from_json(v: &serde_json::Value) -> PushOverlayOptions {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty()),
+        comparison_base_sha: v
+            .get("comparison_base_sha")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty()),
+        candidate_snapshot: None,
         changed_files: string_array_from_json(v.get("changed_files")),
         gate: v
             .get("gate")
@@ -2281,6 +2457,8 @@ mod tests {
             base_sha: Some("abc123".into()),
             source_ref: None,
             source_sha: None,
+            comparison_base_sha: None,
+            candidate_snapshot: None,
             changed_files: None,
             gate: false,
             check_ids: None,
@@ -2580,6 +2758,8 @@ mod tests {
                 base_sha: Some("abc123".into()),
                 source_ref: Some("refs/pull/42/head".into()),
                 source_sha: Some("0123456789012345678901234567890123456789".into()),
+                comparison_base_sha: None,
+                candidate_snapshot: None,
                 changed_files: Some(vec!["src/lib.rs".into()]),
                 gate: true,
                 check_ids: None,
@@ -2616,11 +2796,11 @@ mod tests {
                   "tree_oid":"4b825dc642cb6eb9a060e54bf8d69288fbee4904",
                   "entry_count":0,
                   "entries":[],
-                  "snapshot_digest":"sha256:3a3675b92f2ed63ad31fef87284dd56b1edbdc1d5080585fdb270c7c3a107d59",
+                  "snapshot_digest":"sha256:678716534d66e13c5330ef9f0fe7f6c2c07aaca9215b417a698c89e7e923e59e",
                   "operation_count":0,
                   "operations":[]
                 },
-                "manifest_digest":"sha256:3a3675b92f2ed63ad31fef87284dd56b1edbdc1d5080585fdb270c7c3a107d59"
+                "manifest_digest":"sha256:24e2a0b606300456dee5a423cbf3ea1fac756ee794eede8c97d5af0cd4c7bbc2"
               }
             }
         }"#;
@@ -2629,13 +2809,11 @@ mod tests {
         let encoded: serde_json::Value =
             serde_json::from_str(&parsed.to_json()).expect("roundtrip JSON");
         assert_eq!(
-            encoded["comparison_base_sha"],
-            "de16c5f7dd233165813ffa72719869e3181c554b",
+            encoded["comparison_base_sha"], "de16c5f7dd233165813ffa72719869e3181c554b",
             "comparison base is independent from legacy base_sha"
         );
         assert_eq!(
-            encoded["candidate_snapshot"]["schema"],
-            "cargoless-candidate-snapshot/1",
+            encoded["candidate_snapshot"]["schema"], "cargoless-candidate-snapshot/1",
             "the typed candidate manifest must survive every transport codec"
         );
         assert_eq!(
