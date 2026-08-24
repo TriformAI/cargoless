@@ -5041,7 +5041,7 @@ checks:
             "the child authority must not be a mutable named path: {}",
             lines[0]
         );
-        assert_eq!(lines[1], "overwrite=denied");
+        assert_eq!(lines[1], "denied");
         assert_eq!(lines[2], "stable=yes");
         assert_eq!(lines[3], context.snapshot_digest);
         assert_eq!(lines[4], context.comparison_base_sha);
@@ -5116,7 +5116,10 @@ checks:
         })
         .expect_err("the named lifecycle artifact changed identity after its safe open");
 
-        assert!(error.contains("changed file identity"), "{error}");
+        assert!(
+            error.contains("changed opened-file identity or protection"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

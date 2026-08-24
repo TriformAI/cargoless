@@ -3845,12 +3845,17 @@ mod tests {
         let error: serde_json::Value =
             serde_json::from_str(&response).expect("typed v3 parse rejection is JSON");
         assert_eq!(
-            error,
-            serde_json::json!({
-                "code": "candidate_snapshot.json_duplicate_key",
-                "message": "duplicate field candidate_snapshot in request",
-            }),
+            error.get("code").and_then(serde_json::Value::as_str),
+            Some("candidate_snapshot.json_duplicate_key"),
             "POST /v3/attempts must preserve the branchable candidate taxonomy: {response}"
+        );
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .expect("typed candidate rejection includes an actionable message");
+        assert!(
+            message.contains("duplicate field") && message.contains("schema"),
+            "duplicate nested manifest key must be named: {response}"
         );
         assert_eq!(
             pushes.load(Ordering::SeqCst),
