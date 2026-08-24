@@ -109,6 +109,35 @@ struct OverlayManifestSizeProbe<'a> {
     manifest_digest: &'a str,
 }
 
+impl<'a> OverlayManifestSizeProbe<'a> {
+    fn new(
+        git_object_format: GitObjectFormat,
+        comparison_base: &'a GitTreeRef,
+        candidate_tree_oid: &'a str,
+        entries: &'a BTreeMap<String, SnapshotEntry>,
+        snapshot_digest: &'a str,
+        operations: &'a [OverlayOperation],
+        manifest_digest: &'a str,
+    ) -> Self {
+        Self {
+            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
+            git_object_format,
+            comparison_base,
+            candidate: OverlayCandidateSizeProbe {
+                kind: "overlay",
+                base: comparison_base,
+                tree_oid: candidate_tree_oid,
+                entry_count: entries.len() as u64,
+                entries: SnapshotEntryValues(entries),
+                snapshot_digest,
+                operation_count: operations.len() as u64,
+                operations,
+            },
+            manifest_digest,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct OverlayCandidateSizeProbe<'a> {
     kind: &'static str,
@@ -330,33 +359,9 @@ pub(crate) fn build_overlay_manifest(
 
 fn serialize_overlay_manifest_shape<W: Write>(
     writer: W,
-    git_object_format: GitObjectFormat,
-    comparison_base: &GitTreeRef,
-    candidate_tree_oid: &str,
-    entries: &BTreeMap<String, SnapshotEntry>,
-    snapshot_digest: &str,
-    operations: &[OverlayOperation],
-    manifest_digest: &str,
+    manifest: &OverlayManifestSizeProbe<'_>,
 ) -> std::result::Result<(), serde_json::Error> {
-    serde_json::to_writer(
-        writer,
-        &OverlayManifestSizeProbe {
-            schema: CANDIDATE_SNAPSHOT_SCHEMA_V1,
-            git_object_format,
-            comparison_base,
-            candidate: OverlayCandidateSizeProbe {
-                kind: "overlay",
-                base: comparison_base,
-                tree_oid: candidate_tree_oid,
-                entry_count: entries.len() as u64,
-                entries: SnapshotEntryValues(entries),
-                snapshot_digest,
-                operation_count: operations.len() as u64,
-                operations,
-            },
-            manifest_digest,
-        },
-    )
+    serde_json::to_writer(writer, manifest)
 }
 
 fn ensure_overlay_manifest_json_limit(
@@ -368,8 +373,7 @@ fn ensure_overlay_manifest_json_limit(
     maximum_bytes: usize,
 ) -> Result<usize> {
     let mut writer = ManifestSizeWriter::new(maximum_bytes);
-    match serialize_overlay_manifest_shape(
-        &mut writer,
+    let manifest = OverlayManifestSizeProbe::new(
         git_object_format,
         comparison_base,
         candidate_tree_oid,
@@ -377,7 +381,8 @@ fn ensure_overlay_manifest_json_limit(
         ZERO_DIGEST,
         operations,
         ZERO_DIGEST,
-    ) {
+    );
+    match serialize_overlay_manifest_shape(&mut writer, &manifest) {
         Ok(()) => Ok(writer.bytes),
         Err(_) if writer.exceeded => Err(CandidateSnapshotGitError::new(format!(
             "candidate_snapshot.limit_exceeded: manifest exceeds {maximum_bytes} bytes"
@@ -1350,8 +1355,7 @@ mod tests {
         )
         .unwrap();
         let mut accounted_json = Vec::new();
-        serialize_overlay_manifest_shape(
-            &mut accounted_json,
+        let accounted_manifest = OverlayManifestSizeProbe::new(
             GitObjectFormat::Sha1,
             &base,
             &tree_oid,
@@ -1359,8 +1363,8 @@ mod tests {
             manifest.candidate.snapshot_digest(),
             &operations,
             &manifest.manifest_digest,
-        )
-        .unwrap();
+        );
+        serialize_overlay_manifest_shape(&mut accounted_json, &accounted_manifest).unwrap();
 
         assert_eq!(accounted, canonical.len());
         assert_eq!(accounted_json, canonical.as_bytes());
