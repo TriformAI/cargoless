@@ -5069,14 +5069,14 @@ impl VerdictService for ServeVerdictState {
         }
 
         let rollback_attempt = |reason: &str| {
-            if let Some(reservation) = attempt_reservation.as_ref()
-                && let Err(error) = self.rollback_attempt_admission_v3(reservation)
-            {
-                tracing::error!(
-                    worktree,
-                    error = %error,
-                    "failed to roll back owned attempt admission"
-                );
+            if let Some(reservation) = attempt_reservation.as_ref() {
+                if let Err(error) = self.rollback_attempt_admission_v3(reservation) {
+                    tracing::error!(
+                        worktree,
+                        error = %error,
+                        "failed to roll back owned attempt admission"
+                    );
+                }
             }
             rejected_push(worktree, reason)
         };
@@ -5277,14 +5277,14 @@ impl VerdictService for ServeVerdictState {
                         if let Some(context) = semantic.as_ref() {
                             self.forget_outcome_v3(&context.attempt_id);
                         }
-                        if let Some(reservation) = attempt_reservation.as_ref()
-                            && let Err(error) = self.rollback_attempt_admission_v3(reservation)
-                        {
-                            tracing::error!(
-                                worktree,
-                                error = %error,
-                                "failed to roll back queue-rejected attempt admission"
-                            );
+                        if let Some(reservation) = attempt_reservation.as_ref() {
+                            if let Err(error) = self.rollback_attempt_admission_v3(reservation) {
+                                tracing::error!(
+                                    worktree,
+                                    error = %error,
+                                    "failed to roll back queue-rejected attempt admission"
+                                );
+                            }
                         }
                         self.mark_worktree_published(worktree);
                         return rejected_push_queue_full(worktree, cap, depth);
