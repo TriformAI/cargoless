@@ -126,6 +126,9 @@ const HARD_WITNESS_HISTORY_CAP_DEFAULT: usize = 64;
 /// 128 MiB per `transport::http`'s cap). Same-base_sha still latest-wins
 /// (replace in place) even at the cap. Override via env.
 const PUSHED_MAX_PER_WT_DEFAULT: usize = 8;
+/// Maximum number of terminal outcomes retained in memory. Live pending
+/// attempts remain until completion so their replay and publish state cannot
+/// disappear under unrelated outcome churn.
 const OUTCOME_V3_MEMORY_CAP: usize = 1024;
 const PROJECT_CHECK_MANIFEST_NAME: &str = "cargoless.checks.yaml";
 /// CGLS-26 — bump when the warm shared-target-dir layout or keying changes,
@@ -787,6 +790,8 @@ pub struct ServeVerdictState {
     /// Exact attempt-keyed semantic state. This is intentionally independent
     /// of the last-writer-wins worktree status slot.
     outcomes_v3: Mutex<BTreeMap<cargoless_core::outcome::AttemptId, OutcomeEnvelope>>,
+    /// Oldest-first order of terminal entries in `outcomes_v3`. Pending
+    /// attempts are deliberately absent because they are live dispatch state.
     outcome_order_v3: Mutex<VecDeque<cargoless_core::outcome::AttemptId>>,
     /// Serializes semantic attempt reservation through accepted dispatch. The
     /// durable create-new record protects restarts; this short process lock
@@ -2221,15 +2226,22 @@ impl ServeVerdictState {
 
     fn remember_outcome_v3(&self, outcome: OutcomeEnvelope) {
         let attempt_id = outcome.attempt_id.clone();
+        let is_terminal = !matches!(&outcome.conclusion, Conclusion::Pending { .. });
         let mut outcomes = poisoned(&self.outcomes_v3);
         let mut order = poisoned(&self.outcome_order_v3);
-        if outcomes.insert(attempt_id.clone(), outcome).is_some() {
-            order.retain(|existing| existing != &attempt_id);
+        outcomes.insert(attempt_id.clone(), outcome);
+        order.retain(|existing| existing != &attempt_id);
+        if is_terminal {
+            order.push_back(attempt_id);
         }
-        order.push_back(attempt_id);
         while order.len() > OUTCOME_V3_MEMORY_CAP {
             if let Some(expired) = order.pop_front() {
-                outcomes.remove(&expired);
+                let remains_terminal = outcomes.get(&expired).is_some_and(|outcome| {
+                    !matches!(&outcome.conclusion, Conclusion::Pending { .. })
+                });
+                if remains_terminal {
+                    outcomes.remove(&expired);
+                }
             }
         }
     }
