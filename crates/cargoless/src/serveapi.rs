@@ -93,6 +93,10 @@ static HARD_WITNESS_SEQ: AtomicU64 = AtomicU64::new(0);
 /// retained result; this process-local sequence keeps concurrent hard-witness
 /// claims from superseding one another before either result is published.
 static CANDIDATE_EXECUTION_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Process-local discriminator for exact-Git verification refs. Git's
+/// `FETCH_HEAD` is checkout-global, so repo-sync and concurrent submissions
+/// must never use it as the identity proof for an immutable candidate.
+static SOURCE_FETCH_VERIFICATION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct HardWitnessClaim {
@@ -5908,6 +5912,15 @@ fn validate_source_ref_syntax(source_ref: &str) -> Result<(), String> {
 /// a commit reachable from it. The checkout itself is not moved: project
 /// checks create a detached scratch worktree at `source_sha`.
 fn fetch_verified_source(root: &Path, source_ref: &str, source_sha: &str) -> Result<(), String> {
+    fetch_verified_source_with_after_fetch(root, source_ref, source_sha, |_| {})
+}
+
+fn fetch_verified_source_with_after_fetch(
+    root: &Path,
+    source_ref: &str,
+    source_sha: &str,
+    after_fetch: impl FnOnce(&Path),
+) -> Result<(), String> {
     if !root.join(".git").exists() {
         return Err(format!(
             "analysis_root `{}` is not a git checkout",
@@ -5918,32 +5931,63 @@ fn fetch_verified_source(root: &Path, source_ref: &str, source_sha: &str) -> Res
     if !is_commit_hash(source_sha) {
         return Err("source_sha must be a full 40- or 64-hex object id".to_string());
     }
-    retry_with_sleeps(
-        &[Duration::from_secs(1), Duration::from_secs(3)],
-        |attempt| {
-            if attempt > 0 {
-                eprintln!(
-                    "[cargoless:git] source fetch retry attempt={attempt} root={}",
-                    root.display()
-                );
-            }
-            run_git(root, &["fetch", "--no-tags", "origin", source_ref])
-        },
-    )?;
-    if !local_commit_exists(root, source_sha) {
-        return Err(format!(
-            "source_sha {source_sha} is not a commit after fetching {source_ref}"
-        ));
+    let verification_id = SOURCE_FETCH_VERIFICATION_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let verification_ref = format!(
+        "refs/cargoless/source-verification/{}-{verification_id}",
+        std::process::id()
+    );
+    let refspec = format!("+{source_ref}:{verification_ref}");
+
+    let verification_result = (|| {
+        retry_with_sleeps(
+            &[Duration::from_secs(1), Duration::from_secs(3)],
+            |attempt| {
+                if attempt > 0 {
+                    eprintln!(
+                        "[cargoless:git] source fetch retry attempt={attempt} root={}",
+                        root.display()
+                    );
+                }
+                run_git(
+                    root,
+                    &[
+                        "fetch",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        "origin",
+                        &refspec,
+                    ],
+                )
+            },
+        )?;
+        after_fetch(root);
+        if !local_commit_exists(root, source_sha) {
+            return Err(format!(
+                "source_sha {source_sha} is not a commit after fetching {source_ref}"
+            ));
+        }
+        if !run_git_success(
+            root,
+            &["merge-base", "--is-ancestor", source_sha, &verification_ref],
+        )? {
+            return Err(format!(
+                "source_sha {source_sha} is not reachable from fetched {source_ref}"
+            ));
+        }
+        Ok(())
+    })();
+
+    let cleanup_result = run_git(root, &["update-ref", "-d", &verification_ref]);
+    match (verification_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(format!(
+            "verified source_sha {source_sha}, but failed to remove private verification ref: {cleanup_error}"
+        )),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{error}; additionally failed to remove private verification ref: {cleanup_error}"
+        )),
     }
-    if !run_git_success(
-        root,
-        &["merge-base", "--is-ancestor", source_sha, "FETCH_HEAD"],
-    )? {
-        return Err(format!(
-            "source_sha {source_sha} is not reachable from fetched {source_ref}"
-        ));
-    }
-    Ok(())
 }
 
 /// Run `op` up to `1 + sleeps.len()` times, sleeping `sleeps[n]` after
