@@ -2419,6 +2419,12 @@ fn publish_verdict(
         // (necessary-not-sufficient) from plain green without joining
         // against the push side.
         ra_blind_paths = ra_blind_paths,
+        // #A7 — witness-vs-RA-native discriminator: a dashboard query
+        // needs this to score the two lanes against their own SLOs (10s
+        // RA-native vs 45m witness). Without it no query can split them
+        // (HANDOVER-2026-07-28 P2/P3).
+        witness_compile = !gated_checks_ran.is_empty(),
+        gated_checks_ran = gated_checks_ran.len(),
         pid = std::process::id(),
         trigger_source = trigger_source,
         analysed_at = now,
@@ -2462,11 +2468,23 @@ fn publish_verdict(
     // #A7 — one greppable latency line per push-triggered verdict, with
     // an explicit SLO-breach bit so the soak evidence is a `grep -c
     // slo_breach=true` away (no telemetry stack required).
+    //
+    // Class-aware threshold (HANDOVER-2026-07-28 P3): verdicts backed by a
+    // real compile witness (`gated_checks_ran` non-empty) are scored
+    // against the 45m witness budget; everything else keeps the 10s
+    // RA-native budget. The `class=` field keeps greps honest when both
+    // lanes share this one line shape.
     if let Some(ms) = verdict_latency_ms {
-        let slo_ms = verdict_slo_ms();
+        let witness = !gated_checks_ran.is_empty();
+        let (slo_ms, class) = if witness {
+            (witness_slo_ms(), "witness")
+        } else {
+            (verdict_slo_ms(), "ra-native")
+        };
         eprintln!(
-            "[cargoless:obs] verdict-latency wt={} ms={} slo_ms={} slo_breach={} (#A7)",
+            "[cargoless:obs] verdict-latency wt={} class={} ms={} slo_ms={} slo_breach={} (#A7)",
             wt.display(),
+            class,
             ms,
             slo_ms,
             ms > slo_ms
@@ -2565,13 +2583,39 @@ fn publish_stranded_unknown(
 }
 
 /// #A7 — verdict-latency SLO threshold (ms) for the `slo_breach=` stderr
-/// bit. Default 10s: generous against the ~2s RA-native budget, tight
-/// enough that a breach means "a human would have noticed the wait".
+/// bit, RA-NATIVE verdicts only (FS-watch / coalesced / EmitVerdict-arm
+/// publishes with no gated checks). Default 10s: generous against the ~2s
+/// RA-native budget, tight enough that a breach means "a human would have
+/// noticed the wait".
+///
+/// Compile-witness verdicts (`gated_checks_ran` non-empty) are scored
+/// against [`witness_slo_ms`] instead — this 10s figure was authored
+/// against the RA-native budget and applied to witness publishes it could
+/// never fit, so every witness verdict printed `slo_breach=true` by
+/// construction (noise; see HANDOVER-2026-07-28 P3).
 fn verdict_slo_ms() -> u64 {
     std::env::var("CARGOLESS_VERDICT_SLO_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(10_000)
+}
+
+/// #A7 — verdict-latency SLO threshold (ms) for COMPILE-WITNESS verdicts
+/// (push-gated publishes whose `gated_checks_ran` is non-empty — a real
+/// project-checks compile ran between push receipt and verdict publish).
+///
+/// Default 45 min: comfortably above the warm witness range (~20-40 min
+/// observed on the serve-witness fleet, 2026-08-25: 21m green / 37m red)
+/// and well below the 4800s wall + 5100s CI poll deadline, so a breach
+/// means "degraded beyond normal warm range — look" rather than
+/// "trivially true" or "already timed out elsewhere". Cold-cache
+/// witnesses (50-80 min) breach by design: they ARE degraded vs
+/// steady state and that is exactly the signal this bit exists to carry.
+fn witness_slo_ms() -> u64 {
+    std::env::var("CARGOLESS_WITNESS_SLO_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2_700_000)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
