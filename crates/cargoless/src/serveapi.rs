@@ -12017,6 +12017,65 @@ checks:
     }
 
     #[test]
+    fn exact_git_fetch_verification_ignores_concurrent_fetch_head_changes() {
+        let root = temp_root("exact-git-fetch-head-race");
+        let remote = temp_root("exact-git-fetch-head-race-remote");
+        git(&remote, &["init", "--bare"]);
+        git(&root, &["init"]);
+        git(
+            &root,
+            &["config", "user.email", "cargoless@example.invalid"],
+        );
+        git(&root, &["config", "user.name", "Cargoless Test"]);
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        let base_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("candidate.txt"), "candidate\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "candidate"]);
+        let source_sha = git_capture(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["push", "origin", "HEAD:main"]);
+        git(&root, &["reset", "--hard", &base_sha]);
+
+        fetch_verified_source_with_after_fetch(&root, "refs/heads/main", &source_sha, |checkout| {
+            std::fs::write(
+                checkout.join(".git/FETCH_HEAD"),
+                format!("{base_sha}\t\tconcurrent repo-sync fetch\n"),
+            )
+            .unwrap();
+        })
+        .expect("verification must use its private fetched ref, not shared FETCH_HEAD");
+
+        assert_eq!(
+            git_capture(&root, &["rev-parse", "FETCH_HEAD"]),
+            base_sha,
+            "the injected concurrent fetch must remain observable"
+        );
+        assert_eq!(
+            git_capture(
+                &root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/cargoless/source-verification",
+                ],
+            ),
+            "",
+            "private verification refs must be cleaned after use"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[test]
     fn typed_overlay_keeps_attribution_comparison_and_operation_bases_distinct() {
         let root = temp_root("candidate-distinct-bases");
         git(&root, &["init"]);
