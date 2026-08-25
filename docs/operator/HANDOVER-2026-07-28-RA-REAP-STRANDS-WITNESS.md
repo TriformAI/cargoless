@@ -243,6 +243,14 @@ hours:
 
 ## P3 — the 10s SLO is a category error for the witness lane
 
+> **RESOLVED 2026-08-25** — scoped per-lane: `publish_verdict` now scores
+> `gated_checks_ran`-non-empty verdicts against `CARGOLESS_WITNESS_SLO_MS`
+> (default 45m, between the ~20-40m warm range and the 4800s wall) and
+> everything else against the original `CARGOLESS_VERDICT_SLO_MS` (10s);
+> the `verdict-latency` line gained `class=witness|ra-native` and the
+> `verdict.publish` span gained `witness_compile`/`gated_checks_ran` attrs
+> so dashboard queries can split the lanes (P2). Historical text below.
+
 `CARGOLESS_VERDICT_SLO_MS` (default 10s,
 `crates/cargoless/src/servedrv.rs:1676-1685`) was authored against the ~2s
 RA-native budget, but `publish_verdict` is shared by all modes. So **every**
