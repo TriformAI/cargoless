@@ -66,8 +66,8 @@ pub use cargoless_proto::{
     Diagnostic, FileState, InputHash, Profile, Severity, StateEvent, TargetTriple, TreeState,
 };
 pub use config::{
-    FleetConfig, FleetConfigError, FleetOverrides, Provenance, Source, TelemetryConfig,
-    TelemetryOverrides, TelemetryProvenance,
+    FleetConfig, FleetConfigError, FleetOverrides, LaneProvenance, LaneSettings, Provenance,
+    Source, TelemetryConfig, TelemetryOverrides, TelemetryProvenance,
 };
 pub use model::LifecycleEvent;
 
