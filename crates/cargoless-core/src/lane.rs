@@ -744,6 +744,21 @@ impl LaneState {
 
     /// Advance the lane.
     pub fn step(&mut self, event: LaneEvent) -> Vec<LaneAction> {
+        self.step_inner(event, true)
+    }
+
+    /// Apply an event completely, but leave newly-runnable queued work idle.
+    ///
+    /// The driver uses this only after one pump has consumed its eager-step
+    /// budget. A terminal build event must still eject/requeue/report exactly
+    /// once, but starting another blocking generation in the same call would
+    /// recreate the recursive chain the budget is meant to bound. The next
+    /// host tick goes through [`Self::step`] and starts the retained queue.
+    pub(crate) fn step_without_build_start(&mut self, event: LaneEvent) -> Vec<LaneAction> {
+        self.step_inner(event, false)
+    }
+
+    fn step_inner(&mut self, event: LaneEvent, allow_build_start: bool) -> Vec<LaneAction> {
         let mut actions = Vec::new();
         match event {
             LaneEvent::Enqueue(member) => self.on_enqueue(member, &mut actions),
@@ -810,9 +825,13 @@ impl LaneState {
                 self.expire_ejections(&mut actions);
             }
         }
-        // One place decides whether a build starts, so every path that could
-        // make the lane runnable gets the same treatment.
-        self.maybe_start_build(&mut actions);
+        if allow_build_start {
+            // One place decides whether a build starts, so every ordinary path
+            // that could make the lane runnable gets the same treatment. The
+            // driver's bounded-yield path deliberately defers only this final
+            // decision; every other effect of the event has already applied.
+            self.maybe_start_build(&mut actions);
+        }
         actions
     }
 

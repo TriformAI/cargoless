@@ -2197,19 +2197,43 @@ impl<T: CandidateTree, R: LegRunner, L: LaneLander> LaneDriver<T, R, L> {
         event: LaneEvent,
         mut observe: impl FnMut(&LaneState, &LaneActivity),
     ) -> Vec<LaneAction> {
-        const MAX_STEPS: usize = 64;
+        const MAX_EAGER_STEPS: usize = 64;
         let mut all = Vec::new();
         let mut pending = std::collections::VecDeque::from(vec![event]);
         let mut steps = 0;
+        let mut allow_build_start = true;
         // FIFO, not LIFO: follow-up events must be applied in the order they
         // were produced, or a lander re-enqueueing several members would
         // reverse their arrival order and quietly reshuffle the queue.
         while let Some(ev) = pending.pop_front() {
             steps += 1;
-            if steps > MAX_STEPS {
-                break;
+            if allow_build_start && steps >= MAX_EAGER_STEPS {
+                // The old guard broke out here and DROPPED `ev`. In a
+                // conflict-heavy queue that event is the BuildFinished for a
+                // subprocess that already exited. Dropping it leaves
+                // LaneState in Building forever while the activity snapshot
+                // honestly says Settled — the exact generation-111 production
+                // wedge from 2026-08-28.
+                //
+                // Switch modes instead: drain every already-produced event and
+                // all of its reporting/ejection/requeue effects, but do not
+                // start another blocking generation in this pump. With new
+                // StartBuild actions disabled, the remaining follow-up graph is
+                // finite. The host gets an honest idle snapshot and its next
+                // tick may continue the retained queue.
+                allow_build_start = false;
+                let line = format!(
+                    "[cargoless:obs] lane-pump-yield generation={} reason=step_budget steps={MAX_EAGER_STEPS}",
+                    lane.generation()
+                );
+                self.trail_line(&line);
+                eprintln!("{line}");
             }
-            let actions = lane.step(ev);
+            let actions = if allow_build_start {
+                lane.step(ev)
+            } else {
+                lane.step_without_build_start(ev)
+            };
             // Observe the NEW state before running the actions it produced.
             // `lane.step` has already set phase/in_flight; `execute` is what
             // blocks.
