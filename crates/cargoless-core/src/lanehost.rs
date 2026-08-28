@@ -958,7 +958,11 @@ mod tests {
             LaneState::with_config(
                 "/tmp/lanehost-test-conflict-step-budget",
                 LaneConfig {
-                    max_members: 10,
+                    // Keep admission from triggering on fullness before the
+                    // sentinel tick. Once that tick opens the build, every
+                    // conflict requeues its survivors and the historical pump
+                    // recursively starts the next generation even below cap.
+                    max_members: 100,
                     capture_window_ticks: 100,
                     ..Default::default()
                 },
