@@ -669,6 +669,8 @@ mod tests {
     use cargoless_proto::TreeState;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc::{Sender as StdSender, channel as std_channel};
     use std::time::{Duration, Instant};
 
@@ -676,6 +678,24 @@ mod tests {
     impl CandidateTree for NoTree {
         fn materialize(&self, _members: &[LaneMember]) -> Result<PathBuf, MaterializeError> {
             Ok(PathBuf::from("/tmp/lanehost-test-candidate"))
+        }
+    }
+
+    /// A candidate materializer that deterministically names the first member
+    /// as conflicting. A deep queue therefore produces one terminal conflict
+    /// after another without involving a compiler or a forge.
+    struct FirstMemberConflicts {
+        attempts: Arc<AtomicUsize>,
+    }
+    impl CandidateTree for FirstMemberConflicts {
+        fn materialize(&self, members: &[LaneMember]) -> Result<PathBuf, MaterializeError> {
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(MaterializeError::Conflict {
+                id: members[0].id.clone(),
+                files: vec![PathBuf::from(format!("src/{}.rs", members[0].id))],
+                shared_with: Vec::new(),
+                reason: "fixture merge conflict".to_string(),
+            })
         }
     }
 
@@ -911,6 +931,81 @@ mod tests {
             host.snapshot()
         );
         release_tx.send(()).expect("release B");
+    }
+
+    /// Production regression, 2026-08-28: generation 111 wrote a terminal
+    /// `outcome=conflict`, but GET /lane remained `phase=building` /
+    /// `activity=settled` for hours with seven members in flight and no build
+    /// process. The driver had reached its 64-step recursion guard and silently
+    /// dropped the pending BuildFinished event, leaving the pure state machine
+    /// latched in Building after the subprocess was already gone.
+    ///
+    /// A large conflict-heavy queue is legitimate finite work, not a policy
+    /// loop. Reaching the pump budget must yield in an honest idle state with
+    /// every unjudged survivor retained. A later host tick may start the next
+    /// generation; this pump may not claim a build that does not exist.
+    #[test]
+    fn the_step_budget_yields_idle_instead_of_latching_a_completed_conflict_build() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let driver = LaneDriver::new(
+            FirstMemberConflicts {
+                attempts: attempts.clone(),
+            },
+            GreenLegs,
+            NoLander,
+        );
+        let host = LaneHost::spawn(
+            LaneState::with_config(
+                "/tmp/lanehost-test-conflict-step-budget",
+                LaneConfig {
+                    max_members: 10,
+                    capture_window_ticks: 100,
+                    ..Default::default()
+                },
+            ),
+            driver,
+        );
+
+        for i in 0..70 {
+            host.enqueue(LaneMember::new(format!("P{i:02}"), format!("sha-{i:02}")))
+                .expect("queued");
+        }
+        // This sentinel is ordered after every Enqueue on the host channel.
+        // Seeing its clock value proves the worker owns all 70 members before
+        // the build-triggering tick arrives; the accepted read-side overlay
+        // alone is not sufficient evidence of that.
+        host.tick(1);
+        assert!(
+            until(|| {
+                let snapshot = host.snapshot();
+                snapshot.now == 1 && snapshot.phase == "idle" && snapshot.queue_depth == 70
+            }),
+            "setup must drain all admissions without opening the capture window: {:?}",
+            host.snapshot()
+        );
+
+        host.tick(100);
+        assert!(
+            until(|| attempts.load(AtomicOrdering::SeqCst) >= 63),
+            "the fixture must reach the old 64-step boundary"
+        );
+
+        let snapshot = host.snapshot();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 63);
+        assert_eq!(snapshot.generation, 63);
+        assert_eq!(snapshot.phase, "idle", "no build exists: {snapshot:?}");
+        assert_eq!(
+            snapshot.activity, "settled",
+            "the pump has returned and no blocking action exists: {snapshot:?}"
+        );
+        assert!(
+            snapshot.in_flight.is_empty(),
+            "no phantom build: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.queue_depth, 7,
+            "all seven unjudged survivors must remain queued for the next tick: {snapshot:?}"
+        );
     }
 
     /// A member accepted behind a long build must join the retry after a
