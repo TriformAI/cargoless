@@ -88,7 +88,9 @@ impl fmt::Display for ConfigError {
             ConfigError::BadTfToml { line_no, line, why } => write!(
                 f,
                 "tf.toml: {why} (line {line_no}: `{line}`).\n  \
-                 Supported: [project] root/target, [cache] dir. `#` comments."
+                 Supported here: [project] root/target, [cache] dir. \
+                 `#` comments. ([fleet], [telemetry] and [lane] are read by \
+                 `cargoless serve` and ignored by this command.)"
             ),
         }
     }
@@ -193,11 +195,27 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// Apply a parsed `tf.toml` over a defaulted [`Config`]. Unknown
-/// keys/sections are a hard error (a silently-ignored typo in a zero-config
-/// tool is a support nightmare).
+/// Apply a parsed `tf.toml` over a defaulted [`Config`]. Unknown keys and
+/// sections **that this reader owns** are a hard error (a silently-ignored
+/// typo in a zero-config tool is a support nightmare).
+///
+/// The exception is the sections owned by the DAEMON's resolver
+/// (`cargoless_core::config`): `[fleet]`, `[telemetry]` and `[lane]`. This
+/// reader owns `[project]`/`[cache]` and must keep catching typos there, but
+/// it reads the SAME shared `tf.toml` — so a section belonging to the other
+/// reader is not an error here, it is simply someone else's key.
+///
+/// This was latent rather than harmless: `[fleet]`/`[telemetry]` escaped only
+/// because `Cmd::Serve` early-returns in `main.rs` BEFORE this reader runs.
+/// Any reorder of that dispatch would have made every `[fleet]` tf.toml a hard
+/// failure for `check`/`watch`/`build`. `[lane]` would have hit it immediately,
+/// because a lane knob lives in the same repo people run `cargoless check` in.
 pub fn apply_tf_toml(cfg: &mut Config, text: &str) -> Result<(), ConfigError> {
     let mut section = String::new();
+    // Whether the section currently being scanned belongs to the daemon's
+    // resolver. Skipping the header alone would not be enough — the key loop
+    // below would then reject `max_members` via its `_` arm.
+    let mut foreign = false;
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
         let line = strip_comment(raw).trim();
@@ -206,13 +224,18 @@ pub fn apply_tf_toml(cfg: &mut Config, text: &str) -> Result<(), ConfigError> {
         }
         if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             section = name.trim().to_string();
-            if !matches!(section.as_str(), "project" | "cache") {
+            foreign = matches!(section.as_str(), "fleet" | "telemetry" | "lane");
+            if !foreign && !matches!(section.as_str(), "project" | "cache") {
                 return Err(ConfigError::BadTfToml {
                     line_no,
                     line: raw.trim().to_string(),
                     why: format!("unknown section `[{section}]`"),
                 });
             }
+            continue;
+        }
+        if foreign {
+            // Not ours to validate; the daemon's resolver owns these keys.
             continue;
         }
         let Some((key, val)) = line.split_once('=') else {
@@ -356,6 +379,42 @@ mod tests {
             apply_tf_toml(&mut c, "[serve]\nport = 1\n"),
             Err(ConfigError::BadTfToml { .. })
         ));
+    }
+
+    #[test]
+    fn daemon_owned_sections_are_ignored_not_rejected() {
+        // The daemon's resolver owns [fleet], [telemetry] and [lane] over this
+        // same shared file. Rejecting them here would make a repo that
+        // configures `serve` unusable with `check`/`watch`/`build` — and for
+        // [lane] that is not hypothetical: a lane knob lives in the repo people
+        // run `cargoless check` in.
+        let mut c = Config::defaults(PathBuf::from("/p"), Detection::TfToml);
+        apply_tf_toml(
+            &mut c,
+            "[project]\ntarget = \"wasm32-unknown-unknown\"\n\
+             [fleet]\nrepo = \"/workspace/repo\"\n\
+             [telemetry]\notel_endpoint = \"http://otel:4317\"\n\
+             [lane]\nmax_members = 40\ncapture_window_ticks = 300\n",
+        )
+        .unwrap();
+        // The owned key still applied; the foreign ones were skipped, not read.
+        assert_eq!(c.target, "wasm32-unknown-unknown");
+
+        // Tolerance must NOT have leaked into the sections this reader owns.
+        assert!(
+            matches!(
+                apply_tf_toml(&mut c, "[project]\nnot_a_key = 1\n"),
+                Err(ConfigError::BadTfToml { .. })
+            ),
+            "a typo in an owned section must still be a hard error"
+        );
+        assert!(
+            matches!(
+                apply_tf_toml(&mut c, "[serve]\nport = 1\n"),
+                Err(ConfigError::BadTfToml { .. })
+            ),
+            "a section nobody owns must still be a hard error"
+        );
     }
 
     #[test]
