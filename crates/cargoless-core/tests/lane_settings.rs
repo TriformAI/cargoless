@@ -38,10 +38,14 @@ fn a_tf_toml_batch_size_actually_bounds_a_build() {
     // The end-to-end proof. If any seam between the file and the machine
     // regresses to `LaneConfig::default()`, this goes red: the default cap is
     // 10, so all five members would ride one build instead of three.
-    let dir = project(
-        "bounds",
-        "[lane]\nmax_members = 3\ncapture_window_ticks = 0\n",
-    );
+    //
+    // The capture window is left at its DEFAULT deliberately. A zero window
+    // builds the first arrival on its own — correct behaviour, wrong test: the
+    // cap would never be reached and this would prove nothing about
+    // `max_members`. With the window open, A and B wait, C fills the queue to
+    // the cap, and the build short-circuits the window because there is
+    // nothing left to gather. Same shape as `max_members_bounds_a_build`.
+    let dir = project("bounds", "[lane]\nmax_members = 3\n");
     let settings = LaneSettings::resolve_layered(&dir, &no_env).expect("resolve [lane]");
     assert_eq!(settings.lane.max_members, 3);
 
