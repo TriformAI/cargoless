@@ -3854,6 +3854,17 @@ impl VerdictService for ServeVerdictState {
                 "head": m.head,
                 "state": m.state,
             })).collect::<Vec<_>>(),
+            // The policy in force. The boot line reports this too, but that
+            // dies with the pod; this is what an operator can poll — and the
+            // only way to confirm a lane that RECOVERED an active build kept
+            // the configured policy instead of reverting to the built-in one.
+            "policy": {
+                "max_members": s.policy.max_members,
+                "capture_window_ticks": s.policy.capture_window_ticks,
+                "eject_ttl_ticks": s.policy.eject_ttl_ticks,
+                "infra_backoff_ticks": s.policy.infra_backoff_ticks,
+                "infra_max_attempts": s.policy.infra_max_attempts,
+            },
             "ejections": s.ejections.iter().map(|e| serde_json::json!({
                 "id": e.id,
                 "head": e.head,
