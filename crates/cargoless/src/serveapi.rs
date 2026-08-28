@@ -1715,6 +1715,7 @@ impl ServeVerdictState {
         base_ref: &str,
         plan: cargoless_core::lanedrv::LegPlan,
         land_command: Option<Vec<String>>,
+        lane_cfg: cargoless_core::lane::LaneConfig,
     ) -> Self {
         let tree = cargoless_core::lanetree::GitCandidateTree::new(
             repo,
@@ -1770,11 +1771,10 @@ impl ServeVerdictState {
             None => Box::new(cargoless_core::lanedrv::ReportOnlyLander),
         };
         let recovery_path = state_dir.join("lane-active-generation.json");
-        let lane = match LaneState::load_active_build(
-            repo,
-            &recovery_path,
-            cargoless_core::lane::LaneConfig::default(),
-        ) {
+        // BOTH arms take the same resolved policy, so a recovered lane and a
+        // fresh one are governed identically. A restart must not be a silent
+        // way back to the built-in defaults.
+        let lane = match LaneState::load_active_build(repo, &recovery_path, lane_cfg.clone()) {
             Ok(Some(lane)) => {
                 eprintln!(
                     "[cargoless:obs] lane-recovery outcome=reattach generation={} members={}",
@@ -1783,7 +1783,7 @@ impl ServeVerdictState {
                 );
                 lane
             }
-            Ok(None) => LaneState::new(repo),
+            Ok(None) => LaneState::with_config(repo, lane_cfg),
             Err(e) => {
                 // Starting empty would select a second batch while the first
                 // remote build may still be running. Refuse to arm the lane
