@@ -1770,7 +1770,11 @@ impl ServeVerdictState {
             None => Box::new(cargoless_core::lanedrv::ReportOnlyLander),
         };
         let recovery_path = state_dir.join("lane-active-generation.json");
-        let lane = match LaneState::load_active_build(repo, &recovery_path) {
+        let lane = match LaneState::load_active_build(
+            repo,
+            &recovery_path,
+            cargoless_core::lane::LaneConfig::default(),
+        ) {
             Ok(Some(lane)) => {
                 eprintln!(
                     "[cargoless:obs] lane-recovery outcome=reattach generation={} members={}",

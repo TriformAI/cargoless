@@ -566,6 +566,11 @@ pub struct LaneState {
 }
 
 impl LaneState {
+    /// A lane on the built-in default policy.
+    ///
+    /// For tests and for a caller with no project configuration. Production
+    /// resolves `[lane]` from the project's `tf.toml` — see
+    /// `crate::config::LaneSettings` — and goes through [`Self::with_config`].
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self::with_config(root, LaneConfig::default())
@@ -597,9 +602,14 @@ impl LaneState {
     /// same `StartBuild` again; an idempotent dispatcher can then reattach to
     /// the exact external run instead of selecting a different batch and
     /// orphaning the first compile.
+    /// `cfg` is the resolved project policy, not a default: a lane recovered
+    /// after a restart must run under the policy the operator configured, not
+    /// silently revert to the built-in one. It is a required parameter so that
+    /// reverting is unrepresentable rather than merely discouraged.
     pub fn load_active_build(
         root: impl Into<PathBuf>,
         path: &Path,
+        cfg: LaneConfig,
     ) -> Result<Option<Self>, String> {
         if !path.exists() {
             return Ok(None);
@@ -631,7 +641,7 @@ impl LaneState {
                 path.display()
             ));
         }
-        let mut lane = Self::new(root);
+        let mut lane = Self::with_config(root, cfg);
         lane.phase = LanePhase::Building;
         lane.in_flight = members;
         lane.generation = generation;
@@ -641,6 +651,14 @@ impl LaneState {
 
     /// Durable representation of the currently blocking generation.
     /// `None` means there is no remote build to reattach after a restart.
+    ///
+    /// The roster and generation are journalled; the POLICY deliberately is
+    /// not. Config belongs to the live process — a restart after an operator
+    /// raises `[lane] max_members` must run under the NEW value, not resurrect
+    /// the one the dead pod booted with. A journalled policy would be exactly
+    /// the invisible-knob failure the `load_active_build` config parameter was
+    /// added to remove. `schema` therefore stays at 1: nothing about the
+    /// durable shape changed.
     #[must_use]
     pub(crate) fn active_build_recovery_value(&self) -> Option<Value> {
         if self.phase != LanePhase::Building || self.in_flight.is_empty() {
@@ -704,6 +722,17 @@ impl LaneState {
     #[must_use]
     pub fn now(&self) -> u64 {
         self.now
+    }
+
+    /// The policy this lane is running under.
+    ///
+    /// Exists so the effective policy can be REPORTED (boot log, `GET /lane`)
+    /// rather than inferred from behaviour. A knob whose effect is invisible
+    /// is dead machinery, and the restart path is precisely where a silently
+    /// reverted policy would otherwise go unnoticed.
+    #[must_use]
+    pub fn cfg(&self) -> &LaneConfig {
+        &self.cfg
     }
 
     /// Move the clock forward WITHOUT stepping the machine.

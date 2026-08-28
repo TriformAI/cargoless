@@ -737,10 +737,26 @@ mod tests {
         );
         persist_active_build(&journal, &interrupted).expect("persist active generation");
 
-        let recovered = LaneState::load_active_build(&root, &journal)
-            .expect("read valid journal")
-            .expect("journal contains an active build");
+        let recovered = LaneState::load_active_build(
+            &root,
+            &journal,
+            LaneConfig {
+                capture_window_ticks: 0,
+                ..Default::default()
+            },
+        )
+        .expect("read valid journal")
+        .expect("journal contains an active build");
         assert_eq!(recovered.generation(), 1);
+        // The recovered lane must run under the CALLER's policy. This used to
+        // call `LaneState::new` internally, so a configured lane silently
+        // reverted to the built-in defaults after any restart that reattached
+        // a build — invisible until someone counted members.
+        assert_eq!(
+            recovered.cfg().capture_window_ticks,
+            0,
+            "recovery must keep the caller's policy, not the built-in default"
+        );
         assert_eq!(
             recovered.in_flight(),
             &[LaneMember::new("pr-7", "head-7").with_changed_files(["physics/src/lib.rs"])]
@@ -788,7 +804,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::write(&path, b"{not-json\n").expect("write malformed journal");
-        let error = LaneState::load_active_build("/tmp/lane-invalid", &path)
+        let error = LaneState::load_active_build("/tmp/lane-invalid", &path, LaneConfig::default())
             .expect_err("a corrupt active journal must not start an empty lane");
         assert!(error.contains("parse"), "unexpected error: {error}");
         let _ = fs::remove_file(path);
