@@ -526,7 +526,10 @@ pub enum LanePhase {
     Building,
 }
 
-#[derive(Debug, Clone)]
+// `PartialEq, Eq` so `config::LaneSettings` (which wraps this) can derive
+// them for its own tests. Not `Copy`: a future non-integer field would
+// silently make that a trap.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneConfig {
     /// Cap on members per build. A bigger train amortises the build cost but
     /// widens the blast radius of one red and raises the chance some head goes

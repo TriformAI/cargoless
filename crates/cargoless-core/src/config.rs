@@ -56,12 +56,14 @@
 //! `CLAUDE.md` (no new deps; keep the cold-build path AC#1/#2 measure
 //! lean). The `tf.toml` reader here is a **tolerant partial overlay**: it
 //! reads only the keys it owns and *ignores everything else*. This is the
-//! deliberate opposite of the CLI `Config` reader, which hard-errors on any
-//! unknown section/key. Both are correct for their ownership scope — the
-//! CLI reader owns `[project] root/target` + `[cache] dir` and must catch
-//! typos there; this reader is a partial view of the *same shared file* and
-//! must never reject keys it does not own (doing so would break every
-//! existing v0 `tf.toml`).
+//! deliberate opposite of the CLI `Config` reader, which hard-errors on an
+//! unknown key inside a section *it* owns (`[project] root/target`,
+//! `[cache] dir`) — a silently-ignored typo in a zero-config tool is a
+//! support nightmare. Both are correct for their ownership scope, and they
+//! read the *same shared file*: this reader must never reject keys it does
+//! not own (doing so would break every existing v0 `tf.toml`), and the CLI
+//! reader skips the sections owned here (`[fleet]`, `[telemetry]`, `[lane]`)
+//! rather than rejecting them.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -95,6 +97,20 @@ impl Source {
             Source::TfToml => "tf.toml",
             Source::Env => "environment",
             Source::Cli => "CLI flag",
+        }
+    }
+
+    /// Short, grep-safe tag for `key=value` observability lines.
+    ///
+    /// [`Self::describe`] is prose for humans ("default (v0-compatible)") and
+    /// its spaces and parens break a boot-line field split. An operator reading
+    /// `max_members_src=tf.toml` needs one token, not a sentence.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Source::Default => "default",
+            Source::TfToml => "tf.toml",
+            Source::Env => "env",
+            Source::Cli => "cli",
         }
     }
 }
@@ -187,6 +203,18 @@ pub enum FleetConfigError {
         key: String,
         value: String,
     },
+    /// A `[lane]` / `CARGOLESS_LANE_*` setting is unparseable or out of range.
+    ///
+    /// Carries `key` rather than hardcoding it (unlike `parse_sampler_arg`
+    /// below, which names `OTEL_TRACES_SAMPLER_ARG` in every message it
+    /// produces): the lane has five numeric settings, and an error that names
+    /// the wrong one is worse than no error.
+    BadLaneSetting {
+        origin: &'static str,
+        key: &'static str,
+        value: String,
+        why: &'static str,
+    },
 }
 
 impl fmt::Display for FleetConfigError {
@@ -195,7 +223,11 @@ impl fmt::Display for FleetConfigError {
             FleetConfigError::BadTfToml { line_no, line, why } => write!(
                 f,
                 "tf.toml: {why} (line {line_no}: `{line}`).\n  \
-                 [fleet] keys: repo, bind, corun, auth_token. \
+                 [fleet] repo, bind, corun, auth_token. \
+                 [telemetry] otel_endpoint, otel_headers, otel_service_name, \
+                 otel_log_level, otel_sampler_arg. \
+                 [lane] max_members, capture_window_ticks, eject_ttl_ticks, \
+                 infra_backoff_ticks, infra_max_attempts. \
                  [project] state_dir. [cache] cas_dir."
             ),
             FleetConfigError::BadBind { value, why } => write!(
@@ -203,6 +235,18 @@ impl fmt::Display for FleetConfigError {
                 "invalid bind address `{value}`: {why}.\n  \
                  expected `HOST:PORT`, e.g. `127.0.0.1:8080` (loopback, \
                  safe) or `0.0.0.0:8080` (network — requires --auth-token)."
+            ),
+            FleetConfigError::BadLaneSetting {
+                origin,
+                key,
+                value,
+                why,
+            } => write!(
+                f,
+                "{origin}: `{key}` = `{value}` — {why}.\n  \
+                 [lane] keys: max_members, capture_window_ticks, \
+                 eject_ttl_ticks, infra_backoff_ticks, infra_max_attempts \
+                 (whole numbers; only capture_window_ticks may be 0)."
             ),
             FleetConfigError::BadBool { origin, key, value } => write!(
                 f,
@@ -760,6 +804,315 @@ fn apply_telemetry_tf_toml_overlay(
     Ok(())
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Lane policy — the `[lane]` section of `tf.toml`.
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The build lane's batch size and retry policy, declared BY THE PROJECT, in
+// the project's own repo, versioned alongside the code whose build cost it
+// describes. How many changes may safely ride one release build is a
+// property of the codebase — not of whoever happened to start the daemon.
+//
+// Before this existed, `lane::LaneConfig::default()` was the only value the
+// production path could ever see: `with_lane` called `LaneState::new`, which
+// is `with_config(root, LaneConfig::default())`. `max_members` was documented
+// as a tunable knob in two places and reachable from none, which cost one
+// investigation already — a shell-script constant was raised to 20, found to
+// be inert, and reverted, without locating the real bound.
+//
+// Do not confuse this `max_members` with the CHECK COALESCER's identically
+// named field (`serveapi.rs`, default 40, `CARGOLESS_BATCH_MAX_MEMBERS`).
+// That one bounds a fast per-save check batch; this one bounds how many
+// members ride a 25-80 minute release build. The name collision is exactly
+// what derailed the earlier investigation.
+//
+// Precedence: `environment  >  tf.toml  >  built-in default`.
+//
+// There is deliberately NO `LaneOverrides` / CLI layer: no `--lane-*` flag
+// exists, and an injection struct that is always `Default::default()` is the
+// dead machinery `servedrv.rs` forbids ("a knob whose effect is invisible").
+// Add one when the first flag lands, not before.
+
+/// Per-field provenance for [`LaneSettings`] — mirror of [`Provenance`] and
+/// [`TelemetryProvenance`]. Surfaced so an operator can tell "the tf.toml was
+/// read" from "the default merely coincided" — without that, a knob that
+/// silently failed to apply looks identical to one that applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneProvenance {
+    pub max_members: Source,
+    pub capture_window_ticks: Source,
+    pub eject_ttl_ticks: Source,
+    pub infra_backoff_ticks: Source,
+    pub infra_max_attempts: Source,
+}
+
+impl Default for LaneProvenance {
+    fn default() -> Self {
+        Self {
+            max_members: Source::Default,
+            capture_window_ticks: Source::Default,
+            eject_ttl_ticks: Source::Default,
+            infra_backoff_ticks: Source::Default,
+            infra_max_attempts: Source::Default,
+        }
+    }
+}
+
+/// Fully-resolved lane policy for this project: `[lane]` in `tf.toml` plus
+/// `CARGOLESS_LANE_*` env, layered over the built-in defaults.
+///
+/// Holds a [`crate::lane::LaneConfig`] rather than mirroring its five fields.
+/// That type is the machine's own contract — it is what
+/// `LaneState::with_config` takes, and it carries the production forensics
+/// behind each default in its doc comments. Duplicating five integers here
+/// would mean two places to change and a conversion that can drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneSettings {
+    /// Ready to hand to `LaneState::with_config`.
+    pub lane: crate::lane::LaneConfig,
+    /// Which layer won, per field.
+    pub provenance: LaneProvenance,
+}
+
+impl LaneSettings {
+    /// The built-in policy — byte-identical to `LaneConfig::default()`, so a
+    /// project with no `[lane]` section and no env behaves exactly as before.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            lane: crate::lane::LaneConfig::default(),
+            provenance: LaneProvenance::default(),
+        }
+    }
+
+    /// Resolve for `repo_root`, layering `default < tf.toml < env`. Reads the
+    /// process environment; see [`Self::resolve_layered`] for the env-injected
+    /// (unit-testable) variant.
+    pub fn resolve(repo_root: impl AsRef<Path>) -> Result<Self, FleetConfigError> {
+        let env = |k: &str| std::env::var(k).ok();
+        Self::resolve_layered(repo_root.as_ref(), &env)
+    }
+
+    /// Env-injected resolver core. `env` is the only IO seam beyond reading
+    /// `tf.toml`, so the precedence logic is pure and unit-testable without
+    /// touching the process environment.
+    ///
+    /// Calls [`Self::validate`] before returning, so no caller can forget it.
+    pub fn resolve_layered(
+        repo_root: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, FleetConfigError> {
+        let mut cfg = Self::defaults();
+
+        // ---- layer 1: tf.toml (tolerant partial overlay) -------------
+        if let Ok(text) = std::fs::read_to_string(repo_root.join("tf.toml")) {
+            apply_lane_tf_toml_overlay(&mut cfg, &text)?;
+        }
+
+        // ---- layer 2: environment ------------------------------------
+        // `CARGOLESS_LANE_*`, matching the lane's existing env family
+        // (CARGOLESS_LANE_PROFILE / _BASE / _ARTIFACT / ...), NOT the older
+        // `TF_*` fleet family. Env matters concretely here: the lane is turned
+        // ON by env in a deployment, where the tf.toml is the repo's own and
+        // shared with every developer's checkout — a shared daemon needs a
+        // bigger batch than a laptop does.
+        if let Some(v) = env("CARGOLESS_LANE_MAX_MEMBERS").filter(|s| !s.trim().is_empty()) {
+            cfg.lane.max_members =
+                parse_lane_num("env CARGOLESS_LANE_MAX_MEMBERS", "max_members", &v)?;
+            cfg.provenance.max_members = Source::Env;
+        }
+        if let Some(v) = env("CARGOLESS_LANE_CAPTURE_WINDOW_TICKS").filter(|s| !s.trim().is_empty())
+        {
+            cfg.lane.capture_window_ticks = parse_lane_num(
+                "env CARGOLESS_LANE_CAPTURE_WINDOW_TICKS",
+                "capture_window_ticks",
+                &v,
+            )?;
+            cfg.provenance.capture_window_ticks = Source::Env;
+        }
+        if let Some(v) = env("CARGOLESS_LANE_EJECT_TTL_TICKS").filter(|s| !s.trim().is_empty()) {
+            cfg.lane.eject_ttl_ticks =
+                parse_lane_num("env CARGOLESS_LANE_EJECT_TTL_TICKS", "eject_ttl_ticks", &v)?;
+            cfg.provenance.eject_ttl_ticks = Source::Env;
+        }
+        if let Some(v) = env("CARGOLESS_LANE_INFRA_BACKOFF_TICKS").filter(|s| !s.trim().is_empty())
+        {
+            cfg.lane.infra_backoff_ticks = parse_lane_num(
+                "env CARGOLESS_LANE_INFRA_BACKOFF_TICKS",
+                "infra_backoff_ticks",
+                &v,
+            )?;
+            cfg.provenance.infra_backoff_ticks = Source::Env;
+        }
+        if let Some(v) = env("CARGOLESS_LANE_INFRA_MAX_ATTEMPTS").filter(|s| !s.trim().is_empty()) {
+            cfg.lane.infra_max_attempts = parse_lane_num(
+                "env CARGOLESS_LANE_INFRA_MAX_ATTEMPTS",
+                "infra_max_attempts",
+                &v,
+            )?;
+            cfg.provenance.infra_max_attempts = Source::Env;
+        }
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Refuse a policy that cannot work. Sibling in spirit to
+    /// [`FleetConfig::security_check`]: a frozen rule with a frozen message,
+    /// testable without a daemon.
+    ///
+    /// The rule is **deliberately not** a uniform "every field must be > 0" —
+    /// `capture_window_ticks = 0` is documented, intentional, and what every
+    /// unit test and single-developer project uses. A tidy all-fields-positive
+    /// validator would break exactly that configuration.
+    pub fn validate(&self) -> Result<(), FleetConfigError> {
+        // `max_members = 0` is not a deadlock, it is an infinite loop of real
+        // release builds. `maybe_start_build` has already returned if the queue
+        // is empty, so `queue.len() >= 0` is unconditionally true: the capture
+        // window is skipped, `take = len.min(0) = 0` drains nobody, and
+        // `StartBuild` fires with an EMPTY roster. The driver then compiles the
+        // bare base for 25-80 minutes, finishes, returns to Idle with the queue
+        // still full, and fires again — forever, journalling nothing (the
+        // recovery value is None while `in_flight` is empty).
+        if self.lane.max_members == 0 {
+            return Err(FleetConfigError::BadLaneSetting {
+                origin: "lane policy",
+                key: "max_members",
+                value: "0".to_string(),
+                why: "a lane that may carry nobody dispatches empty builds forever",
+            });
+        }
+        // The increment precedes the `>=` check, so 0 ejects the whole roster
+        // on the FIRST transient failure — the opposite of what the field is
+        // for. `lane_policy.rs` already asserts the shipped default is non-zero.
+        if self.lane.infra_max_attempts == 0 {
+            return Err(FleetConfigError::BadLaneSetting {
+                origin: "lane policy",
+                key: "infra_max_attempts",
+                value: "0".to_string(),
+                why: "0 ejects the whole queue on the first transient failure",
+            });
+        }
+        // "A zero backoff IS the hot loop" — the retry fires as fast as the
+        // failure returns. Measured at ~one candidate attempt every 2.5s,
+        // indefinitely, on the first real deployment.
+        if self.lane.infra_backoff_ticks == 0 {
+            return Err(FleetConfigError::BadLaneSetting {
+                origin: "lane policy",
+                key: "infra_backoff_ticks",
+                value: "0".to_string(),
+                why: "a zero backoff retries as fast as the failure returns",
+            });
+        }
+        // `now >= expires_at_tick` is immediately true, so an ejection lapses
+        // on the very next tick: the lane ejects a member and silently
+        // readmits it, rebuilding the same red tree every cycle. A gate that
+        // visibly ejects and invisibly readmits is indistinguishable from a bug.
+        if self.lane.eject_ttl_ticks == 0 {
+            return Err(FleetConfigError::BadLaneSetting {
+                origin: "lane policy",
+                key: "eject_ttl_ticks",
+                value: "0".to_string(),
+                why: "an ejection that lapses on the next tick never holds",
+            });
+        }
+        // `capture_window_ticks = 0` is intentionally ABSENT from these checks:
+        // it means "build immediately", which is what a single-developer repo
+        // and every unit test want. Do not add it.
+        Ok(())
+    }
+}
+
+/// Parse a `[lane]` / `CARGOLESS_LANE_*` whole number.
+///
+/// Generic over the target so `usize`/`u64`/`u32` each parse natively and no
+/// lossy cast is needed. Takes `key` and reports it — `parse_sampler_arg`
+/// above hardcodes its key into the error, so reusing that shape for the
+/// lane's five numeric settings would name the wrong one.
+///
+/// Returns a typed error rather than falling back to the default. The
+/// `configured_batch_*` helpers in the `cargoless` binary do the opposite and
+/// swallow typos; letting `max_members = "fourty"` boot silently as 10 is the
+/// invisible-knob failure this whole section exists to remove.
+fn parse_lane_num<T: FromStr>(
+    origin: &'static str,
+    key: &'static str,
+    v: &str,
+) -> Result<T, FleetConfigError> {
+    T::from_str(v.trim()).map_err(|_| FleetConfigError::BadLaneSetting {
+        origin,
+        key,
+        value: v.to_string(),
+        why: "expects a whole number",
+    })
+}
+
+/// Same tolerant-overlay contract as [`apply_tf_toml_overlay`] — unknown
+/// sections/keys are ignored, owned keys' values are validated.
+///
+/// Owned keys (all under `[lane]`, all whole numbers):
+/// - `max_members = <n>`
+/// - `capture_window_ticks = <n>`
+/// - `eject_ttl_ticks = <n>`
+/// - `infra_backoff_ticks = <n>`
+/// - `infra_max_attempts = <n>`
+fn apply_lane_tf_toml_overlay(cfg: &mut LaneSettings, text: &str) -> Result<(), FleetConfigError> {
+    let mut section = String::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = name.trim().to_string();
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = unquote(val.trim());
+        // A malformed value from tf.toml reports as `BadTfToml` so the LINE
+        // NUMBER survives — the same trade the telemetry sampler arm makes.
+        // `BadLaneSetting` is for the env layer and for `validate`, where
+        // there is no line to point at.
+        macro_rules! lane_num {
+            ($field:ident, $name:literal) => {{
+                cfg.lane.$field = parse_lane_num(concat!("tf.toml [lane] ", $name), $name, &val)
+                    .map_err(|_| FleetConfigError::BadTfToml {
+                        line_no,
+                        line: raw.trim().to_string(),
+                        why: format!(
+                            concat!("`", $name, "` expects a whole number, got `{}`"),
+                            val
+                        ),
+                    })?;
+                cfg.provenance.$field = Source::TfToml;
+            }};
+        }
+        match (section.as_str(), key) {
+            ("lane", "max_members") if !val.trim().is_empty() => {
+                lane_num!(max_members, "max_members")
+            }
+            ("lane", "capture_window_ticks") if !val.trim().is_empty() => {
+                lane_num!(capture_window_ticks, "capture_window_ticks")
+            }
+            ("lane", "eject_ttl_ticks") if !val.trim().is_empty() => {
+                lane_num!(eject_ttl_ticks, "eject_ttl_ticks")
+            }
+            ("lane", "infra_backoff_ticks") if !val.trim().is_empty() => {
+                lane_num!(infra_backoff_ticks, "infra_backoff_ticks")
+            }
+            ("lane", "infra_max_attempts") if !val.trim().is_empty() => {
+                lane_num!(infra_max_attempts, "infra_max_attempts")
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Build a [`FleetOverrides`] from an already-collected string map — a
 /// convenience for the CLI crate / tests that have flag values as strings.
 /// Not used by core itself; keeps the string→typed boundary in one place.
@@ -1295,5 +1648,175 @@ mod tests {
         assert_eq!(c.otel_endpoint.as_deref(), Some("http://env-good:4317"));
         // env stays the winning provenance (CLI blank did not promote).
         assert_eq!(c.provenance.otel_endpoint, Source::Env);
+    }
+
+    // ---- [lane] policy -------------------------------------------------
+
+    /// A unique temp dir per test, matching the tf.toml convention above.
+    fn lane_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("cl-lane-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn lane_defaults_match_lane_config_default() {
+        // The no-behaviour-change guarantee: a project with no `[lane]` and no
+        // env gets exactly the policy the lane shipped with. Analogue of
+        // `defaults_are_v0`.
+        let s = LaneSettings::defaults();
+        assert_eq!(s.lane, crate::lane::LaneConfig::default());
+        assert_eq!(s.provenance.max_members, Source::Default);
+        assert_eq!(s.provenance.capture_window_ticks, Source::Default);
+        assert_eq!(s.provenance.eject_ttl_ticks, Source::Default);
+        assert_eq!(s.provenance.infra_backoff_ticks, Source::Default);
+        assert_eq!(s.provenance.infra_max_attempts, Source::Default);
+    }
+
+    #[test]
+    fn lane_resolve_with_no_inputs_equals_defaults() {
+        let dir = lane_dir("noinput");
+        let s = LaneSettings::resolve_layered(&dir, &no_env).unwrap();
+        assert_eq!(s, LaneSettings::defaults());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lane_precedence_env_beats_tf_toml_beats_default() {
+        let dir = lane_dir("prec");
+        std::fs::write(
+            dir.join("tf.toml"),
+            "[lane]\nmax_members = 25\ncapture_window_ticks = 300\n",
+        )
+        .unwrap();
+
+        // tf.toml only.
+        let c = LaneSettings::resolve_layered(&dir, &no_env).unwrap();
+        assert_eq!(c.lane.max_members, 25);
+        assert_eq!(c.provenance.max_members, Source::TfToml);
+        assert_eq!(c.lane.capture_window_ticks, 300);
+        assert_eq!(c.provenance.capture_window_ticks, Source::TfToml);
+        // Untouched fields keep the built-in default AND its provenance.
+        assert_eq!(
+            c.lane.eject_ttl_ticks,
+            crate::lane::LaneConfig::default().eject_ttl_ticks
+        );
+        assert_eq!(c.provenance.eject_ttl_ticks, Source::Default);
+
+        // env overrides tf.toml for max_members only.
+        let env = |k: &str| match k {
+            "CARGOLESS_LANE_MAX_MEMBERS" => Some("40".to_string()),
+            _ => None,
+        };
+        let c = LaneSettings::resolve_layered(&dir, &env).unwrap();
+        assert_eq!(c.lane.max_members, 40);
+        assert_eq!(c.provenance.max_members, Source::Env);
+        // The field env did NOT set must still come from tf.toml.
+        assert_eq!(c.lane.capture_window_ticks, 300);
+        assert_eq!(c.provenance.capture_window_ticks, Source::TfToml);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lane_tf_toml_overlay_is_tolerant_of_foreign_keys() {
+        // The same shared file carries other readers' sections, and a future
+        // additive `[lane]` key must never break an older binary.
+        let dir = lane_dir("tolerant");
+        std::fs::write(
+            dir.join("tf.toml"),
+            "[project]\nroot = \".\"\nstate_dir = \".cargoless\"\n\
+             [cache]\ndir = \"/tmp/c\"\n\
+             [fleet]\nrepo = \"/workspace/repo\"\n\
+             [telemetry]\notel_endpoint = \"http://otel:4317\"\n\
+             [serve]\nport = 8080\n\
+             [lane]\nmax_members = 12\nmax_batch_bytes = 1\n",
+        )
+        .unwrap();
+        let c = LaneSettings::resolve_layered(&dir, &no_env).unwrap();
+        assert_eq!(c.lane.max_members, 12);
+        assert_eq!(
+            c.lane.capture_window_ticks,
+            crate::lane::LaneConfig::default().capture_window_ticks
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lane_malformed_value_is_actionable_and_names_the_right_key() {
+        // tf.toml keeps the line number.
+        let dir = lane_dir("malformed");
+        std::fs::write(dir.join("tf.toml"), "[lane]\nmax_members = \"ten\"\n").unwrap();
+        let err = LaneSettings::resolve_layered(&dir, &no_env).unwrap_err();
+        assert!(matches!(err, FleetConfigError::BadTfToml { .. }));
+        assert!(
+            err.to_string().contains("max_members"),
+            "message must name the failing key: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // env reports the key that ACTUALLY failed — the anti-`parse_sampler_arg`
+        // assertion. A shared helper that hardcodes one key would name the wrong
+        // field here, and five numeric settings make that a real hazard.
+        let env = |k: &str| (k == "CARGOLESS_LANE_INFRA_MAX_ATTEMPTS").then(|| "nope".to_string());
+        let err = LaneSettings::resolve_layered(Path::new("/nonexistent"), &env).unwrap_err();
+        assert!(matches!(err, FleetConfigError::BadLaneSetting { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("infra_max_attempts"),
+            "message must name the failing key: {msg}"
+        );
+        assert!(
+            !msg.contains("`max_members` = `nope`"),
+            "message must not name a different key: {msg}"
+        );
+    }
+
+    #[test]
+    fn lane_illegal_zeros_are_refused_but_a_zero_capture_window_is_legal() {
+        // Deliberately NOT a uniform "every field must be > 0": a zero capture
+        // window means "build immediately", which is what a single-developer
+        // repo and every lane unit test use. The other four zeros each wedge
+        // the lane in a different way.
+        for key in [
+            "max_members",
+            "infra_max_attempts",
+            "infra_backoff_ticks",
+            "eject_ttl_ticks",
+        ] {
+            let dir = lane_dir(&format!("zero-{key}"));
+            std::fs::write(dir.join("tf.toml"), format!("[lane]\n{key} = 0\n")).unwrap();
+            let Err(err) = LaneSettings::resolve_layered(&dir, &no_env) else {
+                panic!("`{key} = 0` must be refused");
+            };
+            assert!(
+                err.to_string().contains(key),
+                "refusal must name `{key}`: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        let dir = lane_dir("zero-window");
+        std::fs::write(dir.join("tf.toml"), "[lane]\ncapture_window_ticks = 0\n").unwrap();
+        let c = LaneSettings::resolve_layered(&dir, &no_env)
+            .expect("a zero capture window is the documented build-immediately mode");
+        assert_eq!(c.lane.capture_window_ticks, 0);
+        assert_eq!(c.provenance.capture_window_ticks, Source::TfToml);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lane_env_family_is_cargoless_lane_not_tf() {
+        // The lane's env family is `CARGOLESS_LANE_*` (matching _PROFILE,
+        // _BASE, _ARTIFACT...); `TF_*` is the older fleet-only prefix. Pins the
+        // convention against a future "helpful" alias.
+        let env = |k: &str| (k == "TF_LANE_MAX_MEMBERS").then(|| "99".to_string());
+        let c = LaneSettings::resolve_layered(Path::new("/nonexistent"), &env).unwrap();
+        assert_eq!(
+            c.lane.max_members,
+            crate::lane::LaneConfig::default().max_members
+        );
+        assert_eq!(c.provenance.max_members, Source::Default);
     }
 }
