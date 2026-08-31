@@ -691,6 +691,30 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             Some(land_cmd)
         };
 
+        // The PROJECT's lane policy: `[lane]` in the repo's own tf.toml,
+        // overridden by CARGOLESS_LANE_* env. Resolved against
+        // `scope.repo_root` — the same root `FleetConfig::resolve` used —
+        // because there is exactly ONE lane per daemon, building candidates on
+        // one base. A per-worktree lane policy would name nothing.
+        //
+        // Fails CLOSED, unlike telemetry (which logs and continues with
+        // defaults because it must never wedge the daemon). This one can move
+        // the trunk, and a lane silently running a policy the operator did not
+        // choose is the failure this whole seam exists to remove.
+        let lane_settings = match cargoless_core::LaneSettings::resolve(&scope.repo_root) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[cargoless] FATAL: lane configuration is unusable: {e}");
+                eprintln!(
+                    "[cargoless] Refusing to start: an out-of-range lane policy can \
+                     dispatch empty builds in a loop or eject the queue on the first \
+                     transient failure. Fix `[lane]` in tf.toml (or the \
+                     CARGOLESS_LANE_* env) and restart."
+                );
+                std::process::exit(2);
+            }
+        };
+
         // Announce it. A lane that can move the trunk must be visible in the
         // boot log, not inferred from behaviour — the same reasoning as the
         // resolved-caps lines below. `where=` and `land=` are the load-bearing
@@ -712,6 +736,50 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             },
             intergeneration_yield.as_secs()
         );
+        // The resolved policy, on its OWN line rather than appended to the one
+        // above: that line's `where=`/`land=` fields are the load-bearing
+        // security read and its shape should stay stable. Same `key=value`
+        // grammar as the resolved-caps lines below.
+        //
+        // Each value carries a `_src=`, because "the tf.toml was read" and "the
+        // default merely coincided" are indistinguishable otherwise — and a
+        // knob that silently failed to apply is exactly what this replaced.
+        let src = &lane_settings.provenance;
+        let pol = &lane_settings.lane;
+        eprintln!(
+            "[cargoless:obs] build-lane-policy max_members={} max_members_src={} \
+             capture_window_ticks={} capture_window_ticks_src={} \
+             eject_ttl_ticks={} eject_ttl_ticks_src={} \
+             infra_backoff_ticks={} infra_backoff_ticks_src={} \
+             infra_max_attempts={} infra_max_attempts_src={}",
+            pol.max_members,
+            src.max_members.tag(),
+            pol.capture_window_ticks,
+            src.capture_window_ticks.tag(),
+            pol.eject_ttl_ticks,
+            src.eject_ttl_ticks.tag(),
+            pol.infra_backoff_ticks,
+            src.infra_backoff_ticks.tag(),
+            pol.infra_max_attempts,
+            src.infra_max_attempts.tag(),
+        );
+        // Raising the cap alone buys nothing when arrivals are sparse: the lane
+        // builds early only once the queue REACHES max_members, and otherwise
+        // waits out the capture window. Someone who sets `max_members = 40` and
+        // sees batches of three has not hit a bug — they have hit the pairing.
+        // Say so at boot rather than letting them conclude the knob is broken,
+        // which is precisely how the previous batch-size investigation went.
+        if pol.max_members > cargoless_core::lane::LaneConfig::default().max_members
+            && src.capture_window_ticks == cargoless_core::Source::Default
+        {
+            eprintln!(
+                "[cargoless:obs] build-lane-policy \
+                 advisory=raised-max-members-with-default-window \
+                 detail=a bigger cap only fills when arrivals cluster inside \
+                 capture_window_ticks={}s; sparser arrivals still build small batches",
+                pol.capture_window_ticks
+            );
+        }
         api_state = api_state.with_lane(
             &scope.repo_root,
             &state_dir,
@@ -719,6 +787,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             plan,
             land_command,
             intergeneration_yield,
+            lane_settings.lane.clone(),
         );
     }
     let api = Arc::new(api_state);

@@ -1976,6 +1976,7 @@ impl ServeVerdictState {
         plan: cargoless_core::lanedrv::LegPlan,
         land_command: Option<Vec<String>>,
         intergeneration_yield: Duration,
+        lane_cfg: cargoless_core::lane::LaneConfig,
     ) -> Self {
         let tree = cargoless_core::lanetree::GitCandidateTree::new(
             repo,
@@ -2051,7 +2052,12 @@ impl ServeVerdictState {
         cargoless_core::lanedrv::close_abandoned_generations(&trail);
 
         self.lane = Some(LaneHost::spawn_with_intergeneration_yield(
-            LaneState::new(repo),
+            // The PROJECT's resolved policy, not the built-in default. This
+            // was `LaneState::new(repo)`, which is
+            // `with_config(root, LaneConfig::default())` — so `max_members`
+            // was pinned at 10 in production while being documented as a
+            // tunable knob in two places.
+            LaneState::with_config(repo, lane_cfg),
             cargoless_core::lanedrv::LaneDriver::new(tree, legs, lander).with_trail(trail),
             intergeneration_yield,
         ));
