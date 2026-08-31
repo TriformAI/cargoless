@@ -1968,6 +1968,12 @@ impl ServeVerdictState {
     /// push-capable forge token via `.git/config` on its shared volume, checked
     /// 2026-07-31) must dispatch instead. See `DispatchLegRunner`.
     #[must_use]
+    // Eight, one past clippy's threshold. Every one is a distinct boot-time
+    // decision an operator makes independently — where the legs run, what
+    // lands, how long to yield, what policy to run under — so bundling them
+    // into a struct would trade one honest signature for an indirection that
+    // hides the same arity. The house remedy elsewhere in this crate.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_lane(
         mut self,
         repo: &Path,

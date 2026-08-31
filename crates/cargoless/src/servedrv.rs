@@ -787,7 +787,7 @@ pub fn run(scope: RepoScope, parent: &ParentWatch) -> ExitCode {
             plan,
             land_command,
             intergeneration_yield,
-            lane_settings.lane.clone(),
+            lane_settings.lane,
         );
     }
     let api = Arc::new(api_state);
