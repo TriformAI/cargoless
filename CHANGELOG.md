@@ -26,6 +26,24 @@ canonical, in this order):
 
 ### Added
 
+- **Project-defined build-lane policy (`[lane]` in `tf.toml`)** — the lane's
+  batch size and retry policy are now declared by the project, in the
+  project's own repo, versioned alongside the code whose build cost they
+  describe. Five settings (`max_members`, `capture_window_ticks`,
+  `eject_ttl_ticks`, `infra_backoff_ticks`, `infra_max_attempts`), layered
+  `default < tf.toml < CARGOLESS_LANE_* env`, with per-field provenance
+  reported in a new `build-lane-policy` boot line and under `policy` on
+  `GET /lane`. Defaults are unchanged, so a project that sets nothing behaves
+  exactly as before. Previously `max_members` was pinned at 10 in production
+  — documented as tunable in two places and settable from nowhere, because
+  `with_lane` always built its lane on `LaneConfig::default()`. The same seam
+  made a *recovered* lane silently revert to the built-in policy after any
+  restart that reattached a running build; both are fixed. Out-of-range
+  values are refused at boot rather than clamped, except
+  `capture_window_ticks = 0`, which is the documented build-immediately mode.
+  Not to be confused with the check coalescer's identically-named
+  `CARGOLESS_BATCH_MAX_MEMBERS`.
+
 - **Stale-base detection in `--allow-existing-red` classification** —
   `cargoless checks run --base <ref> --allow-existing-red` now warns when
   the local tracking ref is behind real origin before re-running checks

@@ -71,11 +71,45 @@ change broke it.
 
 ### Lane settings
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `max_members` | 10 | Cap per build. Bigger amortises the build cost; also widens the blast radius of one red and raises the chance a head goes stale mid-build. |
-| `capture_window_ticks` | 60 | How long an idle lane waits for company. `0` builds immediately. |
-| `eject_ttl_ticks` | 3600 | Backstop: an ejection lapses after this regardless. |
+The project declares its own lane policy in its own `tf.toml`, versioned
+alongside the code whose build cost it describes. Precedence is
+`built-in default < [lane] in tf.toml < CARGOLESS_LANE_* env`.
+
+```toml
+[lane]
+max_members = 25
+capture_window_ticks = 300
+```
+
+| Setting | Default | Set with | Meaning |
+|---|---|---|---|
+| `max_members` | 10 | `[lane] max_members` / `CARGOLESS_LANE_MAX_MEMBERS` | Cap per build. Bigger amortises the build cost; also widens the blast radius of one red and raises the chance a head goes stale mid-build. |
+| `capture_window_ticks` | 60 | `[lane] capture_window_ticks` / `CARGOLESS_LANE_CAPTURE_WINDOW_TICKS` | How long an idle lane waits for company. `0` builds immediately. |
+| `eject_ttl_ticks` | 3600 | `[lane] eject_ttl_ticks` / `CARGOLESS_LANE_EJECT_TTL_TICKS` | Backstop: an ejection lapses after this regardless. |
+| `infra_backoff_ticks` | 120 | `[lane] infra_backoff_ticks` / `CARGOLESS_LANE_INFRA_BACKOFF_TICKS` | Wait after an infrastructure failure before rebuilding the same members. Sized to a preview-daemon restart, not a blip. |
+| `infra_max_attempts` | 10 | `[lane] infra_max_attempts` / `CARGOLESS_LANE_INFRA_MAX_ATTEMPTS` | Consecutive infra failures before the lane stops retrying and ejects. |
+
+Ticks are wall-clock seconds.
+
+**`max_members` and `capture_window_ticks` are a pair.** The lane builds early
+only once the queue *reaches* `max_members`; otherwise it waits out the window.
+Raising the cap alone therefore changes nothing when arrivals are sparse — the
+daemon emits a `build-lane-policy advisory=` line at boot when it sees that
+combination, because "I raised it and nothing happened" is the obvious way to
+conclude, wrongly, that the knob is broken.
+
+Four of the five settings **refuse zero**, each for a different reason:
+`max_members = 0` dispatches empty-roster builds forever, `infra_max_attempts = 0`
+ejects the whole queue on the first transient failure, `infra_backoff_ticks = 0`
+is the retry hot loop, and `eject_ttl_ticks = 0` lapses an ejection on the next
+tick. `capture_window_ticks = 0` is the one legal zero — it is the
+build-immediately mode a single-developer repo wants. An out-of-range value is
+refused at boot rather than clamped.
+
+> Not to be confused with the **check coalescer's** `max_members`
+> (`CARGOLESS_BATCH_MAX_MEMBERS`, default 40), which bounds a fast per-save
+> check batch. This one bounds how many members ride a 25–80 minute release
+> build. The shared name has already cost one investigation.
 
 ## The capture window
 

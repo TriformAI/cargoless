@@ -59,6 +59,27 @@ a member on no evidence. Fail-safe.
    | `CARGOLESS_LANE_DISPATCH_REMOTE` | git remote used to publish the immutable candidate. Default `origin`. |
    | `CARGOLESS_LANE_DISPATCH_REF_PREFIX` | content-addressed ref prefix. Default `refs/heads/lane-candidate`. |
    | `CARGOLESS_LANE_LAND` | trusted argv that receives the green roster and candidate identity and performs forge-specific landing. Unset ⇒ report-only. |
+   | `CARGOLESS_LANE_MAX_MEMBERS` | cap per build. Default 10. |
+   | `CARGOLESS_LANE_CAPTURE_WINDOW_TICKS` | seconds an idle lane waits for company. Default 60; `0` builds immediately. |
+   | `CARGOLESS_LANE_EJECT_TTL_TICKS` | seconds an ejection survives. Default 3600. |
+   | `CARGOLESS_LANE_INFRA_BACKOFF_TICKS` | seconds between infra retries. Default 120. |
+   | `CARGOLESS_LANE_INFRA_MAX_ATTEMPTS` | consecutive infra failures before ejecting. Default 10. |
+
+   The last five are the **lane policy**, and env is only the top layer: they
+   are normally declared by the project in `[lane]` in its own `tf.toml`, which
+   is where they belong — how many changes may safely ride one release build is
+   a property of the codebase. Env overrides the file, for a deployment that
+   needs a different batch size than a developer's checkout.
+
+   The daemon prints the resolved policy at boot, with the layer each value
+   came from:
+
+   ```
+   [cargoless:obs] build-lane-policy max_members=25 max_members_src=tf.toml \
+     capture_window_ticks=60 capture_window_ticks_src=default ...
+   ```
+
+   `GET /lane` reports the same under `policy`.
 
    Leave `CARGOLESS_LANE_ARTIFACT` unset for a **check-only lane**: it proves
    the merged tree compiles and deliberately leaves `.cargoless/latest-green`
@@ -255,11 +276,29 @@ green.
 
 ## Tuning
 
+Set these in `[lane]` in the repo's `tf.toml`, or override per-deployment with
+the matching `CARGOLESS_LANE_*` env var.
+
 | knob | default | raise it when | lower it when |
 |---|---|---|---|
 | `capture_window_ticks` | 60 | arrivals cluster and you want fewer, fuller builds | a single-developer repo where waiting buys nothing (`0` = off) |
 | `max_members` | 10 | builds are cheap and reds are rare | a red re-tests too much, or heads go stale mid-build |
 | `eject_ttl_ticks` | 3600 | ejections are usually correct | attribution is being wrong and stranding people |
+| `infra_backoff_ticks` | 120 | your infra outages outlast a pod restart | retries are cheap and you want faster recovery |
+| `infra_max_attempts` | 10 | transient failures are common and clear on their own | a permanent failure should be surfaced sooner |
 
 Raising `max_members` amortises the build cost and widens the blast radius of
 one red. That is the whole trade; there is no setting that avoids it.
+
+**Raise `capture_window_ticks` with it.** The lane builds early only once the
+queue *reaches* `max_members`, so on sparse arrivals a bigger cap changes
+nothing — you get the same small batches and conclude the knob is broken. The
+boot log emits a `build-lane-policy advisory=` line when it sees a raised cap
+against a defaulted window.
+
+Zero is refused for every knob here **except** `capture_window_ticks`, where it
+is the documented build-immediately mode. Each rejection is a different failure:
+a cap of 0 dispatches empty-roster builds forever, `infra_max_attempts = 0`
+ejects the queue on the first transient failure, `infra_backoff_ticks = 0` is
+the retry hot loop, and `eject_ttl_ticks = 0` lapses an ejection on the next
+tick. An out-of-range value stops the daemon at boot rather than being clamped.
