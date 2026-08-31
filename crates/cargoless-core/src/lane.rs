@@ -707,6 +707,17 @@ impl LaneState {
         self.now
     }
 
+    /// The policy this lane is running under.
+    ///
+    /// Exists so the effective policy can be REPORTED (boot log, `GET /lane`)
+    /// rather than inferred from behaviour. A knob whose effect is invisible is
+    /// dead machinery, and `max_members` spent the lane's whole life documented
+    /// as tunable while being reachable from nowhere.
+    #[must_use]
+    pub fn cfg(&self) -> &LaneConfig {
+        &self.cfg
+    }
+
     /// Move the clock forward WITHOUT stepping the machine.
     ///
     /// A `Tick` does two things: it advances `now`, and it runs the expiry +
