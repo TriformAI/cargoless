@@ -90,6 +90,26 @@ pub struct LaneSnapshot {
     pub members: Vec<MemberView>,
     /// One entry per live ejection: (id, kind, human-readable reason, files).
     pub ejections: Vec<EjectionView>,
+    /// The policy in force — what the lane is actually running with, as
+    /// opposed to what a config file says it should be.
+    pub policy: LanePolicyView,
+}
+
+/// The policy the lane is running under.
+///
+/// Nested rather than flattened into [`LaneSnapshot`]'s live-state fields:
+/// this is configuration, not state. The boot log announces it too, but that
+/// line dies with the pod — this is what an operator can poll.
+///
+/// Provenance is deliberately absent: `LaneConfig` carries none, and the boot
+/// log already answers "which layer won".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LanePolicyView {
+    pub max_members: usize,
+    pub capture_window_ticks: u64,
+    pub eject_ttl_ticks: u64,
+    pub infra_backoff_ticks: u64,
+    pub infra_max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +248,13 @@ impl LaneSnapshot {
             now: lane.now(),
             in_flight,
             ejections,
+            policy: LanePolicyView {
+                max_members: lane.cfg().max_members,
+                capture_window_ticks: lane.cfg().capture_window_ticks,
+                eject_ttl_ticks: lane.cfg().eject_ttl_ticks,
+                infra_backoff_ticks: lane.cfg().infra_backoff_ticks,
+                infra_max_attempts: lane.cfg().infra_max_attempts,
+            },
         }
     }
 
@@ -1240,6 +1267,7 @@ mod tests {
                 },
             ],
             ejections: Vec::new(),
+            policy: LanePolicyView::default(),
         };
         let pending = HashSet::from(["B".to_string()]);
 
