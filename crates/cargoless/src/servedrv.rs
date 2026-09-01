@@ -2403,16 +2403,60 @@ fn publish_verdict(
     // statically, so a non-zero count surfacing on `verdict=red` (and a
     // populated `verdict_failure_reason` surfacing on `verdict=unknown`)
     // becomes the load-bearing telemetry contract.
-    let otel_status = match verdict {
-        statusfile::Verdict::Green => "OK",
-        // Both Red and Unknown represent the daemon-side error condition
-        // worth surfacing in SigNoz's `hasError=true` filter — the
-        // distinction is then made by reading `verdict_color` +
-        // `verdict_failure_reason`. Treating them both as ERROR keeps
-        // operators from missing Unknown verdicts (the new, honest
-        // failure mode) in the same dashboards that currently page on Red.
-        statusfile::Verdict::Red | statusfile::Verdict::Unknown => "ERROR",
-    };
+    // INFRA-819 (2026-09-01): `otel.status_code` is NOT set from the verdict.
+    //
+    // It used to be — `Red | Unknown => "ERROR"` — on the stated reasoning that
+    // both are "the daemon-side error condition worth surfacing in SigNoz's
+    // `hasError=true` filter", so that "dashboards that currently page on Red"
+    // would also catch Unknown. Every clause of that is about a paging
+    // contract, and the contract was never measured. Measured 2026-09-01
+    // against the live SigNoz install: **20 alert rules exist cluster-wide,
+    // exactly ONE reads the traces signal at all** (`PanelStateStream5xx`,
+    // filtered to `http.route LIKE '%panel-state-stream%'` on triform-physics).
+    // Not one rule reads `cargoless`, `verdict`, `hasError`, or `status_code`
+    // on this service. Nothing pages on this span, so nothing could be missed
+    // by not marking it — the signal being protected had no consumer.
+    //
+    // What DOES consume it reads the mark as a defect. The "Cargoless Gate
+    // Health" dashboard's `Daemon Error Spans` widget counts
+    // `has_error = true OR status_code = 2` across every cargoless span and
+    // documents itself as "the quick 'is something broken' number. 0 =
+    // healthy." Over 7d that number was **2068**, of which 2068 were
+    // `verdict.publish` — 74.4% of all published verdicts (2068/2780), and
+    // `verdict.publish` was the ONLY cargoless-serve span emitting an error
+    // status at all. Its permanent floor made the widget unreadable, so the
+    // over-marking did not merely fail to help a pager: it destroyed the one
+    // instrument that would show a real daemon fault.
+    //
+    // The span status answers "did THIS span's execution fail?". A non-green
+    // verdict is the daemon's normal, correct work product — the publish
+    // succeeded. Marking it ERROR is a category error, and the spans prove it
+    // carry no failure payload: all 2068 had `exception.type` empty and
+    // `status_message` empty.
+    //
+    // The outcome is not lost — it never lived in the status. It rides the
+    // INFRA-36 attributes below, which are populated and queryable today
+    // (measured over the same window: `verdict_color` splits
+    // unknown=1984 / green=712 / red=84, and `verdict_failure_reason` carries
+    // a live classifier on every unknown, e.g. `ra_native_attempt_stderr_error`
+    // 1739, `ra_blind_path_green_unwitnessed` 217). A dashboard or alert that
+    // wants "red, or unknown" queries `verdict_color IN ('red','unknown')`,
+    // which is strictly MORE precise than `hasError` — it can separate the two
+    // classes the old mapping deliberately merged, and cannot be confused with
+    // a genuine daemon exception.
+    //
+    // If this span ever needs an error status again, the sanctioned path
+    // already exists and is the whole point: `telemetry::record_exception`,
+    // which sets `otel.status_code=ERROR` *together with* `exception.type` /
+    // `exception.message` from a real `std::error::Error`. It is still
+    // `#[allow(dead_code)]` awaiting its first error-attaching site — and that
+    // is the structural cause of this defect, not a coincidence. With the one
+    // API that couples a status to its evidence marked unused, the only way to
+    // reach `hasError=true` from here was to hand-roll the status alone, and a
+    // hand-rolled status has nothing to attach, so it gets keyed on whatever
+    // value is in scope. The verdict was in scope. Set the status from a caught
+    // failure of the publish operation via that helper — never from `verdict`.
+    // `scripts/tests/verdict-span-status-test.sh` pins that.
     let _span = tracing::info_span!(
         "verdict.publish",
         worktree = %wt.display(),
@@ -2455,7 +2499,6 @@ fn publish_verdict(
         pid = std::process::id(),
         trigger_source = trigger_source,
         analysed_at = now,
-        otel.status_code = otel_status,
     )
     .entered();
     let st = Status {

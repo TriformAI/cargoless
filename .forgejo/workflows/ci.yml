@@ -176,6 +176,12 @@ jobs:
       # to fail is caught before its PASS is believed.
       - run: bash scripts/tests/explanation-reaches-the-wire-test.sh --self-test
       - run: bash scripts/tests/explanation-reaches-the-wire-test.sh
+      # INFRA-819: a span status must measure the span, not the verdict it
+      # carries. Same shape and same reason as the line above — static, <1s,
+      # no build — and --self-test first so a guard that has quietly stopped
+      # being able to fail is caught before its PASS is believed.
+      - run: bash scripts/tests/verdict-span-status-test.sh --self-test
+      - run: bash scripts/tests/verdict-span-status-test.sh
 
   fmt:
     runs-on: cargoless-ci
